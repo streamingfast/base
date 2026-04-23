@@ -8,5 +8,8 @@ pub use cached_execution::{
     NoopCachedExecutionProvider,
 };
 
+mod firehose_extras;
+pub use firehose_extras::OpPostTxExtras;
+
 mod validator;
 pub use validator::{BaseEngineValidator, BaseEngineValidatorBuilder};
