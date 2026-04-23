@@ -6,7 +6,7 @@ use base_revm::{
     BasePrecompiles, OpContext, OpHaltReason, OpSpecId, OpTransaction, OpTransactionError,
 };
 use revm::{
-    ExecuteEvm, InspectEvm, Inspector, SystemCallEvm,
+    ExecuteEvm, InspectEvm, InspectSystemCallEvm, Inspector, SystemCallEvm,
     context::{BlockEnv, TxEnv},
     context_interface::result::{EVMError, ResultAndState},
     handler::{PrecompileProvider, instructions::EthInstructions},
@@ -102,7 +102,11 @@ where
         contract: Address,
         data: Bytes,
     ) -> Result<ResultAndState<Self::HaltReason>, Self::Error> {
-        self.inner.system_call_with_caller(caller, contract, data)
+        if self.inspect {
+            self.inner.inspect_system_call_with_caller(caller, contract, data)
+        } else {
+            self.inner.system_call_with_caller(caller, contract, data)
+        }
     }
 
     fn finish(self) -> (Self::DB, EvmEnv<Self::Spec>) {
