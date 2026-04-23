@@ -3644,6 +3644,7 @@ dependencies = [
  "reth-engine-tree",
  "reth-errors",
  "reth-evm",
+ "reth-firehose",
  "reth-node-api",
  "reth-node-builder",
  "reth-payload-primitives",

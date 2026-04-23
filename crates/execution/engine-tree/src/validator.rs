@@ -500,6 +500,54 @@ where
 
         let block = self.convert_to_block(input)?.with_senders(senders);
 
+        // Firehose: re-execute the block with FirehoseInspector for live block tracing. The
+        // drop guard defers the `on_block_end` flush until `mark_verified` is called at the
+        // end of this function — any early return (including the `ensure_ok_post_block!`
+        // branches below) drops the guard, which emits `on_block_end(Some(err))` and
+        // discards the block so invalid blocks are never flushed downstream.
+        let mut fh_tracer: Option<reth_firehose::FirehoseBlockTracer> =
+            if reth_firehose::is_tracer_initialized() {
+                match self.provider.state_by_block_hash(parent_block.hash()) {
+                    Ok(state_provider) => {
+                        let mut db = State::builder()
+                            .with_database(StateProviderDatabase::new(state_provider))
+                            .with_bundle_update()
+                            .build();
+                        let mut guard = reth_firehose::FirehoseBlockTracer::start::<OpPrimitives>(
+                            &block, None,
+                        );
+                        match reth_firehose::executor::trace_block(
+                            &self.evm_config,
+                            &mut db,
+                            &block,
+                            Some(output.result.receipts.as_slice()),
+                            &mut guard,
+                        ) {
+                            Ok(_) => Some(guard),
+                            Err(err) => {
+                                warn!(
+                                    target: "engine::tree::payload_validator",
+                                    %err,
+                                    "Firehose live block tracing failed"
+                                );
+                                guard.mark_failed(&err);
+                                None
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            target: "engine::tree::payload_validator",
+                            %err,
+                            "Failed to get parent state for Firehose live block tracing"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
         // Wait for the receipt root computation to complete.
         let receipt_root_bloom = receipt_root_rx
             .blocking_recv()
@@ -638,6 +686,11 @@ where
 
         if let Some(valid_block_tx) = valid_block_tx {
             let _ = valid_block_tx.send(());
+        }
+
+        // All post-execution validations passed — flush the Firehose block.
+        if let Some(guard) = fh_tracer.take() {
+            guard.mark_verified();
         }
 
         Ok(self.spawn_deferred_trie_task(
