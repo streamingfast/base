@@ -323,7 +323,7 @@ alloy-rpc-types-beacon = "1.6.3"
 alloy-rlp = { version = "0.3.13", default-features = false }
 alloy-trie = { version = "0.9.4", default-features = false }
 alloy-eips = { version = "1.6.3", default-features = false }
-alloy-evm = { version = "0.27.2", default-features = false }
+alloy-evm = { version = "0.27.3", default-features = false }
 alloy-serde = { version = "1.6.3", default-features = false }
 alloy-chains = { version = "0.2.5", default-features = false }
 alloy-genesis = { version = "1.6.3", default-features = false }
@@ -601,3 +601,82 @@ toml = { version = "1.0", default-features = false }
 ark-ff = { version = "0.5.0", default-features = false }
 unsigned-varint = { version = "0.8", default-features = false }
 ark-bls12-381 = { version = "0.5.0", default-features = false }
+
+# Firehose tracer (defined by the streamingfast reth fork, release/reth-1.x branch).
+reth-firehose = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", branch = "main" }
+
+[patch.crates-io]
+# Route EVM system calls (EIP-4788, EIP-2935, ...) through the Inspector when inspect mode
+# is enabled — without this, the Firehose inspector misses system-call state changes.
+# Mirrors the patch applied on the streamingfast reth fork at release/reth-1.x.
+alloy-evm = { git = "https://github.com/streamingfast/evm.git", branch = "sf/v0.27.3" }
+
+[patch."https://github.com/paradigmxyz/reth"]
+reth-db = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-cli = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-ipc = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-evm = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-rpc = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-revm = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-trie = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-exex = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-tasks = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-errors = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-db-api = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-metrics = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-trie-db = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-rpc-api = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-network = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-tracing = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-provider = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-cli-util = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-node-api = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-db-common = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-rpc-layer = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-node-core = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-consensus = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-chainspec = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-primitives = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-cli-runner = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-tokio-util = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-rpc-convert = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-rpc-builder = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-storage-api = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-rpc-eth-api = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-engine-tree = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-chain-state = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-trie-common = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-payload-util = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-node-builder = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-node-metrics = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-cli-commands = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-evm-ethereum = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-tracing-otlp = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-testing-utils = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-rpc-eth-types = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-trie-parallel = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-network-peers = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-node-ethereum = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-rpc-engine-api = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-e2e-test-utils = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-payload-builder = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-execution-types = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-exex-test-utils = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-rpc-server-types = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-transaction-pool = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-execution-errors = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-payload-validator = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-primitives-traits = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-engine-primitives = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-payload-primitives = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-ethereum-primitives = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-basic-payload-builder = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-payload-builder-primitives = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-prune-types = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-stages-types = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-storage-errors = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-ethereum-forks = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-consensus-common = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-codecs = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+reth-zstd-compressors = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }

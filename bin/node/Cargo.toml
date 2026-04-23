@@ -38,6 +38,10 @@ base-execution-cli = { workspace = true, features = ["otlp"] }
 url.workspace = true
 clap.workspace = true
 
+# firehose
+reth-firehose.workspace = true
+firehose-tracer.workspace = true
+
 [features]
 default = [ "jemalloc" ]
 jemalloc = [ "base-execution-cli/jemalloc", "reth-cli-util/jemalloc" ]

@@ -30,6 +30,7 @@ reth-payload-builder.workspace = true
 reth-rpc-engine-api.workspace = true
 reth-transaction-pool.workspace = true
 reth-rpc-server-types.workspace = true
+reth-firehose.workspace = true
 ## ensure secp256k1 recovery with rayon support is activated
 reth-primitives-traits = { workspace = true, features = ["secp256k1", "rayon"] }
 

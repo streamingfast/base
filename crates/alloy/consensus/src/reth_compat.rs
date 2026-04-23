@@ -502,3 +502,36 @@ impl reth_db_api::table::Decompress for OpReceipt {
         Ok(obj)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Firehose SignatureFields
+// ---------------------------------------------------------------------------
+
+impl reth_firehose::mapper::SignatureFields for OpTxEnvelope {
+    fn signature_fields(&self) -> (B256, B256, Bytes) {
+        use alloc::vec;
+
+        // OP deposit transactions have no signature — emit zeroes to preserve layout.
+        let Some(sig) = self.signature() else {
+            return (B256::ZERO, B256::ZERO, Bytes::new());
+        };
+        let y_parity = sig.v() as u64;
+        let v = match self {
+            Self::Legacy(signed) => match signed.tx().chain_id {
+                Some(chain_id) => chain_id * 2 + 35 + y_parity,
+                None => 27 + y_parity,
+            },
+            _ => y_parity,
+        };
+        let v_bytes = {
+            let be = v.to_be_bytes();
+            let first_nonzero = be.iter().position(|&b| b != 0).unwrap_or(be.len());
+            Bytes::from(if first_nonzero == be.len() {
+                vec![]
+            } else {
+                be[first_nonzero..].to_vec()
+            })
+        };
+        (sig.r().into(), sig.s().into(), v_bytes)
+    }
+}

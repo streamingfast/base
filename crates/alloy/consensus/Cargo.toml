@@ -49,6 +49,9 @@ reth-zstd-compressors = { workspace = true, optional = true }
 reth-primitives-traits = { workspace = true, optional = true, features = ["serde-bincode-compat"] }
 reth-ethereum-primitives = { workspace = true, optional = true, features = ["serde-bincode-compat"] }
 
+# firehose
+reth-firehose = { workspace = true }
+
 [dev-dependencies]
 rand.workspace = true
 rstest.workspace = true
