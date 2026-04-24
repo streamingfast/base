@@ -503,9 +503,18 @@ where
                 let sealed = self.convert_to_block(input)?;
                 let tracer =
                     reth_firehose::FirehoseBlockTracer::start::<OpPrimitives>(&sealed, None);
-                let fh_tracer = (!tracer.is_genesis()).then_some(tracer);
+                let is_genesis = tracer.is_genesis();
+                firehose_tracer::firehose_debug!(
+                    "validator: firehose tracer initialized (block={}, is_genesis={})",
+                    sealed.header().number(),
+                    is_genesis
+                );
+                let fh_tracer = (!is_genesis).then_some(tracer);
                 (fh_tracer, BlockOrPayload::Block(sealed))
             } else {
+                firehose_tracer::firehose_debug!(
+                    "validator: firehose tracer NOT initialized — non-traced execution path"
+                );
                 (None, input)
             };
 
