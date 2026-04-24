@@ -1,7 +1,8 @@
 //! Firehose chain-specific hooks for Base / OP Stack.
 //!
-//! Two hooks live here, both installed on the [`reth_firehose::FirehoseWrappedExecutor`]
-//! via `with_hooks`:
+//! Two hooks live here, both installed on a [`reth_firehose::FirehoseWrappedExecutor`]
+//! (directly on the live path, indirectly via [`crate::OpFirehoseEvmConfig`] on the pipeline
+//! path):
 //!
 //! * [`OpPostTxExtras`] — re-emits the three fee-vault balance changes that
 //!   [`base_revm::OpHandler::reward_beneficiary`] applies via `Journal::balance_incr` during

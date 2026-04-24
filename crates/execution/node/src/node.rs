@@ -824,10 +824,12 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
 
 /// A regular Base EVM and executor builder.
 ///
-/// The produced EVM config is wrapped in [`reth_firehose::FirehoseEvmConfig`] so that the
-/// stages pipeline's `execute_and_trace_one` routes through [`FirehoseBlockExecutor`] and
-/// fires tracer hooks when the global Firehose tracer is initialized. When the tracer is
-/// not initialized, `FirehoseEvmConfig` is a transparent pass-through to the inner config.
+/// The produced EVM config is wrapped in [`base_execution_firehose::OpFirehoseEvmConfig`] so
+/// that the stages pipeline's `execute_and_trace_one` routes through
+/// [`reth_firehose::FirehoseBlockExecutor`] with the OP [`ChainHooks`] installed
+/// ([`base_execution_firehose::OpPostTxExtras`] / [`base_execution_firehose::OpPreTxAdjust`]).
+/// When the tracer is not initialized, `FirehoseBlockExecutor` still runs but skips the
+/// trace-and-hook path, so the wrapper is effectively transparent.
 #[derive(Debug, Copy, Clone, Default)]
 #[non_exhaustive]
 pub struct OpExecutorBuilder;
@@ -836,14 +838,14 @@ impl<Node> ExecutorBuilder<Node> for OpExecutorBuilder
 where
     Node: FullNodeTypes<Types: NodeTypes<ChainSpec: BaseUpgrades, Primitives = OpPrimitives>>,
 {
-    type EVM = reth_firehose::FirehoseEvmConfig<
+    type EVM = base_execution_firehose::OpFirehoseEvmConfig<
         OpEvmConfig<<Node::Types as NodeTypes>::ChainSpec, <Node::Types as NodeTypes>::Primitives>,
     >;
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
         let evm_config = OpEvmConfig::new(ctx.chain_spec(), OpRethReceiptBuilder::default());
 
-        Ok(reth_firehose::FirehoseEvmConfig::new(evm_config))
+        Ok(base_execution_firehose::OpFirehoseEvmConfig::new(evm_config))
     }
 }
 

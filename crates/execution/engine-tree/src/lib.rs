@@ -8,8 +8,7 @@ pub use cached_execution::{
     NoopCachedExecutionProvider,
 };
 
-mod firehose_extras;
-pub use firehose_extras::{OpPostTxExtras, OpPreTxAdjust};
+pub use base_execution_firehose::{OpPostTxExtras, OpPreTxAdjust};
 
 mod validator;
 pub use validator::{BaseEngineValidator, BaseEngineValidatorBuilder};

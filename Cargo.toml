@@ -227,6 +227,7 @@ base-execution-exex = { path = "crates/execution/exex" }
 base-execution-trie = { path = "crates/execution/trie" }
 base-txpool-rpc = { path = "crates/execution/txpool-rpc" }
 base-engine-tree = { path = "crates/execution/engine-tree" }
+base-execution-firehose = { path = "crates/execution/firehose" }
 base-flashblocks = { path = "crates/execution/flashblocks" }
 base-execution-forks = { path = "crates/execution/hardforks" }
 base-execution-storage = { path = "crates/execution/storage" }
@@ -680,3 +681,4 @@ reth-ethereum-forks = { git = "https://github.com/streamingfast/reth.git", branc
 reth-consensus-common = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
 reth-codecs = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
 reth-zstd-compressors = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
+
