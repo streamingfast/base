@@ -83,7 +83,8 @@ impl FlashblocksServiceBuilder {
     }
 }
 
-impl<Node, Pool> PayloadServiceBuilder<Node, Pool, OpEvmConfig> for FlashblocksServiceBuilder
+impl<Node, Pool> PayloadServiceBuilder<Node, Pool, reth_firehose::FirehoseEvmConfig<OpEvmConfig>>
+    for FlashblocksServiceBuilder
 where
     Node: NodeBounds,
     Pool: PoolBounds,
@@ -92,7 +93,7 @@ where
         self,
         ctx: &BuilderContext<Node>,
         pool: Pool,
-        _: OpEvmConfig,
+        _: reth_firehose::FirehoseEvmConfig<OpEvmConfig>,
     ) -> eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypes>::Payload>> {
         self.spawn_payload_builder_service(ctx, pool)
     }
