@@ -29,10 +29,6 @@ alloy-primitives = { workspace = true, features = ["rand", "arbitrary"] }
 
 [features]
 default = []
-std = [
-	"alloy-eips/std",
-	"alloy-primitives/std",
-	"base-common-consensus/std",
-]
+std = [ "alloy-eips/std", "alloy-primitives/std", "base-common-consensus/std" ]
 k256 = [ "alloy-primitives/k256", "base-common-consensus/k256" ]
 kzg = [ "alloy-eips/kzg", "base-common-consensus/kzg", "std" ]
