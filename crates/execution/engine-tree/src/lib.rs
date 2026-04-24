@@ -9,7 +9,7 @@ pub use cached_execution::{
 };
 
 mod firehose_extras;
-pub use firehose_extras::OpPostTxExtras;
+pub use firehose_extras::{OpPostTxExtras, OpPreTxAdjust};
 
 mod validator;
 pub use validator::{BaseEngineValidator, BaseEngineValidatorBuilder};

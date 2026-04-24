@@ -957,9 +957,10 @@ where
         let withdrawals = input
             .withdrawals()
             .map(|w| alloy_eips::eip4895::Withdrawals::new(w.to_vec()));
-        let mut executor = reth_firehose::FirehoseWrappedExecutor::with_extras(
+        let mut executor = reth_firehose::FirehoseWrappedExecutor::with_hooks(
             op_executor,
             withdrawals,
+            crate::OpPreTxAdjust,
             crate::OpPostTxExtras,
         );
 

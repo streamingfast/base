@@ -1,21 +1,31 @@
-//! Firehose post-tx extras for the Base / OP Stack fee vault predeploys.
+//! Firehose chain-specific hooks for Base / OP Stack.
 //!
-//! Revm's `post_execution` phase fires no inspector hooks, so the three `Journal::balance_incr`
-//! calls made inside [`base_revm::OpHandler::reward_beneficiary`] (crediting the L1FeeVault,
-//! BaseFeeVault, and OperatorFeeVault predeploys) are invisible to the Firehose tracer. This
-//! module wires those credits back into the tracer via the
-//! [`reth_firehose::PostTxExtras`] hook, mirroring the computation done in the handler.
+//! Two hooks live here, both installed on the [`reth_firehose::FirehoseWrappedExecutor`]
+//! via `with_hooks`:
+//!
+//! * [`OpPostTxExtras`] — re-emits the three fee-vault balance changes that
+//!   [`base_revm::OpHandler::reward_beneficiary`] applies via `Journal::balance_incr` during
+//!   revm's post_execution phase. Revm fires no inspector hooks in that phase, so without this
+//!   the L1FeeVault / BaseFeeVault / OperatorFeeVault credits would be invisible to the tracer.
+//!
+//! * [`OpPreTxAdjust`] — patches the per-tx [`firehose_tracer::types::TxEvent`] before it
+//!   reaches the tracer. OP deposit transaction envelopes carry no nonce field
+//!   ([`alloy_op_consensus::TxDeposit::nonce`] returns a literal `0`); the effective nonce is
+//!   the sender account's pre-execution nonce, which this hook reads from the DB and writes
+//!   into the event.
 
 use alloy_evm::Evm as _;
-use alloy_primitives::{Bytes, U256};
+use alloy_primitives::{Address, Bytes, U256};
 use base_alloy_evm::OpEvm;
 use base_revm::{
-    BASE_FEE_RECIPIENT, L1_FEE_RECIPIENT, OPERATOR_FEE_RECIPIENT, OpContext, OpSpecId, OpTxTr,
+    BASE_FEE_RECIPIENT, DEPOSIT_TRANSACTION_TYPE, L1_FEE_RECIPIENT, OPERATOR_FEE_RECIPIENT,
+    OpContext, OpSpecId, OpTxTr,
 };
 use firehose_tracer::firehose_debug;
 use firehose_tracer::pb::sf::ethereum::r#type::v2::balance_change::Reason;
-use reth_firehose::PostTxExtras;
+use firehose_tracer::types::{TxEvent, TxType};
 use reth_firehose::inspector::FirehoseInspectorApi;
+use reth_firehose::{PostTxExtras, PreTxAdjust};
 use reth_revm::revm::{
     context_interface::ContextTr,
     handler::PrecompileProvider,
@@ -123,5 +133,44 @@ where
                 .tracer_mut()
                 .on_balance_change(vault, old, new, Reason::RewardTransactionFee);
         }
+    }
+}
+
+/// Patches the per-tx [`TxEvent`] for OP Stack deposit transactions.
+///
+/// Deposit envelopes ([`alloy_op_consensus::TxDeposit`]) carry no nonce field: their
+/// `Transaction::nonce()` impl returns a literal `0`. The effective nonce is the sender
+/// account's current on-chain nonce (post-Regolith the state transition increments it as part
+/// of the deposit). This hook reads the pre-execution nonce from the DB and writes it into the
+/// event so the trace matches what geth's instrumented node emits.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OpPreTxAdjust;
+
+impl<DB, I, P> PreTxAdjust<OpEvm<DB, I, P>> for OpPreTxAdjust
+where
+    DB: alloy_evm::Database,
+    I: Inspector<OpContext<DB>, EthInterpreter> + FirehoseInspectorApi,
+    P: PrecompileProvider<OpContext<DB>, Output = InterpreterResult>,
+{
+    fn adjust_tx_event(
+        &self,
+        evm: &mut OpEvm<DB, I, P>,
+        tx_event: &mut TxEvent,
+        sender: Address,
+    ) {
+        // Only OP deposit txs need a nonce fixup — every other envelope carries a real nonce.
+        if !matches!(tx_event.tx_type, TxType::OptimismDeposit) {
+            return;
+        }
+        debug_assert_eq!(TxType::OptimismDeposit as u8, DEPOSIT_TRANSACTION_TYPE);
+        let (db, _inspector, _) = evm.components_mut();
+        let nonce = db.basic(sender).ok().flatten().map(|i| i.nonce).unwrap_or(0);
+        firehose_debug!(
+            "OpPreTxAdjust: deposit tx sender={:?} envelope_nonce={} db_nonce={}",
+            sender,
+            tx_event.nonce,
+            nonce
+        );
+        tx_event.nonce = nonce;
     }
 }
