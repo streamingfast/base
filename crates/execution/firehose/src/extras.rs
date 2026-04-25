@@ -84,6 +84,14 @@ where
             spec
         );
 
+        // CRITICAL: `calculate_tx_l1_cost` caches its result on `L1BlockInfo.tx_l1_cost`
+        // (see `l1block.rs:297`). The OP handler relies on that cache being `None` at the
+        // start of each tx — `Handler::execution_result` clears it after `reward_beneficiary`
+        // runs (see `handler.rs:324`) so the next tx's `validate_against_state_and_deduct_caller`
+        // computes the L1 cost from *its own* envelope. Our hook runs *after* that clear, so
+        // calling `calculate_tx_l1_cost` here re-caches *this* tx's value. Without an explicit
+        // re-clear below, tx N+1's `tx_cost_with_tx` would short-circuit at the cache check
+        // and charge the caller tx N's L1 cost — the post-state diverges, state root mismatch.
         let (l1_cost, operator_fee_cost) = {
             let l1 = evm.ctx_mut().chain_mut();
             let l1_cost = l1.calculate_tx_l1_cost(&enveloped, spec);
@@ -92,6 +100,7 @@ where
             } else {
                 U256::ZERO
             };
+            l1.clear_tx_l1_cost();
             (l1_cost, operator_fee_cost)
         };
         let base_fee_amount =
