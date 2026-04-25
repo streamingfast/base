@@ -113,14 +113,18 @@ where
             operator_fee_cost
         );
 
-        // Match the handler's emission order: L1 cost → base fee → operator fee.
-        // Ordinal ordering within the tx: generic coinbase-tip emission first (inspector), then
-        // these three. Skip zero-amount entries to avoid phantom balance changes (Isthmus gate,
-        // pre-London basefee, etc.).
+        // Emission order matches the geth-instrumented op-node: BaseFeeVault (0x...19) →
+        // L1FeeVault (0x...1A) → OperatorFeeVault (0x...1B). Note this differs from
+        // `OpHandler::reward_beneficiary`'s journal-balance_incr order (L1 → base → operator)
+        // — the handler order doesn't matter for state since increments commute, but the
+        // firehose trace contract pins ordinals to the geth instrumentation, so we emit in
+        // address-ascending order here. Generic coinbase-tip emission already fired (inspector)
+        // before these. Skip zero-amount entries to avoid phantom balance changes (Isthmus
+        // gate, pre-London basefee, etc.).
         let (db, inspector, _) = evm.components_mut();
         for (vault, amount) in [
-            (L1_FEE_RECIPIENT, l1_cost),
             (BASE_FEE_RECIPIENT, base_fee_amount),
+            (L1_FEE_RECIPIENT, l1_cost),
             (OPERATOR_FEE_RECIPIENT, operator_fee_cost),
         ] {
             if amount.is_zero() {
