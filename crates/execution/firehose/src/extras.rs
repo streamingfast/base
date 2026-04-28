@@ -172,12 +172,13 @@ where
         tx_event: &mut TxEvent,
         sender: Address,
     ) {
-        // Only OP deposit txs need a nonce fixup — every other envelope carries a real nonce.
+        // Only OP deposit txs need any fixup — every other envelope carries a real nonce and
+        // is correctly classified as `GasBuy` by the generic depth-0 inspector path.
         if !matches!(tx_event.tx_type, TxType::OptimismDeposit) {
             return;
         }
         debug_assert_eq!(TxType::OptimismDeposit as u8, DEPOSIT_TRANSACTION_TYPE);
-        let (db, _inspector, _) = evm.components_mut();
+        let (db, inspector, _) = evm.components_mut();
         let nonce = db.basic(sender).ok().flatten().map(|i| i.nonce).unwrap_or(0);
         firehose_debug!(
             "OpPreTxAdjust: deposit tx sender={:?} envelope_nonce={} db_nonce={}",
@@ -186,5 +187,16 @@ where
             nonce
         );
         tx_event.nonce = nonce;
+
+        // Reclassify the depth-0 sender balance change. For deposit txs,
+        // `OpHandler::validate_against_state_and_deduct_caller` writes
+        // `balance + mint − effective_balance_spending` (op-revm/handler.rs:104-142). For
+        // typical deposits (zero gas cost, zero spending) the change is purely the `mint`
+        // credit — the geth-instrumented op-node tags this as `IncreaseMint` (reason 18),
+        // not `GasBuy` (reason 7). The generic inspector defaults to `GasBuy`; this override
+        // takes over for the next depth-0 emission only (single-shot, consumed inside
+        // `enter_frame_pre_hook`). Non-deposit OP txs hit the early return above and keep
+        // the default `GasBuy` reason.
+        inspector.set_root_balance_reason(Reason::IncreaseMint);
     }
 }
