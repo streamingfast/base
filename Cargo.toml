@@ -605,17 +605,13 @@ ark-bls12-381 = { version = "0.5.0", default-features = false }
 
 # Firehose tracer (defined by the streamingfast reth fork, release/reth-1.x branch).
 reth-firehose = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
-firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", branch = "main" }
+firehose-tracer = "5.0.0"
 
 [patch.crates-io]
 # Route EVM system calls (EIP-4788, EIP-2935, ...) through the Inspector when inspect mode
 # is enabled — without this, the Firehose inspector misses system-call state changes.
 # Mirrors the patch applied on the streamingfast reth fork at release/reth-1.x.
 alloy-evm = { git = "https://github.com/streamingfast/evm.git", branch = "sf/v0.27.3" }
-# Unify firehose-tracer with the git version used by our crates. The streamingfast reth
-# fork depends on `firehose-tracer = "5.0.0"` from crates.io; without this patch we end
-# up with two distinct copies of the crate (and its types) in the graph.
-firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", branch = "main" }
 
 [patch."https://github.com/paradigmxyz/reth"]
 reth-db = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
@@ -685,4 +681,3 @@ reth-ethereum-forks = { git = "https://github.com/streamingfast/reth.git", branc
 reth-consensus-common = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
 reth-codecs = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
 reth-zstd-compressors = { git = "https://github.com/streamingfast/reth.git", branch = "release/reth-1.x" }
-
