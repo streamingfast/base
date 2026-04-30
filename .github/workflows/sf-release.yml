@@ -3,7 +3,7 @@ name: Build, push and release (if tag)
 on:
   push:
     tags:
-      - "*-v*"
+      - "v*-fh*"
     branches:
       - "firehose/*"
   workflow_dispatch:
@@ -159,9 +159,20 @@ jobs:
           docker cp $(docker create --platform=linux/amd64 ${{ steps.image.outputs.ID }}-amd64):/usr/local/bin/base-reth-node ./base-reth-node_linux_amd64
           docker cp $(docker create --platform=linux/arm64 ${{ steps.image.outputs.ID }}-arm64):/usr/local/bin/base-reth-node ./base-reth-node_linux_arm64
 
+      - name: Extract Changelog
+        id: changelog
+        run: |
+          curl -L https://github.com/streamingfast/sfreleaser/releases/download/v0.12.1/sfreleaser_linux_x86_64.tar.gz | tar -xz
+          chmod +x sfreleaser
+
+          ./sfreleaser changelog extract-section \
+            github://token:${{ github.token }}@${{ github.repository }}/$GITHUB_SHA/CHANGELOG.sf.md \
+            --github-output="changelog:$GITHUB_OUTPUT"
+
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
+          body: ${{ steps.changelog.outputs.changelog }}
           prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
           files: |
             ./base-reth-node_linux_amd64
