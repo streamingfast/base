@@ -23,9 +23,11 @@ Concretely this means:
 
 ## Dev Feedback
 
-Note: `cargo fetch` could not complete in the sandbox due to a libgit2 bug — the `streamingfast/reth` tag `v1.11.4-fh` contains a gitlink entry (`.worktrees/feature-update-to-reth-2.x`, mode 160000) without a corresponding `.gitmodules` file, causing libgit2 to fail with "no URL configured for submodule". The tag commit SHA was verified via `git ls-remote` (`18dec45a3d48e6fa8f16a51ff0cd30ad5f86f3dd`) and the Cargo.lock was updated directly. The user should run `cargo fetch` on their machine to confirm it resolves correctly (the issue may not affect their local git setup if the repo is already cached).
-
-**User response**: A new tag v1.11.4-fh-1 has been pushed which removes this one, make the necessary work to update to it, ensuring Cargo.lock is updated and double check that cargo test passes.
+**User response*:
+1. Rust toolchain has been installed, worst case install it, you are in a sandbox.
+2. You must merge `v0.8.0` tag inside your worktree branch to ensure that merge base of your worktree branch is at the end `v0.8.0`. Fix any conflicts that arise
+3. Run cargo tests ensuring all is fine.
+4. Edit CHANGELOG.sf.md with entry that we are updating to base 0.8.0
 
 ## Spec & Implementation
 

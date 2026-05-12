@@ -14,15 +14,16 @@ workspace = true
 # reth
 reth-evm.workspace = true
 reth-revm.workspace = true
-base-revm = { workspace = true, features = ["reth"] }
 reth-errors.workspace = true
 reth-firehose.workspace = true
 firehose-tracer.workspace = true
 reth-primitives-traits.workspace = true
-base-execution-primitives.workspace = true
+
+# base
+base-common-evm = { workspace = true, features = ["reth"] }
+base-common-consensus = { workspace = true, features = ["reth"] }
 
 # alloy
 alloy-evm.workspace = true
 alloy-consensus.workspace = true
 alloy-primitives.workspace = true
-base-alloy-evm = { workspace = true, features = ["std"] }

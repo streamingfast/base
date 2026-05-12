@@ -15,9 +15,13 @@
 use alloy_consensus::{BlockHeader, Transaction, transaction::TxHashRef};
 use alloy_evm::block::BlockExecutor;
 use alloy_primitives::Sealable;
-use base_alloy_evm::OpEvmFactory;
+use base_common_consensus::BasePrimitives;
+use base_common_evm::{BaseEvmFactory, OpTransaction};
 use reth_errors::BlockExecutionError;
-use reth_evm::{ConfigureEngineEvm, ConfigureEvm, EvmEnvFor, ExecutionCtxFor, execute::Executor};
+use reth_evm::{
+    ConfigureEngineEvm, ConfigureEvm, EvmEnvFor, ExecutionCtxFor, TransactionEnv,
+    execute::Executor,
+};
 use reth_firehose::{
     ChainHooks, FirehoseBlockExecutor, FirehoseBlockTracer, FirehoseWrappedExecutor,
     mapper::SignatureFields,
@@ -26,6 +30,7 @@ use reth_primitives_traits::{
     Block as BlockTrait, BlockBody, BlockTy, NodePrimitives, RecoveredBlock, TxTy,
 };
 use alloy_evm::block::BlockExecutionResult;
+use reth_revm::revm::context::TxEnv;
 
 use crate::{OpPostTxExtras, OpPreTxAdjust};
 
@@ -42,12 +47,13 @@ pub struct OpChainHooks;
 impl<F> ChainHooks<F> for OpChainHooks
 where
     F: ConfigureEvm<
-            Primitives = base_execution_primitives::OpPrimitives,
+            Primitives = BasePrimitives,
             BlockExecutorFactory: alloy_evm::block::BlockExecutorFactory<
-                EvmFactory = OpEvmFactory,
+                EvmFactory = BaseEvmFactory,
             >,
         > + Unpin
         + 'static,
+    OpTransaction<TxEnv>: TransactionEnv,
     BlockTy<F::Primitives>: BlockTrait,
     <BlockTy<F::Primitives> as BlockTrait>::Header: BlockHeader + Sealable,
     <BlockTy<F::Primitives> as BlockTrait>::Body: BlockBody,
@@ -109,12 +115,13 @@ impl<F> OpFirehoseEvmConfig<F> {
 impl<F> ConfigureEvm for OpFirehoseEvmConfig<F>
 where
     F: ConfigureEvm<
-            Primitives = base_execution_primitives::OpPrimitives,
+            Primitives = BasePrimitives,
             BlockExecutorFactory: alloy_evm::block::BlockExecutorFactory<
-                EvmFactory = OpEvmFactory,
+                EvmFactory = BaseEvmFactory,
             >,
         > + Unpin
         + 'static,
+    OpTransaction<TxEnv>: TransactionEnv,
     BlockTy<F::Primitives>: BlockTrait,
     <BlockTy<F::Primitives> as BlockTrait>::Header: BlockHeader + Sealable,
     <BlockTy<F::Primitives> as BlockTrait>::Body: BlockBody,
@@ -181,9 +188,9 @@ where
 impl<F, ExecutionData> ConfigureEngineEvm<ExecutionData> for OpFirehoseEvmConfig<F>
 where
     F: ConfigureEvm<
-            Primitives = base_execution_primitives::OpPrimitives,
+            Primitives = BasePrimitives,
             BlockExecutorFactory: alloy_evm::block::BlockExecutorFactory<
-                EvmFactory = OpEvmFactory,
+                EvmFactory = BaseEvmFactory,
             >,
         > + ConfigureEngineEvm<ExecutionData>
         + Unpin
