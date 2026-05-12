@@ -42,7 +42,7 @@ Note: `cargo check` could not be run in the sandbox (Rust toolchain not installe
 ## State Tracker
 
 **Last Updated:** 2026-05-12
-**Current Step:** Step 4 — Updated to v1.11.4-fh-1
+**Current Step:** Step 5 — Post-merge fixes committed, tests passing
 **Status:** Ready for review
 
 ### Step 1 — Implementation (Completed)
@@ -61,4 +61,18 @@ Note: `cargo check` could not be run in the sandbox (Rust toolchain not installe
 - Updated all 68 references in Cargo.toml from `tag = "v1.11.4-fh"` to `tag = "v1.11.4-fh-1"`
 - Updated all 109 Cargo.lock entries to use new SHA `54e9307e50bf85e5190aac2ea8b288394229b1cc`
 - Committed: `ee152398b`
-- Note: Rust toolchain not available in sandbox; user should run `cargo check`/`cargo test` to confirm
+
+### Step 4 — Merged v0.8.0 tag (Completed)
+- Ran `git merge v0.8.0` and resolved all conflicts
+- Non-firehose files took `--theirs` (upstream v0.8.0)
+- Resolved Cargo.toml conflicts: alloy upgraded to 1.8, kept firehose patch sections
+- Committed merge: `6eb9894f9`
+
+### Step 5 — Post-merge compilation fixes (Completed)
+- Removed duplicate `alloy-sol-types` key in `crates/client/metering/Cargo.toml`
+- Updated `crates/execution/firehose/Cargo.toml`: replaced old deps with `base-common-evm` (reth feature) and `base-common-consensus` (reth feature)
+- Updated `extras.rs`: replaced `base_alloy_evm::OpEvm`/`base_revm::*` with `base_common_evm::{BaseEvm, ...}`, inlined fee recipient addresses
+- Updated `evm_config.rs`: replaced `OpEvmFactory`→`BaseEvmFactory`, `OpPrimitives`→`BasePrimitives`, added `OpTransaction<TxEnv>: TransactionEnv` where clauses
+- `cargo check --workspace` passes (only unrelated `sp1-prover-types` build script failure, pre-existing)
+- `cargo test -p base-execution-firehose` passes
+- Committed: `db62c390f`
