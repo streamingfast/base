@@ -23,6 +23,10 @@ Concretely this means:
 
 ## Dev Feedback
 
+Note: `cargo fetch` could not complete in the sandbox due to a libgit2 bug — the `streamingfast/reth` tag `v1.11.4-fh` contains a gitlink entry (`.worktrees/feature-update-to-reth-2.x`, mode 160000) without a corresponding `.gitmodules` file, causing libgit2 to fail with "no URL configured for submodule". The tag commit SHA was verified via `git ls-remote` (`18dec45a3d48e6fa8f16a51ff0cd30ad5f86f3dd`) and the Cargo.lock was updated directly. The user should run `cargo fetch` on their machine to confirm it resolves correctly (the issue may not affect their local git setup if the repo is already cached).
+
+**User response**: A new tag v1.11.4-fh-1 has been pushed which removes this one, make the necessary work to update to it, ensuring Cargo.lock is updated and double check that cargo test passes.
+
 ## Spec & Implementation
 
 ### Changes Made
@@ -36,11 +40,23 @@ Note: `cargo check` could not be run in the sandbox (Rust toolchain not installe
 ## State Tracker
 
 **Last Updated:** 2026-05-12
-**Current Step:** Step 2 — Ready for review
-**Status:** Implementation complete, awaiting review
+**Current Step:** Step 4 — Updated to v1.11.4-fh-1
+**Status:** Ready for review
 
 ### Step 1 — Implementation (Completed)
 - Bumped workspace version to v0.8.0
 - Updated all 68 reth dependency references from branch to tag v1.11.4-fh
 - Updated CHANGELOG.sf.md
 - Committed: `d0d396013`
+
+### Step 2 — Cargo.lock Updated (Completed)
+- Updated 109 reth source entries in Cargo.lock from `branch=release%2Freth-1.x` to `tag=v1.11.4-fh#18dec45a3d48e6fa8f16a51ff0cd30ad5f86f3dd`
+- `cargo fetch` failed in sandbox due to libgit2 bug with gitlink-without-.gitmodules in reth tag; Cargo.lock updated directly with verified commit SHA
+- Committed: `c669ff610`
+
+### Step 3 — Updated to v1.11.4-fh-1 (Completed)
+- User pushed new tag v1.11.4-fh-1 which removes the problematic gitlink entry
+- Updated all 68 references in Cargo.toml from `tag = "v1.11.4-fh"` to `tag = "v1.11.4-fh-1"`
+- Updated all 109 Cargo.lock entries to use new SHA `54e9307e50bf85e5190aac2ea8b288394229b1cc`
+- Committed: `ee152398b`
+- Note: Rust toolchain not available in sandbox; user should run `cargo check`/`cargo test` to confirm
