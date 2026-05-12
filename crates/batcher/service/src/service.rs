@@ -4,8 +4,6 @@ use std::sync::Arc;
 
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::BlockNumberOrTag;
-use base_alloy_consensus::OpBlock;
-use base_alloy_network::Base;
 use base_batcher_admin::AdminServer;
 use base_batcher_core::{
     AdminHandle, BatchDriver, DaThrottle, NoopThrottleClient, ThrottleClient, ThrottleConfig,
@@ -13,6 +11,8 @@ use base_batcher_core::{
 };
 use base_batcher_encoder::BatchEncoder;
 use base_batcher_source::{BlockSubscription, HybridBlockSource, HybridL1HeadSource, SourceError};
+use base_common_consensus::BaseBlock;
+use base_common_network::Base;
 use base_consensus_rpc::RollupNodeApiClient;
 use base_runtime::TokioRuntime;
 use base_tx_manager::{BaseTxMetrics, SignerConfig, SimpleTxManager, TxManagerConfig};
@@ -60,7 +60,7 @@ enum Subscription {
 }
 
 impl BlockSubscription for Subscription {
-    fn take_stream(&mut self) -> BoxStream<'static, Result<OpBlock, SourceError>> {
+    fn take_stream(&mut self) -> BoxStream<'static, Result<BaseBlock, SourceError>> {
         match self {
             Self::Ws(ws) => ws.take_stream(),
             Self::Null(null) => null.take_stream(),
@@ -90,7 +90,7 @@ type ServiceDriver = BatchDriver<
     TokioRuntime,
     BatchEncoder,
     HybridBlockSource<Subscription, RpcPollingSource, TokioRuntime>,
-    SimpleTxManager,
+    SimpleTxManager<RootProvider>,
     ServiceThrottle,
     HybridL1HeadSource<L1Subscription, RpcL1HeadPollingSource>,
 >;
@@ -257,6 +257,13 @@ impl BatcherService {
     pub async fn setup(self, runtime: TokioRuntime) -> eyre::Result<ReadyBatcher> {
         self.config.encoder_config.validate()?;
 
+        if self.config.stopped && self.config.admin_addr.is_none() {
+            eyre::bail!(
+                "--stopped requires --admin-port: the batcher would start stopped with no way to \
+                 resume because the admin JSON-RPC server is not enabled"
+            );
+        }
+
         info!(
             l1_rpc = %self.config.l1_rpc_url,
             l2_rpc = %self.config.l2_rpc_url,
@@ -290,7 +297,7 @@ impl BatcherService {
         info!(rollup_rpc = %self.config.rollup_rpc_url, "fetching rollup config");
         let rollup_config = Arc::new(
             rollup_client
-                .op_rollup_config()
+                .rollup_config()
                 .await
                 .map_err(|e| eyre::eyre!("optimism_rollupConfig RPC failed: {e}"))?,
         );
@@ -301,10 +308,13 @@ impl BatcherService {
 
         // Fetch sync status to determine the safe L2 head for startup backfill.
         let sync_status = rollup_client
-            .op_sync_status()
+            .sync_status()
             .await
             .map_err(|e| eyre::eyre!("optimism_syncStatus RPC failed: {e}"))?;
         let safe_l2_number = sync_status.safe_l2.block_info.number;
+        let next_l2_timestamp =
+            sync_status.safe_l2.block_info.timestamp.saturating_add(rollup_config.block_time);
+        self.config.encoder_config.validate_for_rollup_config(&rollup_config, next_l2_timestamp)?;
         info!(safe_l2 = %safe_l2_number, "fetched safe L2 head");
 
         // Validate the recent-tx scan depth against the maximum. Do this early so
@@ -464,7 +474,8 @@ impl BatcherService {
             DaThrottle::new(throttle, throttle_client),
             l1_head_source,
         )
-        .with_safe_head_rx(safe_head_rx);
+        .with_safe_head_rx(safe_head_rx)
+        .with_stopped(self.config.stopped);
 
         let admin_server = match self.config.admin_addr {
             Some(addr) => {

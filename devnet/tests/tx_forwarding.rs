@@ -13,9 +13,9 @@ use alloy_provider::Provider;
 use alloy_rpc_client::RpcClient;
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
-use base_alloy_rpc_types::OpTransactionRequest;
+use base_common_rpc_types::BaseTransactionRequest;
+use base_execution_txpool::ValidatedTransaction;
 use base_tx_forwarding::TxForwardingConfig;
-use base_txpool::ValidatedTransaction;
 use devnet::{
     DevnetBuilder,
     config::{ANVIL_ACCOUNT_1, ANVIL_ACCOUNT_2, ANVIL_ACCOUNT_3, ANVIL_ACCOUNT_4},
@@ -36,7 +36,7 @@ fn create_signed_eip1559_tx(
 ) -> Result<(Address, Bytes, alloy_primitives::B256)> {
     let sender = signer.address();
 
-    let tx_request = OpTransactionRequest::default()
+    let tx_request = BaseTransactionRequest::default()
         .from(sender)
         .to(recipient)
         .value(U256::from(1_000_000_000u64))

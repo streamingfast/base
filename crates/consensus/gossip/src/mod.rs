@@ -34,7 +34,7 @@
 //! - Peer protection mechanisms
 //! - Automatic connection pruning
 //!
-//! [`OpNetworkPayloadEnvelope`]: base_alloy_rpc_types_engine::OpNetworkPayloadEnvelope
+//! [`NetworkPayloadEnvelope`]: base_common_rpc_types_engine::NetworkPayloadEnvelope
 
 mod behaviour;
 pub use behaviour::{Behaviour, BehaviourError};
@@ -76,4 +76,4 @@ mod block_validity;
 pub use block_validity::BlockInvalidError;
 
 #[cfg(test)]
-pub(crate) use block_validity::tests::*;
+pub use block_validity::tests::*;

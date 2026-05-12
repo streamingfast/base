@@ -19,11 +19,11 @@ base-batcher-source.workspace = true
 base-batcher-encoder.workspace = true
 base-protocol = { workspace = true, features = ["std"] }
 base-runtime = { workspace = true, features = ["tokio"] }
-base-alloy-consensus = { workspace = true, features = ["std"] }
+base-common-consensus = { workspace = true, features = ["std"] }
 
 # external
+auto_impl.workspace = true
 futures.workspace = true
-metrics.workspace = true
 tracing = { workspace = true, features = ["std"] }
 thiserror = { workspace = true, features = ["std"] }
 serde = { workspace = true, features = ["derive", "std"] }
@@ -65,6 +65,7 @@ name = "pause_resume"
 required-features = ["test-utils"]
 
 [features]
+metrics = [ "base-batcher-encoder/metrics", "base-tx-manager/metrics" ]
 test-utils = [
 	"base-protocol/test-utils",
 	"base-runtime/test-utils",

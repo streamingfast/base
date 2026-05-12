@@ -4,7 +4,10 @@ use alloy_primitives::Address;
 use revm::precompile::PrecompileId;
 use url::Url;
 
-use crate::utils::{BaselineError, Result};
+use crate::{
+    config::OsakaTarget,
+    utils::{BaselineError, Result},
+};
 
 /// Configuration for a single transaction type with its weight.
 #[derive(Debug, Clone)]
@@ -45,6 +48,11 @@ pub enum TxType {
         /// Looper contract address (required when iterations > 1).
         looper_contract: Option<Address>,
     },
+    /// Osaka (Base V1) opcode or precompile transaction.
+    Osaka {
+        /// Target Osaka feature.
+        target: OsakaTarget,
+    },
 }
 
 /// Default maximum gas price cap (1000 gwei).
@@ -53,8 +61,8 @@ pub const DEFAULT_MAX_GAS_PRICE: u128 = 1_000_000_000_000;
 /// Configuration for a load test run.
 #[derive(Debug, Clone)]
 pub struct LoadConfig {
-    /// RPC endpoint URL.
-    pub rpc_url: Url,
+    /// HTTP JSON-RPC endpoint URL.
+    pub rpc_http_url: Url,
     /// Chain ID.
     pub chain_id: u64,
     /// Number of test accounts to create.
@@ -69,8 +77,8 @@ pub struct LoadConfig {
     pub transactions: Vec<TxConfig>,
     /// Target gas per second.
     pub target_gps: u64,
-    /// Duration of the load test.
-    pub duration: Duration,
+    /// Duration of the load test. `None` means run indefinitely until stopped.
+    pub duration: Option<Duration>,
     /// Maximum in-flight (unconfirmed) transactions per sender.
     pub max_in_flight_per_sender: u64,
     /// Number of transactions to batch together before submitting.
@@ -79,13 +87,17 @@ pub struct LoadConfig {
     pub batch_timeout: Duration,
     /// Maximum gas price cap to prevent overspending during congestion.
     pub max_gas_price: u128,
+    /// WebSocket JSON-RPC endpoint URL for block subscription (enables block latency tracking).
+    pub rpc_ws_url: Option<Url>,
+    /// WebSocket URL for flashblocks subscription (enables flashblock latency tracking).
+    pub flashblocks_ws_url: Option<Url>,
 }
 
 impl LoadConfig {
     /// Creates a new load config for devnet.
     pub fn devnet() -> Self {
         Self {
-            rpc_url: "http://localhost:8545".parse().unwrap(),
+            rpc_http_url: "http://localhost:8545".parse().expect("valid default rpc_http_url"),
             chain_id: 1337,
             account_count: 10,
             seed: 42,
@@ -93,30 +105,15 @@ impl LoadConfig {
             sender_offset: 0,
             transactions: vec![TxConfig { weight: 100, tx_type: TxType::Transfer }],
             target_gps: 2_100_000,
-            duration: Duration::from_secs(30),
+            duration: Some(Duration::from_secs(30)),
             max_in_flight_per_sender: 50,
             batch_size: 5,
             batch_timeout: Duration::from_millis(50),
             max_gas_price: DEFAULT_MAX_GAS_PRICE,
-        }
-    }
-
-    /// Creates a new load config for Sepolia Alpha.
-    pub fn sepolia_alpha() -> Self {
-        Self {
-            rpc_url: "https://base-sepolia-alpha.cbhq.net".parse().unwrap(),
-            chain_id: 11763072,
-            account_count: 10,
-            seed: 42,
-            mnemonic: None,
-            sender_offset: 0,
-            transactions: vec![TxConfig { weight: 100, tx_type: TxType::Transfer }],
-            target_gps: 2_100_000,
-            duration: Duration::from_secs(30),
-            max_in_flight_per_sender: 50,
-            batch_size: 5,
-            batch_timeout: Duration::from_millis(50),
-            max_gas_price: DEFAULT_MAX_GAS_PRICE,
+            rpc_ws_url: Some("ws://localhost:8546".parse().expect("valid default rpc_ws_url")),
+            flashblocks_ws_url: Some(
+                "ws://localhost:7111".parse().expect("valid default flashblocks_ws_url"),
+            ),
         }
     }
 
@@ -128,8 +125,10 @@ impl LoadConfig {
         if self.target_gps == 0 {
             return Err(BaselineError::Config("target_gps must be > 0".into()));
         }
-        if self.duration.is_zero() {
-            return Err(BaselineError::Config("duration must be > 0".into()));
+        if self.duration == Some(Duration::ZERO) {
+            return Err(BaselineError::Config(
+                "duration must be > 0 (or omit for continuous)".into(),
+            ));
         }
         if self.batch_size == 0 {
             return Err(BaselineError::Config("batch_size must be > 0".into()));
@@ -140,9 +139,9 @@ impl LoadConfig {
         Ok(())
     }
 
-    /// Sets the RPC URL.
-    pub fn with_rpc_url(mut self, rpc_url: Url) -> Self {
-        self.rpc_url = rpc_url;
+    /// Sets the HTTP JSON-RPC URL.
+    pub fn with_rpc_http_url(mut self, url: Url) -> Self {
+        self.rpc_http_url = url;
         self
     }
 
@@ -190,7 +189,13 @@ impl LoadConfig {
 
     /// Sets the test duration.
     pub const fn with_duration(mut self, duration: Duration) -> Self {
-        self.duration = duration;
+        self.duration = Some(duration);
+        self
+    }
+
+    /// Sets the test to run indefinitely until stopped via the stop flag or Ctrl-C.
+    pub const fn with_continuous(mut self) -> Self {
+        self.duration = None;
         self
     }
 

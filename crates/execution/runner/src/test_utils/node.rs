@@ -4,8 +4,8 @@ use std::{any::Any, fmt, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use alloy_provider::RootProvider;
 use alloy_rpc_client::RpcClient;
-use base_alloy_network::Base;
-use base_execution_chainspec::OpChainSpec;
+use base_common_network::Base;
+use base_execution_chainspec::BaseChainSpec;
 use base_node_core::args::RollupArgs;
 use eyre::Result;
 use reth_db::{
@@ -21,17 +21,19 @@ use reth_provider::providers::BlockchainProvider;
 use reth_tasks::Runtime;
 
 use crate::{
-    BaseNodeExtension, NodeHooks, OpProvider, node::BaseNode, test_utils::engine::EngineApi,
+    BaseNodeExtension, BaseProvider, NodeHooks, node::BaseNode, test_utils::engine::EngineApi,
 };
 
 /// Convenience alias for the local blockchain provider type.
-pub type LocalNodeProvider = OpProvider;
+pub type LocalNodeProvider = BaseProvider;
 
 /// Handle to a launched local node along with the resources required to keep it alive.
 pub struct LocalNode {
-    pub(crate) http_api_addr: SocketAddr,
+    /// HTTP API address of the local node.
+    pub http_api_addr: SocketAddr,
     engine_ipc_path: String,
-    pub(crate) ws_api_addr: SocketAddr,
+    /// WebSocket API address of the local node.
+    pub ws_api_addr: SocketAddr,
     provider: LocalNodeProvider,
     _node_exit_future: NodeExitFuture,
     _node: Box<dyn Any + Sync + Send>,
@@ -60,7 +62,7 @@ impl LocalNode {
     /// Launch a new local node with the provided extensions and chain spec.
     pub async fn new(
         extensions: Vec<Box<dyn BaseNodeExtension>>,
-        chain_spec: Arc<OpChainSpec>,
+        chain_spec: Arc<BaseChainSpec>,
     ) -> Result<Self> {
         let exec = Runtime::test();
 

@@ -20,9 +20,12 @@ pub mod witness;
 
 pub use config::{BaseEthConfigApiServer, BaseEthConfigHandler};
 #[cfg(feature = "client")]
-pub use engine::OpEngineApiClient;
-pub use engine::{OP_ENGINE_CAPABILITIES, OpEngineApi, OpEngineApiServer};
+pub use engine::BaseEngineApiClient;
+pub use engine::{BaseEngineApi, BaseEngineApiServer, OP_ENGINE_CAPABILITIES};
 pub use error::{OpEthApiError, OpInvalidTransactionError, SequencerClientError};
-pub use eth::{OpEthApi, OpEthApiBuilder, OpReceiptBuilder};
-pub use metrics::{EthApiExtMetrics, SequencerMetrics};
-pub use sequencer::SequencerClient;
+pub use eth::{BaseReceiptBuilder, OpEthApi, OpEthApiBuilder};
+pub use metrics::{DebugApiExtMetrics, DebugApis, EthApiExtMetrics, SequencerMetrics};
+#[cfg(feature = "client")]
+pub use miner::MinerApiExtClient;
+pub use miner::MinerApiExtServer;
+pub use sequencer::{SequencerClient, SequencerClientInner};

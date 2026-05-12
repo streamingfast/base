@@ -34,13 +34,12 @@ struct CachedEntry {
 #[derive(Debug, Clone)]
 pub struct PendingTrieCache {
     cache: Arc<ArcSwap<Option<CachedEntry>>>,
-    metrics: Metrics,
 }
 
 impl PendingTrieCache {
     /// Creates a new empty pending trie cache.
     pub fn new() -> Self {
-        Self { cache: Arc::new(ArcSwap::from_pointee(None)), metrics: Metrics::default() }
+        Self { cache: Arc::new(ArcSwap::from_pointee(None)) }
     }
 
     /// Ensures the trie input for the given flashblock is cached and returns it.
@@ -60,14 +59,13 @@ impl PendingTrieCache {
             && cached.payload_id == payload_id
             && cached.flashblock_index == flashblock_index
         {
-            self.metrics.pending_trie_cache_hits.increment(1);
+            Metrics::pending_trie_cache_hits().increment(1);
             return Ok(cached.trie_input.clone());
         }
 
         // Cache miss - compute the trie input with metrics
         let hashed = canonical_state_provider.hashed_post_state(bundle_state);
-        let trie_input =
-            compute_pending_trie_input(canonical_state_provider, hashed, &self.metrics)?;
+        let trie_input = compute_pending_trie_input(canonical_state_provider, hashed)?;
 
         // Store the new entry, replacing any previous cached entry
         self.cache.store(Arc::new(Some(CachedEntry {
@@ -89,7 +87,8 @@ impl Default for PendingTrieCache {
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{Address, B256, U256};
-    use base_node_runner::test_utils::{Account, TestHarness};
+    use base_node_runner::test_utils::TestHarness;
+    use base_test_utils::Account;
     use reth_provider::{HashedPostStateProvider, StateProviderFactory};
     use reth_revm::{bytecode::Bytecode, primitives::KECCAK_EMPTY, state::AccountInfo};
     use revm_database::states::BundleState;
@@ -157,11 +156,7 @@ mod tests {
         let bundle_b = bundle_with_nonce(alice, 0, 2);
 
         let hashed_b = state_provider.hashed_post_state(&bundle_b);
-        let expected = crate::meter::compute_pending_trie_input(
-            &*state_provider,
-            hashed_b,
-            &Metrics::default(),
-        )?;
+        let expected = crate::meter::compute_pending_trie_input(&*state_provider, hashed_b)?;
 
         let cache = PendingTrieCache::new();
         cache.ensure_cached(payload_a, flashblock_index, &bundle_a, &*state_provider)?;

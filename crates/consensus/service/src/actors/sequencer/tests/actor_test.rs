@@ -2,12 +2,12 @@ use std::{sync::Arc, time::Duration};
 
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::ExecutionPayloadV1;
-use base_alloy_rpc_types_engine::{
-    OpExecutionPayload, OpExecutionPayloadEnvelope, OpPayloadAttributes,
+use base_common_rpc_types_engine::{
+    BaseExecutionPayload, BaseExecutionPayloadEnvelope, BasePayloadAttributes,
 };
 use base_consensus_derive::{BuilderError, PipelineErrorKind, test_utils::TestAttributesBuilder};
 use base_consensus_engine::SealTaskError;
-use base_protocol::{BlockInfo, L2BlockInfo, OpAttributesWithParent};
+use base_protocol::{AttributesWithParent, BlockInfo, L2BlockInfo};
 use jsonrpsee::core::ClientError;
 use rstest::rstest;
 
@@ -22,10 +22,10 @@ use crate::{
     },
 };
 
-fn dummy_envelope() -> OpExecutionPayloadEnvelope {
-    OpExecutionPayloadEnvelope {
+fn dummy_envelope() -> BaseExecutionPayloadEnvelope {
+    BaseExecutionPayloadEnvelope {
         parent_beacon_block_root: None,
-        execution_payload: OpExecutionPayload::V1(ExecutionPayloadV1 {
+        execution_payload: BaseExecutionPayload::V1(ExecutionPayloadV1 {
             parent_hash: B256::ZERO,
             fee_recipient: alloy_primitives::Address::ZERO,
             state_root: B256::ZERO,
@@ -48,8 +48,8 @@ fn conductor_rpc_error() -> ConductorError {
     ConductorError::Rpc(ClientError::Custom("test conductor error".to_string()))
 }
 
-fn dummy_attributes_with_parent() -> OpAttributesWithParent {
-    OpAttributesWithParent::new(OpPayloadAttributes::default(), L2BlockInfo::default(), None, false)
+fn dummy_attributes_with_parent() -> AttributesWithParent {
+    AttributesWithParent::new(BasePayloadAttributes::default(), L2BlockInfo::default(), None, false)
 }
 
 fn handle_with_parent_number(number: u64) -> UnsealedPayloadHandle {
@@ -63,8 +63,8 @@ fn handle_with_parent(number: u64, hash: B256) -> UnsealedPayloadHandle {
     };
     UnsealedPayloadHandle {
         payload_id: Default::default(),
-        attributes_with_parent: OpAttributesWithParent::new(
-            OpPayloadAttributes::default(),
+        attributes_with_parent: AttributesWithParent::new(
+            BasePayloadAttributes::default(),
             parent,
             None,
             false,

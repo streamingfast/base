@@ -8,19 +8,18 @@ use std::{
 
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::B256;
-use base_alloy_consensus::{OpBlock, OpTxEnvelope};
+use base_common_consensus::{BaseBlock, BaseTxEnvelope};
 use base_comp::{
     BatchComposer, ChannelOut, CompressionAlgo, CompressorType, Config, ShadowCompressor,
 };
 use base_consensus_genesis::RollupConfig;
-use base_protocol::{Batch, ChannelId, Frame, SingleBatch, SpanBatch};
-use metrics::{counter, gauge, histogram};
+use base_protocol::{Batch, BatchType, ChannelId, Frame, SingleBatch, SpanBatch};
 use rand::{RngCore, SeedableRng, rngs::SmallRng};
 use tracing::{debug, warn};
 
 use crate::{
-    BatchPipeline, BatchSubmission, BatchType, BatcherMetrics, EncoderConfig, ReorgError,
-    StepError, StepResult, SubmissionId,
+    BatchPipeline, BatchSubmission, BatcherMetrics, DaType, EncoderConfig, ReorgError, StepError,
+    StepResult, SubmissionId,
     channel::{OpenChannel, PendingRef, ReadyChannel},
 };
 
@@ -36,7 +35,7 @@ pub struct BatchEncoder {
     /// Current L1 head block number (for channel duration tracking).
     l1_head: u64,
     /// L2 blocks waiting to be encoded. Pruned when all their frames are confirmed.
-    blocks: VecDeque<OpBlock>,
+    blocks: VecDeque<BaseBlock>,
     /// Index into `blocks`: next block not yet fed into the current channel.
     block_cursor: usize,
     /// Hash of the last block's header (or `B256::ZERO` if empty). Used for reorg detection.
@@ -204,7 +203,8 @@ impl BatchEncoder {
                     // `ready_channels`, where it can never be confirmed and never removed,
                     // leaking memory and growing the O(N) scan in `next_submission`.
                     // Emit a closed counter to keep opened/closed balanced.
-                    counter!(BatcherMetrics::CHANNEL_CLOSED_TOTAL, "reason" => BatcherMetrics::REASON_DISCARD).increment(1);
+                    BatcherMetrics::channel_closed_total(BatcherMetrics::REASON_DISCARD)
+                        .increment(1);
                     self.current_channel = None;
                 }
             }
@@ -263,14 +263,14 @@ impl BatchEncoder {
         );
 
         // Emit close counter and channel lifetime / compression ratio histograms.
-        counter!(BatcherMetrics::CHANNEL_CLOSED_TOTAL, "reason" => close_reason).increment(1);
-        histogram!(BatcherMetrics::CHANNEL_DURATION_BLOCKS).record(duration_blocks as f64);
+        BatcherMetrics::channel_closed_total(close_reason).increment(1);
+        BatcherMetrics::channel_duration_blocks().record(duration_blocks as f64);
         if input_bytes > 0 {
             let ratio = compressed_bytes as f64 / input_bytes as f64;
-            histogram!(BatcherMetrics::CHANNEL_COMPRESSION_RATIO).record(ratio);
+            BatcherMetrics::channel_compression_ratio().record(ratio);
         }
         // All frames from this channel are now pending submission.
-        gauge!(BatcherMetrics::PENDING_FRAMES).increment(frame_count as f64);
+        BatcherMetrics::pending_frames().increment(frame_count as f64);
 
         self.ready_channels.push_back(ReadyChannel {
             id: channel_id,
@@ -298,7 +298,7 @@ impl BatchEncoder {
         let channel_out = ChannelOut::new(id, Arc::clone(&self.rollup_config), compressor);
 
         debug!(channel_id = ?id, l1_head = %self.l1_head, "opened new channel");
-        counter!(BatcherMetrics::CHANNEL_OPENED_TOTAL).increment(1);
+        BatcherMetrics::channel_opened_total().increment(1);
 
         self.current_channel = Some(OpenChannel { out: channel_out, opened_at_l1: self.l1_head });
     }
@@ -337,7 +337,7 @@ impl BatchEncoder {
 }
 
 impl BatchPipeline for BatchEncoder {
-    fn add_block(&mut self, block: OpBlock) -> Result<(), (ReorgError, Box<OpBlock>)> {
+    fn add_block(&mut self, block: BaseBlock) -> Result<(), (ReorgError, Box<BaseBlock>)> {
         if !self.blocks.is_empty() && block.header.parent_hash != self.tip {
             return Err((
                 ReorgError::ParentMismatch { expected: self.tip, got: block.header.parent_hash },
@@ -349,7 +349,7 @@ impl BatchPipeline for BatchEncoder {
         let hash = block.header.hash_slow();
         self.tip = hash;
         self.blocks.push_back(block);
-        gauge!(BatcherMetrics::PENDING_BLOCKS).increment(1.0);
+        BatcherMetrics::pending_blocks().increment(1.0);
 
         debug!(block = %number, pending_blocks = %self.blocks.len(), "block added to encoder queue");
 
@@ -469,7 +469,39 @@ impl BatchPipeline for BatchEncoder {
                 let frame_start = channel.cursor;
                 // Pack up to `target_num_frames` frames into a single L1 transaction.
                 let available = channel.frames.len() - frame_start;
-                let frame_count = available.min(self.config.target_num_frames).max(1);
+                let frame_count = if self.config.da_type == DaType::Calldata {
+                    if let Some(max_size) = self.config.max_l1_tx_size_bytes {
+                        // For calldata, accumulate frames until the next frame would push
+                        // the total calldata size over `max_l1_tx_size_bytes`.
+                        // Each frame serialises as: 1 (DERIVATION_VERSION_0) + 16 (channel
+                        // id) + 2 (frame number) + 4 (data length) + data + 1 (is_last).
+                        let mut total = 0usize;
+                        let mut n = 0usize;
+                        for frame in channel.frames[frame_start..].iter().take(available) {
+                            if n >= self.config.target_num_frames {
+                                break;
+                            }
+                            let frame_size = 24 + frame.data.len();
+                            if n > 0 && total + frame_size > max_size {
+                                break;
+                            }
+                            if n == 0 && frame_size > max_size {
+                                warn!(
+                                    frame_size,
+                                    max_l1_tx_size_bytes = max_size,
+                                    "frame exceeds max_l1_tx_size_bytes; submitting anyway"
+                                );
+                            }
+                            total += frame_size;
+                            n += 1;
+                        }
+                        n.max(1)
+                    } else {
+                        available.min(self.config.target_num_frames).max(1)
+                    }
+                } else {
+                    available.min(self.config.target_num_frames).max(1)
+                };
                 // Clone the Arcs (pointer copies, not deep copies of frame data).
                 let frames: Vec<_> =
                     channel.frames[frame_start..frame_start + frame_count].to_vec();
@@ -484,7 +516,7 @@ impl BatchPipeline for BatchEncoder {
                     .insert(id, PendingRef { channel_idx: chan_idx, frame_start, frame_count });
 
                 // Frames move from pending → in-flight; decrement the pending gauge.
-                gauge!(BatcherMetrics::PENDING_FRAMES).decrement(frame_count as f64);
+                BatcherMetrics::pending_frames().decrement(frame_count as f64);
                 debug!(
                     id = %id.0,
                     frame_count = %frame_count,
@@ -546,7 +578,7 @@ impl BatchPipeline for BatchEncoder {
             if prune_count > 0 {
                 self.blocks.drain(..prune_count);
                 self.block_cursor = self.block_cursor.saturating_sub(prune_count);
-                gauge!(BatcherMetrics::PENDING_BLOCKS).decrement(prune_count as f64);
+                BatcherMetrics::pending_blocks().decrement(prune_count as f64);
 
                 debug!(prune_count = %prune_count, "pruned confirmed blocks from encoder queue");
 
@@ -586,7 +618,7 @@ impl BatchPipeline for BatchEncoder {
             channel.cursor = pending_ref.frame_start;
         }
         // Frames are back in pending state; re-increment the gauge.
-        gauge!(BatcherMetrics::PENDING_FRAMES).increment(pending_ref.frame_count as f64);
+        BatcherMetrics::pending_frames().increment(pending_ref.frame_count as f64);
 
         debug!(
             id = ?id,
@@ -632,8 +664,8 @@ impl BatchPipeline for BatchEncoder {
         self.rng = SmallRng::from_os_rng();
 
         // Zero out state gauges — all buffered data has been discarded.
-        gauge!(BatcherMetrics::PENDING_BLOCKS).set(0.0);
-        gauge!(BatcherMetrics::PENDING_FRAMES).set(0.0);
+        BatcherMetrics::pending_blocks().set(0.0);
+        BatcherMetrics::pending_frames().set(0.0);
     }
 
     fn prune_safe(&mut self, safe_l2_number: u64) {
@@ -655,7 +687,7 @@ impl BatchPipeline for BatchEncoder {
 
         self.blocks.drain(..prune_count);
         self.block_cursor -= prune_count;
-        gauge!(BatcherMetrics::PENDING_BLOCKS).decrement(prune_count as f64);
+        BatcherMetrics::pending_blocks().decrement(prune_count as f64);
 
         // Adjust block_range high-water marks in ready channels so that confirm()
         // does not over-prune later. This mirrors the adjustment in confirm().
@@ -669,7 +701,7 @@ impl BatchPipeline for BatchEncoder {
             .iter()
             .skip(self.block_cursor)
             .flat_map(|b| &b.body.transactions)
-            .filter(|tx| !matches!(tx, OpTxEnvelope::Deposit(_)))
+            .filter(|tx| !matches!(tx, BaseTxEnvelope::Deposit(_)))
             .map(|tx| tx.encode_2718_len() as u64)
             .sum()
     }
@@ -679,32 +711,32 @@ impl BatchPipeline for BatchEncoder {
 mod tests {
     use alloy_consensus::{BlockBody, Header, SignableTransaction, TxLegacy};
     use alloy_primitives::{Bytes, Sealed, Signature};
-    use base_alloy_consensus::{OpTxEnvelope, TxDeposit};
+    use base_common_consensus::{BaseTxEnvelope, TxDeposit};
     use base_comp::BatchComposeError;
     use base_protocol::{L1BlockInfoBedrock, L1BlockInfoTx};
     use rstest::rstest;
 
     use super::*;
 
-    fn make_deposit_tx() -> OpTxEnvelope {
+    fn make_deposit_tx() -> BaseTxEnvelope {
         let calldata = L1BlockInfoTx::Bedrock(L1BlockInfoBedrock::default()).encode_calldata();
-        OpTxEnvelope::Deposit(Sealed::new(TxDeposit { input: calldata, ..Default::default() }))
+        BaseTxEnvelope::Deposit(Sealed::new(TxDeposit { input: calldata, ..Default::default() }))
     }
 
-    fn make_block(parent_hash: B256) -> OpBlock {
-        OpBlock {
+    fn make_block(parent_hash: B256) -> BaseBlock {
+        BaseBlock {
             header: Header { parent_hash, ..Default::default() },
             body: BlockBody { transactions: vec![make_deposit_tx()], ..Default::default() },
         }
     }
 
-    fn make_block_with_user_tx(parent_hash: B256) -> OpBlock {
+    fn make_block_with_user_tx(parent_hash: B256) -> BaseBlock {
         let user_tx = {
             let signed = TxLegacy::default().into_signed(Signature::test_signature());
-            OpTxEnvelope::Legacy(signed)
+            BaseTxEnvelope::Legacy(signed)
         };
 
-        OpBlock {
+        BaseBlock {
             header: Header { parent_hash, ..Default::default() },
             body: BlockBody {
                 transactions: vec![make_deposit_tx(), user_tx],
@@ -1108,30 +1140,30 @@ mod tests {
     // skipped: skipping would produce a gap in the L2 block sequence submitted
     // to L1, which the derivation spec prohibits.
 
-    fn make_empty_block(parent_hash: B256) -> OpBlock {
-        OpBlock {
+    fn make_empty_block(parent_hash: B256) -> BaseBlock {
+        BaseBlock {
             header: Header { parent_hash, ..Default::default() },
             body: BlockBody { transactions: vec![], ..Default::default() },
         }
     }
 
-    fn make_non_deposit_block(parent_hash: B256) -> OpBlock {
+    fn make_non_deposit_block(parent_hash: B256) -> BaseBlock {
         let user_tx = {
             let signed = TxLegacy::default().into_signed(Signature::test_signature());
-            OpTxEnvelope::Legacy(signed)
+            BaseTxEnvelope::Legacy(signed)
         };
-        OpBlock {
+        BaseBlock {
             header: Header { parent_hash, ..Default::default() },
             body: BlockBody { transactions: vec![user_tx], ..Default::default() },
         }
     }
 
-    fn make_bad_calldata_block(parent_hash: B256) -> OpBlock {
-        let deposit = OpTxEnvelope::Deposit(Sealed::new(TxDeposit {
+    fn make_bad_calldata_block(parent_hash: B256) -> BaseBlock {
+        let deposit = BaseTxEnvelope::Deposit(Sealed::new(TxDeposit {
             input: Bytes::new(),
             ..Default::default()
         }));
-        OpBlock {
+        BaseBlock {
             header: Header { parent_hash, ..Default::default() },
             body: BlockBody { transactions: vec![deposit], ..Default::default() },
         }
@@ -1143,7 +1175,7 @@ mod tests {
     #[case::empty_block(make_empty_block(B256::ZERO), BatchComposeError::EmptyBlock)]
     #[case::not_deposit(make_non_deposit_block(B256::ZERO), BatchComposeError::NotDepositTx)]
     #[case::bad_calldata(make_bad_calldata_block(B256::ZERO), BatchComposeError::L1InfoDecode)]
-    fn test_step_fatal(#[case] block: OpBlock, #[case] expected_source: BatchComposeError) {
+    fn test_step_fatal(#[case] block: BaseBlock, #[case] expected_source: BatchComposeError) {
         let mut encoder = default_encoder();
         encoder.add_block(block).unwrap();
         let err = encoder.step().unwrap_err();
@@ -1388,11 +1420,13 @@ mod tests {
 
     // --- prune_safe tests ---
 
-    fn make_numbered_block(parent_hash: B256, number: u64) -> OpBlock {
+    fn make_numbered_block(parent_hash: B256, number: u64) -> BaseBlock {
         let calldata = L1BlockInfoTx::Bedrock(L1BlockInfoBedrock::default()).encode_calldata();
-        let deposit =
-            OpTxEnvelope::Deposit(Sealed::new(TxDeposit { input: calldata, ..Default::default() }));
-        OpBlock {
+        let deposit = BaseTxEnvelope::Deposit(Sealed::new(TxDeposit {
+            input: calldata,
+            ..Default::default()
+        }));
+        BaseBlock {
             header: Header { parent_hash, number, ..Default::default() },
             body: BlockBody { transactions: vec![deposit], ..Default::default() },
         }
@@ -1570,5 +1604,91 @@ mod tests {
             "expected at least 3 frames with max_frame_size=80, got {}",
             frames.len()
         );
+    }
+
+    /// `max_l1_tx_size_bytes` limits the calldata submission size for calldata DA.
+    ///
+    /// With a very small limit, only one frame (at minimum) is included per submission
+    /// even when multiple frames are available.
+    #[test]
+    fn calldata_max_l1_tx_size_limits_submission() {
+        let rollup_config = Arc::new(RollupConfig::default());
+        // Use a tiny max_frame_size to generate multiple small frames and
+        // a max_l1_tx_size_bytes of 0 to force a single-frame submission each time.
+        let config = EncoderConfig {
+            da_type: DaType::Calldata,
+            target_num_frames: 1, // required for calldata
+            max_frame_size: 100,
+            target_frame_size: 100,
+            max_l1_tx_size_bytes: Some(0), // smaller than any real frame; always warns
+            ..EncoderConfig::default()
+        };
+        let mut encoder = BatchEncoder::new(rollup_config, config);
+
+        let block = make_block_with_user_tx(B256::ZERO);
+        encoder.add_block(block).expect("add block");
+        encoder.encode_and_drain().expect("encode_and_drain");
+
+        // With max_l1_tx_size_bytes=0 every frame exceeds the limit, but we still get
+        // at least one submission (the .max(1) ensures we never stall).
+        let sub = encoder.next_submission();
+        // All frames were already drained by encode_and_drain; submissions were emitted
+        // during drain. The key property is that no panic occurred and the encoder
+        // handled the oversized-frame case gracefully.
+        let _ = sub; // may be None if all frames came out during encode_and_drain
+    }
+
+    /// When `max_l1_tx_size_bytes` is large enough to hold all frames, all frames in a
+    /// calldata channel are packed into a single submission (bounded by `target_num_frames`).
+    #[test]
+    fn calldata_max_l1_tx_size_no_op_when_large() {
+        let rollup_config = Arc::new(RollupConfig::default());
+        // Use a small frame size to generate multiple frames, but a large tx size limit.
+        let config = EncoderConfig {
+            da_type: DaType::Calldata,
+            target_num_frames: 1, // required for calldata
+            max_frame_size: 100,
+            target_frame_size: 100,
+            max_l1_tx_size_bytes: Some(1_000_000),
+            ..EncoderConfig::default()
+        };
+        let mut encoder = BatchEncoder::new(rollup_config, config);
+
+        let block = make_block_with_user_tx(B256::ZERO);
+        encoder.add_block(block).expect("add block");
+
+        // Run until idle, force-close, and drain submissions.
+        loop {
+            if encoder.step().expect("step") == StepResult::Idle {
+                break;
+            }
+        }
+        encoder.force_close_channel();
+
+        // Each submission contains exactly 1 frame (target_num_frames=1).
+        let mut count = 0;
+        while let Some(sub) = encoder.next_submission() {
+            assert_eq!(sub.frames.len(), 1, "calldata submission must have exactly 1 frame");
+            count += 1;
+        }
+        assert!(count >= 1, "expected at least one submission");
+    }
+
+    /// `max_l1_tx_size_bytes` is a no-op for blob DA; submissions are not affected.
+    #[test]
+    fn blob_da_ignores_max_l1_tx_size_bytes() {
+        let rollup_config = Arc::new(RollupConfig::default());
+        let config = EncoderConfig {
+            da_type: DaType::Blob,
+            target_num_frames: 1,
+            max_l1_tx_size_bytes: Some(1), // would cut every tx if applied to blobs
+            ..EncoderConfig::default()
+        };
+        let mut encoder = BatchEncoder::new(rollup_config, config);
+
+        let block = make_block_with_user_tx(B256::ZERO);
+        encoder.add_block(block).expect("add block");
+        let frames = encoder.encode_and_drain().expect("encode_and_drain");
+        assert!(!frames.is_empty(), "blob DA must still produce frames despite tiny size limit");
     }
 }

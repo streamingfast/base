@@ -4,24 +4,24 @@ use alloc::{sync::Arc, vec};
 
 use alloy_chains::Chain;
 use alloy_primitives::{U256, b256};
-use base_alloy_chains::{BaseChainConfig, BaseUpgrade};
-use base_execution_forks::BASE_SEPOLIA_HARDFORKS;
+use base_common_chains::{BaseUpgrade, ChainConfig};
+use base_execution_upgrades::BASE_SEPOLIA_UPGRADES;
 use reth_chainspec::{BaseFeeParams, BaseFeeParamsKind, ChainSpec, Hardfork};
 use reth_ethereum_forks::EthereumHardfork;
 use reth_primitives_traits::{SealedHeader, sync::LazyLock};
 
-use crate::OpChainSpec;
+use crate::BaseChainSpec;
 
 /// The Base Sepolia spec
-pub static BASE_SEPOLIA: LazyLock<Arc<OpChainSpec>> = LazyLock::new(|| {
-    let genesis = serde_json::from_str(BaseChainConfig::sepolia().genesis_json)
+pub static BASE_SEPOLIA: LazyLock<Arc<BaseChainSpec>> = LazyLock::new(|| {
+    let genesis = serde_json::from_str(ChainConfig::sepolia().genesis_json)
         .expect("Can't deserialize Base Sepolia genesis json");
-    let hardforks = BASE_SEPOLIA_HARDFORKS.clone();
-    OpChainSpec {
+    let hardforks = BASE_SEPOLIA_UPGRADES.clone();
+    BaseChainSpec {
         inner: ChainSpec {
             chain: Chain::base_sepolia(),
             genesis_header: SealedHeader::new(
-                OpChainSpec::make_genesis_header(&genesis, &hardforks),
+                BaseChainSpec::make_genesis_header(&genesis, &hardforks),
                 b256!("0x0dcc9e089e30b90ddfc55be9a37dd15bc551aeee999d2e2b51414c54eaf934e4"),
             ),
             genesis,

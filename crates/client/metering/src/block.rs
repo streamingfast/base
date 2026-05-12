@@ -4,9 +4,9 @@ use std::{sync::Arc, time::Instant};
 
 use alloy_consensus::{BlockHeader, Header, transaction::SignerRecoverable};
 use alloy_primitives::B256;
-use base_alloy_consensus::OpBlock;
-use base_execution_chainspec::OpChainSpec;
-use base_execution_evm::{OpEvmConfig, OpNextBlockEnvAttributes};
+use base_common_consensus::BaseBlock;
+use base_execution_chainspec::BaseChainSpec;
+use base_execution_evm::{BaseEvmConfig, OpNextBlockEnvAttributes};
 use eyre::{Result as EyreResult, eyre};
 use reth_evm::{ConfigureEvm, execute::BlockBuilder};
 use reth_primitives_traits::Block as BlockT;
@@ -36,8 +36,8 @@ use crate::types::{MeterBlockResponse, MeterBlockTransactions};
 /// the `state_root_time_us` value.
 pub fn meter_block<P>(
     provider: P,
-    chain_spec: Arc<OpChainSpec>,
-    block: &OpBlock,
+    chain_spec: Arc<BaseChainSpec>,
+    block: &BaseBlock,
 ) -> EyreResult<MeterBlockResponse>
 where
     P: StateProviderFactory + HeaderProvider<Header = Header>,
@@ -88,7 +88,7 @@ where
 
     let evm_start = Instant::now();
     {
-        let evm_config = OpEvmConfig::optimism(chain_spec);
+        let evm_config = BaseEvmConfig::optimism(chain_spec);
         let mut builder = evm_config.builder_for_next_block(&mut db, &parent_header, attributes)?;
 
         builder.apply_pre_execution_changes()?;
@@ -137,8 +137,9 @@ where
 mod tests {
     use alloy_consensus::TxEip1559;
     use alloy_primitives::{Address, Signature};
-    use base_execution_primitives::{OpBlockBody, OpTransactionSigned};
-    use base_node_runner::test_utils::{Account, TestHarness};
+    use base_common_consensus::{BaseBlockBody, BaseTransactionSigned};
+    use base_node_runner::test_utils::TestHarness;
+    use base_test_utils::Account;
     use reth_primitives_traits::Block as _;
     use reth_transaction_pool::test_utils::TransactionBuilder;
 
@@ -146,8 +147,8 @@ mod tests {
 
     fn create_block_with_transactions(
         harness: &TestHarness,
-        transactions: Vec<OpTransactionSigned>,
-    ) -> OpBlock {
+        transactions: Vec<BaseTransactionSigned>,
+    ) -> BaseBlock {
         let latest = harness.latest_block();
         let header = Header {
             parent_hash: latest.hash(),
@@ -161,9 +162,9 @@ mod tests {
             ..Default::default()
         };
 
-        let body = OpBlockBody { transactions, ommers: vec![], withdrawals: None };
+        let body = BaseBlockBody { transactions, ommers: vec![], withdrawals: None };
 
-        OpBlock::new(header, body)
+        BaseBlock::new(header, body)
     }
 
     #[tokio::test]
@@ -209,7 +210,7 @@ mod tests {
             .max_priority_fee_per_gas(1)
             .into_eip1559();
 
-        let tx = OpTransactionSigned::Eip1559(
+        let tx = BaseTransactionSigned::Eip1559(
             signed_tx.as_eip1559().expect("eip1559 transaction").clone(),
         );
         let tx_hash = tx.tx_hash();
@@ -259,7 +260,7 @@ mod tests {
             .max_priority_fee_per_gas(1)
             .into_eip1559();
 
-        let tx_1 = OpTransactionSigned::Eip1559(
+        let tx_1 = BaseTransactionSigned::Eip1559(
             signed_tx_1.as_eip1559().expect("eip1559 transaction").clone(),
         );
         let tx_hash_1 = tx_1.tx_hash();
@@ -276,7 +277,7 @@ mod tests {
             .max_priority_fee_per_gas(2)
             .into_eip1559();
 
-        let tx_2 = OpTransactionSigned::Eip1559(
+        let tx_2 = BaseTransactionSigned::Eip1559(
             signed_tx_2.as_eip1559().expect("eip1559 transaction").clone(),
         );
         let tx_hash_2 = tx_2.tx_hash();
@@ -339,7 +340,7 @@ mod tests {
             .max_priority_fee_per_gas(1)
             .into_eip1559();
 
-        let tx = OpTransactionSigned::Eip1559(
+        let tx = BaseTransactionSigned::Eip1559(
             signed_tx.as_eip1559().expect("eip1559 transaction").clone(),
         );
 
@@ -384,8 +385,8 @@ mod tests {
             ..Default::default()
         };
 
-        let body = OpBlockBody { transactions: vec![], ommers: vec![], withdrawals: None };
-        let block = OpBlock::new(header, body);
+        let body = BaseBlockBody { transactions: vec![], ommers: vec![], withdrawals: None };
+        let block = BaseBlock::new(header, body);
 
         let result = meter_block(harness.blockchain_provider(), harness.chain_spec(), &block);
 
@@ -423,7 +424,7 @@ mod tests {
 
         let signed_tx =
             alloy_consensus::Signed::new_unchecked(tx, invalid_signature, B256::random());
-        let op_tx = OpTransactionSigned::Eip1559(signed_tx);
+        let op_tx = BaseTransactionSigned::Eip1559(signed_tx);
 
         let block = create_block_with_transactions(&harness, vec![op_tx]);
 

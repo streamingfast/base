@@ -1,0 +1,21 @@
+# SP1 ELF artifact manifest.
+#
+# The binaries themselves are NOT committed to git - only their sha256.
+# To (re)build them locally run:
+#
+#     just succinct build-elfs
+#
+# That target writes the freshly built ELFs into this directory and rewrites
+# the `sha256` fields below. Commit the resulting manifest change together with
+# the code change that caused the ELF to change.
+#
+# The `base-succinct-elfs` crate's build.rs verifies the local cache against
+# these hashes; builds fail fast if they drift.
+
+[[elfs]]
+name = "range-elf-embedded"
+sha256 = "83043f5701478e584ced1481f3a0a5d583ebed0cbc22a58c3cfc23926249b56a"
+
+[[elfs]]
+name = "aggregation-elf"
+sha256 = "a4258062b9ae197601d0ec07b3ae9b0f9444212a604f617d5b4be316e114655a"

@@ -1,13 +1,14 @@
 use std::{sync::Arc, time::Duration};
 
-use base_alloy_consensus::OpBlock;
 use base_batcher_core::{
     BatchDriver, BatchDriverConfig, BatchDriverError, DaThrottle, NoopThrottleClient,
     ThrottleConfig, ThrottleController, ThrottleStrategy,
 };
-use base_batcher_encoder::{BatchEncoder, BatchType, EncoderConfig};
+use base_batcher_encoder::{BatchEncoder, EncoderConfig};
 use base_batcher_source::{ChannelBlockSource, ChannelL1HeadSource, L2BlockEvent};
+use base_common_consensus::BaseBlock;
 use base_consensus_genesis::RollupConfig;
+use base_protocol::BatchType;
 use base_runtime::TokioRuntime;
 use tokio_util::sync::CancellationToken;
 
@@ -321,7 +322,7 @@ impl Batcher<ActionL2Source> {
     /// Push a block into the L2 source for the next [`advance`] call.
     ///
     /// [`advance`]: Batcher::advance
-    pub fn push_block(&mut self, block: OpBlock) {
+    pub fn push_block(&mut self, block: BaseBlock) {
         self.l2_source.push(block);
     }
 }

@@ -1,16 +1,16 @@
 //! Base Node types config.
 
+use base_common_consensus::BasePrimitives;
 use base_engine_tree::BaseEngineValidatorBuilder;
-use base_execution_chainspec::OpChainSpec;
-use base_execution_payload_builder::config::{OpDAConfig, OpGasLimitConfig};
-use base_execution_primitives::OpPrimitives;
+use base_execution_chainspec::BaseChainSpec;
+use base_execution_payload_builder::config::{BaseDAConfig, GasLimitConfig};
 use base_execution_rpc::eth::OpEthApiBuilder;
-use base_execution_storage::OpStorage;
+use base_execution_storage::BaseStorage;
 use base_node_core::{
-    OpConsensusBuilder, OpEngineApiBuilder, OpEngineTypes, OpEngineValidatorBuilder,
-    OpExecutorBuilder, OpNetworkBuilder, OpNodeComponentBuilder, OpNodeTypes,
+    BaseConsensusBuilder, BaseExecutorBuilder, BaseNetworkBuilder, BaseNodeComponentBuilder,
+    BaseNodeTypes, BasePayloadValidatorBuilder, OpEngineApiBuilder, OpEngineTypes,
     args::RollupArgs,
-    node::{OpPayloadBuilder, OpPoolBuilder},
+    node::{BasePoolBuilder, OpPayloadBuilder},
 };
 use reth_node_builder::{
     Node, NodeAdapter, NodeComponentsBuilder,
@@ -34,11 +34,11 @@ pub struct BaseNode {
     /// the `miner_` api).
     ///
     /// By default no throttling is applied.
-    pub da_config: OpDAConfig,
+    pub da_config: BaseDAConfig,
     /// Gas limit configuration for the OP builder.
     /// Used to control the gas limit of the blocks produced by the OP builder. (configured by the
     /// batcher via the `miner_` api)
-    pub gas_limit_config: OpGasLimitConfig,
+    pub gas_limit_config: GasLimitConfig,
 }
 
 impl BaseNode {
@@ -46,41 +46,46 @@ impl BaseNode {
     pub fn new(args: RollupArgs) -> Self {
         Self {
             args,
-            da_config: OpDAConfig::default(),
-            gas_limit_config: OpGasLimitConfig::default(),
+            da_config: BaseDAConfig::default(),
+            gas_limit_config: GasLimitConfig::default(),
         }
     }
 
     /// Configure the data availability configuration for the OP builder.
-    pub fn with_da_config(mut self, da_config: OpDAConfig) -> Self {
+    pub fn with_da_config(mut self, da_config: BaseDAConfig) -> Self {
         self.da_config = da_config;
         self
     }
 
     /// Configure the gas limit configuration for the OP builder.
-    pub fn with_gas_limit_config(mut self, gas_limit_config: OpGasLimitConfig) -> Self {
+    pub fn with_gas_limit_config(mut self, gas_limit_config: GasLimitConfig) -> Self {
         self.gas_limit_config = gas_limit_config;
         self
     }
 
     /// Returns the components for the given [`RollupArgs`].
-    pub fn components<Node>(&self) -> OpNodeComponentBuilder<Node>
+    pub fn components<Node>(&self) -> BaseNodeComponentBuilder<Node>
     where
-        Node: FullNodeTypes<Types: OpNodeTypes>,
+        Node: FullNodeTypes<Types: BaseNodeTypes>,
     {
-        let RollupArgs { disable_txpool_gossip, compute_pending_block, discovery_v4, .. } =
-            self.args;
+        let RollupArgs {
+            disable_txpool_gossip,
+            compute_pending_block,
+            discovery_v4,
+            base_protocol,
+            ..
+        } = self.args;
         ComponentsBuilder::default()
             .node_types::<Node>()
-            .pool(OpPoolBuilder::default())
-            .executor(OpExecutorBuilder::default())
+            .pool(BasePoolBuilder::default())
+            .executor(BaseExecutorBuilder::default())
             .payload(BasicPayloadServiceBuilder::new(
                 OpPayloadBuilder::new(compute_pending_block)
                     .with_da_config(self.da_config.clone())
                     .with_gas_limit_config(self.gas_limit_config.clone()),
             ))
-            .network(OpNetworkBuilder::new(disable_txpool_gossip, !discovery_v4))
-            .consensus(OpConsensusBuilder::default())
+            .network(BaseNetworkBuilder::new(disable_txpool_gossip, !discovery_v4, base_protocol))
+            .consensus(BaseConsensusBuilder::default())
     }
 
     /// Returns [`BaseAddOnsBuilder`] with configured arguments.
@@ -103,26 +108,40 @@ impl BaseNode {
     /// ```no_run
     /// use base_execution_chainspec::BASE_MAINNET;
     /// use base_node_runner::BaseNode;
+    /// use reth_provider::providers::ReadOnlyConfig;
     ///
-    /// let factory =
-    ///     BaseNode::provider_factory_builder().open_read_only(BASE_MAINNET.clone(), "datadir").unwrap();
+    /// let runtime = reth_tasks::Runtime::test();
+    /// let factory = BaseNode::provider_factory_builder()
+    ///     .open_read_only(
+    ///         BASE_MAINNET.clone(),
+    ///         ReadOnlyConfig::from_datadir("datadir").no_watch(),
+    ///         runtime,
+    ///     )
+    ///     .unwrap();
     /// ```
     ///
     /// # Open a Providerfactory manually with all required components
     ///
     /// ```no_run
-    /// use reth_db::open_db_read_only;
-    /// use base_execution_chainspec::OpChainSpecBuilder;
+    /// use base_execution_chainspec::BaseChainSpecBuilder;
     /// use base_node_runner::BaseNode;
-    /// use reth_provider::providers::{RocksDBProvider, StaticFileProvider};
-    /// use std::sync::Arc;
+    /// use reth_db::mdbx::DatabaseArguments;
+    /// use reth_provider::providers::ReadOnlyConfig;
     ///
+    /// let runtime = reth_tasks::Runtime::test();
     /// let factory = BaseNode::provider_factory_builder()
-    ///     .db(Arc::new(open_db_read_only("db", Default::default()).unwrap()))
-    ///     .chainspec(OpChainSpecBuilder::base_mainnet().build().into())
-    ///     .static_file(StaticFileProvider::read_only("db/static_files", false).unwrap())
-    ///     .rocksdb_provider(RocksDBProvider::new("db/rocksdb").unwrap())
-    ///     .build_provider_factory();
+    ///     .open_read_only(
+    ///         BaseChainSpecBuilder::base_mainnet().build().into(),
+    ///         ReadOnlyConfig {
+    ///             db_dir: "db".into(),
+    ///             db_args: DatabaseArguments::default(),
+    ///             static_files_dir: "db/static_files".into(),
+    ///             rocksdb_dir: "db/rocksdb".into(),
+    ///             watch_static_files: false,
+    ///         },
+    ///         runtime,
+    ///     )
+    ///     .unwrap();
     /// ```
     pub fn provider_factory_builder() -> ProviderFactoryBuilder<Self> {
         ProviderFactoryBuilder::default()
@@ -131,23 +150,23 @@ impl BaseNode {
 
 impl<N> Node<N> for BaseNode
 where
-    N: FullNodeTypes<Types: OpNodeTypes<ChainSpec = OpChainSpec>>,
+    N: FullNodeTypes<Types: BaseNodeTypes>,
 {
     type ComponentsBuilder = ComponentsBuilder<
         N,
-        OpPoolBuilder,
+        BasePoolBuilder,
         BasicPayloadServiceBuilder<OpPayloadBuilder>,
-        OpNetworkBuilder,
-        OpExecutorBuilder,
-        OpConsensusBuilder,
+        BaseNetworkBuilder,
+        BaseExecutorBuilder,
+        BaseConsensusBuilder,
     >;
 
     type AddOns = BaseAddOns<
         NodeAdapter<N, <Self::ComponentsBuilder as NodeComponentsBuilder<N>>::Components>,
         OpEthApiBuilder,
-        OpEngineValidatorBuilder,
-        OpEngineApiBuilder<OpEngineValidatorBuilder>,
-        BaseEngineValidatorBuilder<OpEngineValidatorBuilder>,
+        BasePayloadValidatorBuilder,
+        OpEngineApiBuilder<BasePayloadValidatorBuilder>,
+        BaseEngineValidatorBuilder<BasePayloadValidatorBuilder>,
     >;
 
     fn components_builder(&self) -> Self::ComponentsBuilder {
@@ -160,8 +179,8 @@ where
 }
 
 impl NodeTypes for BaseNode {
-    type Primitives = OpPrimitives;
-    type ChainSpec = OpChainSpec;
-    type Storage = OpStorage;
+    type Primitives = BasePrimitives;
+    type ChainSpec = BaseChainSpec;
+    type Storage = BaseStorage;
     type Payload = OpEngineTypes;
 }

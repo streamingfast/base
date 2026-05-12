@@ -10,35 +10,28 @@
 extern crate alloc;
 
 mod params;
-pub use params::{BaseFeeConfig, base_fee_config, base_fee_params, base_fee_params_canyon};
+pub use params::FeeConfig;
 
 mod updates;
 pub use updates::{
     BatcherUpdate, DaFootprintGasScalarUpdate, Eip1559Update, GasConfigUpdate, GasLimitUpdate,
-    MinBaseFeeUpdate, OperatorFeeUpdate, UnsafeBlockSignerUpdate,
+    MinBaseFeeUpdate, OperatorFeeUpdate, UnsafeBlockSignerUpdate, UpdateDataValidator,
+    ValidatedUpdateData, ValidationError, Validator,
 };
 
 mod system;
 pub use system::{
-    BatcherUpdateError, CONFIG_UPDATE_EVENT_VERSION_0, CONFIG_UPDATE_TOPIC,
-    DaFootprintGasScalarUpdateError, EIP1559UpdateError, GasConfigUpdateError, GasLimitUpdateError,
-    LogProcessingError, MinBaseFeeUpdateError, OperatorFeeUpdateError, SystemConfig,
-    SystemConfigLog, SystemConfigUpdate, SystemConfigUpdateError, SystemConfigUpdateKind,
-    UnsafeBlockSignerUpdateError,
+    BatcherUpdateError, DaFootprintGasScalarUpdateError, EIP1559UpdateError, GasConfigUpdateError,
+    GasLimitUpdateError, LogProcessingError, MinBaseFeeUpdateError, OperatorFeeUpdateError,
+    SystemConfig, SystemConfigLog, SystemConfigUpdate, SystemConfigUpdateError,
+    SystemConfigUpdateKind, UnsafeBlockSignerUpdateError,
 };
 
 mod chain;
-pub use chain::{
-    AddressList, BaseHardforkConfig, ChainConfig, HardForkConfig, L1ChainConfig, Roles,
-};
+pub use chain::{AddressList, HardForkConfig, HardforkConfig, Roles};
 
 mod genesis;
 pub use genesis::ChainGenesis;
 
 mod rollup;
-pub use rollup::{
-    FJORD_MAX_SEQUENCER_DRIFT, GRANITE_CHANNEL_TIMEOUT, MAX_RLP_BYTES_PER_CHANNEL_BEDROCK,
-    MAX_RLP_BYTES_PER_CHANNEL_FJORD, RollupConfig,
-};
-
-mod conversions;
+pub use rollup::RollupConfig;

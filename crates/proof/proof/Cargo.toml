@@ -25,17 +25,17 @@ base-consensus-genesis = { workspace = true, features = ["serde"] }
 alloy-rlp.workspace = true
 alloy-eips.workspace = true
 alloy-trie.workspace = true
+alloy-genesis.workspace = true
 alloy-consensus.workspace = true
 alloy-primitives.workspace = true
 
 # Base Alloy
-base-alloy-consensus.workspace = true
-base-alloy-rpc-types-engine.workspace = true
+base-common-consensus.workspace = true
+base-common-rpc-types-engine.workspace = true
 
 # Execution
 alloy-evm.workspace = true
-base-revm.workspace = true
-base-alloy-evm.workspace = true
+base-common-evm.workspace = true
 
 # General
 lru.workspace = true
@@ -51,19 +51,21 @@ ark-ff.workspace = true
 ark-bls12-381.workspace = true
 
 # `std` feature dependencies
+c-kzg = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["full"], optional = true }
 
 [dev-dependencies]
 rand.workspace = true
-c-kzg.workspace = true
 rayon.workspace = true
 rstest.workspace = true
+c-kzg = { workspace = true, features = [] }
 tokio = { workspace = true, features = ["full"] }
 alloy-eips = { workspace = true, features = ["kzg"] }
 
 [features]
 std = [
 	"alloy-consensus/std",
+	"alloy-eips/kzg",
 	"alloy-eips/std",
 	"alloy-evm/std",
 	"alloy-primitives/std",
@@ -71,9 +73,9 @@ std = [
 	"alloy-trie/std",
 	"ark-bls12-381/std",
 	"ark-ff/std",
-	"base-alloy-consensus/std",
-	"base-alloy-evm/std",
-	"base-alloy-rpc-types-engine/std",
+	"base-common-consensus/std",
+	"base-common-evm/std",
+	"base-common-rpc-types-engine/std",
 	"base-consensus-genesis/std",
 	"base-consensus-registry/std",
 	"base-proof-driver/std",
@@ -81,7 +83,8 @@ std = [
 	"base-proof-mpt/std",
 	"base-proof-preimage/std",
 	"base-protocol/std",
-	"base-revm/std",
+	"c-kzg?/std",
+	"dep:c-kzg",
 	"dep:tokio",
 	"serde/std",
 	"serde_json/std",

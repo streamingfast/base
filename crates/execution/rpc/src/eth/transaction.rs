@@ -8,8 +8,7 @@ use std::{
 
 use alloy_primitives::{B256, Bytes};
 use alloy_rpc_types_eth::TransactionInfo;
-use base_alloy_consensus::{OpDepositInfo, OpTransaction, OpTransactionInfo};
-use base_execution_primitives::DepositReceipt;
+use base_common_consensus::{BaseTransaction, BaseTransactionInfo, DepositInfo, DepositReceiptExt};
 use futures::StreamExt;
 use reth_chain_state::CanonStateSubscriptions;
 use reth_primitives_traits::{Recovered, SignedTransaction, SignerRecoverable, WithEncoded};
@@ -196,41 +195,41 @@ where
 ///
 /// For deposits, receipt is fetched to extract `deposit_nonce` and `deposit_receipt_version`.
 /// Otherwise, it works like regular Ethereum implementation, i.e. uses [`TransactionInfo`].
-pub struct OpTxInfoMapper<Provider> {
+pub struct BaseTxInfoMapper<Provider> {
     provider: Provider,
 }
 
-impl<Provider: Clone> Clone for OpTxInfoMapper<Provider> {
+impl<Provider: Clone> Clone for BaseTxInfoMapper<Provider> {
     fn clone(&self) -> Self {
         Self { provider: self.provider.clone() }
     }
 }
 
-impl<Provider> Debug for OpTxInfoMapper<Provider> {
+impl<Provider> Debug for BaseTxInfoMapper<Provider> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OpTxInfoMapper").finish()
+        f.debug_struct("BaseTxInfoMapper").finish()
     }
 }
 
-impl<Provider> OpTxInfoMapper<Provider> {
-    /// Creates [`OpTxInfoMapper`] that uses [`ReceiptProvider`] borrowed from given `eth_api`.
+impl<Provider> BaseTxInfoMapper<Provider> {
+    /// Creates [`BaseTxInfoMapper`] that uses [`ReceiptProvider`] borrowed from given `eth_api`.
     pub const fn new(provider: Provider) -> Self {
         Self { provider }
     }
 }
 
-impl<T, Provider> TxInfoMapper<T> for OpTxInfoMapper<Provider>
+impl<T, Provider> TxInfoMapper<T> for BaseTxInfoMapper<Provider>
 where
-    T: OpTransaction + SignedTransaction,
-    Provider: ReceiptProvider<Receipt: DepositReceipt>,
+    T: BaseTransaction + SignedTransaction,
+    Provider: ReceiptProvider<Receipt: DepositReceiptExt>,
 {
-    type Out = OpTransactionInfo;
+    type Out = BaseTransactionInfo;
     type Err = ProviderError;
 
     fn try_map(&self, tx: &T, tx_info: TransactionInfo) -> Result<Self::Out, ProviderError> {
         let deposit_meta = if tx.is_deposit() {
             self.provider.receipt_by_hash(*tx.tx_hash())?.and_then(|receipt| {
-                receipt.as_deposit_receipt().map(|receipt| OpDepositInfo {
+                receipt.as_deposit_receipt().map(|receipt| DepositInfo {
                     deposit_receipt_version: receipt.deposit_receipt_version,
                     deposit_nonce: receipt.deposit_nonce,
                 })
@@ -240,6 +239,6 @@ where
         }
         .unwrap_or_default();
 
-        Ok(OpTransactionInfo::new(tx_info, deposit_meta))
+        Ok(BaseTransactionInfo::new(tx_info, deposit_meta))
     }
 }

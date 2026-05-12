@@ -2,10 +2,10 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use base_execution_chainspec::OpChainSpec;
-use base_execution_primitives::OpPrimitives;
+use base_common_consensus::BasePrimitives;
+use base_execution_chainspec::BaseChainSpec;
 use base_execution_trie::{
-    InitializationJob, OpProofsStorage, OpProofsStore, db::MdbxProofsStorage,
+    BaseProofsStorage, BaseProofsStore, InitializationJob, db::MdbxProofsStorage,
 };
 use clap::Parser;
 use reth_chainspec::ChainInfo;
@@ -36,9 +36,9 @@ pub struct InitCommand<C: ChainSpecParser> {
     pub storage_path: PathBuf,
 }
 
-impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> InitCommand<C> {
+impl<C: ChainSpecParser<ChainSpec = BaseChainSpec>> InitCommand<C> {
     /// Execute `initialize-op-proofs` command
-    pub async fn execute<N: CliNodeTypes<ChainSpec = C::ChainSpec, Primitives = OpPrimitives>>(
+    pub async fn execute<N: CliNodeTypes<ChainSpec = C::ChainSpec, Primitives = BasePrimitives>>(
         self,
     ) -> eyre::Result<()> {
         info!(target: "reth::cli", version = %version_metadata().short_version, "reth starting");
@@ -48,7 +48,7 @@ impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> InitCommand<C> {
         let Environment { provider_factory, .. } = self.env.init::<N>(AccessRights::RO)?;
 
         // Create the proofs storage
-        let storage: OpProofsStorage<Arc<MdbxProofsStorage>> = Arc::new(
+        let storage: BaseProofsStorage<Arc<MdbxProofsStorage>> = Arc::new(
             MdbxProofsStorage::new(&self.storage_path)
                 .map_err(|e| eyre::eyre!("Failed to create MdbxProofsStorage: {e}"))?,
         )

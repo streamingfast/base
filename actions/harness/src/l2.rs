@@ -3,30 +3,25 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use alloy_consensus::{Header, SignableTransaction};
-use alloy_eips::{BlockNumHash, eip2718::Decodable2718};
-use alloy_hardforks::ForkCondition;
+use alloy_consensus::SignableTransaction;
+use alloy_eips::{BlockNumHash, eip2718::Encodable2718, eip7685::EMPTY_REQUESTS_HASH};
 use alloy_primitives::{Address, B256, Bytes, Signature, TxKind, U256};
+use alloy_rpc_types_engine::{CancunPayloadFields, PraguePayloadFields};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
-use alloy_trie::{EMPTY_ROOT_HASH, TrieAccount, root::state_root_unhashed};
-use base_alloy_chains::BaseUpgrade;
-use base_alloy_consensus::{OpBlock, OpTxEnvelope};
-use base_alloy_rpc_types_engine::{OpExecutionPayload, OpNetworkPayloadEnvelope, PayloadHash};
-use base_consensus_genesis::{L1ChainConfig, RollupConfig, SystemConfig};
-use base_execution_chainspec::OpChainSpecBuilder;
-use base_execution_evm::OpEvmConfig;
-use base_protocol::{BlockInfo, L1BlockInfoTx, L2BlockInfo, OpAttributesWithParent};
-use base_revm::OpTransaction;
-use reth_evm::{ConfigureEvm, Evm as _, FromRecoveredTx};
-use revm::{
-    DatabaseCommit,
-    context::{TxEnv, result::ResultAndState},
-    database::InMemoryDB,
-    state::AccountInfo,
+use base_common_consensus::{BaseBlock, BaseTxEnvelope};
+use base_common_rpc_types_engine::{
+    BaseExecutionPayload, BaseExecutionPayloadSidecar, NetworkPayloadEnvelope, PayloadHash,
 };
+use base_consensus_derive::{AttributesBuilder, StatefulAttributesBuilder};
+use base_consensus_genesis::RollupConfig;
+use base_consensus_node::{L1OriginSelector, OriginSelector, SequencerEngineClient};
+use base_protocol::{AttributesWithParent, BlockInfo, L2BlockInfo};
 
-use crate::{L2BlockProvider, SharedL1Chain, SupervisedP2P};
+use crate::{
+    ActionEngineClient, ActionL1ChainProvider, ActionL2ChainProvider, L2BlockProvider,
+    SharedL1Chain, SupervisedP2P,
+};
 
 /// Hardcoded private key for the test account used across all action tests.
 ///
@@ -42,9 +37,6 @@ pub const TEST_ACCOUNT_KEY: B256 = B256::new([0x01u8; 32]);
 // Address derived from the secp256k1 public key of [0x01; 32].
 pub const TEST_ACCOUNT_ADDRESS: Address =
     alloy_primitives::address!("1a642f0E3c3aF545E7AcBD38b07251B3990914F1");
-
-/// Initial balance for the test account (1 ETH).
-const TEST_ACCOUNT_BALANCE: U256 = U256::from_limbs([1_000_000_000_000_000_000u64, 0, 0, 0]);
 
 /// A test account with nonce tracking and signing capability.
 ///
@@ -76,13 +68,13 @@ impl TestAccount {
     pub fn sign_tx(
         &mut self,
         tx: alloy_consensus::TxEip1559,
-    ) -> Result<OpTxEnvelope, alloy_signer::Error> {
+    ) -> Result<BaseTxEnvelope, alloy_signer::Error> {
         let sig = self.signer.sign_hash_sync(&tx.signature_hash())?;
-        Ok(OpTxEnvelope::Eip1559(tx.into_signed(sig)))
+        Ok(BaseTxEnvelope::Eip1559(tx.into_signed(sig)))
     }
 
     /// Creates and signs a minimal EIP-1559 transfer, auto-incrementing the nonce.
-    pub fn create_eip1559_tx(&mut self, chain_id: u64) -> OpTxEnvelope {
+    pub fn create_eip1559_tx(&mut self, chain_id: u64) -> BaseTxEnvelope {
         self.create_tx(chain_id, TxKind::Call(Address::ZERO), Bytes::new(), U256::from(1), 21_000)
     }
 
@@ -97,7 +89,7 @@ impl TestAccount {
         input: Bytes,
         value: U256,
         gas_limit: u64,
-    ) -> OpTxEnvelope {
+    ) -> BaseTxEnvelope {
         let tx = alloy_consensus::TxEip1559 {
             chain_id,
             nonce: self.nonce,
@@ -114,7 +106,7 @@ impl TestAccount {
             .sign_hash_sync(&tx.signature_hash())
             .expect("test account signing must not fail");
         self.nonce += 1;
-        OpTxEnvelope::Eip1559(tx.into_signed(sig))
+        BaseTxEnvelope::Eip1559(tx.into_signed(sig))
     }
 
     /// Return the current nonce.
@@ -138,15 +130,27 @@ pub enum L2SequencerError {
     /// EVM execution failed.
     #[error("EVM execution failed: {0}")]
     Evm(String),
+    /// Origin selection failed.
+    #[error("origin selection failed: {0}")]
+    OriginSelection(String),
+    /// Attributes construction failed.
+    #[error("attributes construction failed: {0}")]
+    Attributes(String),
+    /// Engine client error.
+    #[error("engine client error: {0}")]
+    Engine(String),
+    /// Payload conversion error.
+    #[error("payload conversion error: {0}")]
+    PayloadConversion(String),
 }
 
-/// A pre-built queue of [`OpBlock`]s for the batcher to drain.
+/// A pre-built queue of [`BaseBlock`]s for the batcher to drain.
 ///
 /// Tests push fully-formed blocks into the source, which the batcher
 /// consumes one at a time via [`L2BlockProvider::next_block`].
 #[derive(Debug, Default)]
 pub struct ActionL2Source {
-    blocks: VecDeque<OpBlock>,
+    blocks: VecDeque<BaseBlock>,
 }
 
 impl ActionL2Source {
@@ -156,7 +160,7 @@ impl ActionL2Source {
     }
 
     /// Push a block to the back of the queue.
-    pub fn push(&mut self, block: OpBlock) {
+    pub fn push(&mut self, block: BaseBlock) {
         self.blocks.push_back(block);
     }
 
@@ -172,12 +176,12 @@ impl ActionL2Source {
 }
 
 impl L2BlockProvider for ActionL2Source {
-    fn next_block(&mut self) -> Option<OpBlock> {
+    fn next_block(&mut self) -> Option<BaseBlock> {
         self.blocks.pop_front()
     }
 }
 
-/// Underlying map type for [`SharedBlockHashRegistry`]: block number → (hash, optional state root).
+/// Underlying map type for [`SharedBlockHashRegistry`]: block number -> (hash, optional state root).
 pub type BlockHashInner = Arc<Mutex<HashMap<u64, (B256, Option<B256>)>>>;
 
 /// Shared L2 block hashes and state roots keyed by block number.
@@ -185,9 +189,8 @@ pub type BlockHashInner = Arc<Mutex<HashMap<u64, (B256, Option<B256>)>>>;
 /// `L2Sequencer` writes into this registry as blocks are built, and
 /// `TestRollupNode` reads from the same registry when it applies derived
 /// attributes so the resulting safe-head hash chain matches the sequencer's
-/// sealed headers. The [`StatefulL2Executor`] inside the node's
-/// [`ActionEngineClient`] reads the stored state root for post-derivation
-/// execution validation.
+/// sealed headers. The [`ActionEngineClient`] reads the stored state root for
+/// post-derivation execution validation.
 ///
 /// The state root field is `Option<B256>`: it is `Some` only when the entry
 /// was produced by real EVM execution (e.g. via [`L2Sequencer`] or
@@ -196,7 +199,6 @@ pub type BlockHashInner = Arc<Mutex<HashMap<u64, (B256, Option<B256>)>>>;
 /// executor to skip state-root validation for that block rather than panic
 /// against a bogus sentinel value.
 ///
-/// [`ActionEngineClient`]: crate::ActionEngineClient
 /// [`TestRollupNode::act_l2_unsafe_gossip_receive`]: crate::TestRollupNode::act_l2_unsafe_gossip_receive
 /// [`TestRollupNode::register_block_hash`]: crate::TestRollupNode::register_block_hash
 #[derive(Debug, Clone, Default)]
@@ -211,7 +213,7 @@ impl SharedBlockHashRegistry {
     /// Record the block hash and optional state root for an L2 block number.
     ///
     /// Pass `Some(state_root)` when the block was produced by real EVM
-    /// execution so that the [`StatefulL2Executor`] inside the node can validate it.
+    /// execution so that the engine client can validate it.
     /// Pass `None` for synthetic blocks (e.g. via
     /// [`TestRollupNode::register_block_hash`]); the executor will skip
     /// state-root validation for those blocks.
@@ -240,7 +242,12 @@ impl SharedBlockHashRegistry {
     }
 }
 
-/// Builds real [`OpBlock`]s for use in action tests.
+/// Builds real [`BaseBlock`]s for use in action tests using production components.
+///
+/// Uses:
+/// - [`L1OriginSelector`] for epoch selection (same as the production sequencer)
+/// - [`StatefulAttributesBuilder`] for L1-info deposit and attribute construction
+/// - [`ActionEngineClient`] via [`SequencerEngineClient`] for block building
 ///
 /// Each block contains:
 /// - A correct L1-info deposit transaction (type `0x7E`) as the first
@@ -248,65 +255,59 @@ impl SharedBlockHashRegistry {
 /// - A configurable number of signed EIP-1559 user transactions from the
 ///   test account ([`TEST_ACCOUNT_KEY`]).
 ///
-/// Epoch selection mirrors the real sequencer: the epoch advances to the next
-/// L1 block once that block's timestamp is ≤ the new L2 block's timestamp,
+/// Epoch selection mirrors the real sequencer via [`L1OriginSelector`],
 /// unless an L1 origin is pinned via [`pin_l1_origin`].
-///
-/// # EVM Execution & State Root
-///
-/// Transactions are executed against an in-memory EVM database seeded with the
-/// test account balance (1 ETH). The state root in the header is computed from
-/// the post-execution state using a Merkle Patricia Trie. The header is sealed
-/// to produce a real block hash, which is used for correct parent-hash chaining.
 ///
 /// [`pin_l1_origin`]: L2Sequencer::pin_l1_origin
 #[derive(Debug)]
 pub struct L2Sequencer {
+    /// Production L1 origin selector.
+    origin_selector: L1OriginSelector<SharedL1Chain>,
+    /// Production attributes builder.
+    attributes_builder: StatefulAttributesBuilder<ActionL1ChainProvider, ActionL2ChainProvider>,
+    /// Production engine client for block building.
+    engine_client: Arc<ActionEngineClient>,
     /// Current unsafe L2 head.
     head: L2BlockInfo,
-    /// Shared view of the L1 chain for epoch selection.
-    l1_chain: SharedL1Chain,
     /// Rollup configuration.
-    rollup_config: RollupConfig,
-    /// L1 chain config (needed for [`L1BlockInfoTx`]).
-    l1_chain_config: L1ChainConfig,
-    /// Current system config (updated on epoch changes or key rotation).
-    system_config: SystemConfig,
+    rollup_config: Arc<RollupConfig>,
     /// Test account used for signing user transactions.
     test_account: Arc<Mutex<TestAccount>>,
-    /// In-process EVM executor carrying state across blocks.
-    executor: StatefulL2Executor,
-    /// Optional pinned L1 origin. When set, epoch selection is bypassed and
-    /// this block is used as the epoch for every subsequent L2 block built.
-    l1_origin_pin: Option<BlockInfo>,
     /// Shared registry of built L2 block hashes, keyed by block number.
     block_hashes: SharedBlockHashRegistry,
     /// Optional P2P handle for broadcasting unsafe blocks to a test transport.
     supervised_p2p: Option<SupervisedP2P>,
+    /// Optional pinned L1 origin. When set, epoch selection is bypassed and
+    /// this block is used as the epoch for every subsequent L2 block built.
+    l1_origin_pin: Option<BlockInfo>,
+    /// Mutable L2 chain provider (for inserting new blocks/configs after each build).
+    l2_provider: ActionL2ChainProvider,
 }
 
 impl L2Sequencer {
-    /// Create a new sequencer starting from the given L2 genesis head.
+    /// Create a new sequencer using production components.
     pub fn new(
         head: L2BlockInfo,
-        l1_chain: SharedL1Chain,
-        rollup_config: RollupConfig,
-        system_config: SystemConfig,
+        origin_selector: L1OriginSelector<SharedL1Chain>,
+        attributes_builder: StatefulAttributesBuilder<ActionL1ChainProvider, ActionL2ChainProvider>,
+        engine_client: Arc<ActionEngineClient>,
+        rollup_config: Arc<RollupConfig>,
+        l2_provider: ActionL2ChainProvider,
     ) -> Self {
         let test_account = Arc::new(Mutex::new(TestAccount::new(TEST_ACCOUNT_KEY)));
-        let executor = StatefulL2Executor::new(rollup_config.clone());
+        let block_hashes = engine_client.block_hash_registry();
 
         Self {
+            origin_selector,
+            attributes_builder,
+            engine_client,
             head,
-            l1_chain,
             rollup_config,
-            l1_chain_config: L1ChainConfig::default(),
-            system_config,
             test_account,
-            executor,
-            l1_origin_pin: None,
-            block_hashes: SharedBlockHashRegistry::new(),
+            block_hashes,
             supervised_p2p: None,
+            l1_origin_pin: None,
+            l2_provider,
         }
     }
 
@@ -323,26 +324,44 @@ impl L2Sequencer {
         Arc::clone(&self.test_account)
     }
 
-    /// Returns a reference to the sequencer's in-memory EVM database.
-    ///
-    /// Callers can inspect account state and storage written by executed
-    /// transactions.
-    pub const fn db(&self) -> &InMemoryDB {
-        self.executor.db()
-    }
-
     /// Return the sequencer's shared block-hash registry.
     pub fn block_hash_registry(&self) -> SharedBlockHashRegistry {
         self.block_hashes.clone()
     }
 
+    /// Return a clone of the sequencer's engine client.
+    ///
+    /// The derivation node can use this to share `executed_headers` with the
+    /// sequencer so blocks pre-built by the sequencer are recognised as
+    /// already-executed and not re-built from scratch during derivation.
+    pub fn engine_client(&self) -> Arc<ActionEngineClient> {
+        Arc::clone(&self.engine_client)
+    }
+
+    /// Read a storage value from the latest committed state via the engine client.
+    ///
+    /// Accepts the slot as a `U256` for convenience.
+    /// Returns `U256::ZERO` if the account or slot does not exist.
+    pub fn storage_at(
+        &self,
+        address: alloy_primitives::Address,
+        slot: alloy_primitives::U256,
+    ) -> alloy_primitives::U256 {
+        self.engine_client.storage_at(address, slot)
+    }
+
+    /// Check whether an account has non-empty code deployed via the engine client.
+    pub fn has_code(&self, address: alloy_primitives::Address) -> bool {
+        self.engine_client.has_code(address)
+    }
+
     /// Pin the L1 origin to the given block, bypassing automatic epoch advance.
     ///
-    /// While pinned, every call to [`build_next_block`] uses `origin` as the
-    /// epoch regardless of timestamps. The sequencer number increments within
+    /// While pinned, every call to [`build_next_block_with_transactions`] uses `origin`
+    /// as the epoch regardless of timestamps. The sequencer number increments within
     /// the same epoch until the pin is cleared.
     ///
-    /// [`build_next_block`]: L2Sequencer::build_next_block
+    /// [`build_next_block_with_transactions`]: L2Sequencer::build_next_block_with_transactions
     pub const fn pin_l1_origin(&mut self, origin: BlockInfo) {
         self.l1_origin_pin = Some(origin);
     }
@@ -365,7 +384,7 @@ impl L2Sequencer {
         self.supervised_p2p = Some(p2p);
     }
 
-    /// Broadcast `block` as an [`OpNetworkPayloadEnvelope`] to the wired
+    /// Broadcast `block` as an [`NetworkPayloadEnvelope`] to the wired
     /// [`SupervisedP2P`] handle.
     ///
     /// A no-op when no handle has been set via [`set_supervised_p2p`]. The
@@ -373,11 +392,11 @@ impl L2Sequencer {
     /// validation.
     ///
     /// [`set_supervised_p2p`]: L2Sequencer::set_supervised_p2p
-    pub fn broadcast_unsafe_block(&self, block: &OpBlock) {
+    pub fn broadcast_unsafe_block(&self, block: &BaseBlock) {
         let Some(p2p) = &self.supervised_p2p else { return };
         let block_hash = block.header.hash_slow();
-        let (execution_payload, _) = OpExecutionPayload::from_block_unchecked(block_hash, block);
-        let network = OpNetworkPayloadEnvelope {
+        let (execution_payload, _) = BaseExecutionPayload::from_block_unchecked(block_hash, block);
+        let network = NetworkPayloadEnvelope {
             payload: execution_payload,
             signature: Signature::new(U256::ZERO, U256::ZERO, false),
             payload_hash: PayloadHash(B256::ZERO),
@@ -388,323 +407,164 @@ impl L2Sequencer {
 
     /// Build the next L2 block containing no user transactions.
     ///
-    /// Temporarily sets `user_txs_per_block = 0`, calls [`build_next_block`],
-    /// then restores the original count. Useful for simulating forced-empty
-    /// blocks at the sequencer drift boundary.
+    /// Useful for simulating forced-empty blocks at the sequencer drift boundary.
     ///
     /// # Panics
     ///
     /// Panics if the block cannot be built (e.g. missing L1 block data).
-    ///
-    /// [`build_next_block`]: L2Sequencer::build_next_block
-    pub fn build_empty_block(&mut self) -> OpBlock {
-        self.build_next_block_with_transactions(vec![])
+    pub async fn build_empty_block(&mut self) -> BaseBlock {
+        self.build_next_block_with_transactions(vec![]).await
     }
 
     /// Build the next L2 block with a single transaction.
-    pub fn build_next_block_with_single_transaction(&mut self) -> OpBlock {
+    pub async fn build_next_block_with_single_transaction(&mut self) -> BaseBlock {
         let tx = {
             let mut account = self.test_account.lock().expect("test account lock poisoned");
             account.create_eip1559_tx(self.rollup_config.l2_chain_id.id())
         };
-        self.build_next_block_with_transactions(vec![tx])
+        self.build_next_block_with_transactions(vec![tx]).await
     }
 
     /// Build the next L2 block and advance the internal head.
     ///
-    /// Returns a fully-formed [`OpBlock`] containing the L1-info deposit and
-    /// any configured user transactions, with a real state root and block hash.
+    /// Returns a fully-formed [`BaseBlock`] containing the L1-info deposit and
+    /// any provided user transactions, built by the production engine.
     ///
     /// # Panics
     ///
-    /// Panics if the block cannot be built (e.g. missing L1 block data or EVM
-    /// execution failure). Use [`try_build_next_block`] if you need to inspect
-    /// the error.
+    /// Panics if the block cannot be built (e.g. missing L1 block data or engine
+    /// execution failure). Use [`try_build_next_block_with_transactions`] if you need
+    /// to inspect the error.
     ///
-    /// [`try_build_next_block`]: L2Sequencer::try_build_next_block
-    pub fn build_next_block_with_transactions(
+    /// [`try_build_next_block_with_transactions`]: L2Sequencer::try_build_next_block_with_transactions
+    pub async fn build_next_block_with_transactions(
         &mut self,
-        transactions: Vec<OpTxEnvelope>,
-    ) -> OpBlock {
+        transactions: Vec<BaseTxEnvelope>,
+    ) -> BaseBlock {
         self.try_build_next_block_with_transactions(transactions)
+            .await
             .unwrap_or_else(|e| panic!("L2Sequencer::build_next_block failed: {e}"))
     }
 
     /// Build the next L2 block, returning an error instead of panicking.
     ///
-    /// Prefer [`build_next_block`] in test code; this method exists for
-    /// callers that need to inspect the failure reason.
+    /// Prefer [`build_next_block_with_transactions`] in test code; this method
+    /// exists for callers that need to inspect the failure reason.
     ///
-    /// [`build_next_block`]: L2Sequencer::build_next_block
-    pub fn try_build_next_block_with_transactions(
+    /// [`build_next_block_with_transactions`]: L2Sequencer::build_next_block_with_transactions
+    pub async fn try_build_next_block_with_transactions(
         &mut self,
-        transactions: Vec<OpTxEnvelope>,
-    ) -> Result<OpBlock, L2SequencerError> {
-        let mut transactions = transactions;
-        let next_number = self.head.block_info.number + 1;
-        let next_timestamp = self.head.block_info.timestamp + self.rollup_config.block_time;
-        let parent_hash = self.head.block_info.hash;
-        let current_epoch = self.head.l1_origin.number;
-
-        // Epoch selection: use pinned origin if set, otherwise auto-advance.
-        let (epoch_number, l1_header) = if let Some(pin) = self.l1_origin_pin {
-            let block = self
-                .l1_chain
-                .get_block(pin.number)
-                .ok_or(L2SequencerError::MissingL1Block(pin.number))?;
-            (block.number(), block.header)
-        } else if let Some(next_l1) = self.l1_chain.get_block(current_epoch + 1) {
-            if next_l1.timestamp() <= next_timestamp {
-                (next_l1.number(), next_l1.header)
-            } else {
-                let cur = self
-                    .l1_chain
-                    .get_block(current_epoch)
-                    .ok_or(L2SequencerError::MissingL1Block(current_epoch))?;
-                (cur.number(), cur.header)
-            }
+        user_txs: Vec<BaseTxEnvelope>,
+    ) -> Result<BaseBlock, L2SequencerError> {
+        // 1. Origin selection: use pinned origin if set, otherwise production L1OriginSelector.
+        let l1_origin = if let Some(pin) = self.l1_origin_pin {
+            pin
         } else {
-            let cur = self
-                .l1_chain
-                .get_block(current_epoch)
-                .ok_or(L2SequencerError::MissingL1Block(current_epoch))?;
-            (cur.number(), cur.header)
+            self.origin_selector
+                .next_l1_origin(self.head, false)
+                .await
+                .map_err(|e| L2SequencerError::OriginSelection(e.to_string()))?
         };
 
+        // 2. Attribute construction via production StatefulAttributesBuilder.
+        let epoch = BlockNumHash { number: l1_origin.number, hash: l1_origin.hash };
+        let mut attrs = self
+            .attributes_builder
+            .prepare_payload_attributes(self.head, epoch)
+            .await
+            .map_err(|e| L2SequencerError::Attributes(format!("{e}")))?;
+
+        // 3. Inject user transactions (encoded as Bytes) after the deposit txs.
+        let encoded_user_txs: Vec<Bytes> = user_txs
+            .iter()
+            .map(|tx| {
+                let mut buf = Vec::new();
+                tx.encode_2718(&mut buf);
+                Bytes::from(buf)
+            })
+            .collect();
+        if let Some(txs) = &mut attrs.transactions {
+            txs.extend(encoded_user_txs);
+        }
+        attrs.no_tx_pool = Some(true);
+
+        // 4. Build via production engine client.
+        let attrs_with_parent = AttributesWithParent::new(attrs, self.head, None, false);
+        let payload_id = self
+            .engine_client
+            .start_build_block(attrs_with_parent.clone())
+            .await
+            .map_err(|e| L2SequencerError::Engine(format!("start_build: {e}")))?;
+
+        let envelope = self
+            .engine_client
+            .get_sealed_payload(payload_id, attrs_with_parent)
+            .await
+            .map_err(|e| L2SequencerError::Engine(format!("get_sealed: {e}")))?;
+
+        // 5. Insert the block into the engine (updates canonical head).
+        self.engine_client
+            .insert_unsafe_payload(envelope.clone())
+            .await
+            .map_err(|e| L2SequencerError::Engine(format!("insert: {e}")))?;
+
+        // 6. Convert BaseExecutionPayload to BaseBlock.
+        // Use try_into_block_with_sidecar so PBBR and requests_hash are restored on the
+        // returned header. try_into_block() omits these fields, making hash_slow() return a
+        // different value than the sealed block hash. BatchEncoder::add_block tracks self.tip
+        // via block.header.hash_slow(), so missing sidecar fields cause block N+1's parent_hash
+        // (the canonical hash of block N) to not match self.tip, triggering
+        // ReorgError::ParentMismatch and resetting the encoder.
+        //
+        // V4 payloads (Isthmus+) require PraguePayloadFields with EMPTY_REQUESTS_HASH so that
+        // the reconstructed header's requests_hash = Some(EMPTY_REQUESTS_HASH) matches reth's
+        // canonical header.
+        let block_hash = envelope.execution_payload.as_v1().block_hash;
+        let pbbr = envelope.parent_beacon_block_root;
+        let sidecar = match &envelope.execution_payload {
+            BaseExecutionPayload::V4(_) => BaseExecutionPayloadSidecar::v4(
+                CancunPayloadFields {
+                    parent_beacon_block_root: pbbr.unwrap_or_default(),
+                    versioned_hashes: vec![],
+                },
+                PraguePayloadFields::new(EMPTY_REQUESTS_HASH),
+            ),
+            _ => pbbr.map_or_else(BaseExecutionPayloadSidecar::default, |pbbr| {
+                BaseExecutionPayloadSidecar::v3(CancunPayloadFields {
+                    parent_beacon_block_root: pbbr,
+                    versioned_hashes: vec![],
+                })
+            }),
+        };
+        let block: BaseBlock = envelope
+            .execution_payload
+            .try_into_block_with_sidecar(&sidecar)
+            .map_err(|e| L2SequencerError::PayloadConversion(format!("{e}")))?;
+
+        // 7. Compute seq_num and update head.
         let seq_num =
-            if epoch_number == self.head.l1_origin.number { self.head.seq_num + 1 } else { 0 };
-
-        // Build the L1 info deposit (first transaction in every L2 block).
-        let (_l1_info, deposit_tx) = L1BlockInfoTx::try_new_with_deposit_tx(
-            &self.rollup_config,
-            &self.l1_chain_config,
-            &self.system_config,
-            seq_num,
-            &l1_header,
-            next_timestamp,
-        )?;
-
-        transactions.insert(0, OpTxEnvelope::Deposit(deposit_tx));
-
-        // Execute transactions against the in-memory EVM.
-        let (state_root, gas_used) = self.executor.execute_transactions(
-            &transactions,
-            next_number,
-            next_timestamp,
-            parent_hash,
-        )?;
-
-        let epoch_hash = l1_header.hash_slow();
-        let header = Header {
-            number: next_number,
-            timestamp: next_timestamp,
-            parent_hash,
-            gas_limit: 30_000_000,
-            gas_used,
-            state_root,
-            base_fee_per_gas: Some(1_000_000_000),
-            ..Default::default()
-        };
-
-        let block_hash = header.hash_slow();
-
-        let block = OpBlock {
-            header,
-            body: alloy_consensus::BlockBody { transactions, ommers: vec![], withdrawals: None },
-        };
+            if l1_origin.number == self.head.l1_origin.number { self.head.seq_num + 1 } else { 0 };
+        let block_number = block.header.number;
+        let block_timestamp = block.header.timestamp;
 
         self.head = L2BlockInfo {
             block_info: BlockInfo {
-                number: next_number,
-                timestamp: next_timestamp,
-                parent_hash,
+                number: block_number,
+                timestamp: block_timestamp,
+                parent_hash: self.head.block_info.hash,
                 hash: block_hash,
             },
-            l1_origin: BlockNumHash { number: epoch_number, hash: epoch_hash },
+            l1_origin: BlockNumHash { number: l1_origin.number, hash: l1_origin.hash },
             seq_num,
         };
-        self.block_hashes.insert(next_number, block_hash, Some(state_root));
+
+        // 8. Update L2 provider state for next iteration.
+        self.l2_provider.insert_block(self.head);
+        // The system config is updated via the attributes builder's internal
+        // L2 chain provider when the epoch changes. For the sequencer's
+        // L2 provider copy, inherit the genesis config — the attributes
+        // builder reads the correct config from its own provider clone.
 
         Ok(block)
-    }
-}
-
-/// Determine the sender address for a transaction.
-///
-/// Deposit transactions carry an explicit `from` field. Signed user
-/// transactions are always from the given `default_sender` in this test harness.
-const fn tx_sender(tx: &OpTxEnvelope, default_sender: Address) -> Address {
-    match tx {
-        OpTxEnvelope::Deposit(sealed) => sealed.inner().from,
-        _ => default_sender,
-    }
-}
-
-/// Compute a Merkle Patricia Trie state root from the in-memory database.
-///
-/// Iterates over all accounts in the DB cache and builds a proper MPT root,
-/// giving each account the correct storage root and code hash.
-pub fn compute_state_root(db: &InMemoryDB) -> B256 {
-    let accounts = db
-        .cache
-        .accounts
-        .iter()
-        .filter(|(_, db_account)| {
-            !matches!(db_account.account_state, revm::database::AccountState::NotExisting)
-        })
-        .map(|(address, db_account)| {
-            let storage_root = if db_account.storage.is_empty() {
-                EMPTY_ROOT_HASH
-            } else {
-                alloy_trie::root::storage_root_unhashed(
-                    db_account.storage.iter().map(|(slot, value)| (B256::from(*slot), *value)),
-                )
-            };
-
-            let code_hash = db_account.info.code_hash;
-
-            (
-                *address,
-                TrieAccount {
-                    nonce: db_account.info.nonce,
-                    balance: db_account.info.balance,
-                    storage_root,
-                    code_hash,
-                },
-            )
-        });
-
-    state_root_unhashed(accounts)
-}
-
-impl L2BlockProvider for L2Sequencer {
-    fn next_block(&mut self) -> Option<OpBlock> {
-        Some(self.build_next_block_with_single_transaction())
-    }
-}
-
-/// Decode raw EIP-2718-encoded transaction bytes into [`OpTxEnvelope`]s.
-pub fn decode_raw_transactions(raw_txs: &[Bytes]) -> Result<Vec<OpTxEnvelope>, L2SequencerError> {
-    raw_txs
-        .iter()
-        .map(|raw| {
-            OpTxEnvelope::decode_2718(&mut raw.as_ref())
-                .map_err(|e| L2SequencerError::Evm(format!("tx decode: {e}")))
-        })
-        .collect()
-}
-
-/// In-process EVM re-executor for validating derived L2 blocks.
-///
-/// Mirrors the [`L2Sequencer`]'s execution environment — same seeded test
-/// account, same EVM configuration, same state-root computation. Call
-/// [`execute_attrs`] in L2-block order so the internal EVM state advances
-/// identically to the sequencer's. The returned state root can be compared
-/// against the value stored in [`SharedBlockHashRegistry`] to confirm that
-/// the derivation pipeline re-produces the exact same execution result.
-///
-/// [`execute_attrs`]: StatefulL2Executor::execute_attrs
-#[derive(Debug)]
-pub struct StatefulL2Executor {
-    db: InMemoryDB,
-    rollup_config: RollupConfig,
-}
-
-impl StatefulL2Executor {
-    /// Create a new executor with the standard test account seeded.
-    ///
-    /// The initial EVM state matches the [`L2Sequencer`]'s genesis: the
-    /// [`TEST_ACCOUNT_ADDRESS`] is funded with [`TEST_ACCOUNT_BALANCE`].
-    pub fn new(rollup_config: RollupConfig) -> Self {
-        let mut db = InMemoryDB::default();
-        db.insert_account_info(
-            TEST_ACCOUNT_ADDRESS,
-            AccountInfo { balance: TEST_ACCOUNT_BALANCE, ..Default::default() },
-        );
-        Self { db, rollup_config }
-    }
-
-    /// Returns a reference to the internal EVM database.
-    ///
-    /// Callers can inspect account state and storage written by executed
-    /// transactions.
-    pub const fn db(&self) -> &InMemoryDB {
-        &self.db
-    }
-
-    /// Execute the transactions from `attrs` and return the resulting state root.
-    ///
-    /// Decodes each raw EIP-2718-encoded transaction from
-    /// `attrs.attributes.transactions`, executes them in order against the
-    /// internal EVM database, and returns the Merkle Patricia Trie state root.
-    /// The internal state persists between calls so repeated invocations
-    /// mirror the sequencer's block-by-block execution.
-    pub fn execute_attrs(
-        &mut self,
-        attrs: &OpAttributesWithParent,
-        block_number: u64,
-        parent_hash: B256,
-    ) -> Result<B256, L2SequencerError> {
-        let timestamp = attrs.attributes.payload_attributes.timestamp;
-        let txs = decode_raw_transactions(attrs.attributes.transactions.as_deref().unwrap_or(&[]))?;
-        let (state_root, _gas_used) =
-            self.execute_transactions(&txs, block_number, timestamp, parent_hash)?;
-        Ok(state_root)
-    }
-
-    /// Execute transactions against the internal EVM database and return
-    /// `(state_root, cumulative_gas_used)`.
-    ///
-    /// This is the single authoritative execution path shared by both
-    /// [`L2Sequencer`] (which needs the gas total for header construction) and
-    /// [`execute_attrs`] (which only needs the state root for validation).
-    ///
-    /// [`execute_attrs`]: StatefulL2Executor::execute_attrs
-    pub fn execute_transactions(
-        &mut self,
-        transactions: &[OpTxEnvelope],
-        block_number: u64,
-        timestamp: u64,
-        parent_hash: B256,
-    ) -> Result<(B256, u64), L2SequencerError> {
-        let mut spec_builder =
-            OpChainSpecBuilder::base_mainnet().chain(self.rollup_config.l2_chain_id);
-
-        if let Some(ts) = self.rollup_config.hardforks.base.v1 {
-            spec_builder = spec_builder.with_fork(BaseUpgrade::V1, ForkCondition::Timestamp(ts));
-        }
-
-        let chain_spec = Arc::new(spec_builder.build());
-        let evm_config = OpEvmConfig::optimism(chain_spec);
-
-        let header = Header {
-            number: block_number,
-            timestamp,
-            parent_hash,
-            gas_limit: 30_000_000,
-            base_fee_per_gas: Some(1_000_000_000),
-            ..Default::default()
-        };
-
-        let mut cumulative_gas_used = 0u64;
-        for tx in transactions {
-            let sender = tx_sender(tx, TEST_ACCOUNT_ADDRESS);
-            let op_tx: OpTransaction<TxEnv> = OpTransaction::from_recovered_tx(tx, sender);
-
-            let evm_env =
-                evm_config.evm_env(&header).map_err(|e| L2SequencerError::Evm(e.to_string()))?;
-            let mut evm = evm_config.evm_with_env(&mut self.db, evm_env);
-            match evm.transact(op_tx) {
-                Ok(ResultAndState { state, result }) => {
-                    cumulative_gas_used = cumulative_gas_used.saturating_add(result.gas_used());
-                    self.db.commit(state);
-                }
-                Err(e) => {
-                    return Err(L2SequencerError::Evm(format!("{e:?}")));
-                }
-            }
-        }
-
-        Ok((compute_state_root(&self.db), cumulative_gas_used))
     }
 }

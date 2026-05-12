@@ -5,10 +5,10 @@ use alloy_primitives::{B64, B256, Bytes, TxKind, U256, address, hex};
 use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types_engine::{ForkchoiceUpdated, PayloadAttributes, PayloadStatusEnum};
 use alloy_rpc_types_eth::Block;
-use base_alloy_consensus::{OpTypedTransaction, TxDeposit};
-use base_alloy_network::Base;
-use base_alloy_rpc_types::Transaction;
-use base_execution_payload_builder::OpPayloadAttributes;
+use base_common_consensus::{BaseTypedTransaction, TxDeposit};
+use base_common_network::Base;
+use base_common_rpc_types::Transaction;
+use base_common_rpc_types_engine::BasePayloadAttributes;
 use chrono::Utc;
 
 use super::{
@@ -89,6 +89,7 @@ impl<RpcProtocol: Protocol> ChainDriver<RpcProtocol> {
 
 // public test api
 impl<RpcProtocol: Protocol> ChainDriver<RpcProtocol> {
+    /// Builds a new block using only sequencer-injected transactions, skipping the mempool.
     pub async fn build_new_block_with_no_tx_pool(&self) -> eyre::Result<Block<Transaction>> {
         self.build_new_block_with_txs_timestamp(vec![], Some(true), None, None, Some(0)).await
     }
@@ -139,7 +140,7 @@ impl<RpcProtocol: Protocol> ChainDriver<RpcProtocol> {
 
             // Create a temporary signer for the deposit
             let signer = self.signer.clone().unwrap_or_else(PrivateKeySigner::random);
-            let signed_tx = sign_op_tx(&signer, OpTypedTransaction::Deposit(deposit_tx))?;
+            let signed_tx = sign_op_tx(&signer, BaseTypedTransaction::Deposit(deposit_tx))?;
             signed_tx.encoded_2718().into()
         };
 
@@ -171,7 +172,7 @@ impl<RpcProtocol: Protocol> ChainDriver<RpcProtocol> {
             ((DEFAULT_DENOMINATOR as u64) << 32) | (DEFAULT_ELASTICITY as u64);
 
         let fcu_result = self
-            .fcu(OpPayloadAttributes {
+            .fcu(BasePayloadAttributes {
                 payload_attributes: PayloadAttributes {
                     timestamp: block_timestamp,
                     parent_beacon_block_root: Some(B256::ZERO),
@@ -315,7 +316,7 @@ impl<RpcProtocol: Protocol> ChainDriver<RpcProtocol> {
 
 // internal methods
 impl<RpcProtocol: Protocol> ChainDriver<RpcProtocol> {
-    async fn fcu(&self, attribs: OpPayloadAttributes) -> eyre::Result<ForkchoiceUpdated> {
+    async fn fcu(&self, attribs: BasePayloadAttributes) -> eyre::Result<ForkchoiceUpdated> {
         let latest = self.latest().await?.header.hash;
         let response = self.engine_api.update_forkchoice(latest, latest, Some(attribs)).await?;
 

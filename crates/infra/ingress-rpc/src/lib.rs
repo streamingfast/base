@@ -6,7 +6,7 @@ pub use health::HealthServer;
 
 /// Prometheus metrics for the ingress RPC service.
 mod metrics;
-pub use metrics::{Metrics, record_histogram};
+pub use metrics::Metrics;
 
 /// Kafka message queue publishing.
 mod queue;
@@ -25,8 +25,8 @@ use std::{
 
 use alloy_primitives::TxHash;
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
-use base_alloy_network::Base;
 use base_bundles::MeterBundleResponse;
+use base_common_network::Base;
 use clap::Args;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};

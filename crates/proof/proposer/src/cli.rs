@@ -7,6 +7,8 @@ use base_cli_utils::CliStyles;
 use clap::Parser;
 use url::Url;
 
+use crate::constants::RECOVERY_SCAN_CONCURRENCY;
+
 base_cli_utils::define_cli_env!("BASE_PROPOSER");
 base_cli_utils::define_log_args!("BASE_PROPOSER");
 base_cli_utils::define_metrics_args!("BASE_PROPOSER", 7300);
@@ -115,10 +117,6 @@ pub struct ProposerArgs {
     )]
     pub skip_tls_verify: bool,
 
-    /// Wait for node sync before starting.
-    #[arg(long = "wait-node-sync", env = cli_env!("WAIT_NODE_SYNC"), default_value = "false")]
-    pub wait_node_sync: bool,
-
     /// Maximum number of retry attempts for RPC operations.
     #[arg(long = "rpc-max-retries", env = cli_env!("RPC_MAX_RETRIES"), default_value = "5")]
     pub rpc_max_retries: u32,
@@ -154,17 +152,13 @@ pub struct ProposerArgs {
     )]
     pub max_parallel_proofs: usize,
 
-    /// Maximum number of games to scan backwards when recovering state on startup.
-    /// Must be greater than the maximum number of pending (unresolved) dispute games
-    /// that could exist at any given time. For production deployments with high game
-    /// volume, increase this beyond the default to ensure the proposer can always
-    /// find and resume from its most recent game after a restart.
+    /// Maximum number of concurrent RPC calls during the recovery scan.
     #[arg(
-        long = "max-game-recovery-lookback",
-        env = cli_env!("MAX_GAME_RECOVERY_LOOKBACK"),
-        default_value = "5000"
+        long = "recovery-scan-concurrency",
+        env = cli_env!("RECOVERY_SCAN_CONCURRENCY"),
+        default_value_t = RECOVERY_SCAN_CONCURRENCY
     )]
-    pub max_game_recovery_lookback: u64,
+    pub recovery_scan_concurrency: usize,
 
     /// Address of the `TEEProverRegistry` contract on L1.
     /// When set, the proposer validates signers before on-chain submission.
@@ -267,10 +261,8 @@ mod tests {
         assert_eq!(cli.proposer.rpc_timeout, Duration::from_secs(30));
         assert_eq!(cli.proposer.rollup_rpc.as_str(), "http://localhost:7545/");
         assert!(!cli.proposer.skip_tls_verify);
-        assert!(!cli.proposer.wait_node_sync);
         assert_eq!(cli.proposer.game_type, 1);
         assert_eq!(cli.proposer.max_parallel_proofs, 1);
-        assert_eq!(cli.proposer.max_game_recovery_lookback, 5000);
 
         assert_eq!(cli.logging.level, 3);
         assert_eq!(cli.logging.stdout_format, LogFormat::Full);

@@ -9,17 +9,14 @@ use std::{sync::Arc, time::Instant};
 use alloy_rpc_types_engine::PayloadId;
 use base_consensus_derive::{AttributesBuilder, PipelineErrorKind};
 use base_consensus_genesis::RollupConfig;
-use base_protocol::{BlockInfo, L2BlockInfo, OpAttributesWithParent};
+use base_protocol::{AttributesWithParent, BlockInfo, L2BlockInfo};
 
 use crate::{
-    PoolActivation,
+    Metrics, PoolActivation,
     actors::{
         SequencerEngineClient,
         sequencer::{
             error::SequencerActorError,
-            metrics::{
-                update_attributes_build_duration_metrics, update_block_build_duration_metrics,
-            },
             origin_selector::{L1OriginSelectorError, OriginSelector},
             recovery::RecoveryModeGuard,
         },
@@ -31,8 +28,8 @@ use crate::{
 pub struct UnsealedPayloadHandle {
     /// The [`PayloadId`] of the unsealed payload.
     pub payload_id: PayloadId,
-    /// The [`OpAttributesWithParent`] used to start block building.
-    pub attributes_with_parent: OpAttributesWithParent,
+    /// The [`AttributesWithParent`] used to start block building.
+    pub attributes_with_parent: AttributesWithParent,
 }
 
 /// Drives payload attribute preparation and block build initiation.
@@ -96,14 +93,14 @@ impl<A: AttributesBuilder, O: OriginSelector, E: SequencerEngineClient> PayloadB
             return Ok(None);
         };
 
-        update_attributes_build_duration_metrics(attributes_build_start.elapsed());
+        Metrics::sequencer_attributes_build_duration().set(attributes_build_start.elapsed());
 
         let build_request_start = Instant::now();
 
         let payload_id =
             self.engine_client.start_build_block(attributes_with_parent.clone()).await?;
 
-        update_block_build_duration_metrics(build_request_start.elapsed());
+        Metrics::sequencer_block_building_start_task_duration().set(build_request_start.elapsed());
 
         Ok(Some(UnsealedPayloadHandle { payload_id, attributes_with_parent }))
     }
@@ -111,7 +108,7 @@ impl<A: AttributesBuilder, O: OriginSelector, E: SequencerEngineClient> PayloadB
     /// Determines and validates the L1 origin block for the provided L2 unsafe head.
     ///
     /// Returns `Ok(None)` for temporary errors that should be retried on the next tick.
-    async fn get_next_payload_l1_origin(
+    pub async fn get_next_payload_l1_origin(
         &mut self,
         unsafe_head: L2BlockInfo,
     ) -> Result<Option<BlockInfo>, SequencerActorError> {
@@ -157,15 +154,15 @@ impl<A: AttributesBuilder, O: OriginSelector, E: SequencerEngineClient> PayloadB
         Ok(Some(l1_origin))
     }
 
-    /// Builds the `OpAttributesWithParent` for the next block.
+    /// Builds the `AttributesWithParent` for the next block.
     ///
     /// Returns `Ok(None)` if no attributes could be built at this time but future
     /// attempts may succeed.
-    async fn build_attributes(
+    pub async fn build_attributes(
         &mut self,
         unsafe_head: L2BlockInfo,
         l1_origin: BlockInfo,
-    ) -> Result<Option<OpAttributesWithParent>, SequencerActorError> {
+    ) -> Result<Option<AttributesWithParent>, SequencerActorError> {
         let mut attributes = match self
             .attributes_builder
             .prepare_payload_attributes(unsafe_head, l1_origin.id())
@@ -210,7 +207,7 @@ impl<A: AttributesBuilder, O: OriginSelector, E: SequencerEngineClient> PayloadB
         attributes.no_tx_pool =
             Some(!activator.is_enabled(self.recovery_mode.get(), l1_origin, &attributes));
 
-        let attrs_with_parent = OpAttributesWithParent::new(attributes, unsafe_head, None, false);
+        let attrs_with_parent = AttributesWithParent::new(attributes, unsafe_head, None, false);
         Ok(Some(attrs_with_parent))
     }
 }

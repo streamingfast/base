@@ -5,17 +5,15 @@ use core::fmt::Debug;
 
 use alloy_primitives::{Bytes, hex};
 use async_trait::async_trait;
-use base_consensus_genesis::{
-    MAX_RLP_BYTES_PER_CHANNEL_BEDROCK, MAX_RLP_BYTES_PER_CHANNEL_FJORD, RollupConfig,
-};
+use base_consensus_genesis::RollupConfig;
 use base_protocol::{BlockInfo, Channel};
 
 use super::{ChannelReaderProvider, NextFrameProvider};
 use crate::{
     Metrics,
     errors::PipelineError,
-    traits::{OriginAdvancer, OriginProvider, SignalReceiver},
-    types::{PipelineResult, Signal},
+    traits::{OriginAdvancer, OriginProvider, StageReset},
+    types::PipelineResult,
 };
 
 /// The [`ChannelAssembler`] stage is responsible for assembling the [`Frame`]s from the
@@ -27,7 +25,7 @@ use crate::{
 #[derive(Debug)]
 pub struct ChannelAssembler<P>
 where
-    P: NextFrameProvider + OriginAdvancer + OriginProvider + SignalReceiver + Debug,
+    P: NextFrameProvider + OriginAdvancer + OriginProvider + StageReset + Debug,
 {
     /// The rollup configuration.
     pub cfg: Arc<RollupConfig>,
@@ -39,7 +37,7 @@ where
 
 impl<P> ChannelAssembler<P>
 where
-    P: NextFrameProvider + OriginAdvancer + OriginProvider + SignalReceiver + Debug,
+    P: NextFrameProvider + OriginAdvancer + OriginProvider + StageReset + Debug,
 {
     /// Creates a new [`ChannelAssembler`] stage with the given configuration and previous stage.
     pub const fn new(cfg: Arc<RollupConfig>, prev: P) -> Self {
@@ -64,7 +62,7 @@ where
 #[async_trait]
 impl<P> ChannelReaderProvider for ChannelAssembler<P>
 where
-    P: NextFrameProvider + OriginAdvancer + OriginProvider + SignalReceiver + Send + Debug,
+    P: NextFrameProvider + OriginAdvancer + OriginProvider + StageReset + Send + Debug,
 {
     async fn next_data(&mut self) -> PipelineResult<Option<Bytes>> {
         let origin = self.origin().ok_or(PipelineError::MissingOrigin.crit())?;
@@ -129,9 +127,9 @@ where
             Metrics::pipeline_channel_mem().set(size);
 
             let max_rlp_bytes_per_channel = if self.cfg.is_fjord_active(origin.timestamp) {
-                MAX_RLP_BYTES_PER_CHANNEL_FJORD
+                RollupConfig::MAX_RLP_BYTES_PER_CHANNEL_FJORD
             } else {
-                MAX_RLP_BYTES_PER_CHANNEL_BEDROCK
+                RollupConfig::MAX_RLP_BYTES_PER_CHANNEL_BEDROCK
             };
             Metrics::pipeline_max_rlp_bytes().set(max_rlp_bytes_per_channel as f64);
             if channel.size() > max_rlp_bytes_per_channel as usize {
@@ -171,7 +169,7 @@ where
 #[async_trait]
 impl<P> OriginAdvancer for ChannelAssembler<P>
 where
-    P: NextFrameProvider + OriginAdvancer + OriginProvider + SignalReceiver + Send + Debug,
+    P: NextFrameProvider + OriginAdvancer + OriginProvider + StageReset + Send + Debug,
 {
     async fn advance_origin(&mut self) -> PipelineResult<()> {
         self.prev.advance_origin().await
@@ -180,7 +178,7 @@ where
 
 impl<P> OriginProvider for ChannelAssembler<P>
 where
-    P: NextFrameProvider + OriginAdvancer + OriginProvider + SignalReceiver + Debug,
+    P: NextFrameProvider + OriginAdvancer + OriginProvider + StageReset + Debug,
 {
     fn origin(&self) -> Option<BlockInfo> {
         self.prev.origin()
@@ -188,12 +186,28 @@ where
 }
 
 #[async_trait]
-impl<P> SignalReceiver for ChannelAssembler<P>
+impl<P> StageReset for ChannelAssembler<P>
 where
-    P: NextFrameProvider + OriginAdvancer + OriginProvider + SignalReceiver + Send + Debug,
+    P: NextFrameProvider + OriginAdvancer + OriginProvider + StageReset + Send + Debug,
 {
-    async fn signal(&mut self, signal: Signal) -> PipelineResult<()> {
-        self.prev.signal(signal).await?;
+    async fn reset(
+        &mut self,
+        l1_origin: alloy_eips::BlockNumHash,
+        system_config: base_consensus_genesis::SystemConfig,
+    ) -> PipelineResult<()> {
+        self.prev.reset(l1_origin, system_config).await?;
+        self.channel = None;
+        Ok(())
+    }
+
+    async fn activate(&mut self) -> PipelineResult<()> {
+        self.prev.activate().await?;
+        self.channel = None;
+        Ok(())
+    }
+
+    async fn flush_channel(&mut self) -> PipelineResult<()> {
+        self.prev.flush_channel().await?;
         self.channel = None;
         Ok(())
     }
@@ -203,10 +217,7 @@ where
 mod tests {
     use alloc::{sync::Arc, vec};
 
-    use base_consensus_genesis::{
-        HardForkConfig, MAX_RLP_BYTES_PER_CHANNEL_BEDROCK, MAX_RLP_BYTES_PER_CHANNEL_FJORD,
-        RollupConfig,
-    };
+    use base_consensus_genesis::{HardForkConfig, RollupConfig};
     use base_protocol::BlockInfo;
     use tracing::Level;
     use tracing_subscriber::layer::SubscriberExt;
@@ -330,7 +341,7 @@ mod tests {
             crate::frame!(0xFF, 0, vec![0xDD; 50], false),
             crate::frame!(0xFF, 1, vec![0xDD; 50], true),
         ];
-        frames[1].data = vec![0; MAX_RLP_BYTES_PER_CHANNEL_BEDROCK as usize];
+        frames[1].data = vec![0; RollupConfig::MAX_RLP_BYTES_PER_CHANNEL_BEDROCK as usize];
         let mock = TestNextFrameProvider::new(frames.into_iter().rev().map(Ok).collect());
         let cfg = Arc::new(RollupConfig::default());
 
@@ -365,7 +376,7 @@ mod tests {
             crate::frame!(0xFF, 0, vec![0xDD; 50], false),
             crate::frame!(0xFF, 1, vec![0xDD; 50], true),
         ];
-        frames[1].data = vec![0; MAX_RLP_BYTES_PER_CHANNEL_FJORD as usize];
+        frames[1].data = vec![0; RollupConfig::MAX_RLP_BYTES_PER_CHANNEL_FJORD as usize];
         let mock = TestNextFrameProvider::new(frames.into_iter().rev().map(Ok).collect());
         let cfg = Arc::new(RollupConfig {
             hardforks: HardForkConfig { fjord_time: Some(0), ..Default::default() },

@@ -6,16 +6,16 @@ use alloy_eips::eip7840::BlobParams;
 use alloy_genesis::Genesis;
 use alloy_hardforks::Hardfork;
 use alloy_primitives::{B256, U256};
-use base_alloy_chains::{BaseUpgrade, BaseUpgrades};
-use base_execution_forks::BASE_MAINNET_HARDFORKS;
-use base_protocol::Predeploys;
+use base_common_chains::{BaseUpgrade, ChainConfig, Upgrades};
+use base_common_consensus::Predeploys;
+use base_execution_upgrades::BASE_MAINNET_UPGRADES;
 use derive_more::{Constructor, Deref, Into};
 use reth_chainspec::{
     BaseFeeParams, BaseFeeParamsKind, ChainSpec, DepositContract, DisplayHardforks, EthChainSpec,
     EthereumHardforks, ForkFilter, ForkId, Hardforks, Head,
 };
 use reth_ethereum_forks::{ChainHardforks, EthereumHardfork, ForkCondition};
-use reth_network_peers::NodeRecord;
+use reth_network_peers::{NodeRecord, parse_nodes};
 use reth_primitives_traits::SealedHeader;
 
 use crate::{
@@ -29,18 +29,18 @@ pub const SUPPORTED_CHAINS: &[&str] =
 
 /// Genesis info extracted from a Base genesis config.
 #[derive(Default, Debug)]
-pub struct OpGenesisInfo {
+pub struct GenesisInfo {
     /// Base chain info extracted from genesis extra fields.
-    pub optimism_chain_info: base_alloy_rpc_types::OpChainInfo,
+    pub optimism_chain_info: base_common_rpc_types::ChainInfo,
     /// Base fee params derived from the genesis config.
     pub base_fee_params: BaseFeeParamsKind,
 }
 
-impl OpGenesisInfo {
+impl GenesisInfo {
     /// Extracts Base genesis info from an [`alloy_genesis::Genesis`].
     pub fn extract_from(genesis: &Genesis) -> Self {
         let mut info = Self {
-            optimism_chain_info: base_alloy_rpc_types::OpChainInfo::extract_from(
+            optimism_chain_info: base_common_rpc_types::ChainInfo::extract_from(
                 &genesis.config.extra_fields,
             )
             .unwrap_or_default(),
@@ -80,13 +80,13 @@ impl OpGenesisInfo {
 
 /// Base chain spec type.
 #[derive(Debug, Clone, Deref, Into, Constructor, PartialEq, Eq)]
-pub struct OpChainSpec {
+pub struct BaseChainSpec {
     /// [`ChainSpec`].
     pub inner: ChainSpec,
 }
 
-impl OpChainSpec {
-    /// Converts the given [`Genesis`] into an [`OpChainSpec`].
+impl BaseChainSpec {
+    /// Converts the given [`Genesis`] into an [`BaseChainSpec`].
     pub fn from_genesis(genesis: Genesis) -> Self {
         genesis.into()
     }
@@ -112,7 +112,7 @@ impl OpChainSpec {
         header
     }
 
-    /// Parses a chain name into an [`OpChainSpec`], if recognized.
+    /// Parses a chain name into an [`BaseChainSpec`], if recognized.
     pub fn parse_chain(s: &str) -> Option<Arc<Self>> {
         match s {
             "dev" => Some(BASE_DEV.clone()),
@@ -123,9 +123,14 @@ impl OpChainSpec {
             _ => None,
         }
     }
+
+    /// Activates or updates the given hardfork condition in-place.
+    pub fn set_fork<H: Hardfork>(&mut self, fork: H, condition: ForkCondition) {
+        self.inner.hardforks.insert(fork, condition);
+    }
 }
 
-impl EthChainSpec for OpChainSpec {
+impl EthChainSpec for BaseChainSpec {
     type Header = Header;
 
     fn chain(&self) -> Chain {
@@ -169,7 +174,11 @@ impl EthChainSpec for OpChainSpec {
     }
 
     fn bootnodes(&self) -> Option<Vec<NodeRecord>> {
-        self.inner.bootnodes()
+        ChainConfig::by_chain_id(self.chain().id()).map(|cfg| {
+            let enodes: Vec<&str> =
+                cfg.bootnodes.iter().filter(|s| !s.starts_with("enr:")).copied().collect();
+            parse_nodes(&enodes)
+        })
     }
 
     fn is_optimism(&self) -> bool {
@@ -181,9 +190,9 @@ impl EthChainSpec for OpChainSpec {
     }
 
     fn next_block_base_fee(&self, parent: &Header, target_timestamp: u64) -> Option<u64> {
-        if BaseUpgrades::is_jovian_active_at_timestamp(self, parent.timestamp()) {
+        if Upgrades::is_jovian_active_at_timestamp(self, parent.timestamp()) {
             compute_jovian_base_fee(self, parent, target_timestamp).ok()
-        } else if BaseUpgrades::is_holocene_active_at_timestamp(self, parent.timestamp()) {
+        } else if Upgrades::is_holocene_active_at_timestamp(self, parent.timestamp()) {
             decode_holocene_base_fee(self, parent, target_timestamp).ok()
         } else {
             self.inner.next_block_base_fee(parent, target_timestamp)
@@ -191,7 +200,7 @@ impl EthChainSpec for OpChainSpec {
     }
 }
 
-impl Hardforks for OpChainSpec {
+impl Hardforks for BaseChainSpec {
     fn fork<H: Hardfork>(&self, fork: H) -> ForkCondition {
         self.inner.fork(fork)
     }
@@ -213,21 +222,21 @@ impl Hardforks for OpChainSpec {
     }
 }
 
-impl EthereumHardforks for OpChainSpec {
+impl EthereumHardforks for BaseChainSpec {
     fn ethereum_fork_activation(&self, fork: EthereumHardfork) -> ForkCondition {
         self.fork(fork)
     }
 }
 
-impl BaseUpgrades for OpChainSpec {
+impl Upgrades for BaseChainSpec {
     fn upgrade_activation(&self, fork: BaseUpgrade) -> ForkCondition {
         self.fork(fork)
     }
 }
 
-impl From<Genesis> for OpChainSpec {
+impl From<Genesis> for BaseChainSpec {
     fn from(genesis: Genesis) -> Self {
-        let optimism_genesis_info = OpGenesisInfo::extract_from(&genesis);
+        let optimism_genesis_info = GenesisInfo::extract_from(&genesis);
         let genesis_info =
             optimism_genesis_info.optimism_chain_info.genesis_info.unwrap_or_default();
 
@@ -292,7 +301,7 @@ impl From<Genesis> for OpChainSpec {
         block_hardforks.append(&mut time_hardforks);
 
         // Order hardforks to match mainnet ordering
-        let mainnet_hardforks = BASE_MAINNET_HARDFORKS.clone();
+        let mainnet_hardforks = BASE_MAINNET_UPGRADES.clone();
         let mainnet_order = mainnet_hardforks.forks_iter();
 
         let mut ordered_hardforks = Vec::with_capacity(block_hardforks.len());
@@ -321,7 +330,7 @@ impl From<Genesis> for OpChainSpec {
     }
 }
 
-impl From<ChainSpec> for OpChainSpec {
+impl From<ChainSpec> for BaseChainSpec {
     fn from(value: ChainSpec) -> Self {
         Self { inner: value }
     }
@@ -337,17 +346,17 @@ mod tests {
     use core::str::FromStr;
 
     use alloy_consensus::proofs::storage_root_unhashed;
-    use alloy_genesis::{ChainConfig, Genesis};
+    use alloy_genesis::{ChainConfig as AlloyChainConfig, Genesis};
     use alloy_hardforks::Hardfork;
     use alloy_primitives::{B256, U256, b256, hex};
-    use base_alloy_chains::{BaseChainConfig, BaseUpgrade, BaseUpgrades};
-    use base_alloy_rpc_types::OpBaseFeeInfo;
+    use base_common_chains::{BaseUpgrade, ChainConfig, Upgrades};
+    use base_common_rpc_types::FeeInfo;
     use reth_chainspec::{
         BaseFeeParams, BaseFeeParamsKind, EthChainSpec, EthereumHardforks, test_fork_ids,
     };
     use reth_ethereum_forks::{EthereumHardfork, ForkCondition, ForkHash, ForkId, Head};
 
-    use crate::{BASE_MAINNET, BASE_SEPOLIA, BASE_ZERONET, OpChainSpec, OpChainSpecBuilder};
+    use crate::{BASE_MAINNET, BASE_SEPOLIA, BASE_ZERONET, BaseChainSpec, BaseChainSpecBuilder};
 
     #[test]
     fn test_storage_root_consistency() {
@@ -387,7 +396,7 @@ mod tests {
 
     #[test]
     fn base_mainnet_forkids() {
-        let mut base_mainnet = OpChainSpecBuilder::base_mainnet().build();
+        let mut base_mainnet = BaseChainSpecBuilder::base_mainnet().build();
         base_mainnet.inner.genesis_header.set_hash(BASE_MAINNET.genesis_hash());
         test_fork_ids(
             &BASE_MAINNET,
@@ -432,13 +441,13 @@ mod tests {
                     Head { number: 0, timestamp: 1746806401, ..Default::default() },
                     ForkId {
                         hash: ForkHash([0x86, 0x72, 0x8b, 0x4e]),
-                        next: BaseChainConfig::mainnet().jovian_timestamp,
+                        next: ChainConfig::mainnet().jovian_timestamp,
                     },
                 ),
                 (
                     Head {
                         number: 0,
-                        timestamp: BaseChainConfig::mainnet().jovian_timestamp,
+                        timestamp: ChainConfig::mainnet().jovian_timestamp,
                         ..Default::default()
                     },
                     BASE_MAINNET.hardfork_fork_id(BaseUpgrade::Jovian).unwrap(),
@@ -496,13 +505,13 @@ mod tests {
                     Head { number: 0, timestamp: 1744905600, ..Default::default() },
                     ForkId {
                         hash: ForkHash([0x06, 0x0a, 0x4d, 0x1d]),
-                        next: BaseChainConfig::sepolia().jovian_timestamp,
+                        next: ChainConfig::sepolia().jovian_timestamp,
                     },
                 ),
                 (
                     Head {
                         number: 0,
-                        timestamp: BaseChainConfig::sepolia().jovian_timestamp,
+                        timestamp: ChainConfig::sepolia().jovian_timestamp,
                         ..Default::default()
                     },
                     BASE_SEPOLIA.hardfork_fork_id(BaseUpgrade::Jovian).unwrap(),
@@ -552,7 +561,7 @@ mod tests {
 
     #[test]
     fn latest_base_mainnet_fork_id_with_builder() {
-        let base_mainnet = OpChainSpecBuilder::base_mainnet().build();
+        let base_mainnet = BaseChainSpecBuilder::base_mainnet().build();
         assert_eq!(
             ForkId { hash: ForkHash(hex!("1cfeafc9")), next: 0 },
             base_mainnet.latest_fork_id()
@@ -584,7 +593,7 @@ mod tests {
     }
     "#;
         let genesis: Genesis = serde_json::from_str(geth_genesis).unwrap();
-        let chain_spec: OpChainSpec = genesis.into();
+        let chain_spec: BaseChainSpec = genesis.into();
 
         assert_eq!(
             chain_spec.base_fee_params,
@@ -664,7 +673,7 @@ mod tests {
             })
         );
 
-        let chain_spec: OpChainSpec = genesis.into();
+        let chain_spec: BaseChainSpec = genesis.into();
 
         assert_eq!(
             chain_spec.base_fee_params,
@@ -726,7 +735,7 @@ mod tests {
     }
     "#;
         let genesis: Genesis = serde_json::from_str(geth_genesis).unwrap();
-        let chainspec = OpChainSpec::from(genesis.clone());
+        let chainspec = BaseChainSpec::from(genesis.clone());
 
         let actual_chain_id = genesis.config.chain_id;
         assert_eq!(actual_chain_id, 8453);
@@ -745,11 +754,11 @@ mod tests {
 
         let optimism_object = genesis.config.extra_fields.get("optimism").unwrap();
         let optimism_base_fee_info =
-            serde_json::from_value::<OpBaseFeeInfo>(optimism_object.clone()).unwrap();
+            serde_json::from_value::<FeeInfo>(optimism_object.clone()).unwrap();
 
         assert_eq!(
             optimism_base_fee_info,
-            OpBaseFeeInfo {
+            FeeInfo {
                 eip1559_elasticity: Some(6),
                 eip1559_denominator: Some(50),
                 eip1559_denominator_canyon: None,
@@ -770,7 +779,7 @@ mod tests {
     #[test]
     fn test_fork_order_base_hardforks() {
         let genesis = Genesis {
-            config: ChainConfig {
+            config: AlloyChainConfig {
                 chain_id: 0,
                 homestead_block: Some(0),
                 dao_fork_block: Some(0),
@@ -812,7 +821,7 @@ mod tests {
             ..Default::default()
         };
 
-        let chain_spec: OpChainSpec = genesis.into();
+        let chain_spec: BaseChainSpec = genesis.into();
 
         let hardforks: Vec<_> = chain_spec.hardforks.forks_iter().map(|(h, _)| h).collect();
         let expected_hardforks = vec![
@@ -907,8 +916,8 @@ mod tests {
         "#;
 
         let genesis: Genesis = serde_json::from_str(geth_genesis).unwrap();
-        let chainspec = OpChainSpec::from_genesis(genesis);
-        assert!(BaseUpgrades::is_holocene_active_at_timestamp(&chainspec, 1732633200));
+        let chainspec = BaseChainSpec::from_genesis(genesis);
+        assert!(Upgrades::is_holocene_active_at_timestamp(&chainspec, 1732633200));
     }
 
     #[test]
@@ -965,7 +974,7 @@ mod tests {
         "#;
 
         let genesis: Genesis = serde_json::from_str(geth_genesis).unwrap();
-        let chainspec = OpChainSpec::from_genesis(genesis);
+        let chainspec = BaseChainSpec::from_genesis(genesis);
         assert!(chainspec.is_holocene_active_at_timestamp(1732633200));
 
         assert!(chainspec.is_shanghai_active_at_timestamp(0));

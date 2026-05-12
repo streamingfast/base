@@ -6,16 +6,17 @@
 //! [`OutputRoot`](base_protocol::OutputRoot), and compares them against the
 //! onchain claims.
 
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
+use base_common_consensus::Predeploys;
 use base_proof_rpc::{L2Provider, RpcError};
-use base_protocol::{OutputRoot, Predeploys};
+use base_protocol::OutputRoot;
 use futures::stream::{self, StreamExt};
 use thiserror::Error;
 use tracing::{info, warn};
 
-use crate::{ChallengerMetrics, verify_account_proof};
+use crate::{AccountProofVerifier, ChallengerMetrics};
 
 /// Errors that can occur during output root validation.
 #[derive(Debug, Error)]
@@ -132,16 +133,6 @@ struct Checkpoint {
     claimed_root: B256,
 }
 
-/// RAII guard that records the validation latency histogram on drop.
-struct RecordOnDrop(Instant);
-
-impl Drop for RecordOnDrop {
-    fn drop(&mut self) {
-        metrics::histogram!(ChallengerMetrics::VALIDATION_LATENCY_SECONDS)
-            .record(self.0.elapsed().as_secs_f64());
-    }
-}
-
 /// Validates output roots for candidate dispute games.
 ///
 /// Fetches L2 block headers and `L2ToL1MessagePasser` storage proofs to
@@ -211,9 +202,9 @@ impl<L2: L2Provider> OutputValidator<L2> {
         let account_result =
             self.l2_provider.get_proof(Predeploys::L2_TO_L1_MESSAGE_PASSER, rpc_hash).await?;
 
-        verify_account_proof(&account_result, consensus_header.state_root).map_err(|e| {
-            ValidatorError::AccountProofFailed { block_number, reason: e.to_string() }
-        })?;
+        AccountProofVerifier::verify(&account_result, consensus_header.state_root).map_err(
+            |e| ValidatorError::AccountProofFailed { block_number, reason: e.to_string() },
+        )?;
 
         let storage_root = account_result.storage_hash;
         let output_root =
@@ -232,7 +223,7 @@ impl<L2: L2Provider> OutputValidator<L2> {
         game_address: Address,
         checkpoints: &[Checkpoint],
     ) -> Result<Option<(usize, B256)>, ValidatorError> {
-        let _latency = RecordOnDrop(Instant::now());
+        let _latency = base_metrics::timed!(ChallengerMetrics::validation_latency_seconds());
 
         let mut stream = stream::iter(checkpoints.iter().enumerate())
             .map(|(idx, cp)| async move { (idx, cp, self.compute_output_root(cp.block).await) })
@@ -240,7 +231,7 @@ impl<L2: L2Provider> OutputValidator<L2> {
 
         while let Some((idx, cp, result)) = stream.next().await {
             let expected_root = result.inspect_err(|e| {
-                metrics::counter!(ChallengerMetrics::VALIDATION_ERRORS_TOTAL).increment(1);
+                ChallengerMetrics::validation_errors_total().increment(1);
                 warn!(
                     game = %game_address,
                     block = cp.block,
@@ -259,7 +250,7 @@ impl<L2: L2Provider> OutputValidator<L2> {
                     claimed = %cp.claimed_root,
                     "invalid output root detected"
                 );
-                metrics::counter!(ChallengerMetrics::GAMES_INVALID_TOTAL).increment(1);
+                ChallengerMetrics::games_invalid_total().increment(1);
                 return Ok(Some((idx, expected_root)));
             }
         }

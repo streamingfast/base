@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -8,40 +8,58 @@ use std::{
 };
 
 use alloy_network::{Ethereum, EthereumWallet, TransactionBuilder};
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{Address, Bytes, TxHash, U256, utils::format_ether};
 use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types::TransactionRequest;
 use alloy_signer_local::PrivateKeySigner;
 use base_tx_manager::NonceManager;
+use futures::stream::{self, StreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
+use parking_lot::RwLock;
+use tokio::sync::{mpsc, watch};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, instrument, warn};
+
+/// Maximum number of concurrent RPC requests during funding/draining operations.
+const FUNDING_CONCURRENCY: usize = 32;
+
+/// Maximum number of funding TXs to send before waiting for confirmation.
+/// Kept below typical per-sender txpool limits (e.g. reth default is 16) to
+/// avoid "txpool is full" rejections when all TXs originate from one funder.
+const FUNDING_BATCH_SIZE: usize = 16;
+
+use super::{
+    AdaptiveBackoff, BlockFirstSeen, BlockWatcher, Confirmer, ConfirmerHandle, DisplaySnapshot,
+    FlashblockTimes, FlashblockTracker, LoadConfig, LoadTestDisplay, RateLimiter, TxType,
+};
+use crate::{
+    BaselineError, Result,
+    config::{OsakaTarget, WorkloadConfig},
+    metrics::{MetricsCollector, MetricsSummary, TransactionMetrics},
+    rpc::{RpcClient, WalletProvider, create_wallet_provider},
+    workload::{
+        AccountPool, CalldataPayload, Erc20Payload, OsakaPayload, PrecompilePayload,
+        TransferPayload, WorkloadGenerator,
+    },
+};
 
 /// Provider type for nonce management. Uses Ethereum network type because
 /// `NonceManager` only calls `get_transaction_count`, which returns the same
 /// response for both Ethereum and Base networks.
 type NonceProvider = RootProvider<Ethereum>;
-use tokio::sync::mpsc;
-use tracing::{debug, error, info, instrument, warn};
-
-use super::{AdaptiveBackoff, Confirmer, ConfirmerHandle, LoadConfig, RateLimiter, TxType};
-use crate::{
-    BaselineError, Result,
-    config::WorkloadConfig,
-    metrics::{MetricsCollector, MetricsSummary, TransactionMetrics},
-    rpc::{RpcClient, WalletProvider, create_wallet_provider},
-    workload::{
-        AccountPool, CalldataPayload, Erc20Payload, PrecompilePayload, TransferPayload,
-        WorkloadGenerator,
-    },
-};
 
 struct PreparedTx {
     from: Address,
-    to: Address,
+    to: Option<Address>,
     value: U256,
     data: Bytes,
     gas_limit: u64,
 }
 
 const NONCE_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Warn when any account drops below 0.001 ETH.
+const LOW_BALANCE_THRESHOLD: u128 = 1_000_000_000_000_000;
 
 /// Executes load tests by generating and submitting transactions at a target rate.
 pub struct LoadRunner {
@@ -51,18 +69,29 @@ pub struct LoadRunner {
     generator: WorkloadGenerator,
     collector: MetricsCollector,
     stop_flag: Arc<AtomicBool>,
+    cancel_token: CancellationToken,
     nonce_managers: HashMap<Address, NonceManager<NonceProvider>>,
     providers: HashMap<Address, WalletProvider>,
     gas_price: u128,
+    display: Option<LoadTestDisplay>,
+    /// Optional watch channel for pushing live display snapshots to a TUI view.
+    snapshot_tx: Option<watch::Sender<DisplaySnapshot>>,
+    last_total_eth: Option<String>,
+    last_min_eth: Option<String>,
+    last_funds_low: bool,
+    /// Checksummed address of the funder wallet; set by the caller after `fund_accounts`.
+    funder_address: Option<String>,
+    /// Pre-computed checksummed addresses of all sender accounts for snapshot inclusion.
+    sender_addresses: Vec<String>,
 }
 
 impl LoadRunner {
     /// Creates a new load runner with the given configuration.
-    #[instrument(skip_all, fields(rpc_url = %config.rpc_url, chain_id = config.chain_id))]
+    #[instrument(skip_all, fields(rpc_url = %config.rpc_http_url, chain_id = config.chain_id))]
     pub fn new(config: LoadConfig) -> Result<Self> {
         config.validate()?;
 
-        let client = RpcClient::new(config.rpc_url.clone());
+        let client = RpcClient::new(config.rpc_http_url.clone());
 
         let accounts = if let Some(mnemonic) = &config.mnemonic {
             info!(
@@ -81,7 +110,8 @@ impl LoadRunner {
             AccountPool::with_offset(config.seed, config.account_count, config.sender_offset)?
         };
 
-        let providers = Self::build_providers(&config.rpc_url, &accounts);
+        let providers = Self::build_providers(&config.rpc_http_url, &accounts);
+        let sender_addresses = accounts.accounts().iter().map(|a| a.address.to_string()).collect();
 
         let workload_config = WorkloadConfig::new("load-test").with_seed(config.seed);
         let generator = Self::create_generator(workload_config, &config)?;
@@ -99,10 +129,23 @@ impl LoadRunner {
             generator,
             collector: MetricsCollector::new(),
             stop_flag: Arc::new(AtomicBool::new(false)),
+            cancel_token: CancellationToken::new(),
             nonce_managers: HashMap::new(),
             providers,
             gas_price: 0,
+            display: None,
+            snapshot_tx: None,
+            last_total_eth: None,
+            last_min_eth: None,
+            last_funds_low: false,
+            funder_address: None,
+            sender_addresses,
         })
+    }
+
+    /// Sets the funder wallet address for inclusion in live snapshots.
+    pub fn set_funder_address(&mut self, addr: String) {
+        self.funder_address = Some(addr);
     }
 
     fn build_providers(
@@ -157,6 +200,10 @@ impl LoadRunner {
                     );
                     generator = generator.with_payload(payload, weight_pct);
                 }
+                TxType::Osaka { target } => {
+                    generator =
+                        generator.with_payload(OsakaPayload::new(target.clone()), weight_pct);
+                }
             }
         }
 
@@ -176,6 +223,10 @@ impl LoadRunner {
                 TxType::Calldata { max_size, .. } => 21_000 + (*max_size as u64 * 16),
                 TxType::Erc20 { .. } => 65_000,
                 TxType::Precompile { iterations, .. } => 50_000 + 100_000 * (*iterations as u64),
+                TxType::Osaka { target } => match target {
+                    OsakaTarget::Clz => 80_000,
+                    OsakaTarget::P256verifyOsaka | OsakaTarget::ModexpOsaka => 30_000,
+                },
             };
             weighted_gas += gas_estimate * tx_config.weight as u64;
         }
@@ -190,18 +241,49 @@ impl LoadRunner {
         funding_key: PrivateKeySigner,
         amount_per_account: U256,
     ) -> Result<()> {
+        let total_accounts = self.accounts.len();
+        let client = self.client.clone();
+        let rpc_url = self.config.rpc_http_url.clone();
+        let chain_id = self.config.chain_id;
+        let max_gas_price = self.config.max_gas_price;
+
+        let pb_check = self.progress_bar(total_accounts as u64, "Checking balances");
+
+        // Phase 1: Parallel balance + nonce queries.
+        let addresses: Vec<(Address, usize)> =
+            self.accounts.accounts().iter().enumerate().map(|(i, a)| (a.address, i)).collect();
+
+        let balance_futs: Vec<_> = addresses
+            .iter()
+            .map(|&(addr, idx)| {
+                let client = client.clone();
+                async move {
+                    let balance = client.get_balance(addr).await?;
+                    let nonce = client.get_nonce(addr).await?;
+                    Ok::<_, BaselineError>((addr, idx, balance, nonce))
+                }
+            })
+            .collect();
+
+        let results: Vec<_> = stream::iter(balance_futs)
+            .buffer_unordered(FUNDING_CONCURRENCY)
+            .inspect(|_| pb_check.inc(1))
+            .collect()
+            .await;
+        pb_check.finish_and_clear();
+
         let mut accounts_to_fund = Vec::new();
-        for account in self.accounts.accounts_mut() {
-            let balance = self.client.get_balance(account.address).await?;
+        for result in results {
+            let (addr, idx, balance, nonce) = result?;
+            let account = &mut self.accounts.accounts_mut()[idx];
             account.balance = balance;
-            let account_nonce = self.client.get_nonce(account.address).await?;
-            account.nonce = account_nonce;
+            account.nonce = nonce;
 
             if balance < amount_per_account {
                 let deficit = amount_per_account.saturating_sub(balance);
-                accounts_to_fund.push((account.address, deficit));
+                accounts_to_fund.push((addr, deficit));
             } else {
-                debug!(address = %account.address, balance = %balance, "account already funded");
+                debug!(address = %addr, balance = %balance, "account already funded");
             }
         }
 
@@ -212,8 +294,41 @@ impl LoadRunner {
 
         let funder_address = funding_key.address();
         let wallet = EthereumWallet::from(funding_key);
-        let funder_provider = create_wallet_provider(self.config.rpc_url.clone(), wallet);
-        let mut nonce = funder_provider
+        let funder_provider = Arc::new(create_wallet_provider(rpc_url.clone(), wallet));
+
+        let gas_price = client.get_gas_price().await?;
+        let max_priority_fee = (gas_price / 10).max(1);
+        // Ensure max_fee >= max_priority_fee (EIP-1559 requirement).
+        // When gas_price is 0 (e.g. a fresh devnet), `gas_price * 2` would be 0
+        // while max_priority_fee=1, causing the transaction to be rejected.
+        let max_fee = gas_price.saturating_mul(2).max(max_priority_fee).min(max_gas_price);
+
+        // Phase 2: Early balance validation — abort before sending any TXs if
+        // the funder cannot cover the total cost.
+        let total_deficit: U256 = accounts_to_fund
+            .iter()
+            .map(|(_, deficit)| *deficit)
+            .fold(U256::ZERO, |a, b| a.saturating_add(b));
+        let gas_cost_per_tx = U256::from(21_000u64).saturating_mul(U256::from(max_fee));
+        let total_gas_cost = gas_cost_per_tx.saturating_mul(U256::from(accounts_to_fund.len()));
+        let total_needed = total_deficit.saturating_add(total_gas_cost);
+
+        let funder_balance = client.get_balance(funder_address).await?;
+
+        if funder_balance < total_needed {
+            let shortfall = total_needed.saturating_sub(funder_balance);
+            return Err(BaselineError::Transaction(format!(
+                "funder {} has insufficient balance: has {} ETH, needs {} ETH (deficit {} ETH + gas {} ETH), shortfall {} ETH",
+                funder_address,
+                format_ether(funder_balance),
+                format_ether(total_needed),
+                format_ether(total_deficit),
+                format_ether(total_gas_cost),
+                format_ether(shortfall),
+            )));
+        }
+
+        let start_nonce = funder_provider
             .get_transaction_count(funder_address)
             .pending()
             .await
@@ -223,112 +338,159 @@ impl LoadRunner {
             from = %funder_address,
             amount = %amount_per_account,
             accounts_needing_funds = accounts_to_fund.len(),
+            funder_balance = %format_ether(funder_balance),
+            total_needed = %format_ether(total_needed),
             "funding accounts"
         );
-
-        let gas_price = self.client.get_gas_price().await?;
-        let max_fee = gas_price.saturating_mul(2).min(self.config.max_gas_price);
-        let max_priority_fee = (gas_price / 10).max(1);
 
         let replacement_max_fee = max_fee.saturating_mul(3);
         let replacement_priority_fee = max_priority_fee.saturating_mul(3);
 
-        let mut pending_txs = Vec::new();
-        for (address, deficit) in &accounts_to_fund {
-            let tx = TransactionRequest::default()
-                .with_to(*address)
-                .with_value(*deficit)
-                .with_nonce(nonce)
-                .with_chain_id(self.config.chain_id)
-                .with_gas_limit(21_000)
-                .with_max_fee_per_gas(max_fee)
-                .with_max_priority_fee_per_gas(max_priority_fee);
+        // Phase 3+4: Send funding TXs in batches and confirm each batch before
+        // sending the next. This avoids overwhelming the txpool's per-sender limit.
+        let txs: Vec<(TransactionRequest, Address, U256, u64)> = accounts_to_fund
+            .iter()
+            .enumerate()
+            .map(|(i, &(address, deficit))| {
+                let nonce = start_nonce
+                    .checked_add(u64::try_from(i).expect("account index exceeds u64"))
+                    .expect("nonce overflow");
+                let tx = TransactionRequest::default()
+                    .with_to(address)
+                    .with_value(deficit)
+                    .with_nonce(nonce)
+                    .with_chain_id(chain_id)
+                    .with_gas_limit(21_000)
+                    .with_max_fee_per_gas(max_fee)
+                    .with_max_priority_fee_per_gas(max_priority_fee);
+                (tx, address, deficit, nonce)
+            })
+            .collect();
 
-            match funder_provider.send_transaction(tx).await {
-                Ok(pending) => {
-                    let tx_hash = *pending.tx_hash();
-                    debug!(to = %address, deficit = %deficit, nonce, tx_hash = %tx_hash, "funding tx sent");
-                    pending_txs.push((tx_hash, *address));
-                    nonce += 1;
+        let total_txs = txs.len() as u64;
+        let pb_fund = self.progress_bar(total_txs, "Funding accounts");
+        let mut txs_remaining = txs.into_iter().peekable();
+        while txs_remaining.peek().is_some() {
+            let batch: Vec<_> = txs_remaining.by_ref().take(FUNDING_BATCH_SIZE).collect();
+            let mut batch_pending: Vec<(TxHash, Address)> = Vec::with_capacity(batch.len());
+            let mut retries: Vec<(Address, U256, u64)> = Vec::new();
+            let mut fatal_errors: Vec<String> = Vec::new();
+
+            let send_futs = batch.into_iter().map(|(tx, address, deficit, nonce)| {
+                let provider = Arc::clone(&funder_provider);
+                async move {
+                    let result = provider.send_transaction(tx).await;
+                    (result, address, deficit, nonce)
                 }
-                Err(e) => {
-                    let error_str = e.to_string();
-                    if error_str.contains("already known") {
-                        warn!(to = %address, nonce, "funding tx already in mempool, replacing with higher gas price");
+            });
+
+            let mut send_stream = stream::iter(send_futs).buffer_unordered(FUNDING_BATCH_SIZE);
+
+            while let Some((result, address, deficit, nonce)) = send_stream.next().await {
+                match result {
+                    Ok(pending) => {
+                        let tx_hash = *pending.tx_hash();
+                        debug!(to = %address, deficit = %deficit, nonce, tx_hash = %tx_hash, "funding tx sent");
+                        batch_pending.push((tx_hash, address));
+                    }
+                    Err(e) => {
+                        let error_str = e.to_string();
+                        if error_str.contains("already known") {
+                            retries.push((address, deficit, nonce));
+                        } else {
+                            error!(to = %address, error = %e, "failed to fund account");
+                            fatal_errors.push(format!("failed to fund {address}: {e}"));
+                        }
+                    }
+                }
+            }
+
+            if !fatal_errors.is_empty() {
+                pb_fund.finish_and_clear();
+                return Err(BaselineError::Transaction(format!(
+                    "{} funding tx(s) failed: {}",
+                    fatal_errors.len(),
+                    fatal_errors.join("; "),
+                )));
+            }
+
+            if !retries.is_empty() {
+                let retry_futs = retries.into_iter().map(|(address, deficit, nonce)| {
+                    let provider = Arc::clone(&funder_provider);
+                    async move {
                         let replacement = TransactionRequest::default()
-                            .with_to(*address)
-                            .with_value(*deficit)
+                            .with_to(address)
+                            .with_value(deficit)
                             .with_nonce(nonce)
-                            .with_chain_id(self.config.chain_id)
+                            .with_chain_id(chain_id)
                             .with_gas_limit(21_000)
                             .with_max_fee_per_gas(replacement_max_fee)
                             .with_max_priority_fee_per_gas(replacement_priority_fee);
+                        let result = provider.send_transaction(replacement).await;
+                        (result, address, nonce)
+                    }
+                });
 
-                        match funder_provider.send_transaction(replacement).await {
-                            Ok(pending) => {
-                                let tx_hash = *pending.tx_hash();
-                                info!(to = %address, nonce, tx_hash = %tx_hash, "replacement funding tx sent");
-                                pending_txs.push((tx_hash, *address));
-                            }
-                            Err(replace_err) => {
-                                warn!(to = %address, nonce, error = %replace_err, "replacement tx also failed, proceeding");
-                            }
+                let mut retry_stream =
+                    stream::iter(retry_futs).buffer_unordered(FUNDING_BATCH_SIZE);
+
+                while let Some((result, address, nonce)) = retry_stream.next().await {
+                    match result {
+                        Ok(pending) => {
+                            let tx_hash = *pending.tx_hash();
+                            info!(to = %address, nonce, tx_hash = %tx_hash, "replacement funding tx sent");
+                            batch_pending.push((tx_hash, address));
                         }
-                        nonce += 1;
-                        continue;
-                    }
-                    error!(to = %address, error = %e, "failed to fund account");
-                    return Err(BaselineError::Transaction(format!(
-                        "failed to fund {address}: {e}",
-                    )));
-                }
-            }
-        }
-
-        info!(count = pending_txs.len(), "waiting for funding txs to confirm");
-        let timeout = Duration::from_secs(60);
-        let poll_interval = Duration::from_millis(500);
-        let start = Instant::now();
-
-        while !pending_txs.is_empty() && start.elapsed() < timeout {
-            tokio::time::sleep(poll_interval).await;
-
-            let mut still_pending = Vec::new();
-            for (tx_hash, address) in pending_txs {
-                match self.client.get_transaction_receipt(tx_hash).await {
-                    Ok(Some(_)) => {
-                        debug!(tx_hash = %tx_hash, address = %address, "funding tx confirmed");
-                    }
-                    Ok(None) => {
-                        still_pending.push((tx_hash, address));
-                    }
-                    Err(e) => {
-                        warn!(tx_hash = %tx_hash, error = %e, "failed to get receipt");
-                        still_pending.push((tx_hash, address));
+                        Err(replace_err) => {
+                            warn!(to = %address, nonce, error = %replace_err, "replacement tx also failed, proceeding");
+                        }
                     }
                 }
             }
-            pending_txs = still_pending;
-        }
 
-        if !pending_txs.is_empty() {
-            let unconfirmed: Vec<_> = pending_txs.iter().map(|(_, addr)| addr).collect();
-            return Err(BaselineError::Transaction(format!(
-                "funding txs did not confirm within timeout: {unconfirmed:?}"
-            )));
+            Self::await_confirmations(&client, &mut batch_pending, &pb_fund).await?;
         }
+        pb_fund.finish_and_clear();
 
-        for account in self.accounts.accounts_mut() {
-            let balance = self.client.get_balance(account.address).await?;
+        // Phase 5: Parallel post-funding state refresh.
+        let pb_refresh = self.progress_bar(total_accounts as u64, "Refreshing account state");
+        let refresh_futs: Vec<_> = self
+            .accounts
+            .accounts()
+            .iter()
+            .map(|a| {
+                let client = client.clone();
+                let addr = a.address;
+                async move {
+                    let balance = client.get_balance(addr).await?;
+                    let nonce = client.get_nonce(addr).await?;
+                    Ok::<_, BaselineError>((addr, balance, nonce))
+                }
+            })
+            .collect();
+
+        let refresh_results: Vec<_> = stream::iter(refresh_futs)
+            .buffer_unordered(FUNDING_CONCURRENCY)
+            .inspect(|_| pb_refresh.inc(1))
+            .collect()
+            .await;
+        pb_refresh.finish_and_clear();
+
+        let addr_to_idx: HashMap<Address, usize> =
+            self.accounts.accounts().iter().enumerate().map(|(i, a)| (a.address, i)).collect();
+
+        for result in refresh_results {
+            let (addr, balance, account_nonce) = result?;
+            let idx = addr_to_idx[&addr];
+            let account = &mut self.accounts.accounts_mut()[idx];
             account.balance = balance;
-            let account_nonce = self.client.get_nonce(account.address).await?;
             account.nonce = account_nonce;
 
-            let provider = NonceProvider::new_http(self.config.rpc_url.clone());
-            let nonce_manager = NonceManager::new(provider, account.address, NONCE_RPC_TIMEOUT);
-            self.nonce_managers.insert(account.address, nonce_manager);
+            let provider = NonceProvider::new_http(self.config.rpc_http_url.clone());
+            let nonce_manager = NonceManager::new(provider, addr, NONCE_RPC_TIMEOUT);
+            self.nonce_managers.insert(addr, nonce_manager);
 
-            debug!(address = %account.address, balance = %balance, nonce = account_nonce, "account state refreshed");
+            debug!(address = %addr, balance = %balance, nonce = account_nonce, "account state refreshed");
         }
 
         info!(funded = accounts_to_fund.len(), "funding complete");
@@ -336,18 +498,19 @@ impl LoadRunner {
     }
 
     /// Runs the load test and returns metrics summary.
-    #[instrument(skip(self), fields(target_gps = self.config.target_gps, duration = ?self.config.duration))]
+    #[instrument(skip(self), fields(target_gps = self.config.target_gps, continuous = self.config.duration.is_none(), duration = ?self.config.duration))]
     pub async fn run(&mut self) -> Result<MetricsSummary> {
         self.collector.reset();
         self.collector.start();
         self.stop_flag.store(false, Ordering::SeqCst);
+        self.cancel_token = CancellationToken::new();
 
         self.gas_price = self.client.get_gas_price().await?;
         info!(gas_price = self.gas_price, "fetched current gas price");
 
         for account in self.accounts.accounts() {
             if !self.nonce_managers.contains_key(&account.address) {
-                let provider = NonceProvider::new_http(self.config.rpc_url.clone());
+                let provider = NonceProvider::new_http(self.config.rpc_http_url.clone());
                 let nonce_manager = NonceManager::new(provider, account.address, NONCE_RPC_TIMEOUT);
                 self.nonce_managers.insert(account.address, nonce_manager);
             }
@@ -369,13 +532,53 @@ impl LoadRunner {
         let (metrics_tx, mut metrics_rx) =
             mpsc::channel::<TransactionMetrics>(METRICS_CHANNEL_BUFFER);
 
+        let flashblock_times: FlashblockTimes = Arc::new(RwLock::new(HashMap::new()));
+        let block_first_seen: BlockFirstSeen = Arc::new(RwLock::new(BTreeMap::new()));
+
+        let flashblock_tracker_task = if let Some(url) = &self.config.flashblocks_ws_url {
+            info!(url = %url, "starting flashblock tracker");
+            Some(
+                FlashblockTracker::new(
+                    url.clone(),
+                    Arc::clone(&flashblock_times),
+                    self.cancel_token.clone(),
+                )
+                .start(),
+            )
+        } else {
+            info!("flashblocks_ws_url not configured, flashblock latency tracking disabled");
+            None
+        };
+
+        let block_watcher_task = if let Some(url) = &self.config.rpc_ws_url {
+            info!(url = %url, "starting block watcher");
+            Some(
+                BlockWatcher::new(
+                    url.clone(),
+                    Arc::clone(&block_first_seen),
+                    self.cancel_token.clone(),
+                )
+                .start(),
+            )
+        } else {
+            info!("rpc_ws_url not configured, using block timestamps for latency");
+            None
+        };
+
         let sender_addresses: Vec<_> = self.accounts.accounts().iter().map(|a| a.address).collect();
-        let mut confirmer =
-            Confirmer::new(&sender_addresses, metrics_tx, Arc::clone(&self.stop_flag));
+        let block_ws_enabled = block_watcher_task.is_some();
+        let mut confirmer = Confirmer::new(
+            &sender_addresses,
+            metrics_tx,
+            Arc::clone(&self.stop_flag),
+            Arc::clone(&flashblock_times),
+            Arc::clone(&block_first_seen),
+            block_ws_enabled,
+        );
         let confirmer_handle = confirmer.handle();
         let confirmer_handle_for_run = confirmer_handle.clone();
 
-        let confirmer_client = RpcClient::new(self.config.rpc_url.clone());
+        let confirmer_client = RpcClient::new(self.config.rpc_http_url.clone());
         let confirmer_task = tokio::spawn(async move {
             confirmer.run(confirmer_client, &confirmer_handle_for_run).await
         });
@@ -409,11 +612,21 @@ impl LoadRunner {
         let mut last_gas_price_refresh = Instant::now();
         let mut last_rate_limiter_update = Instant::now();
         let mut last_progress_report = Instant::now();
+        let mut last_balance_check = Instant::now();
         const GAS_PRICE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
         const RATE_LIMITER_UPDATE_INTERVAL: Duration = Duration::from_secs(10);
         const PROGRESS_REPORT_INTERVAL: Duration = Duration::from_secs(5);
+        const DISPLAY_RENDER_INTERVAL: Duration = Duration::from_millis(500);
+        const BALANCE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
-        while start.elapsed() < self.config.duration && !self.stop_flag.load(Ordering::SeqCst) {
+        let use_live_display = self.display.as_ref().is_some_and(|d| d.is_active());
+        let use_snapshot_tx = self.snapshot_tx.is_some();
+
+        self.check_account_balances().await;
+
+        while self.config.duration.is_none_or(|d| start.elapsed() < d)
+            && !self.stop_flag.load(Ordering::SeqCst)
+        {
             if last_gas_price_refresh.elapsed() >= GAS_PRICE_REFRESH_INTERVAL {
                 if let Ok(new_price) = self.client.get_gas_price().await
                     && new_price != self.gas_price
@@ -462,7 +675,7 @@ impl LoadRunner {
 
             let tx_request = self.generator.generate_payload(from, to)?;
 
-            let to_addr = tx_request.to.and_then(|kind| kind.to().copied()).unwrap_or(to);
+            let to_addr = tx_request.to.and_then(|kind| kind.to().copied());
             let value = tx_request.value.unwrap_or(U256::ZERO);
             let data = tx_request.input.input().cloned().unwrap_or_default();
             let gas_limit = tx_request.gas.unwrap_or(21_000);
@@ -483,13 +696,77 @@ impl LoadRunner {
                 debug!(submitted, "batch submitted");
             }
 
-            if last_progress_report.elapsed() >= PROGRESS_REPORT_INTERVAL {
+            if last_balance_check.elapsed() >= BALANCE_CHECK_INTERVAL {
+                self.check_account_balances().await;
+                last_balance_check = Instant::now();
+            }
+
+            // Drain confirmed metrics non-blocking so the rolling window stays
+            // current during the run (not just during the post-run drain).
+            while let Ok(metrics) = metrics_rx.try_recv() {
+                self.collector.record_confirmed(metrics);
+            }
+
+            if use_live_display || use_snapshot_tx {
+                if last_progress_report.elapsed() >= DISPLAY_RENDER_INTERVAL {
+                    let (p50, p99) = self.collector.rolling_p50_p99();
+                    let (flashblocks_p50, flashblocks_p99) =
+                        self.collector.rolling_flashblocks_p50_p99();
+                    let snap = DisplaySnapshot {
+                        elapsed: start.elapsed(),
+                        duration: self.config.duration,
+                        submitted: self.collector.submitted_count(),
+                        confirmed: self.collector.confirmed_count(),
+                        failed: self.collector.failed_count(),
+                        in_flight: confirmer_handle.total_in_flight(),
+                        senders_blocked: confirmer_handle
+                            .senders_at_limit(max_in_flight_per_sender),
+                        total_senders: account_count,
+                        rolling_tps: self.collector.rolling_tps(),
+                        rolling_gps: self.collector.rolling_gps(),
+                        p50_latency: p50,
+                        p99_latency: p99,
+                        flashblocks_p50_latency: flashblocks_p50,
+                        flashblocks_p99_latency: flashblocks_p99,
+                        gas_price_gwei: self.gas_price as f64 / 1e9,
+                        total_eth: self.last_total_eth.clone(),
+                        min_eth: self.last_min_eth.clone(),
+                        funds_low: self.last_funds_low,
+                        funder_address: self.funder_address.clone(),
+                        sender_addresses: self.sender_addresses.clone(),
+                    };
+                    if let Some(ref d) = self.display {
+                        d.update(&snap);
+                    }
+                    if let Some(ref tx) = self.snapshot_tx {
+                        let _ = tx.send(snap);
+                    }
+                    last_progress_report = Instant::now();
+                }
+            } else if last_progress_report.elapsed() >= PROGRESS_REPORT_INTERVAL {
                 let elapsed_secs = start.elapsed().as_secs();
                 let submitted = self.collector.submitted_count();
                 let confirmed = self.collector.confirmed_count();
                 let failed = self.collector.failed_count();
                 let in_flight = confirmer_handle.total_in_flight();
-                info!(elapsed_secs, submitted, confirmed, failed, in_flight, "progress");
+                let senders_blocked = confirmer_handle.senders_at_limit(max_in_flight_per_sender);
+                let (p50, p99) = self.collector.rolling_p50_p99();
+                let (flashblocks_p50, flashblocks_p99) =
+                    self.collector.rolling_flashblocks_p50_p99();
+                info!(
+                    elapsed_secs,
+                    submitted,
+                    confirmed,
+                    failed,
+                    in_flight,
+                    senders_blocked,
+                    gas_price = self.gas_price,
+                    p50_ms = p50.as_millis() as u64,
+                    p99_ms = p99.as_millis() as u64,
+                    flashblocks_p50_ms = flashblocks_p50.as_millis() as u64,
+                    flashblocks_p99_ms = flashblocks_p99.as_millis() as u64,
+                    "progress"
+                );
                 last_progress_report = Instant::now();
             }
         }
@@ -501,6 +778,10 @@ impl LoadRunner {
         }
 
         self.stop_flag.store(true, Ordering::SeqCst);
+
+        if let Some(display) = &self.display {
+            display.finish();
+        }
 
         let submitted = self.collector.submitted_count();
         let in_flight = confirmer_handle.total_in_flight();
@@ -538,7 +819,31 @@ impl LoadRunner {
             }
         }
 
-        confirmer_task.abort();
+        // Let the confirmer finish gracefully (stop_flag is already set).
+        // Block watcher stays alive so deferred block latencies can still resolve.
+        if tokio::time::timeout(Duration::from_secs(2), confirmer_task).await.is_err() {
+            warn!("confirmer did not shut down in time");
+        }
+
+        while let Ok(metrics) = metrics_rx.try_recv() {
+            self.collector.record_confirmed(metrics);
+        }
+
+        // Now safe to stop WebSocket tasks — confirmer is done.
+        self.cancel_token.cancel();
+
+        if let Some(task) = flashblock_tracker_task {
+            match tokio::time::timeout(Duration::from_secs(2), task).await {
+                Ok(Err(e)) if e.is_panic() => warn!(error = %e, "flashblock tracker panicked"),
+                _ => {}
+            }
+        }
+        if let Some(task) = block_watcher_task {
+            match tokio::time::timeout(Duration::from_secs(2), task).await {
+                Ok(Err(e)) if e.is_panic() => warn!(error = %e, "block watcher panicked"),
+                _ => {}
+            }
+        }
 
         let confirmed = self.collector.confirmed_count();
         info!(confirmed, submitted, "confirmation collection complete");
@@ -576,9 +881,8 @@ impl LoadRunner {
             let nonce = nonce_guard.nonce();
 
             let max_fee = self.gas_price.saturating_mul(2).min(self.config.max_gas_price);
-            let tx = TransactionRequest::default()
+            let mut tx = TransactionRequest::default()
                 .with_from(prepared.from)
-                .with_to(prepared.to)
                 .with_value(prepared.value)
                 .with_input(prepared.data)
                 .with_nonce(nonce)
@@ -586,6 +890,9 @@ impl LoadRunner {
                 .with_max_fee_per_gas(max_fee)
                 .with_max_priority_fee_per_gas((self.gas_price / 10).max(1))
                 .with_gas_limit(prepared.gas_limit);
+            if let Some(to) = prepared.to {
+                tx = tx.with_to(to);
+            }
 
             let mut attempts = 0;
             let max_attempts = 3;
@@ -668,62 +975,95 @@ impl LoadRunner {
     #[instrument(skip(self, funding_key), fields(accounts = self.accounts.len()))]
     pub async fn drain_accounts(&self, funding_key: PrivateKeySigner) -> Result<U256> {
         let funder_address = funding_key.address();
-        let gas_price = self.client.get_gas_price().await?;
-        let max_fee = gas_price.saturating_mul(2).min(self.config.max_gas_price);
+        let client = self.client.clone();
+        let rpc_url = self.config.rpc_http_url.clone();
+        let chain_id = self.config.chain_id;
+
+        let gas_price = client.get_gas_price().await?;
         let max_priority_fee = (gas_price / 10).max(1);
+        // Ensure max_fee >= max_priority_fee (EIP-1559 requirement).
+        let max_fee =
+            gas_price.saturating_mul(2).max(max_priority_fee).min(self.config.max_gas_price);
         let drain_gas_limit = 21_000u128;
         // L1 data fee on OP Stack can be significant (0.0001-0.001 ETH depending on L1 gas prices).
         // Use 0.001 ETH (1e15 wei) buffer to be safe. We may leave dust in accounts.
         let l1_fee_buffer = 1_000_000_000_000_000u128;
         let drain_gas_cost = U256::from(drain_gas_limit * max_fee + l1_fee_buffer);
 
+        let total_accounts = self.accounts.len();
+        let pb_drain = self.progress_bar(total_accounts as u64, "Draining accounts");
+
+        // Each account has its own signer, so drains are fully independent.
+        let account_data: Vec<_> =
+            self.accounts.accounts().iter().map(|a| (a.address, a.signer.clone())).collect();
+
+        let drain_futs: Vec<_> = account_data
+            .into_iter()
+            .map(|(address, signer)| {
+                let client = client.clone();
+                let rpc_url = rpc_url.clone();
+                async move {
+                    let balance = client.get_pending_balance(address).await?;
+                    if balance <= drain_gas_cost {
+                        debug!(
+                            address = %address,
+                            balance = %balance,
+                            "skipping drain, balance too low to cover gas"
+                        );
+                        return Ok::<_, BaselineError>(None);
+                    }
+
+                    let send_amount = balance.saturating_sub(drain_gas_cost);
+                    let wallet = EthereumWallet::from(signer);
+                    let provider = create_wallet_provider(rpc_url, wallet);
+                    let nonce = provider
+                        .get_transaction_count(address)
+                        .pending()
+                        .await
+                        .map_err(|e| BaselineError::Rpc(e.to_string()))?;
+
+                    let tx = TransactionRequest::default()
+                        .with_to(funder_address)
+                        .with_value(send_amount)
+                        .with_nonce(nonce)
+                        .with_chain_id(chain_id)
+                        .with_gas_limit(drain_gas_limit as u64)
+                        .with_max_fee_per_gas(max_fee)
+                        .with_max_priority_fee_per_gas(max_priority_fee);
+
+                    match provider.send_transaction(tx).await {
+                        Ok(pending) => {
+                            let tx_hash = *pending.tx_hash();
+                            debug!(
+                                from = %address,
+                                amount = %send_amount,
+                                tx_hash = %tx_hash,
+                                "drain tx sent"
+                            );
+                            Ok(Some((tx_hash, address, send_amount)))
+                        }
+                        Err(e) => {
+                            warn!(from = %address, error = %e, "drain tx failed, skipping");
+                            Ok(None)
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        let drain_results: Vec<_> = stream::iter(drain_futs)
+            .buffer_unordered(FUNDING_CONCURRENCY)
+            .inspect(|_| pb_drain.inc(1))
+            .collect()
+            .await;
+        pb_drain.finish_and_clear();
+
         let mut pending_txs = Vec::new();
         let mut total_drained = U256::ZERO;
-
-        for account in self.accounts.accounts() {
-            let balance = self.client.get_pending_balance(account.address).await?;
-            if balance <= drain_gas_cost {
-                debug!(
-                    address = %account.address,
-                    balance = %balance,
-                    "skipping drain, balance too low to cover gas"
-                );
-                continue;
-            }
-
-            let send_amount = balance.saturating_sub(drain_gas_cost);
-            let wallet = EthereumWallet::from(account.signer.clone());
-            let provider = create_wallet_provider(self.config.rpc_url.clone(), wallet);
-            let nonce = provider
-                .get_transaction_count(account.address)
-                .pending()
-                .await
-                .map_err(|e| BaselineError::Rpc(e.to_string()))?;
-
-            let tx = TransactionRequest::default()
-                .with_to(funder_address)
-                .with_value(send_amount)
-                .with_nonce(nonce)
-                .with_chain_id(self.config.chain_id)
-                .with_gas_limit(drain_gas_limit as u64)
-                .with_max_fee_per_gas(max_fee)
-                .with_max_priority_fee_per_gas(max_priority_fee);
-
-            match provider.send_transaction(tx).await {
-                Ok(pending) => {
-                    let tx_hash = *pending.tx_hash();
-                    debug!(
-                        from = %account.address,
-                        amount = %send_amount,
-                        tx_hash = %tx_hash,
-                        "drain tx sent"
-                    );
-                    pending_txs.push((tx_hash, account.address));
-                    total_drained = total_drained.saturating_add(send_amount);
-                }
-                Err(e) => {
-                    warn!(from = %account.address, error = %e, "drain tx failed, skipping");
-                }
+        for result in drain_results {
+            if let Some((tx_hash, address, amount)) = result? {
+                pending_txs.push((tx_hash, address));
+                total_drained = total_drained.saturating_add(amount);
             }
         }
 
@@ -732,7 +1072,37 @@ impl LoadRunner {
             return Ok(U256::ZERO);
         }
 
+        let pb_confirm = self.progress_bar(pending_txs.len() as u64, "Confirming drain txs");
         info!(count = pending_txs.len(), total = %total_drained, "waiting for drain txs to confirm");
+
+        if let Err(e) = Self::await_confirmations(&client, &mut pending_txs, &pb_confirm).await {
+            warn!(error = %e, "some drain txs did not confirm within timeout");
+        }
+        pb_confirm.finish_and_clear();
+
+        info!(total = %total_drained, "drain complete");
+        Ok(total_drained)
+    }
+
+    fn progress_bar(&self, total: u64, prefix: &str) -> ProgressBar {
+        if self.snapshot_tx.is_some() {
+            return ProgressBar::hidden();
+        }
+        let pb = ProgressBar::new(total);
+        pb.set_style(
+            ProgressStyle::with_template("{prefix} [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+                .expect("valid template")
+                .progress_chars("█▓░"),
+        );
+        pb.set_prefix(prefix.to_string());
+        pb
+    }
+
+    async fn await_confirmations(
+        client: &RpcClient,
+        pending_txs: &mut Vec<(TxHash, Address)>,
+        pb: &ProgressBar,
+    ) -> Result<()> {
         let timeout = Duration::from_secs(60);
         let poll_interval = Duration::from_millis(500);
         let start = Instant::now();
@@ -740,34 +1110,107 @@ impl LoadRunner {
         while !pending_txs.is_empty() && start.elapsed() < timeout {
             tokio::time::sleep(poll_interval).await;
 
+            let receipt_futs: Vec<_> = pending_txs
+                .iter()
+                .map(|&(tx_hash, address)| {
+                    let client = client.clone();
+                    async move {
+                        let receipt = client.get_transaction_receipt(tx_hash).await;
+                        (tx_hash, address, receipt)
+                    }
+                })
+                .collect();
+
+            let receipts: Vec<_> = futures::future::join_all(receipt_futs).await;
+
             let mut still_pending = Vec::new();
-            for (tx_hash, address) in pending_txs {
-                match self.client.get_transaction_receipt(tx_hash).await {
+            for (tx_hash, address, receipt) in receipts {
+                match receipt {
                     Ok(Some(_)) => {
-                        debug!(tx_hash = %tx_hash, from = %address, "drain tx confirmed");
+                        debug!(tx_hash = %tx_hash, address = %address, "tx confirmed");
+                        pb.inc(1);
                     }
                     Ok(None) => {
                         still_pending.push((tx_hash, address));
                     }
                     Err(e) => {
-                        warn!(tx_hash = %tx_hash, error = %e, "failed to get drain receipt");
+                        warn!(tx_hash = %tx_hash, error = %e, "failed to get receipt");
                         still_pending.push((tx_hash, address));
                     }
                 }
             }
-            pending_txs = still_pending;
+            *pending_txs = still_pending;
         }
 
         if !pending_txs.is_empty() {
             let unconfirmed: Vec<_> = pending_txs.iter().map(|(_, addr)| addr).collect();
-            warn!(accounts = ?unconfirmed, "some drain txs did not confirm within timeout");
+            return Err(BaselineError::Transaction(format!(
+                "txs did not confirm within timeout: {unconfirmed:?}"
+            )));
         }
 
-        info!(total = %total_drained, "drain complete");
-        Ok(total_drained)
+        Ok(())
     }
 
-    /// Signals the load test to stop.
+    /// Checks account balances, stores the results for the live display, and
+    /// logs a warning when any account is running low.
+    async fn check_account_balances(&mut self) {
+        let addresses: Vec<Address> = self.accounts.accounts().iter().map(|a| a.address).collect();
+
+        let results =
+            futures::future::join_all(addresses.iter().map(|&addr| self.client.get_balance(addr)))
+                .await;
+
+        let mut total = U256::ZERO;
+        let mut min = U256::MAX;
+        let mut below_threshold = 0usize;
+
+        for (&address, result) in addresses.iter().zip(results) {
+            match result {
+                Ok(balance) => {
+                    total = total.saturating_add(balance);
+                    if balance < min {
+                        min = balance;
+                    }
+                    if balance < U256::from(LOW_BALANCE_THRESHOLD) {
+                        below_threshold += 1;
+                    }
+                }
+                Err(e) => {
+                    warn!(address = %address, error = %e, "failed to check account balance");
+                }
+            }
+        }
+
+        if min == U256::MAX {
+            return;
+        }
+
+        self.last_total_eth = Some(format_ether(total));
+        self.last_min_eth = Some(format_ether(min));
+        self.last_funds_low = below_threshold > 0;
+
+        if below_threshold > 0 {
+            warn!(
+                total_eth = %format_ether(total),
+                min_eth = %format_ether(min),
+                accounts_low = below_threshold,
+                "account funds running low"
+            );
+        } else {
+            info!(
+                total_eth = %format_ether(total),
+                min_eth = %format_ether(min),
+                "account balances"
+            );
+        }
+    }
+
+    /// Signals the load test to stop gracefully.
+    ///
+    /// Only sets `stop_flag` — does **not** cancel WebSocket tasks or clean up
+    /// resources. The caller must ensure [`run()`](Self::run) completes, which
+    /// handles draining confirmations and cancelling background tasks.
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::SeqCst);
     }
@@ -780,6 +1223,32 @@ impl LoadRunner {
     /// Returns the load configuration.
     pub const fn config(&self) -> &LoadConfig {
         &self.config
+    }
+
+    /// Attaches a live progress-bar display.
+    ///
+    /// When set and stdout is a TTY, the runner updates the indicatif bars
+    /// every 500 ms instead of emitting 5-second progress log lines.
+    pub fn set_display(&mut self, display: LoadTestDisplay) {
+        self.display = Some(display);
+    }
+
+    /// Replaces the internal stop flag with an externally-owned one.
+    ///
+    /// Call this before [`run`] when the caller needs to share the flag across threads
+    /// (e.g. a TUI view pre-creates the flag so it can stop the test without waiting
+    /// for the runner to be fully initialised).
+    pub fn replace_stop_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.stop_flag = flag;
+    }
+
+    /// Attaches a watch channel for streaming live [`DisplaySnapshot`] updates to a TUI view.
+    ///
+    /// When set, the runner publishes a snapshot every 500 ms during the run loop,
+    /// regardless of whether a TTY display is also attached. The TUI view polls
+    /// the corresponding [`watch::Receiver`] on each tick.
+    pub fn set_snapshot_tx(&mut self, tx: watch::Sender<DisplaySnapshot>) {
+        self.snapshot_tx = Some(tx);
     }
 }
 

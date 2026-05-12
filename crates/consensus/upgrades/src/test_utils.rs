@@ -2,8 +2,8 @@
 
 use alloy_eips::Encodable2718;
 use alloy_primitives::{Address, B256, keccak256};
-use base_alloy_consensus::{OpTxType, TxDeposit};
-use base_revm::{DefaultOp, DepositTransactionParts, OpSpecId};
+use base_common_consensus::{OpTxType, TxDeposit};
+use base_common_evm::{DefaultOp, DepositTransactionParts, OpSpecId};
 use revm::{
     Context, ExecuteCommitEvm, MainBuilder,
     context::{
@@ -16,7 +16,7 @@ use revm::{
 
 /// Runs an upgrade deposit transaction that deploys a contract in an in-memory EVM, and checks that
 /// the contract deploys to the expected address and with the expected codehash.
-pub(crate) fn check_deployment_code(
+pub fn check_deployment_code(
     deployment_tx: TxDeposit,
     expected_address: Address,
     expected_code_hash: B256,

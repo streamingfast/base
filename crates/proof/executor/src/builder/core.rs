@@ -12,12 +12,13 @@ use alloy_evm::{
     EvmFactory, FromRecoveredTx, FromTxWithEncoded,
     block::{BlockExecutionResult, BlockExecutor, BlockExecutorFactory},
 };
-use base_alloy_consensus::{OpReceiptEnvelope, OpTxEnvelope};
-use base_alloy_evm::{OpAlloyReceiptBuilder, OpBlockExecutionCtx, OpBlockExecutorFactory, OpTxEnv};
-use base_alloy_rpc_types_engine::OpPayloadAttributes;
+use base_common_consensus::{BaseReceiptEnvelope, BaseTxEnvelope};
+use base_common_evm::{
+    AlloyReceiptBuilder, BaseBlockExecutionCtx, BaseBlockExecutorFactory, BaseTxEnv, OpSpecId,
+};
+use base_common_rpc_types_engine::BasePayloadAttributes;
 use base_consensus_genesis::RollupConfig;
 use base_proof_mpt::TrieHinter;
-use base_revm::{OpSpecId, RollupConfigExt};
 use revm::{
     context::BlockEnv,
     database::{State, states::bundle_state::BundleRetention},
@@ -48,7 +49,7 @@ where
     /// The trie database providing stateless access to L2 state via Merkle proofs.
     pub(crate) trie_db: TrieDB<P, H>,
     /// The block executor factory for creating Base execution environments.
-    pub(crate) factory: OpBlockExecutorFactory<OpAlloyReceiptBuilder, RollupConfig, Evm>,
+    pub(crate) factory: BaseBlockExecutorFactory<AlloyReceiptBuilder, RollupConfig, Evm>,
 }
 
 impl<'a, P, H, Evm> StatelessL2Builder<'a, P, H, Evm>
@@ -57,7 +58,7 @@ where
     H: TrieHinter + Debug,
     Evm: EvmFactory<Spec = OpSpecId, BlockEnv = BlockEnv> + 'static,
     <Evm as EvmFactory>::Tx:
-        FromTxWithEncoded<OpTxEnvelope> + FromRecoveredTx<OpTxEnvelope> + OpTxEnv,
+        FromTxWithEncoded<BaseTxEnvelope> + FromRecoveredTx<BaseTxEnvelope> + BaseTxEnv,
 {
     /// Creates a new stateless L2 block builder instance.
     ///
@@ -78,8 +79,8 @@ where
         parent_header: Sealed<Header>,
     ) -> Self {
         let trie_db = TrieDB::new(parent_header, provider, hinter);
-        let factory = OpBlockExecutorFactory::new(
-            OpAlloyReceiptBuilder::default(),
+        let factory = BaseBlockExecutorFactory::new(
+            AlloyReceiptBuilder::default(),
             config.clone(),
             evm_factory,
         );
@@ -100,7 +101,7 @@ where
     /// * `Err(ExecutorError)` - Block building or execution failure
     pub fn build_block(
         &mut self,
-        attrs: OpPayloadAttributes,
+        attrs: BasePayloadAttributes,
     ) -> ExecutorResult<BlockBuildingOutcome> {
         // Step 1. Set up the execution environment.
         let (base_fee_params, min_base_fee) = Self::active_base_fee_params(
@@ -109,7 +110,7 @@ where
             attrs.payload_attributes.timestamp,
         )?;
         let evm_env = self.evm_env(
-            self.config.spec_id(attrs.payload_attributes.timestamp),
+            OpSpecId::from_timestamp(self.config, attrs.payload_attributes.timestamp),
             self.trie_db.parent_block_header(),
             &attrs,
             &base_fee_params,
@@ -143,7 +144,7 @@ where
             .without_state_clear()
             .build();
         let evm = self.factory.evm_factory().create_evm(&mut state, evm_env);
-        let ctx = OpBlockExecutionCtx {
+        let ctx = BaseBlockExecutionCtx {
             parent_hash,
             parent_beacon_block_root: attrs.payload_attributes.parent_beacon_block_root,
             // This field is unused for individual block building jobs.
@@ -193,12 +194,12 @@ pub struct BlockBuildingOutcome {
     /// The block header.
     pub header: Sealed<Header>,
     /// The block execution result.
-    pub execution_result: BlockExecutionResult<OpReceiptEnvelope>,
+    pub execution_result: BlockExecutionResult<BaseReceiptEnvelope>,
 }
 
-impl From<(Sealed<Header>, BlockExecutionResult<OpReceiptEnvelope>)> for BlockBuildingOutcome {
+impl From<(Sealed<Header>, BlockExecutionResult<BaseReceiptEnvelope>)> for BlockBuildingOutcome {
     fn from(
-        (header, execution_result): (Sealed<Header>, BlockExecutionResult<OpReceiptEnvelope>),
+        (header, execution_result): (Sealed<Header>, BlockExecutionResult<BaseReceiptEnvelope>),
     ) -> Self {
         Self { header, execution_result }
     }

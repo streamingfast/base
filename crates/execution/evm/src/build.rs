@@ -7,10 +7,10 @@ use alloy_consensus::{
 use alloy_eips::{eip7685::EMPTY_REQUESTS_HASH, merge::BEACON_NONCE};
 use alloy_evm::block::BlockExecutorFactory;
 use alloy_primitives::logs_bloom;
-use base_alloy_chains::BaseUpgrades;
-use base_alloy_evm::OpBlockExecutionCtx;
+use base_common_chains::Upgrades;
+use base_common_consensus::DepositReceiptExt;
+use base_common_evm::BaseBlockExecutionCtx;
 use base_execution_consensus::{calculate_receipt_root_no_memo_optimism, isthmus};
-use base_execution_primitives::DepositReceipt;
 use reth_evm::execute::{BlockAssembler, BlockAssemblerInput};
 use reth_execution_errors::BlockExecutionError;
 use reth_execution_types::BlockExecutionResult;
@@ -19,24 +19,24 @@ use revm::context::Block as _;
 
 /// Block builder for Base.
 #[derive(Debug)]
-pub struct OpBlockAssembler<ChainSpec> {
+pub struct BaseBlockAssembler<ChainSpec> {
     chain_spec: Arc<ChainSpec>,
 }
 
-impl<ChainSpec> OpBlockAssembler<ChainSpec> {
-    /// Creates a new [`OpBlockAssembler`].
+impl<ChainSpec> BaseBlockAssembler<ChainSpec> {
+    /// Creates a new [`BaseBlockAssembler`].
     pub const fn new(chain_spec: Arc<ChainSpec>) -> Self {
         Self { chain_spec }
     }
 }
 
-impl<ChainSpec: BaseUpgrades> OpBlockAssembler<ChainSpec> {
+impl<ChainSpec: Upgrades> BaseBlockAssembler<ChainSpec> {
     /// Builds a block for `input` without any bounds on header `H`.
     pub fn assemble_block<
         F: for<'a> BlockExecutorFactory<
-                ExecutionCtx<'a>: Into<OpBlockExecutionCtx>,
+                ExecutionCtx<'a>: Into<BaseBlockExecutionCtx>,
                 Transaction: SignedTransaction,
-                Receipt: Receipt + DepositReceipt,
+                Receipt: Receipt + DepositReceiptExt,
             >,
         H,
     >(
@@ -65,7 +65,7 @@ impl<ChainSpec: BaseUpgrades> OpBlockAssembler<ChainSpec> {
         let mut requests_hash = None;
 
         let withdrawals_root =
-            if BaseUpgrades::is_isthmus_active_at_timestamp(&*self.chain_spec, timestamp) {
+            if Upgrades::is_isthmus_active_at_timestamp(&*self.chain_spec, timestamp) {
                 // always empty requests hash post isthmus
                 requests_hash = Some(EMPTY_REQUESTS_HASH);
 
@@ -75,18 +75,18 @@ impl<ChainSpec: BaseUpgrades> OpBlockAssembler<ChainSpec> {
                     isthmus::withdrawals_root(bundle_state, state_provider)
                         .map_err(BlockExecutionError::other)?,
                 )
-            } else if BaseUpgrades::is_canyon_active_at_timestamp(&*self.chain_spec, timestamp) {
+            } else if Upgrades::is_canyon_active_at_timestamp(&*self.chain_spec, timestamp) {
                 Some(EMPTY_WITHDRAWALS)
             } else {
                 None
             };
 
         let (excess_blob_gas, blob_gas_used) =
-            if BaseUpgrades::is_jovian_active_at_timestamp(&*self.chain_spec, timestamp) {
+            if Upgrades::is_jovian_active_at_timestamp(&*self.chain_spec, timestamp) {
                 // In jovian, we're using the blob gas used field to store the current da
                 // footprint's value.
                 (Some(0), Some(*blob_gas_used))
-            } else if BaseUpgrades::is_ecotone_active_at_timestamp(&*self.chain_spec, timestamp) {
+            } else if Upgrades::is_ecotone_active_at_timestamp(&*self.chain_spec, timestamp) {
                 (Some(0), Some(0))
             } else {
                 (None, None)
@@ -121,29 +121,26 @@ impl<ChainSpec: BaseUpgrades> OpBlockAssembler<ChainSpec> {
             BlockBody {
                 transactions,
                 ommers: Default::default(),
-                withdrawals: BaseUpgrades::is_canyon_active_at_timestamp(
-                    &*self.chain_spec,
-                    timestamp,
-                )
-                .then(Default::default),
+                withdrawals: Upgrades::is_canyon_active_at_timestamp(&*self.chain_spec, timestamp)
+                    .then(Default::default),
             },
         ))
     }
 }
 
-impl<ChainSpec> Clone for OpBlockAssembler<ChainSpec> {
+impl<ChainSpec> Clone for BaseBlockAssembler<ChainSpec> {
     fn clone(&self) -> Self {
         Self { chain_spec: Arc::clone(&self.chain_spec) }
     }
 }
 
-impl<F, ChainSpec> BlockAssembler<F> for OpBlockAssembler<ChainSpec>
+impl<F, ChainSpec> BlockAssembler<F> for BaseBlockAssembler<ChainSpec>
 where
-    ChainSpec: BaseUpgrades,
+    ChainSpec: Upgrades,
     F: for<'a> BlockExecutorFactory<
-            ExecutionCtx<'a> = OpBlockExecutionCtx,
+            ExecutionCtx<'a> = BaseBlockExecutionCtx,
             Transaction: SignedTransaction,
-            Receipt: Receipt + DepositReceipt,
+            Receipt: Receipt + DepositReceiptExt,
         >,
 {
     type Block = Block<F::Transaction>;

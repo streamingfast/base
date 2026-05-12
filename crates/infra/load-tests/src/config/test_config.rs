@@ -114,6 +114,13 @@ pub struct TestConfig {
     /// Address of the precompile looper contract (required when using iterations > 1).
     #[serde(default)]
     pub looper_contract: Option<String>,
+
+    /// WebSocket JSON-RPC endpoint URL for block subscription (enables block latency tracking).
+    #[serde(default, alias = "ws_url")]
+    pub rpc_ws_url: Option<Url>,
+    /// WebSocket URL for flashblocks subscription (enables flashblock latency tracking).
+    #[serde(default, alias = "flashblocks_url")]
+    pub flashblocks_ws_url: Option<Url>,
 }
 
 impl Default for TestConfig {
@@ -131,6 +138,8 @@ impl Default for TestConfig {
             chain_id: None,
             transactions: vec![WeightedTxType { weight: 100, tx_type: TxTypeConfig::Transfer }],
             looper_contract: None,
+            rpc_ws_url: None,
+            flashblocks_ws_url: None,
         }
     }
 }
@@ -150,6 +159,8 @@ impl fmt::Debug for TestConfig {
             .field("chain_id", &self.chain_id)
             .field("transactions", &self.transactions)
             .field("looper_contract", &self.looper_contract)
+            .field("rpc_ws_url", &self.rpc_ws_url)
+            .field("flashblocks_ws_url", &self.flashblocks_ws_url)
             .finish()
     }
 }
@@ -163,6 +174,19 @@ pub struct WeightedTxType {
     /// The transaction type configuration.
     #[serde(flatten)]
     pub tx_type: TxTypeConfig,
+}
+
+/// Osaka (Base V1) transaction target.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OsakaTarget {
+    /// CLZ opcode (EIP-7939): COUNT LEADING ZEROS — CREATE transaction with CLZ initcode.
+    Clz,
+    /// P256VERIFY precompile at 0x0100 with Osaka gas pricing 6 900 (EIP-7951).
+    #[serde(rename = "p256verify_osaka")]
+    P256verifyOsaka,
+    /// MODEXP under Osaka rules: 1 024-byte field limit + min gas 500 (EIP-7823 + EIP-7883).
+    ModexpOsaka,
 }
 
 /// Transaction type configuration.
@@ -196,6 +220,12 @@ pub enum TxTypeConfig {
         /// Number of iterations per transaction. Requires `looper_contract` when > 1.
         #[serde(default = "default_iterations")]
         iterations: u32,
+    },
+
+    /// Osaka (Base V1) opcode or precompile transaction.
+    Osaka {
+        /// Target Osaka feature.
+        target: OsakaTarget,
     },
 }
 
@@ -234,17 +264,57 @@ impl TestConfig {
         if self.sender_count == 0 {
             return Err(BaselineError::Config("sender_count must be > 0".into()));
         }
+
+        if let Some(url) = &self.rpc_ws_url {
+            Self::validate_ws_url(url, "rpc_ws_url")?;
+        }
+        if let Some(url) = &self.flashblocks_ws_url {
+            Self::validate_ws_url(url, "flashblocks_ws_url")?;
+        }
+
         Ok(())
+    }
+
+    fn validate_ws_url(url: &Url, field_name: &str) -> Result<()> {
+        match url.scheme() {
+            "ws" | "wss" => Ok(()),
+            "http" => Err(BaselineError::Config(format!(
+                "{field_name} uses 'http://' scheme but requires 'ws://' for WebSocket connections"
+            ))),
+            "https" => Err(BaselineError::Config(format!(
+                "{field_name} uses 'https://' scheme but requires 'wss://' for secure WebSocket connections"
+            ))),
+            scheme => Err(BaselineError::Config(format!(
+                "{field_name} has invalid scheme '{scheme}', expected 'ws://' or 'wss://'"
+            ))),
+        }
     }
 
     /// Returns the funder key from the `FUNDER_KEY` environment variable.
     pub fn funder_key() -> Result<PrivateKeySigner> {
-        let key = std::env::var("FUNDER_KEY").map_err(|_| {
-            BaselineError::Config("FUNDER_KEY environment variable is required".into())
-        })?;
-        key.parse().map_err(|e| {
-            BaselineError::Config(format!("invalid FUNDER_KEY (expected 0x-prefixed hex): {e}"))
+        Self::resolve_funder_key(None)
+    }
+
+    /// Resolves the funder key from an explicit override string, falling back to the
+    /// `FUNDER_KEY` environment variable when no override is provided.
+    pub fn resolve_funder_key(override_key: Option<&str>) -> Result<PrivateKeySigner> {
+        let key_str = if let Some(s) = override_key {
+            s.to_string()
+        } else {
+            std::env::var("FUNDER_KEY").map_err(|_| {
+                BaselineError::Config("FUNDER_KEY environment variable is required".into())
+            })?
+        };
+        key_str.parse().map_err(|e| {
+            BaselineError::Config(format!("invalid funder key (expected 0x-prefixed hex): {e}"))
         })
+    }
+
+    /// Returns the checksummed funder address string, if the key resolves successfully.
+    ///
+    /// Checks the override first, then falls back to `FUNDER_KEY` env var.
+    pub fn funder_key_address(override_key: Option<&str>) -> Option<String> {
+        Self::resolve_funder_key(override_key).ok().map(|s| s.address().to_string())
     }
 
     /// Parses the duration string into a Duration.
@@ -274,9 +344,9 @@ impl TestConfig {
             BaselineError::Config("chain_id must be provided in config or fetched from RPC".into())
         })?;
 
-        let rpc_url = self.rpc.clone();
+        let rpc_http_url = self.rpc.clone();
 
-        let duration = self.parse_duration()?.unwrap_or_else(|| Duration::from_secs(30));
+        let duration = self.parse_duration()?;
 
         let transactions = if self.transactions.is_empty() {
             vec![TxConfig { weight: 100, tx_type: TxType::Transfer }]
@@ -285,7 +355,7 @@ impl TestConfig {
         };
 
         Ok(crate::runner::LoadConfig {
-            rpc_url,
+            rpc_http_url,
             chain_id: resolved_chain_id,
             account_count: self.sender_count as usize,
             seed: self.seed,
@@ -298,6 +368,8 @@ impl TestConfig {
             batch_size: 5,
             batch_timeout: Duration::from_millis(50),
             max_gas_price: crate::runner::DEFAULT_MAX_GAS_PRICE,
+            rpc_ws_url: self.rpc_ws_url.clone(),
+            flashblocks_ws_url: self.flashblocks_ws_url.clone(),
         })
     }
 
@@ -338,6 +410,7 @@ impl TestConfig {
                     looper_contract,
                 }
             }
+            TxTypeConfig::Osaka { target } => TxType::Osaka { target: target.clone() },
         };
         Ok(TxConfig { weight: weighted.weight, tx_type })
     }
@@ -486,5 +559,49 @@ transactions:
         }
 
         assert!(config.looper_contract.is_some());
+    }
+
+    #[test]
+    fn rejects_http_scheme_for_ws_url() {
+        let yaml = r#"
+rpc: http://localhost:8545
+rpc_ws_url: http://localhost:8546
+"#;
+        let err = TestConfig::from_yaml(yaml).unwrap_err();
+        assert!(err.to_string().contains("rpc_ws_url"));
+        assert!(err.to_string().contains("ws://"));
+    }
+
+    #[test]
+    fn rejects_https_scheme_for_ws_url() {
+        let yaml = r#"
+rpc: http://localhost:8545
+rpc_ws_url: https://localhost:8546
+"#;
+        let err = TestConfig::from_yaml(yaml).unwrap_err();
+        assert!(err.to_string().contains("rpc_ws_url"));
+        assert!(err.to_string().contains("wss://"));
+    }
+
+    #[test]
+    fn accepts_wss_scheme_for_ws_url() {
+        let yaml = r#"
+rpc: http://localhost:8545
+rpc_ws_url: wss://localhost:8546
+flashblocks_ws_url: wss://localhost:7111
+"#;
+        let config = TestConfig::from_yaml(yaml).unwrap();
+        assert_eq!(config.rpc_ws_url.as_ref().unwrap().scheme(), "wss");
+        assert_eq!(config.flashblocks_ws_url.as_ref().unwrap().scheme(), "wss");
+    }
+
+    #[test]
+    fn accepts_omitted_ws_urls() {
+        let yaml = r#"
+rpc: http://localhost:8545
+"#;
+        let config = TestConfig::from_yaml(yaml).unwrap();
+        assert!(config.rpc_ws_url.is_none());
+        assert!(config.flashblocks_ws_url.is_none());
     }
 }

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use alloy_provider::{Network, RootProvider};
-use base_alloy_evm::OpEvmFactory;
-use base_alloy_network::Base;
+use base_common_evm::BaseEvmFactory;
+use base_common_network::Base;
 use base_consensus_providers::{OnlineBeaconClient, OnlineBlobProvider};
 use base_proof::HintType;
 use base_proof_client::{FaultProofProgramError, Prologue};
@@ -19,9 +19,9 @@ use tracing::{Instrument, info, info_span};
 #[cfg(feature = "disk")]
 use crate::DiskKeyValueStore;
 use crate::{
-    BootKeyValueStore, HostConfig, HostError, HostProviders, MemoryKeyValueStore,
+    BootKeyValueStore, HostConfig, HostError, HostProviders, MemoryKeyValueStore, Metrics,
     OfflineHostBackend, OnlineHostBackend, PreimageServer, RecordingOracle, Result,
-    SharedKeyValueStore, SplitKeyValueStore, metrics::timed,
+    SharedKeyValueStore, SplitKeyValueStore,
 };
 
 /// The proof host orchestrator.
@@ -100,9 +100,8 @@ impl Host {
             HintReader::new(hint_chan.host),
             Arc::clone(&backend),
         );
-        let mut server_task = task::spawn(
-            async move { server.start().await }.instrument(info_span!("preimage_server")),
-        );
+        let mut tasks = task::JoinSet::new();
+        tasks.spawn(async move { server.start().await }.instrument(info_span!("preimage_server")));
 
         let recording = RecordingOracle::new(
             OracleReader::new(preimage_chan.client),
@@ -115,11 +114,11 @@ impl Host {
         });
 
         tokio::select! {
-            result = &mut server_task => {
+            result = tasks.join_next() => {
                 return match result {
-                    Err(e) => Err(HostError::ServerPanicked(e)),
-                    Ok(Err(e)) => Err(e),
-                    Ok(Ok(())) => Err(HostError::ServerExitedUnexpectedly),
+                    Some(Err(e)) => Err(HostError::ServerPanicked(e)),
+                    Some(Ok(Err(e))) => Err(e),
+                    Some(Ok(Ok(()))) | None => Err(HostError::ServerExitedUnexpectedly),
                 };
             }
             result = client_task => {
@@ -127,12 +126,9 @@ impl Host {
             }
         }
 
-        server_task.abort();
-        let _ = (&mut server_task).await;
-
         witness.finalize()?;
         let preimage_count = witness.preimage_count()?;
-        base_metrics::set!(gauge, crate::Metrics::PREIMAGE_COUNT, preimage_count as f64);
+        Metrics::preimage_count().set(preimage_count as f64);
         info!(preimage_count, "witness capture complete");
 
         Arc::try_unwrap(witness).map_err(|arc| {
@@ -157,9 +153,9 @@ impl Host {
         H: base_proof_preimage::HintWriterClient + Send + Sync + Clone + std::fmt::Debug + 'static,
         W: WitnessOracle + std::fmt::Debug + 'static,
     {
-        let _timer = timed!(crate::Metrics::REPLAY_DURATION_SECONDS);
+        let _timer = base_metrics::timed!(Metrics::replay_duration_seconds());
         let driver =
-            Prologue::new(recording.clone(), recording, OpEvmFactory::default()).load().await?;
+            Prologue::new(recording.clone(), recording, BaseEvmFactory::default()).load().await?;
         let epilogue = driver.execute().await?;
         epilogue.validate().map_err(|e| *e)?;
         Ok(())

@@ -3,23 +3,24 @@
 use alloc::{boxed::Box, sync::Arc};
 use core::fmt::Debug;
 
+use alloy_eips::BlockNumHash;
 use async_trait::async_trait;
-use base_alloy_rpc_types_engine::OpPayloadAttributes;
-use base_consensus_genesis::RollupConfig;
-use base_protocol::{BlockInfo, L2BlockInfo, OpAttributesWithParent, SingleBatch};
+use base_common_rpc_types_engine::BasePayloadAttributes;
+use base_consensus_genesis::{RollupConfig, SystemConfig};
+use base_protocol::{AttributesWithParent, BlockInfo, L2BlockInfo, SingleBatch};
 
 use crate::{
     Metrics,
     errors::{PipelineError, ResetError},
     traits::{
         AttributesBuilder, AttributesProvider, NextAttributes, OriginAdvancer, OriginProvider,
-        SignalReceiver,
+        StageReset,
     },
-    types::{PipelineResult, Signal},
+    types::PipelineResult,
 };
 
 /// [`AttributesQueue`] accepts batches from the [`BatchQueue`] stage
-/// and transforms them into [`OpPayloadAttributes`].
+/// and transforms them into [`BasePayloadAttributes`].
 ///
 /// The outputted payload attributes cannot be buffered because each batch->attributes
 /// transformation pulls in data about the current L2 safe head.
@@ -34,7 +35,7 @@ use crate::{
 #[derive(Debug)]
 pub struct AttributesQueue<P, AB>
 where
-    P: AttributesProvider + OriginAdvancer + OriginProvider + SignalReceiver + Debug,
+    P: AttributesProvider + OriginAdvancer + OriginProvider + StageReset + Debug,
     AB: AttributesBuilder + Debug,
 {
     /// The rollup config.
@@ -51,7 +52,7 @@ where
 
 impl<P, AB> AttributesQueue<P, AB>
 where
-    P: AttributesProvider + OriginAdvancer + OriginProvider + SignalReceiver + Debug,
+    P: AttributesProvider + OriginAdvancer + OriginProvider + StageReset + Debug,
     AB: AttributesBuilder + Debug,
 {
     /// Create a new [`AttributesQueue`] stage.
@@ -69,11 +70,11 @@ where
         self.batch.as_ref().cloned().ok_or(PipelineError::Eof.temp())
     }
 
-    /// Returns the next [`OpAttributesWithParent`] from the current batch.
+    /// Returns the next [`AttributesWithParent`] from the current batch.
     pub async fn next_attributes(
         &mut self,
         parent: L2BlockInfo,
-    ) -> PipelineResult<OpAttributesWithParent> {
+    ) -> PipelineResult<AttributesWithParent> {
         let batch = match self.load_batch(parent).await {
             Ok(batch) => batch,
             Err(e) => {
@@ -91,7 +92,7 @@ where
         };
         let origin = self.origin().ok_or(PipelineError::MissingOrigin.crit())?;
         let populated_attributes =
-            OpAttributesWithParent::new(attributes, parent, Some(origin), self.is_last_in_span);
+            AttributesWithParent::new(attributes, parent, Some(origin), self.is_last_in_span);
         timer.stop();
 
         // Clear out the local state once payload attributes are prepared.
@@ -100,13 +101,13 @@ where
         Ok(populated_attributes)
     }
 
-    /// Creates the next attributes, transforming a [`SingleBatch`] into [`OpPayloadAttributes`].
+    /// Creates the next attributes, transforming a [`SingleBatch`] into [`BasePayloadAttributes`].
     /// This sets `no_tx_pool` and appends the batched txs to the attributes tx list.
     pub async fn create_next_attributes(
         &mut self,
         batch: SingleBatch,
         parent: L2BlockInfo,
-    ) -> PipelineResult<OpPayloadAttributes> {
+    ) -> PipelineResult<BasePayloadAttributes> {
         // Sanity check parent hash
         if batch.parent_hash != parent.block_info.hash {
             return Err(ResetError::BadParentHash(batch.parent_hash, parent.block_info.hash).into());
@@ -145,7 +146,7 @@ where
 #[async_trait]
 impl<P, AB> OriginAdvancer for AttributesQueue<P, AB>
 where
-    P: AttributesProvider + OriginAdvancer + OriginProvider + SignalReceiver + Debug + Send,
+    P: AttributesProvider + OriginAdvancer + OriginProvider + StageReset + Debug + Send,
     AB: AttributesBuilder + Debug + Send,
 {
     async fn advance_origin(&mut self) -> PipelineResult<()> {
@@ -156,20 +157,20 @@ where
 #[async_trait]
 impl<P, AB> NextAttributes for AttributesQueue<P, AB>
 where
-    P: AttributesProvider + OriginAdvancer + OriginProvider + SignalReceiver + Debug + Send,
+    P: AttributesProvider + OriginAdvancer + OriginProvider + StageReset + Debug + Send,
     AB: AttributesBuilder + Debug + Send,
 {
     async fn next_attributes(
         &mut self,
         parent: L2BlockInfo,
-    ) -> PipelineResult<OpAttributesWithParent> {
+    ) -> PipelineResult<AttributesWithParent> {
         self.next_attributes(parent).await
     }
 }
 
 impl<P, AB> OriginProvider for AttributesQueue<P, AB>
 where
-    P: AttributesProvider + OriginAdvancer + OriginProvider + SignalReceiver + Debug,
+    P: AttributesProvider + OriginAdvancer + OriginProvider + StageReset + Debug,
     AB: AttributesBuilder + Debug,
 {
     fn origin(&self) -> Option<BlockInfo> {
@@ -178,27 +179,33 @@ where
 }
 
 #[async_trait]
-impl<P, AB> SignalReceiver for AttributesQueue<P, AB>
+impl<P, AB> StageReset for AttributesQueue<P, AB>
 where
-    P: AttributesProvider + OriginAdvancer + OriginProvider + SignalReceiver + Send + Debug,
+    P: AttributesProvider + OriginAdvancer + OriginProvider + StageReset + Send + Debug,
     AB: AttributesBuilder + Send + Debug,
 {
-    async fn signal(&mut self, signal: Signal) -> PipelineResult<()> {
-        match signal {
-            s @ Signal::Reset(_) | s @ Signal::Activation(_) => {
-                self.prev.signal(s).await?;
-                self.batch = None;
-                self.is_last_in_span = false;
-            }
-            s @ Signal::FlushChannel => {
-                self.batch = None;
-                self.prev.signal(s).await?;
-            }
-            s @ Signal::ProvideBlock(_) => {
-                self.prev.signal(s).await?;
-            }
-        }
+    async fn reset(
+        &mut self,
+        l1_origin: BlockNumHash,
+        system_config: SystemConfig,
+    ) -> PipelineResult<()> {
+        self.prev.reset(l1_origin, system_config).await?;
+        self.batch = None;
+        self.is_last_in_span = false;
         Ok(())
+    }
+
+    async fn activate(&mut self) -> PipelineResult<()> {
+        self.prev.activate().await?;
+        self.batch = None;
+        self.is_last_in_span = false;
+        Ok(())
+    }
+
+    async fn flush_channel(&mut self) -> PipelineResult<()> {
+        // Clear batch first, then propagate.
+        self.batch = None;
+        self.prev.flush_channel().await
     }
 }
 
@@ -206,18 +213,20 @@ where
 mod tests {
     use alloc::{sync::Arc, vec, vec::Vec};
 
+    use alloy_eips::BlockNumHash;
     use alloy_primitives::{Address, B256, Bytes, b256};
     use alloy_rpc_types_engine::PayloadAttributes;
+    use base_consensus_genesis::SystemConfig;
 
     use super::*;
     use crate::{
+        StageReset,
         errors::{BuilderError, PipelineErrorKind},
         test_utils::{TestAttributesBuilder, TestAttributesProvider, new_test_attributes_provider},
-        types::ResetSignal,
     };
 
-    fn default_optimism_payload_attributes() -> OpPayloadAttributes {
-        OpPayloadAttributes {
+    fn default_optimism_payload_attributes() -> BasePayloadAttributes {
+        BasePayloadAttributes {
             payload_attributes: PayloadAttributes {
                 timestamp: 0,
                 suggested_fee_recipient: Address::default(),
@@ -237,7 +246,7 @@ mod tests {
         cfg: Option<RollupConfig>,
         origin: Option<BlockInfo>,
         batches: Vec<PipelineResult<SingleBatch>>,
-        attributes: Vec<Result<OpPayloadAttributes, PipelineErrorKind>>,
+        attributes: Vec<Result<BasePayloadAttributes, PipelineErrorKind>>,
     ) -> AttributesQueue<TestAttributesProvider, TestAttributesBuilder> {
         let cfg = cfg.unwrap_or_default();
         let mock_batch_queue = new_test_attributes_provider(origin, batches);
@@ -250,7 +259,7 @@ mod tests {
         let mut attributes_queue = new_attributes_queue(None, None, vec![], vec![]);
         attributes_queue.batch = Some(SingleBatch::default());
         assert!(!attributes_queue.prev.flushed);
-        attributes_queue.signal(Signal::FlushChannel).await.unwrap();
+        attributes_queue.flush_channel().await.unwrap();
         assert!(attributes_queue.prev.flushed);
         assert!(attributes_queue.batch.is_none());
     }
@@ -263,7 +272,7 @@ mod tests {
         let mut aq = AttributesQueue::new(Arc::new(cfg), mock, mock_builder);
         aq.batch = Some(SingleBatch::default());
         assert!(!aq.prev.reset);
-        aq.signal(ResetSignal::default().signal()).await.unwrap();
+        aq.reset(BlockNumHash::default(), SystemConfig::default()).await.unwrap();
         assert!(aq.batch.is_none());
         assert!(aq.prev.reset);
     }
@@ -399,7 +408,7 @@ mod tests {
         // It should also reset the last in span flag and clear the batch.
         let attributes = aq.next_attributes(L2BlockInfo::default()).await.unwrap();
         pa.no_tx_pool = Some(true);
-        let populated_attributes = OpAttributesWithParent {
+        let populated_attributes = AttributesWithParent {
             attributes: pa,
             parent: L2BlockInfo::default(),
             derived_from: Some(BlockInfo::default()),

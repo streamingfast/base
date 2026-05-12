@@ -20,9 +20,6 @@ Load testing and benchmarking framework for Base infrastructure.
 # Run load test against local devnet (uses Anvil Account #1)
 just load-test devnet
 
-# Run load test against sepolia-alpha (requires funded key)
-FUNDER_KEY=0x... just load-test sepolia-alpha
-
 # Run load test against sepolia (requires funded key)
 FUNDER_KEY=0x... just load-test sepolia
 ```
@@ -36,11 +33,8 @@ cargo build -p base-load-tests
 # Run tests
 cargo test -p base-load-tests
 
-# Run the load test example with a config file
-cargo run -p base-load-tests --example load_test -- path/to/config.yaml
-
-# Or use the default devnet config
-cargo run -p base-load-tests --example load_test
+# Run the load test binary with a config file
+cargo run -p base-load-tests --bin base-load-test -- path/to/config.yaml
 ```
 
 ## Configuration
@@ -51,6 +45,8 @@ Example minimal config:
 
 ```yaml
 rpc: http://localhost:8545
+rpc_ws_url: "ws://localhost:8546"
+flashblocks_ws_url: "ws://localhost:7111"
 sender_count: 10
 target_gps: 2100000
 duration: "30s"
@@ -61,7 +57,6 @@ duration: "30s"
 | Config | Target | Notes |
 |--------|--------|-------|
 | `devnet.yaml` | Local devnet | Uses Anvil Account #1 |
-| `sepolia-alpha.yaml` | Sepolia Alpha | Requires `FUNDER_KEY` |
 | `sepolia.yaml` | Sepolia | Requires `FUNDER_KEY` |
 
 ### Environment Variables

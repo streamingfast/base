@@ -9,6 +9,8 @@ use base_zk_client::{
 use base_zk_db::ProofRequestRepo;
 use tonic::{Request, Response, Status};
 
+use crate::proof_request_manager::ProofRequestManager;
+
 mod get_proof;
 mod prove_block;
 
@@ -16,6 +18,7 @@ mod prove_block;
 #[derive(Clone)]
 pub struct ProverServiceServer {
     repo: ProofRequestRepo,
+    manager: ProofRequestManager,
 }
 
 impl fmt::Debug for ProverServiceServer {
@@ -26,8 +29,8 @@ impl fmt::Debug for ProverServiceServer {
 
 impl ProverServiceServer {
     /// Create a new prover service server.
-    pub const fn new(repo: ProofRequestRepo) -> Self {
-        Self { repo }
+    pub const fn new(repo: ProofRequestRepo, manager: ProofRequestManager) -> Self {
+        Self { repo, manager }
     }
 }
 

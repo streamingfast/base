@@ -5,16 +5,16 @@ use alloy_provider::Provider;
 use alloy_rlp::Decodable;
 use alloy_rpc_types::{Block, debug::ExecutionWitness};
 use ark_ff::{BigInteger, PrimeField};
-use base_alloy_rpc_types_engine::OpPayloadAttributes;
+use base_common_consensus::Predeploys;
+use base_common_rpc_types_engine::BasePayloadAttributes;
 use base_consensus_providers::BlobWithCommitmentAndProof;
 use base_proof::{Hint, HintType, ROOTS_OF_UNITY};
 use base_proof_preimage::{PreimageKey, PreimageKeyType};
-use base_protocol::{BlockInfo, OutputRoot, Predeploys};
+use base_protocol::{BlockInfo, OutputRoot};
 use tracing::warn;
 
 use crate::{
-    HostConfig, HostError, HostProviders, Result, SharedKeyValueStore, metrics::timed,
-    store_ordered_trie,
+    HostConfig, HostError, HostProviders, Metrics, Result, SharedKeyValueStore, store_ordered_trie,
 };
 
 /// Parses a blob hint, supporting both legacy (48-byte) and new (40-byte) formats.
@@ -61,16 +61,13 @@ pub async fn handle_hint(
 ) -> Result<()> {
     let hint_type_label: &str = hint.ty.into();
 
-    base_metrics::inc!(counter, crate::Metrics::HINT_REQUESTS_TOTAL, crate::Metrics::LABEL_HINT_TYPE => hint_type_label);
-    let _timer = timed!(
-        crate::Metrics::HINT_DURATION_SECONDS,
-        crate::Metrics::LABEL_HINT_TYPE => hint_type_label,
-    );
+    Metrics::hint_requests_total(hint_type_label).increment(1);
+    let _timer = base_metrics::timed!(Metrics::hint_duration_seconds(hint_type_label));
 
     let result = Box::pin(handle_hint_inner(hint, cfg, providers, kv)).await;
 
     if result.is_err() {
-        base_metrics::inc!(counter, crate::Metrics::HINT_ERRORS_TOTAL, crate::Metrics::LABEL_HINT_TYPE => hint_type_label);
+        Metrics::hint_errors_total(hint_type_label).increment(1);
     }
 
     result
@@ -378,12 +375,13 @@ async fn handle_hint_inner(
             }
 
             let parent_block_hash = B256::from_slice(&hint.data.as_ref()[..32]);
-            let payload_attributes: OpPayloadAttributes = serde_json::from_slice(&hint.data[32..])?;
+            let payload_attributes: BasePayloadAttributes =
+                serde_json::from_slice(&hint.data[32..])?;
 
             let execute_payload_response = match providers
                 .l2
                 .client()
-                .request::<(B256, OpPayloadAttributes), ExecutionWitness>(
+                .request::<(B256, BasePayloadAttributes), ExecutionWitness>(
                     "debug_executePayload",
                     (parent_block_hash, payload_attributes),
                 )

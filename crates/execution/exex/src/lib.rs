@@ -13,7 +13,8 @@ use std::{sync::Arc, time::Duration};
 use alloy_consensus::BlockHeader;
 use alloy_eips::eip1898::BlockWithParent;
 use base_execution_trie::{
-    OpProofStoragePrunerTask, OpProofsStorage, OpProofsStore, live::LiveTrieCollector,
+    BaseProofStoragePrunerTask, BaseProofsStorage, BaseProofsStore, live::LiveTrieCollector,
+    metrics::BlockMetrics,
 };
 use futures::TryStreamExt;
 use reth_execution_types::Chain;
@@ -41,25 +42,25 @@ const DEFAULT_PRUNE_INTERVAL: Duration = Duration::from_secs(15);
 /// Default verification interval: disabled
 const DEFAULT_VERIFICATION_INTERVAL: u64 = 0; // disabled
 
-/// Builder for [`OpProofsExEx`].
+/// Builder for [`BaseProofsExEx`].
 #[derive(Debug)]
-pub struct OpProofsExExBuilder<Node, Storage>
+pub struct BaseProofsExExBuilder<Node, Storage>
 where
     Node: FullNodeComponents,
 {
     ctx: ExExContext<Node>,
-    storage: OpProofsStorage<Storage>,
+    storage: BaseProofsStorage<Storage>,
     proofs_history_window: u64,
     proofs_history_prune_interval: Duration,
     verification_interval: u64,
 }
 
-impl<Node, Storage> OpProofsExExBuilder<Node, Storage>
+impl<Node, Storage> BaseProofsExExBuilder<Node, Storage>
 where
     Node: FullNodeComponents,
 {
     /// Create a new builder with required parameters and defaults.
-    pub const fn new(ctx: ExExContext<Node>, storage: OpProofsStorage<Storage>) -> Self {
+    pub const fn new(ctx: ExExContext<Node>, storage: BaseProofsStorage<Storage>) -> Self {
         Self {
             ctx,
             storage,
@@ -87,9 +88,9 @@ where
         self
     }
 
-    /// Builds the [`OpProofsExEx`].
-    pub fn build(self) -> OpProofsExEx<Node, Storage> {
-        OpProofsExEx {
+    /// Builds the [`BaseProofsExEx`].
+    pub fn build(self) -> BaseProofsExEx<Node, Storage> {
+        BaseProofsExEx {
             ctx: self.ctx,
             storage: self.storage,
             proofs_history_window: self.proofs_history_window,
@@ -117,26 +118,26 @@ where
 /// use reth_node_api::NodeTypesWithDBAdapter;
 /// use reth_node_builder::{NodeBuilder, NodeConfig};
 /// use base_execution_chainspec::BASE_MAINNET;
-/// use base_execution_exex::OpProofsExEx;
-/// use base_node_core::{OpNode, args::RollupArgs};
-/// use base_execution_trie::{InMemoryProofsStorage, OpProofsStorage, db::MdbxProofsStorage};
+/// use base_execution_exex::BaseProofsExEx;
+/// use base_node_core::{BaseNode, args::RollupArgs};
+/// use base_execution_trie::{InMemoryProofsStorage, BaseProofsStorage, db::MdbxProofsStorage};
 /// use reth_provider::providers::BlockchainProvider;
 /// use std::{sync::Arc, time::Duration};
 ///
 /// let config = NodeConfig::new(BASE_MAINNET.clone());
 /// let db = create_test_rw_db();
 /// let args = RollupArgs::default();
-/// let op_node = OpNode::new(args);
+/// let op_node = BaseNode::new(args);
 ///
 /// // Create in-memory or persistent storage
-/// let storage: OpProofsStorage<Arc<InMemoryProofsStorage>> =
+/// let storage: BaseProofsStorage<Arc<InMemoryProofsStorage>> =
 ///     Arc::new(InMemoryProofsStorage::new()).into();
 ///
 /// // Example for creating persistent storage
 /// # let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 /// # let storage_path = temp_dir.path().join("proofs_storage");
 ///
-/// # let storage: OpProofsStorage<Arc<MdbxProofsStorage>> = Arc::new(
+/// # let storage: BaseProofsStorage<Arc<MdbxProofsStorage>> = Arc::new(
 /// #    MdbxProofsStorage::new(&storage_path).expect("Failed to create MdbxProofsStorage"),
 /// # ).into();
 ///
@@ -151,10 +152,10 @@ where
 /// // Set this based on your configuration or CLI args
 /// let _builder = NodeBuilder::new(config)
 ///     .with_database(db)
-///     .with_types_and_provider::<OpNode, BlockchainProvider<NodeTypesWithDBAdapter<OpNode, _>>>()
+///     .with_types_and_provider::<BaseNode, BlockchainProvider<NodeTypesWithDBAdapter<BaseNode, _>>>()
 ///     .with_components(op_node.components())
 ///     .install_exex("proofs-history", move |exex_context| async move {
-///         Ok(OpProofsExEx::builder(exex_context, storage_exec)
+///         Ok(BaseProofsExEx::builder(exex_context, storage_exec)
 ///             .with_proofs_history_window(proofs_history_window)
 ///             .with_proofs_history_prune_interval(proofs_history_prune_interval)
 ///             .with_verification_interval(verification_interval)
@@ -166,7 +167,7 @@ where
 ///     .check_launch();
 /// ```
 #[derive(Debug)]
-pub struct OpProofsExEx<Node, Storage>
+pub struct BaseProofsExEx<Node, Storage>
 where
     Node: FullNodeComponents,
 {
@@ -174,7 +175,7 @@ where
     /// events.
     ctx: ExExContext<Node>,
     /// The type of storage DB.
-    storage: OpProofsStorage<Storage>,
+    storage: BaseProofsStorage<Storage>,
     /// The window to span blocks for proofs history. Value is the number of blocks, received as
     /// cli arg.
     proofs_history_window: u64,
@@ -186,29 +187,29 @@ where
     verification_interval: u64,
 }
 
-impl<Node, Storage> OpProofsExEx<Node, Storage>
+impl<Node, Storage> BaseProofsExEx<Node, Storage>
 where
     Node: FullNodeComponents,
 {
-    /// Create a new `OpProofsExEx` instance.
-    pub fn new(ctx: ExExContext<Node>, storage: OpProofsStorage<Storage>) -> Self {
-        OpProofsExExBuilder::new(ctx, storage).build()
+    /// Create a new `BaseProofsExEx` instance.
+    pub fn new(ctx: ExExContext<Node>, storage: BaseProofsStorage<Storage>) -> Self {
+        BaseProofsExExBuilder::new(ctx, storage).build()
     }
 
-    /// Create a new builder for `OpProofsExEx`.
+    /// Create a new builder for `BaseProofsExEx`.
     pub const fn builder(
         ctx: ExExContext<Node>,
-        storage: OpProofsStorage<Storage>,
-    ) -> OpProofsExExBuilder<Node, Storage> {
-        OpProofsExExBuilder::new(ctx, storage)
+        storage: BaseProofsStorage<Storage>,
+    ) -> BaseProofsExExBuilder<Node, Storage> {
+        BaseProofsExExBuilder::new(ctx, storage)
     }
 }
 
-impl<Node, Storage, Primitives> OpProofsExEx<Node, Storage>
+impl<Node, Storage, Primitives> BaseProofsExEx<Node, Storage>
 where
     Node: FullNodeComponents<Types: NodeTypes<Primitives = Primitives>>,
     Primitives: NodePrimitives,
-    Storage: OpProofsStore + Clone + 'static,
+    Storage: BaseProofsStore + Clone + 'static,
 {
     /// Main execution loop for the `ExEx`
     pub async fn run(mut self) -> eyre::Result<()> {
@@ -229,7 +230,7 @@ where
             sync_target.update_state(SyncTargetState::SyncUpTo { to: best_block });
         }
 
-        let prune_task = OpProofStoragePrunerTask::new(
+        let prune_task = BaseProofStoragePrunerTask::new(
             self.storage.clone(),
             self.ctx.provider().clone(),
             self.proofs_history_window,
@@ -288,14 +289,7 @@ where
 
         // Need to update the earliest block metric on startup as this is not called frequently and
         // can show outdated info. When metrics are disabled, this is a no-op.
-        #[cfg(feature = "metrics")]
-        {
-            self.storage
-                .metrics()
-                .block_metrics()
-                .earliest_number
-                .set(earliest_block_number as f64);
-        }
+        BlockMetrics::earliest_number().set(earliest_block_number as f64);
 
         Ok(())
     }
@@ -337,7 +331,7 @@ where
 
     async fn sync_loop(
         sync_target: Arc<SyncTarget>,
-        storage: OpProofsStorage<Storage>,
+        storage: BaseProofsStorage<Storage>,
         provider: Node::Provider,
         collector: &LiveTrieCollector<'_, Node::Evm, Node::Provider, Storage>,
         verification_interval: u64,
@@ -384,7 +378,7 @@ where
     }
 
     fn handle_revert(
-        storage: &OpProofsStorage<Storage>,
+        storage: &BaseProofsStorage<Storage>,
         collector: &LiveTrieCollector<'_, Node::Evm, Node::Provider, Storage>,
         revert_to: BlockWithParent,
     ) {
@@ -419,7 +413,7 @@ where
 
     async fn sync_forward(
         sync_target: &SyncTarget,
-        storage: &OpProofsStorage<Storage>,
+        storage: &BaseProofsStorage<Storage>,
         provider: &Node::Provider,
         collector: &LiveTrieCollector<'_, Node::Evm, Node::Provider, Storage>,
         verification_interval: u64,
@@ -695,7 +689,7 @@ mod tests {
     use alloy_consensus::private::alloy_primitives::B256;
     use alloy_eips::{BlockNumHash, NumHash, eip1898::BlockWithParent};
     use base_execution_trie::{
-        BlockStateDiff, OpProofsStorage, OpProofsStore, db::MdbxProofsStorage,
+        BaseProofsStorage, BaseProofsStore, BlockStateDiff, db::MdbxProofsStorage,
     };
     use reth_db::test_utils::tempdir_path;
     use reth_ethereum_primitives::{Block, Receipt};
@@ -764,7 +758,7 @@ mod tests {
     }
 
     /// Store blocks directly into proofs storage (bypasses the sync loop).
-    fn store_blocks<S: OpProofsStore>(from: u64, to: u64, storage: &OpProofsStorage<S>) {
+    fn store_blocks<S: BaseProofsStore>(from: u64, to: u64, storage: &BaseProofsStorage<S>) {
         for n in from..=to {
             let chain = mk_chain_with_updates(n, n, None);
             let block = chain.blocks().get(&n).unwrap();
@@ -774,7 +768,7 @@ mod tests {
         }
     }
 
-    fn init_storage<S: OpProofsStore>(storage: OpProofsStorage<S>) {
+    fn init_storage<S: BaseProofsStore>(storage: BaseProofsStorage<S>) {
         let genesis_block = NumHash::new(0, b256(0x00));
         storage
             .set_earliest_block_number(genesis_block.number, genesis_block.hash)
@@ -790,13 +784,13 @@ mod tests {
     // Initialize exex with config
     fn build_test_exex<NodeT, Store>(
         ctx: ExExContext<NodeT>,
-        storage: OpProofsStorage<Store>,
-    ) -> OpProofsExEx<NodeT, Store>
+        storage: BaseProofsStorage<Store>,
+    ) -> BaseProofsExEx<NodeT, Store>
     where
         NodeT: FullNodeComponents,
-        Store: OpProofsStore + Clone + 'static,
+        Store: BaseProofsStore + Clone + 'static,
     {
-        OpProofsExEx::builder(ctx, storage)
+        BaseProofsExEx::builder(ctx, storage)
             .with_proofs_history_window(20)
             .with_proofs_history_prune_interval(Duration::from_secs(3600))
             .with_verification_interval(1000)
@@ -808,7 +802,7 @@ mod tests {
         // MDBX proofs storage
         let dir = tempdir_path();
         let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
-        let proofs: OpProofsStorage<Arc<MdbxProofsStorage>> = Arc::clone(&store).into();
+        let proofs: BaseProofsStorage<Arc<MdbxProofsStorage>> = Arc::clone(&store).into();
 
         init_storage(proofs.clone());
 
@@ -835,7 +829,7 @@ mod tests {
         // MDBX proofs storage
         let dir = tempdir_path();
         let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
-        let proofs: OpProofsStorage<Arc<MdbxProofsStorage>> = Arc::clone(&store).into();
+        let proofs: BaseProofsStorage<Arc<MdbxProofsStorage>> = Arc::clone(&store).into();
 
         init_storage(proofs.clone());
 
@@ -869,7 +863,7 @@ mod tests {
         // MDBX proofs storage
         let dir = tempdir_path();
         let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
-        let proofs: OpProofsStorage<Arc<MdbxProofsStorage>> = Arc::clone(&store).into();
+        let proofs: BaseProofsStorage<Arc<MdbxProofsStorage>> = Arc::clone(&store).into();
 
         init_storage(proofs.clone());
         store_blocks(1, 10, &proofs);
@@ -913,7 +907,7 @@ mod tests {
         // MDBX proofs storage
         let dir = tempdir_path();
         let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
-        let proofs: OpProofsStorage<Arc<MdbxProofsStorage>> = Arc::clone(&store).into();
+        let proofs: BaseProofsStorage<Arc<MdbxProofsStorage>> = Arc::clone(&store).into();
 
         init_storage(proofs.clone());
         store_blocks(1, 10, &proofs);
@@ -953,7 +947,7 @@ mod tests {
         // MDBX proofs storage
         let dir = tempdir_path();
         let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
-        let proofs: OpProofsStorage<Arc<MdbxProofsStorage>> = Arc::clone(&store).into();
+        let proofs: BaseProofsStorage<Arc<MdbxProofsStorage>> = Arc::clone(&store).into();
 
         init_storage(proofs.clone());
         store_blocks(1, 10, &proofs);
@@ -991,7 +985,7 @@ mod tests {
         // MDBX proofs storage
         let dir = tempdir_path();
         let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
-        let proofs: OpProofsStorage<Arc<MdbxProofsStorage>> = Arc::clone(&store).into();
+        let proofs: BaseProofsStorage<Arc<MdbxProofsStorage>> = Arc::clone(&store).into();
 
         init_storage(proofs.clone());
         store_blocks(1, 5, &proofs);
@@ -1029,7 +1023,7 @@ mod tests {
         // MDBX proofs storage
         let dir = tempdir_path();
         let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
-        let proofs: OpProofsStorage<Arc<MdbxProofsStorage>> = Arc::clone(&store).into();
+        let proofs: BaseProofsStorage<Arc<MdbxProofsStorage>> = Arc::clone(&store).into();
 
         let (ctx, _handle) =
             reth_exex_test_utils::test_exex_context().await.expect("exex test context");
@@ -1043,7 +1037,7 @@ mod tests {
         // MDBX proofs storage
         let dir = tempdir_path();
         let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
-        let proofs: OpProofsStorage<Arc<MdbxProofsStorage>> = Arc::clone(&store).into();
+        let proofs: BaseProofsStorage<Arc<MdbxProofsStorage>> = Arc::clone(&store).into();
 
         init_storage(proofs.clone());
 
@@ -1071,7 +1065,7 @@ mod tests {
         // MDBX proofs storage
         let dir = tempdir_path();
         let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
-        let proofs: OpProofsStorage<Arc<MdbxProofsStorage>> = Arc::clone(&store).into();
+        let proofs: BaseProofsStorage<Arc<MdbxProofsStorage>> = Arc::clone(&store).into();
 
         init_storage(proofs.clone());
 
@@ -1087,7 +1081,7 @@ mod tests {
         // MDBX proofs storage
         let dir = tempdir_path();
         let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
-        let proofs: OpProofsStorage<Arc<MdbxProofsStorage>> = Arc::clone(&store).into();
+        let proofs: BaseProofsStorage<Arc<MdbxProofsStorage>> = Arc::clone(&store).into();
 
         init_storage(proofs.clone());
 

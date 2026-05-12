@@ -13,6 +13,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+ctor = { workspace = true, optional = true }
 metrics = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -21,6 +22,5 @@ ordered-float = { workspace = true }
 metrics-util = { workspace = true, features = ["debugging"] }
 
 [features]
-default = []
 std = []
-metrics = [ "dep:metrics", "std" ]
+metrics = [ "dep:ctor", "dep:metrics", "std" ]

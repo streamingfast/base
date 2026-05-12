@@ -5,8 +5,8 @@ use alloy_eips::eip4844::Blob;
 use alloy_primitives::{Address, B256, Bytes, Log, LogData, U256};
 use base_batcher_encoder::FrameEncoder;
 use base_blobs::BlobEncoder;
-use base_consensus_genesis::{CONFIG_UPDATE_EVENT_VERSION_0, CONFIG_UPDATE_TOPIC};
-use base_protocol::{BlockInfo, DEPOSIT_EVENT_ABI_HASH, DEPOSIT_EVENT_VERSION_0, Frame};
+use base_consensus_genesis::SystemConfigUpdate;
+use base_protocol::{BlockInfo, Deposits, Frame};
 use tracing::info;
 
 use crate::Action;
@@ -255,7 +255,7 @@ impl L1Miner {
         self.enqueue_log(Log {
             address: l1_sys_cfg_addr,
             data: LogData::new_unchecked(
-                vec![CONFIG_UPDATE_TOPIC, CONFIG_UPDATE_EVENT_VERSION_0, B256::ZERO],
+                vec![SystemConfigUpdate::TOPIC, SystemConfigUpdate::EVENT_VERSION_0, B256::ZERO],
                 data.into(),
             ),
         });
@@ -281,7 +281,11 @@ impl L1Miner {
         self.enqueue_log(Log {
             address: l1_sys_cfg_addr,
             data: LogData::new_unchecked(
-                vec![CONFIG_UPDATE_TOPIC, CONFIG_UPDATE_EVENT_VERSION_0, B256::from(update_type)],
+                vec![
+                    SystemConfigUpdate::TOPIC,
+                    SystemConfigUpdate::EVENT_VERSION_0,
+                    B256::from(update_type),
+                ],
                 data.into(),
             ),
         });
@@ -298,7 +302,11 @@ impl L1Miner {
         self.enqueue_log(Log {
             address: l1_sys_cfg_addr,
             data: LogData::new_unchecked(
-                vec![CONFIG_UPDATE_TOPIC, CONFIG_UPDATE_EVENT_VERSION_0, B256::from(update_type)],
+                vec![
+                    SystemConfigUpdate::TOPIC,
+                    SystemConfigUpdate::EVENT_VERSION_0,
+                    B256::from(update_type),
+                ],
                 data.into(),
             ),
         });
@@ -323,7 +331,11 @@ impl L1Miner {
         self.enqueue_log(Log {
             address: l1_sys_cfg_addr,
             data: LogData::new_unchecked(
-                vec![CONFIG_UPDATE_TOPIC, CONFIG_UPDATE_EVENT_VERSION_0, B256::from(update_type)],
+                vec![
+                    SystemConfigUpdate::TOPIC,
+                    SystemConfigUpdate::EVENT_VERSION_0,
+                    B256::from(update_type),
+                ],
                 data.into(),
             ),
         });
@@ -360,10 +372,10 @@ impl L1Miner {
             address: deposit.deposit_contract,
             data: LogData::new_unchecked(
                 vec![
-                    DEPOSIT_EVENT_ABI_HASH,
+                    Deposits::EVENT_ABI_HASH,
                     B256::from(from_topic),
                     B256::from(to_topic),
-                    DEPOSIT_EVENT_VERSION_0,
+                    Deposits::EVENT_VERSION_0,
                 ],
                 log_data.into(),
             ),
@@ -501,11 +513,7 @@ impl L1Miner {
 
     /// Return the current chain tip as a [`BlockInfo`].
     ///
-    /// Shorthand for `block_info_from(miner.tip())`. Use this as the argument
-    /// to [`TestRollupNode::act_l1_head_signal`] after [`mine_block`].
-    ///
-    /// [`TestRollupNode::act_l1_head_signal`]: crate::TestRollupNode::act_l1_head_signal
-    /// [`mine_block`]: L1Miner::mine_block
+    /// Shorthand for `block_info_from(miner.tip())`.
     pub fn tip_info(&self) -> BlockInfo {
         block_info_from(self.tip())
     }
@@ -563,10 +571,10 @@ impl L1Miner {
     ///
     /// [`mine_block`]: L1Miner::mine_block
     pub fn submit_blob_frames(&mut self, frames: &[Arc<Frame>]) {
-        let blobs =
-            BlobEncoder::encode_frames(frames).expect("frame data fits within blob capacity");
-        for blob in blobs {
-            self.enqueue_blob(B256::ZERO, Box::new(blob));
+        for frame in frames {
+            let blob = BlobEncoder::encode_packed(core::slice::from_ref(frame))
+                .expect("frame data fits within blob capacity");
+            self.enqueue_blob(B256::ZERO, blob);
         }
     }
 

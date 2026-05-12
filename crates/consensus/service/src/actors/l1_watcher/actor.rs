@@ -28,10 +28,8 @@ use tokio::{
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
 use super::{L1BlockFetcher, L1WatcherDerivationClient};
-#[cfg(feature = "metrics")]
-use crate::Metrics;
 use crate::{
-    NodeActor,
+    Metrics, NodeActor,
     actors::{CancellableContext, l1_watcher::error::L1WatcherActorError},
 };
 
@@ -185,8 +183,7 @@ where
         const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
         const MAX_BACKOFF: Duration = Duration::from_millis(500);
 
-        #[cfg(feature = "metrics")]
-        metrics::gauge!(Metrics::L1_VERIFIER_CONFS_DEPTH).set(self.verifier_l1_confs as f64);
+        Metrics::l1_verifier_confs_depth().set(self.verifier_l1_confs as f64);
         if self.verifier_l1_confs > 0 {
             info!(
                 target: "l1_watcher",
@@ -230,8 +227,7 @@ where
                             match self.l1_provider.get_block(BlockId::Number(target.into())).await {
                                 Ok(Some(block)) => block.into_consensus().into(),
                                 Ok(None) => {
-                                    #[cfg(feature = "metrics")]
-                                    metrics::counter!(Metrics::L1_VERIFIER_DELAYED_FETCH_ERRORS).increment(1);
+                                    Metrics::l1_verifier_delayed_fetch_errors().increment(1);
                                     warn!(
                                         target: "l1_watcher",
                                         head = head_block_info.number,
@@ -241,8 +237,7 @@ where
                                     continue;
                                 }
                                 Err(e) => {
-                                    #[cfg(feature = "metrics")]
-                                    metrics::counter!(Metrics::L1_VERIFIER_DELAYED_FETCH_ERRORS).increment(1);
+                                    Metrics::l1_verifier_delayed_fetch_errors().increment(1);
                                     warn!(
                                         target: "l1_watcher",
                                         error = %e,
@@ -257,8 +252,7 @@ where
                             head_block_info
                         };
 
-                        #[cfg(feature = "metrics")]
-                        metrics::counter!(Metrics::L1_VERIFIER_DERIVATION_HEAD)
+                        Metrics::l1_verifier_derivation_head()
                             .absolute(derivation_block.number);
                         self.derivation_client.send_new_l1_head(derivation_block).await.map_err(|e| {
                             warn!(target: "l1_watcher", error = %e, "Error sending l1 head update to derivation actor");

@@ -1,9 +1,9 @@
 use alloy_rpc_types_engine::PayloadId;
-use base_alloy_rpc_types_engine::OpExecutionPayloadEnvelope;
+use base_common_rpc_types_engine::BaseExecutionPayloadEnvelope;
 use base_consensus_engine::{
     BuildTaskError, ConsolidateInput, DelegatedForkchoiceUpdate, EngineQueries, SealTaskError,
 };
-use base_protocol::OpAttributesWithParent;
+use base_protocol::AttributesWithParent;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -53,8 +53,10 @@ pub enum EngineActorRequest {
     ProcessDelegatedForkchoiceUpdateRequest(Box<DelegatedForkchoiceUpdate>),
     /// Request to finalize the L2 block at the provided block number.
     ProcessFinalizedL2BlockNumberRequest(Box<u64>),
-    /// Request to insert the provided unsafe block.
-    ProcessUnsafeL2BlockRequest(Box<OpExecutionPayloadEnvelope>),
+    /// Request to insert the provided external unsafe block.
+    ProcessUnsafeL2BlockRequest(Box<BaseExecutionPayloadEnvelope>),
+    /// Request to insert a locally produced sequencer unsafe block.
+    ProcessLocalUnsafeL2BlockRequest(Box<BaseExecutionPayloadEnvelope>),
     /// Request to reset engine forkchoice.
     ResetRequest(Box<ResetRequest>),
     /// Request for the engine to process the provided RPC request.
@@ -74,8 +76,8 @@ pub enum EngineRpcRequest {
 /// Contains the attributes to build and a channel to send back the resulting `PayloadId`.
 #[derive(Debug)]
 pub struct BuildRequest {
-    /// The [`OpAttributesWithParent`] from which the block build should be started.
-    pub attributes: OpAttributesWithParent,
+    /// The [`AttributesWithParent`] from which the block build should be started.
+    pub attributes: AttributesWithParent,
     /// The channel on which the result, successful or not, will be sent.
     pub result_tx: mpsc::Sender<PayloadId>,
 }
@@ -96,9 +98,9 @@ pub struct SealRequest {
     /// The `PayloadId` to seal and canonicalize.
     pub payload_id: PayloadId,
     /// The attributes necessary for the seal operation.
-    pub attributes: OpAttributesWithParent,
+    pub attributes: AttributesWithParent,
     /// The channel on which the result, successful or not, will be sent.
-    pub result_tx: mpsc::Sender<Result<OpExecutionPayloadEnvelope, SealTaskError>>,
+    pub result_tx: mpsc::Sender<Result<BaseExecutionPayloadEnvelope, SealTaskError>>,
 }
 
 /// A request to get the sealed payload without inserting it into the engine.
@@ -108,7 +110,7 @@ pub struct GetPayloadRequest {
     /// The `PayloadId` to fetch.
     pub payload_id: PayloadId,
     /// The attributes associated with the payload.
-    pub attributes: OpAttributesWithParent,
+    pub attributes: AttributesWithParent,
     /// The channel on which the result, successful or not, will be sent.
-    pub result_tx: mpsc::Sender<Result<OpExecutionPayloadEnvelope, SealTaskError>>,
+    pub result_tx: mpsc::Sender<Result<BaseExecutionPayloadEnvelope, SealTaskError>>,
 }

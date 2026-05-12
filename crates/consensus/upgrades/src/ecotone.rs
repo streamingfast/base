@@ -1,11 +1,10 @@
 //! Module containing a [`TxDeposit`] builder for the Ecotone network upgrade transactions.
 
-use alloc::{string::String, vec::Vec};
+use alloc::vec::Vec;
 
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, address, hex};
-use base_alloy_consensus::{TxDeposit, UpgradeDepositSource};
-use base_protocol::{Deployers, Predeploys, SystemAddresses};
+use base_common_consensus::{Deployers, Predeploys, SystemAddresses, TxDeposit};
 
 use crate::{Hardfork, UpgradeCalldata};
 
@@ -41,62 +40,55 @@ impl Ecotone {
         "0x8b71360ea773b4cfaf1ae6d2bd15464a4e1e2e360f786e475f63aeaed8da0ae5"
     );
 
-    /// Returns the source hash for the deployment of the l1 block contract.
-    pub fn deploy_l1_block_source() -> B256 {
-        UpgradeDepositSource { intent: String::from("Ecotone: L1 Block Deployment") }.source_hash()
-    }
+    upgrade_source_fn!(
+        /// Returns the source hash for the deployment of the l1 block contract.
+        deploy_l1_block_source,
+        "Ecotone: L1 Block Deployment"
+    );
 
-    /// Returns the source hash for the deployment of the gas price oracle contract.
-    pub fn deploy_gas_price_oracle_source() -> B256 {
-        UpgradeDepositSource { intent: String::from("Ecotone: Gas Price Oracle Deployment") }
-            .source_hash()
-    }
+    upgrade_source_fn!(
+        /// Returns the source hash for the deployment of the gas price oracle contract.
+        deploy_gas_price_oracle_source,
+        "Ecotone: Gas Price Oracle Deployment"
+    );
 
-    /// Returns the source hash for the update of the l1 block proxy.
-    pub fn update_l1_block_source() -> B256 {
-        UpgradeDepositSource { intent: String::from("Ecotone: L1 Block Proxy Update") }
-            .source_hash()
-    }
+    upgrade_source_fn!(
+        /// Returns the source hash for the update of the l1 block proxy.
+        update_l1_block_source,
+        "Ecotone: L1 Block Proxy Update"
+    );
 
-    /// Returns the source hash for the update of the gas price oracle proxy.
-    pub fn update_gas_price_oracle_source() -> B256 {
-        UpgradeDepositSource { intent: String::from("Ecotone: Gas Price Oracle Proxy Update") }
-            .source_hash()
-    }
+    upgrade_source_fn!(
+        /// Returns the source hash for the update of the gas price oracle proxy.
+        update_gas_price_oracle_source,
+        "Ecotone: Gas Price Oracle Proxy Update"
+    );
 
-    /// Returns the source hash for the Ecotone Beacon Block Roots Contract deployment.
-    pub fn beacon_roots_source() -> B256 {
-        UpgradeDepositSource {
-            intent: String::from("Ecotone: beacon block roots contract deployment"),
-        }
-        .source_hash()
-    }
+    upgrade_source_fn!(
+        /// Returns the source hash for the Ecotone Beacon Block Roots Contract deployment.
+        beacon_roots_source,
+        "Ecotone: beacon block roots contract deployment"
+    );
 
-    /// Returns the source hash for the Ecotone Gas Price Oracle activation.
-    pub fn enable_ecotone_source() -> B256 {
-        UpgradeDepositSource { intent: String::from("Ecotone: Gas Price Oracle Set Ecotone") }
-            .source_hash()
-    }
+    upgrade_source_fn!(
+        /// Returns the source hash for the Ecotone Gas Price Oracle activation.
+        enable_ecotone_source,
+        "Ecotone: Gas Price Oracle Set Ecotone"
+    );
 
     /// Returns the EIP-4788 creation data.
     pub fn eip4788_creation_data() -> Bytes {
-        hex::decode(include_str!("./bytecode/eip4788_ecotone.hex").replace('\n', ""))
-            .expect("Expected hex byte string")
-            .into()
+        bytecode_from_hex!("./bytecode/eip4788_ecotone.hex")
     }
 
     /// Returns the raw bytecode for the L1 Block deployment.
     pub fn l1_block_deployment_bytecode() -> Bytes {
-        hex::decode(include_str!("./bytecode/l1_block_ecotone.hex").replace('\n', ""))
-            .expect("Expected hex byte string")
-            .into()
+        bytecode_from_hex!("./bytecode/l1_block_ecotone.hex")
     }
 
     /// Returns the gas price oracle deployment bytecode.
     pub fn ecotone_gas_price_oracle_deployment_bytecode() -> Bytes {
-        hex::decode(include_str!("./bytecode/gpo_ecotone.hex").replace('\n', ""))
-            .expect("Expected hex byte string")
-            .into()
+        bytecode_from_hex!("./bytecode/gpo_ecotone.hex")
     }
 
     /// Returns the list of [`TxDeposit`]s for the Ecotone network upgrade.
@@ -194,76 +186,32 @@ impl Hardfork for Ecotone {
 mod tests {
     use alloc::vec;
 
+    use rstest::rstest;
+
     use super::*;
     use crate::test_utils::check_deployment_code;
 
-    #[test]
-    fn test_deploy_l1_block_source() {
-        assert_eq!(
-            Ecotone::deploy_l1_block_source(),
-            hex!("877a6077205782ea15a6dc8699fa5ebcec5e0f4389f09cb8eda09488231346f8")
-        );
+    #[rstest]
+    #[case(Ecotone::deploy_l1_block_source(), hex!("877a6077205782ea15a6dc8699fa5ebcec5e0f4389f09cb8eda09488231346f8"))]
+    #[case(Ecotone::deploy_gas_price_oracle_source(), hex!("a312b4510adf943510f05fcc8f15f86995a5066bd83ce11384688ae20e6ecf42"))]
+    #[case(Ecotone::update_l1_block_source(), hex!("18acb38c5ff1c238a7460ebc1b421fa49ec4874bdf1e0a530d234104e5e67dbc"))]
+    #[case(Ecotone::update_gas_price_oracle_source(), hex!("ee4f9385eceef498af0be7ec5862229f426dec41c8d42397c7257a5117d9230a"))]
+    #[case(Ecotone::enable_ecotone_source(), hex!("0c1cb38e99dbc9cbfab3bb80863380b0905290b37eb3d6ab18dc01c1f3e75f93"))]
+    #[case(Ecotone::beacon_roots_source(), hex!("69b763c48478b9dc2f65ada09b3d92133ec592ea715ec65ad6e7f3dc519dc00c"))]
+    fn test_ecotone_source_hashes(#[case] actual: B256, #[case] expected: [u8; 32]) {
+        assert_eq!(actual, expected);
     }
-    #[test]
-    fn test_verify_ecotone_l1_deployment_code_hash() {
+
+    #[rstest]
+    #[case(0, Ecotone::NEW_L1_BLOCK, Ecotone::L1_BLOCK_DEPLOYER_CODE_HASH)]
+    #[case(1, Ecotone::GAS_PRICE_ORACLE, Ecotone::GAS_PRICE_ORACLE_CODE_HASH)]
+    fn test_ecotone_deployment_code_hashes(
+        #[case] tx_idx: usize,
+        #[case] addr: Address,
+        #[case] code_hash: B256,
+    ) {
         let txs = Ecotone::deposits().collect::<Vec<_>>();
-
-        check_deployment_code(
-            txs[0].clone(),
-            Ecotone::NEW_L1_BLOCK,
-            Ecotone::L1_BLOCK_DEPLOYER_CODE_HASH,
-        );
-    }
-
-    #[test]
-    fn test_verify_ecotone_gas_price_oracle_deployment_code_hash() {
-        let txs = Ecotone::deposits().collect::<Vec<_>>();
-
-        check_deployment_code(
-            txs[1].clone(),
-            Ecotone::GAS_PRICE_ORACLE,
-            Ecotone::GAS_PRICE_ORACLE_CODE_HASH,
-        );
-    }
-
-    #[test]
-    fn test_deploy_gas_price_oracle_source() {
-        assert_eq!(
-            Ecotone::deploy_gas_price_oracle_source(),
-            hex!("a312b4510adf943510f05fcc8f15f86995a5066bd83ce11384688ae20e6ecf42")
-        );
-    }
-
-    #[test]
-    fn test_update_l1_block_source() {
-        assert_eq!(
-            Ecotone::update_l1_block_source(),
-            hex!("18acb38c5ff1c238a7460ebc1b421fa49ec4874bdf1e0a530d234104e5e67dbc")
-        );
-    }
-
-    #[test]
-    fn test_update_gas_price_oracle_source() {
-        assert_eq!(
-            Ecotone::update_gas_price_oracle_source(),
-            hex!("ee4f9385eceef498af0be7ec5862229f426dec41c8d42397c7257a5117d9230a")
-        );
-    }
-
-    #[test]
-    fn test_enable_ecotone_source() {
-        assert_eq!(
-            Ecotone::enable_ecotone_source(),
-            hex!("0c1cb38e99dbc9cbfab3bb80863380b0905290b37eb3d6ab18dc01c1f3e75f93")
-        );
-    }
-
-    #[test]
-    fn test_beacon_block_roots_source() {
-        assert_eq!(
-            Ecotone::beacon_roots_source(),
-            hex!("69b763c48478b9dc2f65ada09b3d92133ec592ea715ec65ad6e7f3dc519dc00c")
-        );
+        check_deployment_code(txs[tx_idx].clone(), addr, code_hash);
     }
 
     #[test]
@@ -272,24 +220,12 @@ mod tests {
         assert_eq!(ecotone_upgrade_tx.len(), 6);
 
         let expected_txs: Vec<Bytes> = vec![
-            hex::decode(include_str!("./bytecode/ecotone_tx_0.hex").replace('\n', ""))
-                .unwrap()
-                .into(),
-            hex::decode(include_str!("./bytecode/ecotone_tx_1.hex").replace('\n', ""))
-                .unwrap()
-                .into(),
-            hex::decode(include_str!("./bytecode/ecotone_tx_2.hex").replace('\n', ""))
-                .unwrap()
-                .into(),
-            hex::decode(include_str!("./bytecode/ecotone_tx_3.hex").replace('\n', ""))
-                .unwrap()
-                .into(),
-            hex::decode(include_str!("./bytecode/ecotone_tx_4.hex").replace('\n', ""))
-                .unwrap()
-                .into(),
-            hex::decode(include_str!("./bytecode/ecotone_tx_5.hex").replace('\n', ""))
-                .unwrap()
-                .into(),
+            bytecode_from_hex!("./bytecode/ecotone_tx_0.hex"),
+            bytecode_from_hex!("./bytecode/ecotone_tx_1.hex"),
+            bytecode_from_hex!("./bytecode/ecotone_tx_2.hex"),
+            bytecode_from_hex!("./bytecode/ecotone_tx_3.hex"),
+            bytecode_from_hex!("./bytecode/ecotone_tx_4.hex"),
+            bytecode_from_hex!("./bytecode/ecotone_tx_5.hex"),
         ];
         for (i, expected) in expected_txs.iter().enumerate() {
             assert_eq!(ecotone_upgrade_tx[i], *expected);

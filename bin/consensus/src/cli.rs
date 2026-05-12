@@ -134,19 +134,18 @@ impl Follow {
     /// Runs the CLI.
     pub fn run(self) -> eyre::Result<()> {
         // Initialize logging from global arguments.
-        LogConfig::from(self.logging.clone()).init_tracing_subscriber()?;
+        base_cli_utils::init_tracing!(
+            LogConfig::from(self.logging.clone()),
+            ["libp2p_gossipsub=error"]
+        )?;
 
         // Initialize unified metrics for the follow-node subsystems.
         base_cli_utils::MetricsConfig::from(self.metrics.clone()).init_with(|| {
-            base_consensus_engine::Metrics::init();
-            base_consensus_node::Metrics::init();
-            base_consensus_derive::Metrics::init();
-            base_consensus_providers::Metrics::init();
             base_cli_utils::register_version_metrics!();
         })?;
 
         // Run the subcommand.
-        RuntimeManager::run_until_ctrl_c(self.exec())
+        RuntimeManager::new().run_until_ctrl_c(self.exec())
     }
 
     /// Run the Follow subcommand.
@@ -182,7 +181,7 @@ impl Follow {
             mode: NodeMode::Validator,
         };
         let local_l2_provider =
-            RootProvider::<base_alloy_network::Base>::new_http(self.l2_rpc_url.clone());
+            RootProvider::<base_common_network::Base>::new_http(self.l2_rpc_url.clone());
 
         if self.proofs {
             local_l2_provider
@@ -299,21 +298,18 @@ impl Node {
     /// Runs the CLI.
     pub fn run(self) -> eyre::Result<()> {
         // Initialize logging from global arguments.
-        LogConfig::from(self.logging.clone()).init_tracing_subscriber()?;
+        base_cli_utils::init_tracing!(
+            LogConfig::from(self.logging.clone()),
+            ["libp2p_gossipsub=error"]
+        )?;
 
         // Initialize unified metrics
         base_cli_utils::MetricsConfig::from(self.metrics.clone()).init_with(|| {
-            base_consensus_gossip::Metrics::init();
-            base_consensus_disc::Metrics::init();
-            base_consensus_engine::Metrics::init();
-            base_consensus_node::Metrics::init();
-            base_consensus_derive::Metrics::init();
-            base_consensus_providers::Metrics::init();
             base_cli_utils::register_version_metrics!();
         })?;
 
         // Run the subcommand.
-        RuntimeManager::run_until_ctrl_c(self.exec())
+        RuntimeManager::new().run_until_ctrl_c(self.exec())
     }
 
     /// Returns the signer [`Address`] from the rollup config for the given l2 chain id.

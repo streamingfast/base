@@ -1,19 +1,18 @@
 use std::marker::PhantomData;
 
-use base_alloy_chains::BaseUpgrades;
 use base_execution_payload_builder::{
-    OpAttributes, OpPayloadPrimitives,
-    config::{OpDAConfig, OpGasLimitConfig},
+    Attributes, PayloadPrimitives,
+    config::{BaseDAConfig, GasLimitConfig},
 };
 use base_execution_rpc::{
+    MinerApiExtServer,
     config::{BaseEthConfigApiServer, BaseEthConfigHandler},
     eth::OpEthApiBuilder,
-    miner::{MinerApiExtServer, OpMinerExtApi},
-    witness::OpDebugWitnessApi,
+    miner::BaseMinerExtApi,
+    witness::BaseDebugWitnessApi,
 };
-use base_node_core::{OpEngineApiBuilder, OpEngineValidatorBuilder, OpNodeTypes};
-use base_txpool::OpPooledTx;
-use reth_chainspec::{EthereumHardforks, Hardforks};
+use base_execution_txpool::OpPooledTx;
+use base_node_core::{BaseNodeTypes, BasePayloadValidatorBuilder, OpEngineApiBuilder};
 use reth_evm::ConfigureEvm;
 use reth_node_api::{BuildNextEnv, FullNodeComponents, HeaderTy, NodeAddOns, PayloadTypes, TxTy};
 use reth_node_builder::{
@@ -48,9 +47,9 @@ pub struct BaseAddOns<
     /// and eth-api.
     pub rpc_add_ons: RpcAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>,
     /// Data availability configuration for the OP builder.
-    pub da_config: OpDAConfig,
+    pub da_config: BaseDAConfig,
     /// Gas limit configuration for the OP builder.
-    pub gas_limit_config: OpGasLimitConfig,
+    pub gas_limit_config: GasLimitConfig,
 }
 
 impl<N, EthB, PVB, EB, EVB, RpcMiddleware> BaseAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>
@@ -62,16 +61,16 @@ where
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
         rpc_add_ons: RpcAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>,
-        da_config: OpDAConfig,
-        gas_limit_config: OpGasLimitConfig,
+        da_config: BaseDAConfig,
+        gas_limit_config: GasLimitConfig,
     ) -> Self {
         Self { rpc_add_ons, da_config, gas_limit_config }
     }
 }
 
-impl<N> Default for BaseAddOns<N, OpEthApiBuilder, OpEngineValidatorBuilder>
+impl<N> Default for BaseAddOns<N, OpEthApiBuilder, BasePayloadValidatorBuilder>
 where
-    N: FullNodeComponents<Types: OpNodeTypes>,
+    N: FullNodeComponents<Types: BaseNodeTypes>,
     OpEthApiBuilder: EthApiBuilder<N>,
 {
     fn default() -> Self {
@@ -83,15 +82,15 @@ impl<N, NetworkT, RpcMiddleware>
     BaseAddOns<
         N,
         OpEthApiBuilder<NetworkT>,
-        OpEngineValidatorBuilder,
-        OpEngineApiBuilder<OpEngineValidatorBuilder>,
+        BasePayloadValidatorBuilder,
+        OpEngineApiBuilder<BasePayloadValidatorBuilder>,
         RpcMiddleware,
     >
 where
-    N: FullNodeComponents<Types: OpNodeTypes>,
+    N: FullNodeComponents<Types: BaseNodeTypes>,
     OpEthApiBuilder<NetworkT>: EthApiBuilder<N>,
 {
-    /// Build a [`OpAddOns`] using [`BaseAddOnsBuilder`].
+    /// Build a [`BaseAddOns`] using [`BaseAddOnsBuilder`].
     pub fn builder() -> BaseAddOnsBuilder<NetworkT> {
         BaseAddOnsBuilder::default()
     }
@@ -182,16 +181,13 @@ impl<N, EthB, PVB, EB, EVB, Attrs, RpcMiddleware> NodeAddOns<N>
     for BaseAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>
 where
     N: FullNodeComponents<
-            Types: NodeTypes<
-                ChainSpec: BaseUpgrades + EthereumHardforks + Hardforks,
-                Primitives: OpPayloadPrimitives,
-                Payload: PayloadTypes<PayloadBuilderAttributes = Attrs>,
-            >,
+            Types: BaseNodeTypes
+                       + NodeTypes<Payload: PayloadTypes<PayloadBuilderAttributes = Attrs>>,
             Evm: ConfigureEvm<
                 NextBlockEnvCtx: BuildNextEnv<
                     Attrs,
                     HeaderTy<N::Types>,
-                    <N::Types as NodeTypes>::ChainSpec,
+                    base_execution_chainspec::BaseChainSpec,
                 >,
             >,
             Pool: TransactionPool<Transaction: OpPooledTx>,
@@ -201,8 +197,8 @@ where
     EB: EngineApiBuilder<N>,
     EVB: EngineValidatorBuilder<N>,
     RpcMiddleware: RethRpcMiddleware,
-    Attrs: OpAttributes<Transaction = TxTy<N::Types>, RpcPayloadAttributes: DeserializeOwned>,
-    <N::Types as NodeTypes>::Primitives: OpPayloadPrimitives<_Header: HeaderMut>,
+    Attrs: Attributes<Transaction = TxTy<N::Types>, RpcPayloadAttributes: DeserializeOwned>,
+    <N::Types as NodeTypes>::Primitives: PayloadPrimitives<_Header: HeaderMut>,
 {
     type Handle = RpcHandle<N, EthB::EthApi>;
 
@@ -220,12 +216,12 @@ where
             ctx.node.evm_config().clone(),
         );
         // install additional OP specific rpc methods
-        let debug_ext = OpDebugWitnessApi::<_, _, _, Attrs>::new(
+        let debug_ext = BaseDebugWitnessApi::<_, _, _, Attrs>::new(
             ctx.node.provider().clone(),
             Box::new(ctx.node.task_executor().clone()),
             builder,
         );
-        let miner_ext = OpMinerExtApi::new(da_config, gas_limit_config);
+        let miner_ext = BaseMinerExtApi::new(da_config, gas_limit_config);
 
         rpc_add_ons
             .launch_add_ons_with(ctx, move |container| {
@@ -265,16 +261,13 @@ impl<N, EthB, PVB, EB, EVB, Attrs, RpcMiddleware> RethRpcAddOns<N>
     for BaseAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>
 where
     N: FullNodeComponents<
-            Types: NodeTypes<
-                ChainSpec: BaseUpgrades + EthereumHardforks + Hardforks,
-                Primitives: OpPayloadPrimitives,
-                Payload: PayloadTypes<PayloadBuilderAttributes = Attrs>,
-            >,
+            Types: BaseNodeTypes
+                       + NodeTypes<Payload: PayloadTypes<PayloadBuilderAttributes = Attrs>>,
             Evm: ConfigureEvm<
                 NextBlockEnvCtx: BuildNextEnv<
                     Attrs,
                     HeaderTy<N::Types>,
-                    <N::Types as NodeTypes>::ChainSpec,
+                    base_execution_chainspec::BaseChainSpec,
                 >,
             >,
         >,
@@ -284,8 +277,8 @@ where
     EB: EngineApiBuilder<N>,
     EVB: EngineValidatorBuilder<N>,
     RpcMiddleware: RethRpcMiddleware,
-    Attrs: OpAttributes<Transaction = TxTy<N::Types>, RpcPayloadAttributes: DeserializeOwned>,
-    <N::Types as NodeTypes>::Primitives: OpPayloadPrimitives<_Header: HeaderMut>,
+    Attrs: Attributes<Transaction = TxTy<N::Types>, RpcPayloadAttributes: DeserializeOwned>,
+    <N::Types as NodeTypes>::Primitives: PayloadPrimitives<_Header: HeaderMut>,
 {
     type EthApi = EthB::EthApi;
 
@@ -321,9 +314,9 @@ pub struct BaseAddOnsBuilder<NetworkT, RpcMiddleware = Identity> {
     /// Headers to use for the sequencer client requests.
     sequencer_headers: Vec<String>,
     /// Data availability configuration for the OP builder.
-    da_config: Option<OpDAConfig>,
+    da_config: Option<BaseDAConfig>,
     /// Gas limit configuration for the OP builder.
-    gas_limit_config: Option<OpGasLimitConfig>,
+    gas_limit_config: Option<GasLimitConfig>,
     /// Marker for network types.
     _nt: PhantomData<NetworkT>,
     /// Minimum suggested priority fee (tip)
@@ -363,13 +356,13 @@ impl<NetworkT, RpcMiddleware> BaseAddOnsBuilder<NetworkT, RpcMiddleware> {
     }
 
     /// Configure the data availability configuration for the OP builder.
-    pub fn with_da_config(mut self, da_config: OpDAConfig) -> Self {
+    pub fn with_da_config(mut self, da_config: BaseDAConfig) -> Self {
         self.da_config = Some(da_config);
         self
     }
 
     /// Configure the gas limit configuration for the OP payload builder.
-    pub fn with_gas_limit_config(mut self, gas_limit_config: OpGasLimitConfig) -> Self {
+    pub fn with_gas_limit_config(mut self, gas_limit_config: GasLimitConfig) -> Self {
         self.gas_limit_config = Some(gas_limit_config);
         self
     }
@@ -414,7 +407,7 @@ impl<NetworkT, RpcMiddleware> BaseAddOnsBuilder<NetworkT, RpcMiddleware> {
 }
 
 impl<NetworkT, RpcMiddleware> BaseAddOnsBuilder<NetworkT, RpcMiddleware> {
-    /// Builds an instance of [`OpAddOns`].
+    /// Builds an instance of [`BaseAddOns`].
     pub fn build<N, PVB, EB, EVB>(
         self,
     ) -> BaseAddOns<N, OpEthApiBuilder<NetworkT>, PVB, EB, EVB, RpcMiddleware>

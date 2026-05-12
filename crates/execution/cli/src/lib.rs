@@ -17,13 +17,12 @@ pub mod commands;
 use std::{ffi::OsString, fmt, marker::PhantomData};
 
 pub use app::CliApp;
-use base_execution_chainspec::OpChainSpec;
+use base_execution_chainspec::BaseChainSpec;
 use base_node_core::args::RollupArgs;
-use chainspec::OpChainSpecParser;
+use chainspec::BaseChainSpecParser;
 use clap::Parser;
 use commands::Commands;
 use futures::Future;
-use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_commands::launcher::FnLauncher;
 use reth_cli_runner::CliRunner;
 use reth_db::DatabaseEnv;
@@ -43,13 +42,12 @@ use reth_rpc_server_types::{DefaultRpcModuleValidator, RpcModuleValidator};
 #[derive(Debug, Parser)]
 #[command(author, name = version_metadata().name_client.as_ref(), version = version_metadata().short_version.as_ref(), long_version = version_metadata().long_version.as_ref(), about = "Reth", long_about = None)]
 pub struct Cli<
-    Spec: ChainSpecParser = OpChainSpecParser,
     Ext: clap::Args + fmt::Debug = RollupArgs,
     Rpc: RpcModuleValidator = DefaultRpcModuleValidator,
 > {
     /// The command to run
     #[command(subcommand)]
-    pub command: Commands<Spec, Ext>,
+    pub command: Commands<Ext>,
 
     /// The logging configuration for the CLI.
     #[command(flatten)]
@@ -80,9 +78,8 @@ impl Cli {
     }
 }
 
-impl<C, Ext, Rpc> Cli<C, Ext, Rpc>
+impl<Ext, Rpc> Cli<Ext, Rpc>
 where
-    C: ChainSpecParser<ChainSpec = OpChainSpec>,
     Ext: clap::Args + fmt::Debug,
     Rpc: RpcModuleValidator,
 {
@@ -90,7 +87,7 @@ where
     ///
     /// This method is used to prepare the CLI for execution by wrapping it in a
     /// [`CliApp`] that can be further configured before running.
-    pub fn configure(self) -> CliApp<C, Ext, Rpc> {
+    pub fn configure(self) -> CliApp<Ext, Rpc> {
         CliApp::new(self)
     }
 
@@ -100,7 +97,7 @@ where
     /// [`NodeCommand`](reth_cli_commands::node::NodeCommand).
     pub fn run<L, Fut>(self, launcher: L) -> eyre::Result<()>
     where
-        L: FnOnce(WithLaunchContext<NodeBuilder<DatabaseEnv, C::ChainSpec>>, Ext) -> Fut,
+        L: FnOnce(WithLaunchContext<NodeBuilder<DatabaseEnv, BaseChainSpec>>, Ext) -> Fut,
         Fut: Future<Output = eyre::Result<()>>,
     {
         self.with_runner(CliRunner::try_default_runtime()?, launcher)
@@ -109,12 +106,12 @@ where
     /// Execute the configured cli command with the provided [`CliRunner`].
     pub fn with_runner<L, Fut>(self, runner: CliRunner, launcher: L) -> eyre::Result<()>
     where
-        L: FnOnce(WithLaunchContext<NodeBuilder<DatabaseEnv, C::ChainSpec>>, Ext) -> Fut,
+        L: FnOnce(WithLaunchContext<NodeBuilder<DatabaseEnv, BaseChainSpec>>, Ext) -> Fut,
         Fut: Future<Output = eyre::Result<()>>,
     {
         let mut this = self.configure();
         this.set_runner(runner);
-        this.run(FnLauncher::new::<C, Ext>(async move |builder, chain_spec| {
+        this.run(FnLauncher::new::<BaseChainSpecParser, Ext>(async move |builder, chain_spec| {
             launcher(builder, chain_spec).await
         }))
     }
@@ -127,11 +124,11 @@ mod tests {
     use clap::Parser;
     use reth_cli_commands::{NodeCommand, node::NoArgs};
 
-    use crate::{Cli, chainspec::OpChainSpecParser, commands::Commands};
+    use crate::{Cli, chainspec::BaseChainSpecParser, commands::Commands};
 
     #[test]
     fn parse_dev() {
-        let cmd = NodeCommand::<OpChainSpecParser, NoArgs>::parse_from(["base-reth", "--dev"]);
+        let cmd = NodeCommand::<BaseChainSpecParser, NoArgs>::parse_from(["base-reth", "--dev"]);
         let chain = BASE_DEV.clone();
         assert_eq!(cmd.chain.chain, chain.chain);
         assert_eq!(cmd.chain.genesis_hash(), chain.genesis_hash());
@@ -154,7 +151,7 @@ mod tests {
         // to a value accepted by reth's OtlpProtocol enum.
         // SAFETY: this is a single-test context; no other thread concurrently reads this var.
         unsafe { std::env::set_var("OTEL_EXPORTER_OTLP_PROTOCOL", "http") };
-        let cmd = Cli::<OpChainSpecParser, RollupArgs>::parse_from([
+        let cmd = Cli::<RollupArgs>::parse_from([
             "base-reth",
             "node",
             "--chain",

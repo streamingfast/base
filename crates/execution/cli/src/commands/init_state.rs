@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use base_execution_chainspec::OpChainSpec;
-use base_execution_primitives::OpPrimitives;
+use base_common_consensus::BasePrimitives;
+use base_execution_chainspec::BaseChainSpec;
 use clap::Parser;
 use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_commands::common::CliNodeTypes;
@@ -15,9 +15,9 @@ pub struct InitStateCommandOp<C: ChainSpecParser> {
     init_state: reth_cli_commands::init_state::InitStateCommand<C>,
 }
 
-impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> InitStateCommandOp<C> {
+impl<C: ChainSpecParser<ChainSpec = BaseChainSpec>> InitStateCommandOp<C> {
     /// Execute the `init` command
-    pub async fn execute<N: CliNodeTypes<ChainSpec = C::ChainSpec, Primitives = OpPrimitives>>(
+    pub async fn execute<N: CliNodeTypes<ChainSpec = C::ChainSpec, Primitives = BasePrimitives>>(
         self,
     ) -> eyre::Result<()> {
         self.init_state.execute::<N>().await

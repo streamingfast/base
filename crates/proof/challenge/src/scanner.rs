@@ -1,20 +1,43 @@
 //! Game scanner for the challenger service.
 //!
 //! Scans the [`DisputeGameFactory`](base_proof_contracts::DisputeGameFactoryClient)
-//! for dispute games requiring validation. Each game is evaluated through a
-//! two-stage filter:
+//! for dispute games that require action. Each game is classified into one
+//! of four [`GameCategory`] variants based on its on-chain state:
 //!
-//! 1. **Status** — must be `IN_PROGRESS` ([`GameScanner::STATUS_IN_PROGRESS`]).
-//! 2. **Challenge state** — `zkProver` must be `Address::ZERO` (unchallenged).
+//! 1. **[`InvalidTeeProposal`](GameCategory::InvalidTeeProposal)** —
+//!    TEE-proposed game (`teeProver != 0`, `zkProver == 0`). The driver
+//!    validates the intermediate roots and, if invalid, nullifies with a
+//!    TEE proof or challenges with a ZK proof.
 //!
-//! Games passing both filters are returned as [`CandidateGame`] structs.
+//! 2. **[`FraudulentZkChallenge`](GameCategory::FraudulentZkChallenge)** —
+//!    A TEE-proposed game that has been challenged by a ZK proof
+//!    (`teeProver != 0`, `zkProver != 0`, `counteredByIntermediateRootIndexPlusOne > 0`).
+//!    The driver validates the originally proposed root at the challenged
+//!    index and, if the original was correct, nullifies the ZK challenge
+//!    with a ZK proof.
+//!
+//! 3. **[`InvalidZkProposal`](GameCategory::InvalidZkProposal)** —
+//!    ZK-proposed game (`teeProver == 0`, `zkProver != 0`, unchallenged).
+//!    The driver validates the intermediate roots and, if invalid,
+//!    nullifies with a ZK proof.
+//!
+//! 4. **[`InvalidDualProposal`](GameCategory::InvalidDualProposal)** —
+//!    Both TEE and ZK proofs are present but no challenge has been filed
+//!    (`counteredByIntermediateRootIndexPlusOne == 0`). The driver
+//!    nullifies the TEE proof first (fast, synchronous) and falls back to
+//!    ZK nullification if TEE proving is unavailable. After the TEE proof
+//!    is nullified, the subsequent scan reclassifies the game as
+//!    [`InvalidZkProposal`](GameCategory::InvalidZkProposal).
+//!
+//! Games that are not `IN_PROGRESS` or have been fully nullified (both
+//! provers zero) are skipped.
 
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use base_proof_contracts::{
     AggregateVerifierClient, DisputeGameFactoryClient, GameAtIndex, GameInfo,
 };
@@ -31,7 +54,46 @@ pub struct ScannerConfig {
     pub lookback_games: u64,
 }
 
-/// A dispute game that has been identified as a candidate for challenge.
+/// Classifies why a game was selected as a candidate and what action the
+/// driver should take.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GameCategory {
+    /// Path 1: TEE-proposed game with a potentially wrong output root.
+    ///
+    /// The driver validates the intermediate roots. If invalid it either
+    /// nullifies with a TEE proof or challenges with a ZK proof.
+    InvalidTeeProposal,
+
+    /// Path 2: A TEE-proposed game was challenged with a potentially
+    /// fraudulent ZK proof.
+    ///
+    /// The driver validates the originally proposed root at the challenged
+    /// index. If the original root was actually correct, a ZK proof is
+    /// submitted via `nullify()` to refute the challenge.
+    FraudulentZkChallenge {
+        /// The 0-based index of the challenged intermediate root.
+        challenged_index: u64,
+    },
+
+    /// Path 3: ZK-proposed game with a potentially wrong output root.
+    ///
+    /// The driver validates the intermediate roots. If invalid it submits
+    /// a ZK proof via `nullify()` to nullify the incorrect ZK proposal.
+    InvalidZkProposal,
+
+    /// Path 4: Both TEE and ZK proofs present with no challenge
+    /// (`countered_index == 0`). The second proof was added via
+    /// `verifyProposalProof`, not via `challenge`.
+    ///
+    /// Both proofs may still verify an incorrect root. The driver
+    /// nullifies the TEE proof first (fast, synchronous) and falls back
+    /// to ZK nullification if TEE proving is unavailable or fails.
+    /// After TEE nullification the game becomes `(false, true, 0)` and
+    /// will be re-classified as [`InvalidZkProposal`] on the next scan.
+    InvalidDualProposal,
+}
+
+/// A dispute game that has been identified as a candidate for action.
 #[derive(Debug, Clone)]
 pub struct CandidateGame {
     /// The factory index of this game.
@@ -44,8 +106,12 @@ pub struct CandidateGame {
     pub starting_block_number: u64,
     /// The intermediate block interval for this game's type.
     pub intermediate_block_interval: u64,
+    /// The L1 head block hash stored at game creation time.
+    pub l1_head: B256,
     /// Address of the TEE prover for this game (`Address::ZERO` if none registered).
     pub tee_prover: Address,
+    /// Classification of this candidate and the action the driver should take.
+    pub category: GameCategory,
 }
 
 impl CandidateGame {
@@ -61,10 +127,11 @@ impl CandidateGame {
     }
 }
 
-/// Scans the `DisputeGameFactory` for new dispute games that need validation.
+/// Scans the `DisputeGameFactory` for dispute games that need validation.
 ///
-/// The scanner is stateless across restarts — `last_scanned_index` is ephemeral
-/// and recomputed from the lookback window on startup.
+/// The scanner is fully stateless — every call re-evaluates the entire
+/// lookback window so that on-chain state changes (new proofs added,
+/// challenges filed) are always detected.
 pub struct GameScanner {
     factory_client: Arc<dyn DisputeGameFactoryClient>,
     verifier_client: Arc<dyn AggregateVerifierClient>,
@@ -95,43 +162,28 @@ impl GameScanner {
         Self { factory_client, verifier_client, config, interval_cache: Mutex::new(HashMap::new()) }
     }
 
-    /// Scans for new candidate games since `last_scanned`.
+    /// Scans the lookback window for candidate games that need validation.
     ///
-    /// Returns a tuple of `(candidates, new_last_scanned)` where `new_last_scanned`
-    /// is the latest factory index that was evaluated. The caller is responsible
-    /// for tracking `last_scanned` between calls.
-    ///
-    /// On a fresh start, pass `None` as `last_scanned` and the lookback window will
-    /// determine the scan range.
+    /// Every call re-evaluates the full lookback window so that on-chain state
+    /// changes (new proofs added, challenges filed) are always detected. Games
+    /// that are not `IN_PROGRESS` or have been fully nullified are filtered out
+    /// cheaply via a single `status()` RPC call.
     ///
     /// Individual game query failures are logged and skipped so that a transient
-    /// RPC error on one game does not abort the entire scan. After evaluation,
-    /// the `base_challenger_games_scanned_total` counter and
+    /// RPC error on one game does not abort the entire scan. Errored games are
+    /// naturally retried on the next tick. After evaluation, the
+    /// `base_challenger_games_scanned_total` counter and
     /// `base_challenger_scan_head` gauge are updated.
-    pub async fn scan(
-        &self,
-        last_scanned: Option<u64>,
-    ) -> Result<(Vec<CandidateGame>, Option<u64>)> {
+    pub async fn scan(&self) -> Result<Vec<CandidateGame>> {
         let game_count = self.factory_client.game_count().await?;
 
         if game_count == 0 {
             debug!("factory has no games");
-            return Ok((vec![], last_scanned));
+            return Ok(vec![]);
         }
 
         let end = game_count - 1;
-        let lookback_start = game_count.saturating_sub(self.config.lookback_games);
-        let start =
-            last_scanned.map_or(lookback_start, |idx| idx.saturating_add(1).max(lookback_start));
-
-        if start > end {
-            debug!(
-                last_scanned = ?last_scanned,
-                game_count = game_count,
-                "no new games since last scan"
-            );
-            return Ok((vec![], last_scanned));
-        }
+        let start = game_count.saturating_sub(self.config.lookback_games);
 
         let games_to_scan = end - start + 1;
 
@@ -142,7 +194,6 @@ impl GameScanner {
             .await;
 
         let mut candidates = Vec::new();
-        let mut lowest_error: Option<u64> = None;
 
         for (i, result) in results {
             match result {
@@ -150,40 +201,31 @@ impl GameScanner {
                 Ok(None) => {}
                 Err(e) => {
                     warn!(error = %e, index = i, "failed to query game, skipping");
-                    lowest_error = lowest_error.map_or(Some(i), |prev| Some(prev.min(i)));
                 }
             }
         }
 
-        candidates.sort_by_key(|c| c.index);
+        candidates.sort_unstable_by_key(|c| c.index);
 
-        metrics::counter!(ChallengerMetrics::GAMES_SCANNED_TOTAL).increment(games_to_scan);
-
-        let new_last_scanned = match lowest_error {
-            Some(0) => last_scanned,
-            Some(e) => Some(e - 1),
-            None => Some(end),
-        };
-
-        if let Some(head) = new_last_scanned {
-            metrics::gauge!(ChallengerMetrics::SCAN_HEAD).set(head as f64);
-        }
+        ChallengerMetrics::games_scanned_total().increment(games_to_scan);
+        ChallengerMetrics::scan_head().set(end as f64);
 
         info!(
             games_found = candidates.len(),
-            scan_head = ?new_last_scanned,
+            scan_head = end,
             games_scanned = games_to_scan,
             "scan complete"
         );
 
-        Ok((candidates, new_last_scanned))
+        Ok(candidates)
     }
 
     /// Evaluates a single game at the given factory index.
     ///
-    /// Returns `Some(CandidateGame)` if the game is `IN_PROGRESS` and has not
-    /// been challenged (`zkProver` == zero). Returns `None` if the game should
-    /// be skipped.
+    /// Returns `Some(CandidateGame)` if the game is `IN_PROGRESS` and
+    /// matches one of the four [`GameCategory`] variants. Returns `None`
+    /// if the game should be skipped (resolved, fully nullified, or in
+    /// an unrecognized state).
     pub async fn evaluate_game(&self, index: u64) -> Result<Option<CandidateGame>> {
         let factory = self.factory_client.game_at_index(index).await?;
 
@@ -193,24 +235,30 @@ impl GameScanner {
             return Ok(None);
         }
 
-        let zk_prover = self.verifier_client.zk_prover(factory.proxy).await?;
-        if zk_prover != Address::ZERO {
-            debug!(
-                index = index,
-                zk_prover = %zk_prover,
-                "skipping already-challenged game"
-            );
-            return Ok(None);
-        }
-
-        let (info, starting_block_number, tee_prover) = tokio::try_join!(
-            self.verifier_client.game_info(factory.proxy),
-            self.verifier_client.starting_block_number(factory.proxy),
+        // Fetch classification fields only for in-progress games.
+        let (zk_prover, tee_prover, countered_index) = tokio::try_join!(
+            self.verifier_client.zk_prover(factory.proxy),
             self.verifier_client.tee_prover(factory.proxy),
+            self.verifier_client.countered_index(factory.proxy),
         )?;
 
-        let intermediate_block_interval =
-            self.resolve_intermediate_block_interval(factory.game_type).await?;
+        let category = match Self::classify(index, tee_prover, zk_prover, countered_index) {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        // Fetch remaining fields only for actionable games.
+        let ((info, starting_block_number, l1_head), intermediate_block_interval) = tokio::try_join!(
+            async {
+                tokio::try_join!(
+                    self.verifier_client.game_info(factory.proxy),
+                    self.verifier_client.starting_block_number(factory.proxy),
+                    self.verifier_client.l1_head(factory.proxy),
+                )
+                .map_err(Into::into)
+            },
+            self.resolve_intermediate_block_interval(factory.game_type),
+        )?;
 
         Ok(Some(CandidateGame {
             index,
@@ -218,8 +266,71 @@ impl GameScanner {
             info,
             starting_block_number,
             intermediate_block_interval,
+            l1_head,
             tee_prover,
+            category,
         }))
+    }
+
+    /// Classifies a game into a [`GameCategory`] based on its prover state,
+    /// or returns `None` if the game should be skipped.
+    fn classify(
+        index: u64,
+        tee_prover: Address,
+        zk_prover: Address,
+        countered_index: u64,
+    ) -> Option<GameCategory> {
+        let has_tee = tee_prover != Address::ZERO;
+        let has_zk = zk_prover != Address::ZERO;
+
+        match (has_tee, has_zk, countered_index) {
+            // Path 1: TEE-proposed, unchallenged.
+            (true, false, 0) => Some(GameCategory::InvalidTeeProposal),
+
+            // TEE-only game with a non-zero countered_index — unexpected state.
+            (true, false, ci) => {
+                debug!(
+                    index = index,
+                    countered_index = ci,
+                    "skipping TEE-only game with unexpected non-zero countered_index"
+                );
+                None
+            }
+
+            // TEE + ZK present but no countered index — second proof was added
+            // via `verifyProposalProof`, not via `challenge`. Both proofs may
+            // still verify an incorrect root. Nullify the TEE proof first
+            // (fast) then the ZK proof on the next scan.
+            (true, true, 0) => {
+                debug!(index = index, "dual-proof game selected for validation");
+                Some(GameCategory::InvalidDualProposal)
+            }
+
+            // Path 2: TEE-proposed and challenged by ZK.
+            (true, true, ci) => {
+                debug_assert!(ci > 0, "ci == 0 should be handled by (true, true, 0) arm");
+                Some(GameCategory::FraudulentZkChallenge { challenged_index: ci - 1 })
+            }
+
+            // Path 3: ZK-proposed, unchallenged.
+            (false, true, 0) => Some(GameCategory::InvalidZkProposal),
+
+            // ZK-only game with a non-zero countered_index — unexpected state.
+            (false, true, ci) => {
+                debug!(
+                    index = index,
+                    countered_index = ci,
+                    "skipping ZK-only game with unexpected non-zero countered_index"
+                );
+                None
+            }
+
+            // Both provers zeroed — already nullified.
+            (false, false, _) => {
+                debug!(index = index, "skipping nullified game (both provers zeroed)");
+                None
+            }
+        }
     }
 
     /// Resolves the intermediate block interval for a game type, using a cache

@@ -1,4 +1,4 @@
-use std::future::Future;
+use std::{future::Future, sync::Arc};
 
 use alloy_network::{Ethereum, EthereumWallet};
 use alloy_primitives::{Address, TxHash, U256};
@@ -7,21 +7,21 @@ use alloy_provider::{
     fillers::{ChainIdFiller, FillProvider, JoinFill, WalletFiller},
 };
 use alloy_rpc_types::BlockNumberOrTag;
-use base_alloy_network::Base;
-use base_alloy_rpc_types::OpTransactionReceipt;
+use base_common_network::Base;
+use base_common_rpc_types::BaseTransactionReceipt;
+use parking_lot::RwLock;
 use tracing::instrument;
 use url::Url;
 
 use crate::utils::{BaselineError, Result};
+
+type BlockTimestampCache = Arc<RwLock<std::collections::HashMap<u64, u64>>>;
 
 /// Provider trait for fetching transaction receipts and block data.
 ///
 /// This trait abstracts the RPC calls needed by the confirmer, enabling
 /// mock implementations for testing.
 pub trait ReceiptProvider: Send + Sync {
-    /// Fetches the current block number.
-    fn get_block_number(&self) -> impl Future<Output = Result<u64>> + Send;
-
     /// Fetches transaction hashes from the pending block.
     fn get_pending_block_tx_hashes(&self) -> impl Future<Output = Result<Vec<TxHash>>> + Send;
 
@@ -29,14 +29,20 @@ pub trait ReceiptProvider: Send + Sync {
     fn get_transaction_receipt(
         &self,
         tx_hash: TxHash,
-    ) -> impl Future<Output = Result<Option<OpTransactionReceipt>>> + Send;
+    ) -> impl Future<Output = Result<Option<BaseTransactionReceipt>>> + Send;
+
+    /// Fetches the block timestamp (unix seconds) for a given block number.
+    fn get_block_timestamp(
+        &self,
+        block_number: u64,
+    ) -> impl Future<Output = Result<Option<u64>>> + Send;
 }
 
 /// Provider type with wallet signing capability for sending transactions.
 ///
 /// Uses Ethereum network type because `send_transaction` works identically
 /// for both Ethereum and Base networks. Only `RpcClient` uses the Base network
-/// type since it needs `OpTransactionReceipt` for receipt handling.
+/// type since it needs `BaseTransactionReceipt` for receipt handling.
 pub type WalletProvider = FillProvider<
     JoinFill<JoinFill<Identity, ChainIdFiller>, WalletFiller<EthereumWallet>>,
     RootProvider<Ethereum>,
@@ -53,16 +59,18 @@ pub fn create_wallet_provider(rpc_url: Url, wallet: EthereumWallet) -> WalletPro
 }
 
 /// RPC client for read-only interactions with Base nodes.
+#[derive(Clone)]
 pub struct RpcClient {
     provider: RootProvider<Base>,
     url: Url,
+    block_timestamp_cache: BlockTimestampCache,
 }
 
 impl RpcClient {
     /// Creates a new RPC client.
     pub fn new(url: Url) -> Self {
         let provider = RootProvider::<Base>::new_http(url.clone());
-        Self { provider, url }
+        Self { provider, url, block_timestamp_cache: Arc::new(RwLock::new(Default::default())) }
     }
 
     /// Returns the RPC endpoint URL.
@@ -101,18 +109,12 @@ impl RpcClient {
             .map_err(|e| BaselineError::Rpc(e.to_string()))
     }
 
-    /// Fetches the current block number.
-    #[instrument(skip(self))]
-    pub async fn get_block_number(&self) -> Result<u64> {
-        self.provider.get_block_number().await.map_err(|e| BaselineError::Rpc(e.to_string()))
-    }
-
     /// Fetches the transaction receipt for a given hash.
     #[instrument(skip(self), fields(tx_hash = %tx_hash))]
     pub async fn get_transaction_receipt(
         &self,
         tx_hash: TxHash,
-    ) -> Result<Option<OpTransactionReceipt>> {
+    ) -> Result<Option<BaseTransactionReceipt>> {
         self.provider
             .get_transaction_receipt(tx_hash)
             .await
@@ -137,6 +139,30 @@ impl RpcClient {
 
         Ok(block.map(|b| b.transactions.hashes().collect()).unwrap_or_default())
     }
+
+    /// Fetches the block timestamp (unix seconds) for a given block number, with caching.
+    #[instrument(skip(self))]
+    pub async fn get_block_timestamp(&self, block_number: u64) -> Result<Option<u64>> {
+        if let Some(&ts) = self.block_timestamp_cache.read().get(&block_number) {
+            return Ok(Some(ts));
+        }
+
+        let block = self
+            .provider
+            .get_block_by_number(BlockNumberOrTag::Number(block_number))
+            .hashes()
+            .await
+            .map_err(|e| BaselineError::Rpc(e.to_string()))?;
+
+        let Some(block) = block else {
+            return Ok(None);
+        };
+
+        let timestamp = block.header.timestamp;
+        self.block_timestamp_cache.write().insert(block_number, timestamp);
+
+        Ok(Some(timestamp))
+    }
 }
 
 impl std::fmt::Debug for RpcClient {
@@ -146,10 +172,6 @@ impl std::fmt::Debug for RpcClient {
 }
 
 impl ReceiptProvider for RpcClient {
-    async fn get_block_number(&self) -> Result<u64> {
-        self.get_block_number().await
-    }
-
     async fn get_pending_block_tx_hashes(&self) -> Result<Vec<TxHash>> {
         self.get_pending_block_tx_hashes().await
     }
@@ -157,7 +179,11 @@ impl ReceiptProvider for RpcClient {
     async fn get_transaction_receipt(
         &self,
         tx_hash: TxHash,
-    ) -> Result<Option<OpTransactionReceipt>> {
+    ) -> Result<Option<BaseTransactionReceipt>> {
         self.get_transaction_receipt(tx_hash).await
+    }
+
+    async fn get_block_timestamp(&self, block_number: u64) -> Result<Option<u64>> {
+        self.get_block_timestamp(block_number).await
     }
 }

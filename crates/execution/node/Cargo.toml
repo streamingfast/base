@@ -12,22 +12,24 @@ workspace = true
 
 [dependencies]
 # reth
+alloy-rlp.workspace = true
 reth-db.workspace = true
-reth-db-api.workspace = true
+reth-discv5.workspace = true
 reth-evm.workspace = true
-reth-network.workspace = true
 reth-tasks.workspace = true
+reth-db-api.workspace = true
+reth-network.workspace = true
 reth-tracing.workspace = true
+reth-rpc-api.workspace = true
 reth-provider.workspace = true
-reth-consensus.workspace = true
 reth-node-api.workspace = true
+reth-consensus.workspace = true
 reth-node-core.workspace = true
 reth-chainspec.workspace = true
-reth-rpc-api.workspace = true
 reth-trie-common.workspace = true
 reth-node-builder.workspace = true
-reth-payload-builder.workspace = true
 reth-rpc-engine-api.workspace = true
+reth-payload-builder.workspace = true
 reth-transaction-pool.workspace = true
 reth-rpc-server-types.workspace = true
 base-execution-firehose.workspace = true
@@ -35,48 +37,42 @@ base-execution-firehose.workspace = true
 reth-primitives-traits = { workspace = true, features = ["secp256k1", "rayon"] }
 
 # op-reth
-base-txpool.workspace = true
-base-protocol.workspace = true
 base-execution-rpc.workspace = true
+base-execution-txpool.workspace = true
 base-execution-storage.workspace = true
 base-execution-chainspec.workspace = true
 base-execution-payload-builder.workspace = true
 base-execution-exex = { workspace = true, features = ["metrics"] }
 base-execution-trie = { workspace = true, features = ["metrics"] }
-base-execution-primitives = { workspace = true, features = [
-	"serde",
-	"serde-bincode-compat",
-	"reth-codec",
-] }
-base-execution-evm = { workspace = true, features = ["std", "rpc"] }
 base-execution-consensus = { workspace = true, features = ["std"] }
+base-execution-evm = { workspace = true, features = ["std", "rpc"] }
 
 # revm with required Base features
 # Note: this must be kept to ensure all features are properly enabled/forwarded
+base-common-evm.workspace = true
 revm = { workspace = true, features = [
 	"secp256k1",
 	"blst",
 	"c-kzg",
 	"memory_limit",
 ] }
-base-revm.workspace = true
 
 # ethereum
 alloy-consensus.workspace = true
 alloy-primitives.workspace = true
+base-common-chains.workspace = true
 alloy-rpc-types-eth.workspace = true
-base-alloy-chains.workspace = true
-base-alloy-consensus.workspace = true
 alloy-rpc-types-engine.workspace = true
-base-alloy-rpc-types-engine = { workspace = true, features = ["reth"] }
+base-common-consensus = { workspace = true, features = ["reth"] }
+base-common-rpc-types-engine = { workspace = true, features = ["reth"] }
 
 # async
 tokio.workspace = true
 
 # misc
-serde.workspace = true
 clap.workspace = true
 eyre.workspace = true
+serde.workspace = true
 futures.workspace = true
 tracing.workspace = true
 humantime.workspace = true
@@ -100,8 +96,8 @@ reth-node-builder = { workspace = true, features = ["test-utils"] }
 
 alloy-eips.workspace = true
 alloy-network.workspace = true
-base-alloy-evm.workspace = true
-base-alloy-network.workspace = true
+base-common-evm.workspace = true
+base-common-network.workspace = true
 
 [features]
 default = [ "reth-codec" ]
@@ -124,10 +120,9 @@ js-tracer = [
 ]
 test-utils = [
 	"alloy-genesis",
+	"base-common-consensus/arbitrary",
 	"base-execution-exex/test-utils",
-	"base-execution-primitives/arbitrary",
 	"base-node-core/test-utils",
-	"base-protocol/test-utils",
 	"reth-chainspec/test-utils",
 	"reth-codec",
 	"reth-consensus/test-utils",
@@ -148,7 +143,7 @@ test-utils = [
 	"reth-trie-db/test-utils",
 	"serde_json",
 ]
-reth-codec = [ "base-execution-primitives/reth-codec" ]
+reth-codec = []
 
 [[test]]
 name = "e2e_testsuite"

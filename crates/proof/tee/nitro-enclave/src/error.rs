@@ -1,5 +1,6 @@
 //! Error types for enclave server operations.
 
+use base_proof_preimage::PreimageKey;
 use thiserror::Error;
 
 /// Errors that can occur during NSM operations.
@@ -26,58 +27,6 @@ pub enum NsmError {
     /// Failed to get random bytes.
     #[error("failed to get random bytes: {0}")]
     Random(String),
-}
-
-/// Errors that can occur during attestation operations.
-#[derive(Debug, Clone, Error)]
-pub enum AttestationError {
-    /// Failed to decode CA roots from base64.
-    #[error("failed to decode CA roots: {0}")]
-    Base64Decode(String),
-    /// CA roots checksum mismatch.
-    #[error("CA roots checksum mismatch: expected {expected}, got {actual}")]
-    ChecksumMismatch {
-        /// Expected checksum.
-        expected: String,
-        /// Actual checksum.
-        actual: String,
-    },
-    /// Failed to read CA roots zip.
-    #[error("failed to read CA roots zip: {0}")]
-    ZipRead(String),
-    /// Failed to parse PEM certificate.
-    #[error("failed to parse PEM certificate: {0}")]
-    PemParse(String),
-    /// Failed to verify attestation.
-    #[error("failed to verify attestation: {0}")]
-    Verification(String),
-    /// Failed to parse CBOR attestation document.
-    #[error("failed to parse CBOR attestation: {0}")]
-    CborParse(String),
-    /// Failed to verify COSE signature.
-    #[error("failed to verify COSE signature: {0}")]
-    CoseVerify(String),
-    /// Certificate chain verification failed.
-    #[error("certificate chain verification failed: {0}")]
-    CertificateChain(String),
-    /// Certificate has expired.
-    #[error("certificate expired: not valid after {not_after}")]
-    CertificateExpired {
-        /// The expiry time of the certificate.
-        not_after: String,
-    },
-    /// Certificate is not yet valid.
-    #[error("certificate not yet valid: not valid before {not_before}")]
-    CertificateNotYetValid {
-        /// The not-before time of the certificate.
-        not_before: String,
-    },
-    /// Certificate chain verification failed against trusted root.
-    #[error("certificate chain verification failed: {0}")]
-    ChainVerificationFailed(String),
-    /// X509 store operation error.
-    #[error("X509 store error: {0}")]
-    X509StoreError(String),
 }
 
 /// Errors that can occur during cryptographic operations.
@@ -144,9 +93,6 @@ pub enum NitroError {
     /// NSM error.
     #[error(transparent)]
     Nsm(#[from] NsmError),
-    /// Attestation error.
-    #[error(transparent)]
-    Attestation(#[from] AttestationError),
     /// Cryptographic error.
     #[error(transparent)]
     Crypto(#[from] CryptoError),
@@ -165,6 +111,9 @@ pub enum NitroError {
     /// Unsupported chain ID.
     #[error("unsupported chain ID: {0}")]
     UnsupportedChain(u64),
+    /// A preimage's content does not match its hash-based key.
+    #[error("preimage hash mismatch for key {0}")]
+    InvalidPreimage(PreimageKey),
 }
 
 /// A specialized Result type for nitro enclave operations.
@@ -179,7 +128,6 @@ mod tests {
     #[test]
     fn error_types_are_send_sync() {
         assert_send_sync::<NsmError>();
-        assert_send_sync::<AttestationError>();
         assert_send_sync::<CryptoError>();
         assert_send_sync::<ProposalError>();
         assert_send_sync::<NitroError>();
@@ -190,7 +138,6 @@ mod tests {
         fn assert_clone<T: Clone>() {}
 
         assert_clone::<NsmError>();
-        assert_clone::<AttestationError>();
         assert_clone::<CryptoError>();
         assert_clone::<ProposalError>();
         assert_clone::<NitroError>();

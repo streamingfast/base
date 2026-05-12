@@ -2,11 +2,11 @@
 
 use std::sync::Arc;
 
-use base_alloy_rpc_types_engine::OpPayloadAttributes;
+use base_common_rpc_types_engine::BasePayloadAttributes;
 use base_consensus_genesis::RollupConfig;
 use base_protocol::BlockInfo;
 
-use super::metrics::{inc_drift_empty_block, inc_recovery_mode_block};
+use crate::Metrics;
 
 /// The `PoolActivation` type identifies if the transaction pool should be enabled.
 #[derive(Debug, Clone)]
@@ -27,11 +27,11 @@ impl PoolActivation {
         &self,
         recovery_mode: bool,
         l1_origin: BlockInfo,
-        attributes: &OpPayloadAttributes,
+        attributes: &BasePayloadAttributes,
     ) -> bool {
         if recovery_mode {
             warn!(target: "sequencer", "Sequencer is in recovery mode, producing empty block");
-            inc_recovery_mode_block();
+            Metrics::sequencer_recovery_mode_blocks_total().increment(1);
             return false;
         }
 
@@ -46,7 +46,7 @@ impl PoolActivation {
                 l1_timestamp = l1_origin.timestamp,
                 "L2 timestamp beyond sequencer drift, producing empty block"
             );
-            inc_drift_empty_block();
+            Metrics::sequencer_drift_empty_blocks_total().increment(1);
             return false;
         }
 

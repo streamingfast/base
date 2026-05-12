@@ -5,7 +5,7 @@ use alloc::string::String;
 use alloy_eips::BlockId;
 use alloy_primitives::B256;
 use base_consensus_genesis::SystemConfigUpdateError;
-use base_protocol::{DepositError, SpanBatchError};
+use base_protocol::{DepositDecodeError, SpanBatchError};
 use thiserror::Error;
 
 use crate::BuilderError;
@@ -266,13 +266,6 @@ pub enum PipelineError {
     /// failures, API errors, and provider-specific issues.
     #[error("Provider error: {0}")]
     Provider(String),
-    /// The pipeline received an unsupported signal type.
-    ///
-    /// This error occurs when a pipeline stage receives a signal that it
-    /// cannot process or that is not supported in the current configuration.
-    /// It indicates a protocol version mismatch or configuration issue.
-    #[error("Unsupported signal")]
-    UnsupportedSignal,
 }
 
 impl PipelineError {
@@ -380,7 +373,7 @@ pub enum PipelineEncodingError {
     EmptyBuffer,
     /// Deposit decoding error.
     #[error("Error decoding deposit: {0}")]
-    DepositError(#[from] DepositError),
+    DepositDecodeError(#[from] DepositDecodeError),
     /// Alloy RLP Encoding Error.
     #[error("RLP error: {0}")]
     AlloyRlpError(alloy_rlp::Error),
@@ -428,7 +421,8 @@ mod tests {
 
     #[test]
     fn test_pipeline_encoding_error_source() {
-        let err = PipelineEncodingError::DepositError(DepositError::UnexpectedTopicsLen(0));
+        let err =
+            PipelineEncodingError::DepositDecodeError(DepositDecodeError::UnexpectedTopicsLen(0));
         assert!(err.source().is_some());
 
         let err = SpanBatchError::TooBigSpanBatchSize;

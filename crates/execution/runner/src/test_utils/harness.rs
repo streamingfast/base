@@ -8,15 +8,15 @@ use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types::BlockNumberOrTag;
 use alloy_rpc_types_engine::PayloadAttributes;
-use base_alloy_consensus::OpBlock;
-use base_alloy_network::Base;
-use base_alloy_rpc_types::OpGenesisInfo;
-use base_alloy_rpc_types_engine::OpPayloadAttributes;
-use base_execution_chainspec::OpChainSpec;
+use base_common_consensus::BaseBlock;
+use base_common_network::Base;
+use base_common_rpc_types::GenesisInfo;
+use base_common_rpc_types_engine::BasePayloadAttributes;
+use base_execution_chainspec::BaseChainSpec;
+use base_test_utils::build_test_genesis;
 use eyre::{Result, eyre};
-use reth_chainspec::ChainSpecProvider;
 use reth_primitives_traits::{Block as BlockT, RecoveredBlock};
-use reth_provider::{BlockNumReader, BlockReader};
+use reth_provider::{BlockNumReader, BlockReader, ChainSpecProvider};
 use tokio::time::sleep;
 
 use crate::{
@@ -34,7 +34,7 @@ use crate::{
 #[derive(Debug, Default)]
 pub struct TestHarnessBuilder {
     extensions: Vec<Box<dyn BaseNodeExtension>>,
-    chain_spec: Option<Arc<OpChainSpec>>,
+    chain_spec: Option<Arc<BaseChainSpec>>,
 }
 
 impl TestHarnessBuilder {
@@ -60,7 +60,7 @@ impl TestHarnessBuilder {
     /// Set a custom chain spec for the test harness.
     ///
     /// If not provided, the default genesis is built programmatically.
-    pub fn with_chain_spec(mut self, chain_spec: Arc<OpChainSpec>) -> Self {
+    pub fn with_chain_spec(mut self, chain_spec: Arc<BaseChainSpec>) -> Self {
         self.chain_spec = Some(chain_spec);
         self
     }
@@ -70,8 +70,8 @@ impl TestHarnessBuilder {
         init_silenced_tracing();
 
         let chain_spec = self.chain_spec.unwrap_or_else(|| {
-            let genesis = crate::test_utils::build_test_genesis();
-            Arc::new(OpChainSpec::from_genesis(genesis))
+            let genesis = build_test_genesis();
+            Arc::new(BaseChainSpec::from_genesis(genesis))
         });
 
         let node = LocalNode::new(self.extensions, chain_spec).await?;
@@ -158,7 +158,7 @@ impl TestHarness {
         let eip_1559_params = ((base_fee_params.max_change_denominator as u64) << 32)
             | (base_fee_params.elasticity_multiplier as u64);
 
-        let payload_attributes = OpPayloadAttributes {
+        let payload_attributes = BasePayloadAttributes {
             payload_attributes: PayloadAttributes {
                 timestamp: next_timestamp,
                 parent_beacon_block_root: Some(parent_beacon_block_root),
@@ -183,11 +183,11 @@ impl TestHarness {
 
         sleep(Duration::from_millis(BLOCK_BUILD_DELAY_MS)).await;
 
-        let v1_active = OpGenesisInfo::extract_from(&chain_spec.genesis.config.extra_fields)
+        let azul_active = GenesisInfo::extract_from(&chain_spec.genesis.config.extra_fields)
             .and_then(|genesis_info| genesis_info.base.v1)
             .is_some_and(|activation_time| next_timestamp >= activation_time);
 
-        let (execution_payload, execution_requests): (_, Vec<Bytes>) = if v1_active {
+        let (execution_payload, execution_requests): (_, Vec<Bytes>) = if azul_active {
             let payload_envelope = self.engine.get_payload_v5(payload_id).await?;
             (payload_envelope.execution_payload, payload_envelope.execution_requests)
         } else {
@@ -228,7 +228,7 @@ impl TestHarness {
     }
 
     /// Return the latest recovered block as seen by the local blockchain provider.
-    pub fn latest_block(&self) -> RecoveredBlock<OpBlock> {
+    pub fn latest_block(&self) -> RecoveredBlock<BaseBlock> {
         let provider = self.blockchain_provider();
         let best_number = provider.best_block_number().expect("able to read best block number");
         let block = provider
@@ -239,7 +239,7 @@ impl TestHarness {
     }
 
     /// Return the chain specification used by the harness.
-    pub fn chain_spec(&self) -> Arc<OpChainSpec> {
+    pub fn chain_spec(&self) -> Arc<BaseChainSpec> {
         self.node.blockchain_provider().chain_spec()
     }
 
@@ -253,9 +253,9 @@ impl TestHarness {
 mod tests {
     use alloy_primitives::U256;
     use alloy_provider::Provider;
+    use base_test_utils::{Account, DEVNET_CHAIN_ID};
 
     use super::*;
-    use crate::test_utils::Account;
 
     #[tokio::test]
     async fn test_harness_setup() -> Result<()> {
@@ -263,7 +263,7 @@ mod tests {
 
         let provider = harness.provider();
         let chain_id = provider.get_chain_id().await?;
-        assert_eq!(chain_id, crate::test_utils::DEVNET_CHAIN_ID);
+        assert_eq!(chain_id, DEVNET_CHAIN_ID);
 
         let alice_balance = provider.get_balance(Account::Alice.address()).await?;
         assert!(alice_balance > U256::ZERO);

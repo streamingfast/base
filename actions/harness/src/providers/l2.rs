@@ -3,7 +3,7 @@ use std::sync::Arc;
 use alloy_eips::BlockNumHash;
 use alloy_primitives::map::HashMap;
 use async_trait::async_trait;
-use base_alloy_consensus::OpBlock;
+use base_common_consensus::BaseBlock;
 use base_consensus_derive::{L2ChainProvider, PipelineError, PipelineErrorKind};
 use base_consensus_genesis::{RollupConfig, SystemConfig};
 use base_protocol::{BatchValidationProvider, BlockInfo, L2BlockInfo};
@@ -42,7 +42,7 @@ pub struct ActionL2ChainProvider {
     /// L2 blocks by block number.
     blocks: HashMap<u64, L2BlockInfo>,
     /// Op blocks (headers + txs) by block number, needed for batch validation.
-    op_blocks: HashMap<u64, OpBlock>,
+    op_blocks: HashMap<u64, BaseBlock>,
     /// System configs by L2 block number.
     system_configs: HashMap<u64, SystemConfig>,
 }
@@ -70,7 +70,15 @@ impl ActionL2ChainProvider {
             seq_num: 0,
         };
 
-        let genesis_config = rollup_config.genesis.system_config.unwrap_or_default();
+        // Use the rollup config's genesis system config, falling back to a harness
+        // default with a non-zero gas_limit. `SystemConfig::default()` has gas_limit=0
+        // (derived Default), which causes the production payload builder to reject all
+        // transactions. Tests that use `RollupConfig::default()` (no explicit system
+        // config) need a workable gas_limit to build blocks.
+        let genesis_config = rollup_config
+            .genesis
+            .system_config
+            .unwrap_or_else(|| SystemConfig { gas_limit: 30_000_000, ..Default::default() });
 
         provider.insert_block(genesis_l2);
         provider.insert_system_config(rollup_config.genesis.l2.number, genesis_config);
@@ -83,7 +91,7 @@ impl ActionL2ChainProvider {
     }
 
     /// Insert a known L2 op-block (with transactions) into the provider.
-    pub fn insert_op_block(&mut self, number: u64, block: OpBlock) {
+    pub fn insert_op_block(&mut self, number: u64, block: BaseBlock) {
         self.op_blocks.insert(number, block);
     }
 
@@ -104,7 +112,7 @@ impl BatchValidationProvider for ActionL2ChainProvider {
         self.blocks.get(&number).copied().ok_or(L2ProviderError::BlockNotFound(number))
     }
 
-    async fn block_by_number(&mut self, number: u64) -> Result<OpBlock, L2ProviderError> {
+    async fn block_by_number(&mut self, number: u64) -> Result<BaseBlock, L2ProviderError> {
         self.op_blocks.get(&number).cloned().ok_or(L2ProviderError::BlockNotFound(number))
     }
 }

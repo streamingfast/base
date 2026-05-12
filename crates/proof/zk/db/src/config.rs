@@ -33,7 +33,8 @@ impl DatabaseConfig {
         let password = std::env::var("POSTGRES_PASSWORD")
             .context("POSTGRES_PASSWORD environment variable is required")?;
 
-        let url = format!("postgres://{user}:{password}@{host}:{port}/{db}");
+        let sslmode = std::env::var("POSTGRES_SSLMODE").unwrap_or_else(|_| "require".to_string());
+        let url = format!("postgres://{user}:{password}@{host}:{port}/{db}?sslmode={sslmode}");
 
         Ok(Self { url, max_connections: 10, connection_timeout: Duration::from_secs(30) })
     }

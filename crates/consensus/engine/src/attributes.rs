@@ -4,10 +4,12 @@ use alloy_eips::{Decodable2718, eip1559::BaseFeeParams};
 use alloy_network::TransactionResponse;
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_eth::{Block, BlockTransactions, Withdrawals};
-use base_alloy_consensus::{EIP1559ParamError, HoloceneExtraData, JovianExtraData, OpTxEnvelope};
-use base_alloy_rpc_types::Transaction;
+use base_common_consensus::{
+    BaseTxEnvelope, EIP1559ParamError, HoloceneExtraData, JovianExtraData,
+};
+use base_common_rpc_types::Transaction;
 use base_consensus_genesis::RollupConfig;
-use base_protocol::OpAttributesWithParent;
+use base_protocol::AttributesWithParent;
 
 /// Result of validating payload attributes against an execution layer block.
 ///
@@ -20,7 +22,7 @@ use base_protocol::OpAttributesWithParent;
 /// ```rust,ignore
 /// use base_consensus_engine::AttributesMatch;
 /// use base_consensus_genesis::RollupConfig;
-/// use base_protocol::OpAttributesWithParent;
+/// use base_protocol::AttributesWithParent;
 ///
 /// let config = RollupConfig::default();
 /// let match_result = AttributesMatch::check_withdrawals(&config, &attributes, &block);
@@ -51,7 +53,7 @@ impl AttributesMatch {
     /// Checks that withdrawals for a block and attributes match.
     pub fn check_withdrawals(
         config: &RollupConfig,
-        attributes: &OpAttributesWithParent,
+        attributes: &AttributesWithParent,
         block: &Block<Transaction>,
     ) -> Self {
         let attr_withdrawals = attributes.attributes().payload_attributes.withdrawals.as_ref();
@@ -146,7 +148,7 @@ impl AttributesMatch {
                 "Checking attributes transaction against block transaction",
             );
             // Let's try to deserialize the attributes transaction
-            let Ok(attr_tx) = OpTxEnvelope::decode_2718(&mut &attr_tx_bytes[..]) else {
+            let Ok(attr_tx) = BaseTxEnvelope::decode_2718(&mut &attr_tx_bytes[..]) else {
                 error!(
                     "Impossible to deserialize transaction from attributes. If we have stored these attributes it means the transactions where well formatted. This is a bug"
                 );
@@ -170,7 +172,7 @@ impl AttributesMatch {
     /// Validates and compares EIP1559 parameters for consolidation.
     fn check_eip1559(
         config: &RollupConfig,
-        attributes: &OpAttributesWithParent,
+        attributes: &AttributesWithParent,
         block: &Block<Transaction>,
     ) -> Self {
         // We can assume that the EIP-1559 params are set iff holocene is active.
@@ -251,12 +253,12 @@ impl AttributesMatch {
         Self::Match
     }
 
-    /// Checks if the specified [`OpAttributesWithParent`] matches the specified [`Block`].
+    /// Checks if the specified [`AttributesWithParent`] matches the specified [`Block`].
     /// Returns [`AttributesMatch::Match`] if they match, otherwise returns
     /// [`AttributesMatch::Mismatch`].
     pub fn check(
         config: &RollupConfig,
-        attributes: &OpAttributesWithParent,
+        attributes: &AttributesWithParent,
         block: &Block<Transaction>,
     ) -> Self {
         if attributes.parent.block_info.hash != block.header.inner.parent_hash {
@@ -334,7 +336,7 @@ impl AttributesMatch {
     }
 }
 
-/// An enum over the type of mismatch between [`OpAttributesWithParent`]
+/// An enum over the type of mismatch between [`AttributesWithParent`]
 /// and a [`Block`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttributesMismatch {
@@ -354,7 +356,7 @@ pub enum AttributesMismatch {
     TransactionLen(usize, usize),
     /// A mismatch in the content of some transactions contained in the attributes and the block.
     TransactionContent(B256, B256),
-    /// The EIP1559 payload for the [`OpAttributesWithParent`] is missing when holocene is active.
+    /// The EIP1559 payload for the [`AttributesWithParent`] is missing when holocene is active.
     MissingAttributesEIP1559,
     /// The EIP1559 payload for the block is missing when holocene is active.
     MissingBlockEIP1559,
@@ -370,7 +372,7 @@ pub enum AttributesMismatch {
     Transactions(u64, u64),
     /// The gas limit of the block does not match the gas limit of the attributes.
     GasLimit(u64, u64),
-    /// The gas limit for the [`OpAttributesWithParent`] is missing.
+    /// The gas limit for the [`AttributesWithParent`] is missing.
     MissingAttributesGasLimit,
     /// The fee recipient of the block does not match the fee recipient of the attributes.
     FeeRecipient(Address, Address),
@@ -399,17 +401,17 @@ mod tests {
     use alloy_primitives::{Bytes, FixedBytes, address, b256};
     use alloy_rpc_types_eth::BlockTransactions;
     use arbitrary::{Arbitrary, Unstructured};
-    use base_alloy_consensus::HoloceneExtraData;
-    use base_alloy_rpc_types_engine::OpPayloadAttributes;
+    use base_common_consensus::HoloceneExtraData;
+    use base_common_rpc_types_engine::BasePayloadAttributes;
     use base_consensus_registry::Registry;
     use base_protocol::{BlockInfo, L2BlockInfo};
 
     use super::*;
     use crate::AttributesMismatch::EIP1559Parameters;
 
-    fn default_attributes() -> OpAttributesWithParent {
-        OpAttributesWithParent {
-            attributes: OpPayloadAttributes::default(),
+    fn default_attributes() -> AttributesWithParent {
+        AttributesWithParent {
+            attributes: BasePayloadAttributes::default(),
             parent: L2BlockInfo::default(),
             derived_from: Some(BlockInfo::default()),
             is_last_in_span: true,
@@ -553,7 +555,7 @@ mod tests {
             .collect()
     }
 
-    fn test_transactions_match_helper() -> (OpAttributesWithParent, Block<Transaction>) {
+    fn test_transactions_match_helper() -> (AttributesWithParent, Block<Transaction>) {
         const NUM_TXS: usize = 10;
 
         let transactions = generate_txs(NUM_TXS);
@@ -590,7 +592,7 @@ mod tests {
     fn test_attributes_mismatch_check_transactions_len() {
         let cfg = default_rollup_config();
         let (mut attributes, block) = test_transactions_match_helper();
-        attributes.attributes = OpPayloadAttributes {
+        attributes.attributes = BasePayloadAttributes {
             transactions: attributes.attributes.transactions.map(|mut txs| {
                 txs.pop();
                 txs
@@ -639,7 +641,8 @@ mod tests {
     fn test_attributes_mismatch_empty_tx_attributes() {
         let cfg = default_rollup_config();
         let (mut attributes, block) = test_transactions_match_helper();
-        attributes.attributes = OpPayloadAttributes { transactions: None, ..attributes.attributes };
+        attributes.attributes =
+            BasePayloadAttributes { transactions: None, ..attributes.attributes };
 
         let block_txs_len = block.transactions.len();
 
@@ -690,7 +693,7 @@ mod tests {
         let (mut attributes, mut block) = test_transactions_match_helper();
 
         attributes.attributes =
-            OpPayloadAttributes { transactions: Some(vec![]), ..attributes.attributes };
+            BasePayloadAttributes { transactions: Some(vec![]), ..attributes.attributes };
 
         block.transactions = BlockTransactions::Full(vec![]);
 
@@ -699,7 +702,8 @@ mod tests {
 
         // Edge case: if the block transactions and the payload attributes are empty, we can also
         // use the hash format (this is the default value of `BlockTransactions`).
-        attributes.attributes = OpPayloadAttributes { transactions: None, ..attributes.attributes };
+        attributes.attributes =
+            BasePayloadAttributes { transactions: None, ..attributes.attributes };
         block.transactions = BlockTransactions::Hashes(vec![]);
 
         let check = AttributesMatch::check(cfg, &attributes, &block);
@@ -714,7 +718,7 @@ mod tests {
         let (mut attributes, mut block) = test_transactions_match_helper();
 
         attributes.attributes =
-            OpPayloadAttributes { transactions: Some(vec![]), ..attributes.attributes };
+            BasePayloadAttributes { transactions: Some(vec![]), ..attributes.attributes };
 
         block.transactions = BlockTransactions::Hashes(vec![]);
 
@@ -729,7 +733,7 @@ mod tests {
         let (mut attributes, mut block) = test_transactions_match_helper();
 
         attributes.attributes =
-            OpPayloadAttributes { transactions: Some(vec![]), ..attributes.attributes };
+            BasePayloadAttributes { transactions: Some(vec![]), ..attributes.attributes };
 
         block.transactions = BlockTransactions::Uncle;
 
@@ -739,7 +743,7 @@ mod tests {
         assert_eq!(check, expected);
     }
 
-    fn eip1559_test_setup() -> (RollupConfig, OpAttributesWithParent, Block<Transaction>) {
+    fn eip1559_test_setup() -> (RollupConfig, AttributesWithParent, Block<Transaction>) {
         let mut cfg = default_rollup_config().clone();
 
         // We need to activate holocene to make sure it works! We set the activation time to zero to

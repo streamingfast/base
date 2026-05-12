@@ -4,10 +4,10 @@ use alloy_consensus::{BlockHeader, Header};
 use alloy_eips::{calc_next_block_base_fee, eip1559::BaseFeeParams, eip7840::BlobParams};
 use alloy_evm::{EvmEnv, EvmFactory};
 use alloy_primitives::U256;
-use base_alloy_rpc_types_engine::OpPayloadAttributes;
+use base_common_evm::OpSpecId;
+use base_common_rpc_types_engine::BasePayloadAttributes;
 use base_consensus_genesis::RollupConfig;
 use base_proof_mpt::TrieHinter;
-use base_revm::{OpSpecId, RollupConfigExt};
 use revm::{
     context::{BlockEnv, CfgEnv},
     context_interface::block::BlobExcessGasAndPrice,
@@ -35,7 +35,7 @@ where
         &self,
         spec_id: OpSpecId,
         parent_header: &Header,
-        payload_attrs: &OpPayloadAttributes,
+        payload_attrs: &BasePayloadAttributes,
         base_fee_params: &BaseFeeParams,
         min_base_fee: u64,
     ) -> ExecutorResult<EvmEnv<OpSpecId>> {
@@ -54,7 +54,7 @@ where
     pub(crate) fn evm_cfg_env(&self, timestamp: u64) -> CfgEnv<OpSpecId> {
         CfgEnv::new()
             .with_chain_id(self.config.l2_chain_id.id())
-            .with_spec_and_mainnet_gas_params(self.config.spec_id(timestamp))
+            .with_spec_and_mainnet_gas_params(OpSpecId::from_timestamp(self.config, timestamp))
     }
 
     fn next_block_base_fee(
@@ -92,12 +92,12 @@ where
         Some(next_block_base_fee)
     }
 
-    /// Prepares a [`BlockEnv`] with the given [`OpPayloadAttributes`].
+    /// Prepares a [`BlockEnv`] with the given [`BasePayloadAttributes`].
     pub(crate) fn prepare_block_env(
         &self,
         spec_id: OpSpecId,
         parent_header: &Header,
-        payload_attrs: &OpPayloadAttributes,
+        payload_attrs: &BasePayloadAttributes,
         base_fee_params: &BaseFeeParams,
         min_base_fee: u64,
     ) -> ExecutorResult<BlockEnv> {

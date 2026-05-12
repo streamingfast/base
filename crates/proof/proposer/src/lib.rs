@@ -6,9 +6,6 @@
 )]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-mod balance;
-pub use balance::{BALANCE_POLL_INTERVAL, balance_monitor};
-
 mod cli;
 pub use cli::{
     AdminArgs, Cli, HealthArgs, LogArgs, MetricsArgs, ProposerArgs, SignerCli, TxManagerCli,
@@ -18,34 +15,30 @@ mod config;
 pub use config::{ConfigError, ProposerConfig};
 
 mod constants;
-pub use constants::*;
+pub use constants::{
+    MAX_PROOF_RETRIES, PROPOSAL_TIMEOUT, PROVER_TIMEOUT, RECOVERY_SCAN_CONCURRENCY,
+};
 
 mod output_proposer;
-pub use output_proposer::{
-    DryRunProposer, OutputProposer, ProposalSubmitter, build_proof_data, is_game_already_exists,
-};
+pub use output_proposer::{DryRunProposer, OutputProposer, ProposalSubmitter};
 
 mod driver;
-pub use driver::{
-    DriverConfig, PipelineConfig, PipelineHandle, ProposerDriverControl, ProvingPipeline,
-    RecoveredState,
-};
+pub use driver::{DriverConfig, PipelineHandle, ProposerDriverControl, RecoveredState};
+
+mod pipeline;
+pub use pipeline::{PipelineConfig, ProvingPipeline};
 
 mod error;
-pub use error::*;
+pub use error::{ProposerError, ProposerResult};
 
 mod admin;
-pub use admin::AdminState;
+pub use admin::{AdminServer, ProposerAdminApiServer, ProposerAdminApiServerImpl};
 
 mod metrics;
-pub use metrics::{
-    ACCOUNT_BALANCE_WEI, INFO, L2_OUTPUT_PROPOSALS_TOTAL, LABEL_VERSION, TEE_SIGNER_INVALID_TOTAL,
-    UP, record_startup_metrics,
-};
+pub use metrics::Metrics;
 
 mod service;
-pub use service::run;
+pub use service::ProposerService;
 
-/// Shared mock implementations for tests.
 #[cfg(test)]
 pub mod test_utils;

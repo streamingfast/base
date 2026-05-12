@@ -2,8 +2,8 @@ use std::{fmt::Debug, sync::Arc};
 
 use alloy_rpc_types_engine::PayloadId;
 use async_trait::async_trait;
-use base_alloy_rpc_types_engine::OpExecutionPayloadEnvelope;
-use base_protocol::{L2BlockInfo, OpAttributesWithParent};
+use base_common_rpc_types_engine::BaseExecutionPayloadEnvelope;
+use base_protocol::{AttributesWithParent, L2BlockInfo};
 use derive_more::Constructor;
 use tokio::sync::{mpsc, watch};
 
@@ -26,7 +26,7 @@ pub trait SequencerEngineClient: Debug + Send + Sync {
     /// Returns a `PayloadId` that can be used to seal the block later.
     async fn start_build_block(
         &self,
-        attributes: OpAttributesWithParent,
+        attributes: AttributesWithParent,
     ) -> EngineClientResult<PayloadId>;
 
     /// Fetches the sealed payload envelope from the engine WITHOUT inserting it.
@@ -34,14 +34,14 @@ pub trait SequencerEngineClient: Debug + Send + Sync {
     async fn get_sealed_payload(
         &self,
         payload_id: PayloadId,
-        attributes: OpAttributesWithParent,
-    ) -> EngineClientResult<OpExecutionPayloadEnvelope>;
+        attributes: AttributesWithParent,
+    ) -> EngineClientResult<BaseExecutionPayloadEnvelope>;
 
     /// Fire-and-forget: submits the sealed payload to the engine for insertion (`new_payload` + FCU).
     /// Call this after a successful conductor commit.
     async fn insert_unsafe_payload(
         &self,
-        payload: OpExecutionPayloadEnvelope,
+        payload: BaseExecutionPayloadEnvelope,
     ) -> EngineClientResult<()>;
 
     /// Returns the current unsafe head [`L2BlockInfo`].
@@ -61,7 +61,7 @@ impl<T: SequencerEngineClient> SequencerEngineClient for Arc<T> {
 
     async fn start_build_block(
         &self,
-        attributes: OpAttributesWithParent,
+        attributes: AttributesWithParent,
     ) -> EngineClientResult<PayloadId> {
         (**self).start_build_block(attributes).await
     }
@@ -69,14 +69,14 @@ impl<T: SequencerEngineClient> SequencerEngineClient for Arc<T> {
     async fn get_sealed_payload(
         &self,
         payload_id: PayloadId,
-        attributes: OpAttributesWithParent,
-    ) -> EngineClientResult<OpExecutionPayloadEnvelope> {
+        attributes: AttributesWithParent,
+    ) -> EngineClientResult<BaseExecutionPayloadEnvelope> {
         (**self).get_sealed_payload(payload_id, attributes).await
     }
 
     async fn insert_unsafe_payload(
         &self,
-        payload: OpExecutionPayloadEnvelope,
+        payload: BaseExecutionPayloadEnvelope,
     ) -> EngineClientResult<()> {
         (**self).insert_unsafe_payload(payload).await
     }
@@ -123,7 +123,7 @@ impl SequencerEngineClient for QueuedSequencerEngineClient {
 
     async fn start_build_block(
         &self,
-        attributes: OpAttributesWithParent,
+        attributes: AttributesWithParent,
     ) -> EngineClientResult<PayloadId> {
         let (payload_id_tx, mut payload_id_rx) = mpsc::channel(1);
 
@@ -152,8 +152,8 @@ impl SequencerEngineClient for QueuedSequencerEngineClient {
     async fn get_sealed_payload(
         &self,
         payload_id: PayloadId,
-        attributes: OpAttributesWithParent,
-    ) -> EngineClientResult<OpExecutionPayloadEnvelope> {
+        attributes: AttributesWithParent,
+    ) -> EngineClientResult<BaseExecutionPayloadEnvelope> {
         let (result_tx, mut result_rx) = mpsc::channel(1);
 
         trace!(target: "sequencer", ?attributes, "Sending get payload request to engine.");
@@ -184,11 +184,11 @@ impl SequencerEngineClient for QueuedSequencerEngineClient {
 
     async fn insert_unsafe_payload(
         &self,
-        payload: OpExecutionPayloadEnvelope,
+        payload: BaseExecutionPayloadEnvelope,
     ) -> EngineClientResult<()> {
         trace!(target: "sequencer", "Sending insert unsafe payload request to engine.");
         self.engine_actor_request_tx
-            .send(EngineActorRequest::ProcessUnsafeL2BlockRequest(Box::new(payload)))
+            .send(EngineActorRequest::ProcessLocalUnsafeL2BlockRequest(Box::new(payload)))
             .await
             .map_err(|_| EngineClientError::RequestError("request channel closed.".to_string()))
     }

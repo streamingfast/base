@@ -1,20 +1,17 @@
 use std::{fmt, sync::Arc};
 
 use base_zk_client::ProveBlockRequest;
-use base_zk_db::{
-    CreateProofSession, MarkOutboxProcessed, ProofRequestRepo, ProofStatus, SessionType,
-};
+use base_zk_db::{CreateProofSession, ProofRequestRepo, ProofStatus, ProofType, SessionType};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::backends::ProvingBackend;
+use crate::{backends::ProvingBackend, metrics};
 
 /// Individual worker that processes a single proving task
 pub struct ProverWorker {
     repo: ProofRequestRepo,
     backend: Arc<dyn ProvingBackend>,
     proof_request_id: Uuid,
-    sequence_id: i64,
     params: ProveBlockRequest,
 }
 
@@ -33,10 +30,9 @@ impl ProverWorker {
         repo: ProofRequestRepo,
         backend: Arc<dyn ProvingBackend>,
         proof_request_id: Uuid,
-        sequence_id: i64,
         params: ProveBlockRequest,
     ) -> Self {
-        Self { repo, backend, proof_request_id, sequence_id, params }
+        Self { repo, backend, proof_request_id, params }
     }
 
     /// Run the proving task
@@ -62,14 +58,6 @@ impl ProverWorker {
             return Ok(());
         }
 
-        // Mark outbox entry as processed now that we've claimed the task.
-        // This is done after atomic_claim_task succeeds to ensure we never
-        // mark an outbox entry as processed without claiming the work.
-        self.repo
-            .mark_outbox_processed(MarkOutboxProcessed { sequence_id: self.sequence_id })
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to mark outbox entry as processed: {e}"))?;
-
         info!(
             proof_request_id = %self.proof_request_id,
             backend = %self.backend.name(),
@@ -82,11 +70,19 @@ impl ProverWorker {
             "Calling backend to prove block"
         );
 
+        let pt_label = ProofType::try_from(self.params.proof_type)
+            .map_or("unknown", metrics::proof_type_label);
+
         // Call backend prove (backend handles temp dir creation and config)
         let result = self.backend.prove(&self.params).await;
 
         match result {
             Ok(prove_result) => {
+                // Record witness generation duration on success
+                if let Some(wg_ms) = prove_result.witness_gen_duration_ms {
+                    metrics::record_witness_generation_duration(pt_label, true, wg_ms);
+                }
+
                 // Success path
                 if let Some(session_id) = prove_result.session_id {
                     info!(
@@ -153,6 +149,11 @@ impl ProverWorker {
                         Some(error_msg.clone()),
                     )
                     .await?;
+
+                // Emit proof_requests_completed for early failures (PENDING → FAILED).
+                // These are never seen by the StatusPoller (which only queries RUNNING),
+                // so we emit directly here.
+                metrics::inc_proof_requests_completed("failed", pt_label);
 
                 info!(
                     proof_request_id = %self.proof_request_id,

@@ -3,15 +3,14 @@ use std::{marker::PhantomData, sync::Arc};
 use alloy_consensus::BlockHeader;
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ExecutionPayloadEnvelopeV2, ExecutionPayloadV1};
-use base_alloy_chains::BaseUpgrades;
-use base_alloy_consensus::OpBlock;
-use base_alloy_rpc_types_engine::{
-    OpExecutionData, OpExecutionPayloadEnvelopeV3, OpExecutionPayloadEnvelopeV4,
-    OpExecutionPayloadEnvelopeV5, OpPayloadAttributes,
+use base_common_chains::Upgrades;
+use base_common_consensus::{BaseBlock, Predeploys};
+use base_common_rpc_types_engine::{
+    BaseExecutionPayloadEnvelopeV3, BaseExecutionPayloadEnvelopeV4, BaseExecutionPayloadEnvelopeV5,
+    BasePayloadAttributes, ExecutionData,
 };
 use base_execution_consensus::isthmus;
-use base_execution_payload_builder::{OpExecutionPayloadValidator, OpPayloadTypes};
-use base_protocol::Predeploys;
+use base_execution_payload_builder::{BasePayloadTypes, OpExecutionPayloadValidator};
 use reth_consensus::ConsensusError;
 use reth_node_api::{
     BuiltPayload, EngineApiValidator, EngineTypes, NodePrimitives, PayloadValidator,
@@ -29,11 +28,11 @@ use reth_trie_common::{HashedPostState, KeyHasher};
 /// The types used in the Base beacon consensus engine.
 #[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
 #[non_exhaustive]
-pub struct OpEngineTypes<T: PayloadTypes = OpPayloadTypes> {
+pub struct OpEngineTypes<T: PayloadTypes = BasePayloadTypes> {
     _marker: PhantomData<T>,
 }
 
-impl<T: PayloadTypes<ExecutionData = OpExecutionData>> PayloadTypes for OpEngineTypes<T> {
+impl<T: PayloadTypes<ExecutionData = ExecutionData>> PayloadTypes for OpEngineTypes<T> {
     type ExecutionData = T::ExecutionData;
     type BuiltPayload = T::BuiltPayload;
     type PayloadAttributes = T::PayloadAttributes;
@@ -44,28 +43,25 @@ impl<T: PayloadTypes<ExecutionData = OpExecutionData>> PayloadTypes for OpEngine
             <<Self::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block,
         >,
     ) -> <T as PayloadTypes>::ExecutionData {
-        OpExecutionData::from_block_unchecked(
-            block.hash(),
-            &block.into_block().into_ethereum_block(),
-        )
+        ExecutionData::from_block_unchecked(block.hash(), &block.into_block().into_ethereum_block())
     }
 }
 
-impl<T: PayloadTypes<ExecutionData = OpExecutionData>> EngineTypes for OpEngineTypes<T>
+impl<T: PayloadTypes<ExecutionData = ExecutionData>> EngineTypes for OpEngineTypes<T>
 where
-    T::BuiltPayload: BuiltPayload<Primitives: NodePrimitives<Block = OpBlock>>
+    T::BuiltPayload: BuiltPayload<Primitives: NodePrimitives<Block = BaseBlock>>
         + TryInto<ExecutionPayloadV1>
         + TryInto<ExecutionPayloadEnvelopeV2>
-        + TryInto<OpExecutionPayloadEnvelopeV3>
-        + TryInto<OpExecutionPayloadEnvelopeV4>
-        + TryInto<OpExecutionPayloadEnvelopeV5>,
+        + TryInto<BaseExecutionPayloadEnvelopeV3>
+        + TryInto<BaseExecutionPayloadEnvelopeV4>
+        + TryInto<BaseExecutionPayloadEnvelopeV5>,
 {
     type ExecutionPayloadEnvelopeV1 = ExecutionPayloadV1;
     type ExecutionPayloadEnvelopeV2 = ExecutionPayloadEnvelopeV2;
-    type ExecutionPayloadEnvelopeV3 = OpExecutionPayloadEnvelopeV3;
-    type ExecutionPayloadEnvelopeV4 = OpExecutionPayloadEnvelopeV4;
-    type ExecutionPayloadEnvelopeV5 = OpExecutionPayloadEnvelopeV5;
-    type ExecutionPayloadEnvelopeV6 = OpExecutionPayloadEnvelopeV5;
+    type ExecutionPayloadEnvelopeV3 = BaseExecutionPayloadEnvelopeV3;
+    type ExecutionPayloadEnvelopeV4 = BaseExecutionPayloadEnvelopeV4;
+    type ExecutionPayloadEnvelopeV5 = BaseExecutionPayloadEnvelopeV5;
+    type ExecutionPayloadEnvelopeV6 = BaseExecutionPayloadEnvelopeV5;
 }
 
 /// Validator for Base engine API.
@@ -93,7 +89,7 @@ impl<P, Tx, ChainSpec> OpEngineValidator<P, Tx, ChainSpec> {
 impl<P, Tx, ChainSpec> Clone for OpEngineValidator<P, Tx, ChainSpec>
 where
     P: Clone,
-    ChainSpec: BaseUpgrades,
+    ChainSpec: Upgrades,
 {
     fn clone(&self) -> Self {
         Self {
@@ -107,7 +103,7 @@ where
 
 impl<P, Tx, ChainSpec> OpEngineValidator<P, Tx, ChainSpec>
 where
-    ChainSpec: BaseUpgrades,
+    ChainSpec: Upgrades,
 {
     /// Returns the chain spec used by the validator.
     #[inline]
@@ -120,8 +116,8 @@ impl<P, Tx, ChainSpec, Types> PayloadValidator<Types> for OpEngineValidator<P, T
 where
     P: StateProviderFactory + Unpin + 'static,
     Tx: SignedTransaction + Unpin + 'static,
-    ChainSpec: BaseUpgrades + Send + Sync + 'static,
-    Types: PayloadTypes<ExecutionData = OpExecutionData>,
+    ChainSpec: Upgrades + Send + Sync + 'static,
+    Types: PayloadTypes<ExecutionData = ExecutionData>,
 {
     type Block = alloy_consensus::Block<Tx>;
 
@@ -157,7 +153,7 @@ where
 
     fn convert_payload_to_block(
         &self,
-        payload: OpExecutionData,
+        payload: ExecutionData,
     ) -> Result<SealedBlock<Self::Block>, NewPayloadError> {
         self.inner.ensure_well_formed_payload(payload).map_err(NewPayloadError::other)
     }
@@ -166,13 +162,13 @@ where
 impl<Types, P, Tx, ChainSpec> EngineApiValidator<Types> for OpEngineValidator<P, Tx, ChainSpec>
 where
     Types: PayloadTypes<
-            PayloadAttributes = OpPayloadAttributes,
-            ExecutionData = OpExecutionData,
+            PayloadAttributes = BasePayloadAttributes,
+            ExecutionData = ExecutionData,
             BuiltPayload: BuiltPayload<Primitives: NodePrimitives<SignedTx = Tx>>,
         >,
     P: StateProviderFactory + Unpin + 'static,
     Tx: SignedTransaction + Unpin + 'static,
-    ChainSpec: BaseUpgrades + Send + Sync + 'static,
+    ChainSpec: Upgrades + Send + Sync + 'static,
 {
     fn validate_version_specific_fields(
         &self,
@@ -207,7 +203,7 @@ where
         validate_version_specific_fields(
             self.chain_spec(),
             version,
-            PayloadOrAttributes::<OpExecutionData, OpPayloadAttributes>::PayloadAttributes(
+            PayloadOrAttributes::<ExecutionData, BasePayloadAttributes>::PayloadAttributes(
                 attributes,
             ),
         )?;
@@ -265,7 +261,7 @@ where
 /// Canyon activates the Shanghai EIPs, see the Canyon specs for more details:
 /// <https://github.com/ethereum-optimism/optimism/blob/ab926c5fd1e55b5c864341c44842d6d1ca679d99/specs/superchain-upgrades.md#canyon>
 pub fn validate_withdrawals_presence(
-    chain_spec: impl BaseUpgrades,
+    chain_spec: impl Upgrades,
     version: EngineApiMessageVersion,
     message_validation_kind: MessageValidationKind,
     timestamp: u64,
@@ -306,7 +302,7 @@ pub fn validate_withdrawals_presence(
 mod tests {
     use alloy_primitives::{Address, B64, B256, b64};
     use alloy_rpc_types_engine::PayloadAttributes;
-    use base_alloy_chains::BaseChainConfig;
+    use base_common_chains::ChainConfig;
     use base_execution_chainspec::BASE_SEPOLIA;
     use reth_provider::noop::NoopProvider;
     use reth_trie_common::KeccakKeyHasher;
@@ -330,8 +326,8 @@ mod tests {
         eip_1559_params: Option<B64>,
         min_base_fee: Option<u64>,
         timestamp: u64,
-    ) -> OpPayloadAttributes {
-        OpPayloadAttributes {
+    ) -> BasePayloadAttributes {
+        BasePayloadAttributes {
             gas_limit: Some(1000),
             eip_1559_params,
             min_base_fee,
@@ -452,7 +448,7 @@ mod tests {
         let attributes = get_attributes(
             Some(b64!("0000000000000000")),
             Some(1),
-            BaseChainConfig::sepolia().jovian_timestamp,
+            ChainConfig::sepolia().jovian_timestamp,
         );
 
         let result = <engine::OpEngineValidator<_, _, _> as EngineApiValidator<
@@ -470,7 +466,7 @@ mod tests {
             BASE_SEPOLIA.clone(),
             NoopProvider::default(),
         );
-        let attributes = get_attributes(None, Some(1), BaseChainConfig::sepolia().jovian_timestamp);
+        let attributes = get_attributes(None, Some(1), ChainConfig::sepolia().jovian_timestamp);
 
         let result = <engine::OpEngineValidator<_, _, _> as EngineApiValidator<
             OpEngineTypes,
@@ -507,7 +503,7 @@ mod tests {
         let attributes = get_attributes(
             Some(b64!("0000000000000000")),
             None,
-            BaseChainConfig::sepolia().jovian_timestamp,
+            ChainConfig::sepolia().jovian_timestamp,
         );
 
         let result = <engine::OpEngineValidator<_, _, _> as EngineApiValidator<
