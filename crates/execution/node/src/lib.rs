@@ -35,6 +35,7 @@ pub mod proof_history;
 pub mod utils;
 
 use base_common_evm as _;
+use base_execution_firehose as _;
 #[cfg(feature = "test-utils")]
 use reth_tasks as _;
 use revm as _;
