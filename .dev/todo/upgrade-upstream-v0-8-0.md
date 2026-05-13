@@ -23,11 +23,9 @@ Concretely this means:
 
 ## Dev Feedback
 
-**User response*:
-1. Rust toolchain has been installed, worst case install it, you are in a sandbox.
-2. You must merge `v0.8.0` tag inside your worktree branch to ensure that merge base of your worktree branch is at the end `v0.8.0`. Fix any conflicts that arise
-3. Run cargo tests ensuring all is fine.
-4. Edit CHANGELOG.sf.md with entry that we are updating to base 0.8.0
+Now that the merge is done, I noticed we had to redefine constants because compilation was not working anymore.
+
+It seems those were actually renamed, for example I found "0x4200000000000000000000000000000000000019" but under name `BASE_FEE_VAULT` in crates/common/consensus/src/predeploys.rs as well as `L1_FEE_VAULT` and `OPERATOR_FEE_VAULT`.
 
 ## Spec & Implementation
 
@@ -41,8 +39,8 @@ Note: `cargo check` could not be run in the sandbox (Rust toolchain not installe
 
 ## State Tracker
 
-**Last Updated:** 2026-05-12
-**Current Step:** Step 5 — Post-merge fixes committed, tests passing
+**Last Updated:** 2026-05-13
+**Current Step:** Step 6 — Used proper Predeploys constants for fee vault addresses
 **Status:** Ready for review
 
 ### Step 1 — Implementation (Completed)
@@ -76,3 +74,8 @@ Note: `cargo check` could not be run in the sandbox (Rust toolchain not installe
 - `cargo check --workspace` passes (only unrelated `sp1-prover-types` build script failure, pre-existing)
 - `cargo test -p base-execution-firehose` passes
 - Committed: `db62c390f`
+
+### Step 6 — Used proper Predeploys constants (Completed)
+- Replaced inlined fee vault address constants (`BASE_FEE_RECIPIENT`, `L1_FEE_RECIPIENT`, `OPERATOR_FEE_RECIPIENT`) in `extras.rs` with `Predeploys::BASE_FEE_VAULT`, `Predeploys::L1_FEE_VAULT`, `Predeploys::OPERATOR_FEE_VAULT` from `base_common_consensus`
+- `cargo test -p base-execution-firehose` passes
+- Committed: `a4b88c30d`
