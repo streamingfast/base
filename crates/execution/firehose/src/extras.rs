@@ -17,7 +17,8 @@
 //!   into the event.
 
 use alloy_evm::Evm as _;
-use alloy_primitives::{Address, Bytes, U256, address};
+use alloy_primitives::{Address, Bytes, U256};
+use base_common_consensus::Predeploys;
 use base_common_evm::{BaseEvm, DEPOSIT_TRANSACTION_TYPE, OpSpecId, OpTxTr};
 use firehose_tracer::firehose_debug;
 use firehose_tracer::pb::sf::ethereum::r#type::v2::balance_change::Reason;
@@ -32,13 +33,6 @@ use reth_revm::revm::{
 };
 
 use base_common_evm::OpContext;
-
-/// The address of the base fee recipient.
-const BASE_FEE_RECIPIENT: Address = address!("0x4200000000000000000000000000000000000019");
-/// The address of L1 fee recipient.
-const L1_FEE_RECIPIENT: Address = address!("0x420000000000000000000000000000000000001A");
-/// The address of the operator fee recipient.
-const OPERATOR_FEE_RECIPIENT: Address = address!("0x420000000000000000000000000000000000001B");
 
 /// Emits the three OP Stack fee vault balance changes that `OpHandler::reward_beneficiary`
 /// applies via `Journal::balance_incr` during revm's post_execution phase.
@@ -129,9 +123,9 @@ where
         // gate, pre-London basefee, etc.).
         let (db, inspector, _) = evm.components_mut();
         for (vault, amount) in [
-            (BASE_FEE_RECIPIENT, base_fee_amount),
-            (L1_FEE_RECIPIENT, l1_cost),
-            (OPERATOR_FEE_RECIPIENT, operator_fee_cost),
+            (Predeploys::BASE_FEE_VAULT, base_fee_amount),
+            (Predeploys::L1_FEE_VAULT, l1_cost),
+            (Predeploys::OPERATOR_FEE_VAULT, operator_fee_cost),
         ] {
             if amount.is_zero() {
                 firehose_debug!(
