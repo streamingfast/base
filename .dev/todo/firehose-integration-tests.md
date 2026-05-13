@@ -15,26 +15,32 @@ target_branch: firehose/0.x
 
 ## Initial Description
 
-We want to have Firehose integration tests that run real Base transaction, trace it and ensure it works properly. We would like to have prestate tests working just like in reth https://github.com/streamingfast/reth/tree/firehose/2.x/crates/firehose-tests/src
+We want to have Firehose integration tests that run real Base transaction, trace it and ensure it works properly. We would like to have prestate tests working just like in reth https://github.com/streamingfast/reth/tree/firehose/1.x/crates/firehose-tests/src
 
 ## Dev Feedback
 
-1. I would like to see some re-use of reth-firehose-tests crate directly especially around the "generic" prestate struct and JSON parsing. Provide needed changes on the reth-firehose-tests crate to improve sharing on that part.
+2. Our reth fork at `https://github.com/streamingfast/reth/tree/firehose/1.x` has all the requested changes defined by you in `Part 1` below. Clone and inspect that the changes are correct according to our plan and adjust the plan with the new details. and removal of part 1 which is not needed.
+
+**Verified (2026-05-13):** Cloned both `v1.11.4-fh-1` tag and `firehose/1.x` branch HEAD.
+- Tag `v1.11.4-fh-1` (currently used by base): `Prestate`, `TraceContext`, `seed_cache_db`, `build_account_info`, `parse_fire_block_for`, `decode_hex` are all **private** in prestate.rs — Part 1 changes are NOT in this tag.
+- Branch `firehose/1.x` HEAD (commit `06e46c3`, "Reformatted code"): All those items are **already public**, and `lib.rs` already re-exports them all — exactly what Part 1 required.
+- There is no `v1.11.4-fh-2` tag yet; only `v1.11.4-fh-1` exists.
+- `reth-firehose-tests` is not in base's `[workspace.dependencies]` yet.
+
+**Conclusion:** Part 1 is done on the branch but not yet tagged. Step 0 in the plan is updated to: "cut a new tag on the `firehose/1.x` branch and update base's Cargo.toml to that tag + add `reth-firehose-tests` to workspace deps." Part 1 section removed from the spec.
 
 ## Spec & Implementation
 
 ### Summary
 
-Create a new `base-firehose-tests` library crate under `crates/execution/firehose-tests/` that reuses the generic harness infrastructure from `reth-firehose-tests` (`streamingfast/reth`, tag `v1.11.4-fh-1`). The plan is split into two parts:
+Create a new `base-firehose-tests` library crate under `crates/execution/firehose-tests/` that reuses the generic harness infrastructure from `reth-firehose-tests` (`streamingfast/reth`). The upstream `reth-firehose-tests` crate on the `firehose/1.x` branch already exposes all required public types (`Prestate`, `TraceContext`, `RunOutcome`, `seed_cache_db`, `build_account_info`, `parse_fire_block_for`, `decode_hex`, serde helpers) — these changes are on the branch but not yet tagged. Step 0 is simply: cut a new tag on the branch and update base's Cargo.toml to point at it.
 
-1. **Upstream changes to `reth-firehose-tests`** — expose the currently-private generic types (`Prestate`, `TraceContext`, `RunOutcome`) and utility functions (`seed_cache_db`, `parse_fire_block_for`, `assert_block_equals_golden`, `decode_hex`, serde helpers) as `pub` so downstream crates can reuse them.
-
-2. **New `base-firehose-tests` crate** — depends on `reth-firehose-tests` and provides only the Base/OP-specific `run_prestate` function and `TraceContext` extension. All shared machinery comes from `reth-firehose-tests` directly.
+The new `base-firehose-tests` crate depends on `reth-firehose-tests` and provides only the Base/OP-specific `run_prestate` function and `OpTraceContext` extension. All shared machinery comes from `reth-firehose-tests` directly.
 
 ### Scope
 
 **In scope:**
-- Changes to `reth-firehose-tests` in `streamingfast/reth` (tag `v1.11.4-fh-1` / branch `firehose/2.x`) to expose reusable generic parts
+- Step 0: cut a new tag on `streamingfast/reth` `firehose/1.x` branch (all Part 1 changes already exist on the branch) and update base's Cargo.toml to that tag + add `reth-firehose-tests` to `[workspace.dependencies]`
 - New workspace crate `base-firehose-tests` at `crates/execution/firehose-tests/`
 - `src/lib.rs` and `src/prestate.rs` — the Base-specific harness (thin layer over `reth-firehose-tests`)
 - `tests/prestate.rs` — the Cargo integration test driver
@@ -48,215 +54,17 @@ Create a new `base-firehose-tests` library crate under `crates/execution/firehos
 
 ---
 
-### Part 1 — Changes to `reth-firehose-tests` (upstream PR to `streamingfast/reth`)
-
-#### What to expose
-
-The following items in `src/prestate.rs` are currently private but are entirely generic (no Ethereum-specific types). They must be made `pub` so `base-firehose-tests` can import them:
-
-| Item | Current visibility | Change |
-|---|---|---|
-| `RunOutcome` struct | `pub` ✓ | Already public — no change needed |
-| `Prestate` struct | `struct` (private) | Make `pub` |
-| `TraceContext` struct | `struct` (private) | Make `pub` |
-| `seed_cache_db` fn | `fn` (private) | Make `pub` |
-| `build_account_info` fn | `fn` (private) | Make `pub` |
-| `parse_fire_block_for` fn | `fn` (private) | Make `pub` |
-| `assert_block_equals_golden` fn | `pub` ✓ | Already public — no change needed |
-| `decode_hex` fn | `fn` (private) | Make `pub` |
-| serde helpers module `private` | private `mod private` | Make `pub mod serde_helpers` (or `pub` items re-exported) |
-
-**Important:** `Prestate` and `TraceContext` use serde `#[serde(deserialize_with = "...")]` referencing local private functions. Once the module is made public, the referenced deserializer functions must also be public (or the private module re-structured so they are callable from outside).
-
-#### Recommended approach for serde helpers
-
-Instead of exposing `deser_u64_str` / `deser_opt_u128_str` / `deser_opt_u256_str` as bare pub functions (which users normally don't call directly), move them into a `pub mod serde_helpers` submodule and re-export from `lib.rs`. The internal `private` module (`parse_decimal_or_hex_u128`) stays private since it is only called by the serde helpers.
-
-Because `Prestate` and `TraceContext` carry `#[serde(deserialize_with = ...)]` attributes that reference these functions by path, the deserializer functions need to be accessible. Since they are referenced in attribute macros, they need to be in scope as `crate::prestate::deser_u64_str` etc. — simply keeping them as `pub fn` in `prestate.rs` (rather than `fn`) is sufficient. The `private` inner module for `parse_decimal_or_hex_u128` can remain private.
-
-#### OP-specific `TraceContext` extension
-
-`base-firehose-tests` may need additional fields in the block context for OP Stack (e.g., `prevRandao`/`mixHash`). Rather than modifying the shared `TraceContext` with OP-specific optional fields, the recommended approach is:
-
-- Keep `reth-firehose-tests`'s `TraceContext` as is (the common Ethereum fields)
-- In `base-firehose-tests`'s `src/prestate.rs`, define a separate `OpTraceContext` struct that **contains** a `TraceContext` (via `#[serde(flatten)]`) plus any OP-specific optional fields
-
-This avoids polluting the Ethereum-centric `TraceContext` with OP fields.
-
-#### `lib.rs` changes in `reth-firehose-tests`
-
-Add re-exports of the newly-public items following AGENTS.md conventions:
-
-```rust
-// existing
-pub mod prestate;
-pub use prestate::{assert_block_equals_golden, run_prestate, RunOutcome};
-
-// new re-exports
-pub use prestate::{
-    Prestate, TraceContext,
-    seed_cache_db, build_account_info,
-    parse_fire_block_for, decode_hex,
-};
-```
-
----
-
-### Part 2 — New `base-firehose-tests` crate
-
-#### Design
-
-The crate depends on `reth-firehose-tests` and re-uses its public generic parts. The only Base-specific code lives in `src/prestate.rs`:
-
-- `OpTraceContext` — extends `TraceContext` with OP-specific optional fields (via `#[serde(flatten)]`)
-- `run_prestate` — the Base adaptation of the harness function, using:
-  - `BaseChainSpec` instead of `ChainSpec`
-  - `BaseEvmConfig` instead of `EthEvmConfig`
-  - `BasePrimitives` instead of `EthPrimitives`
-  - OP transaction decoding (`OpTxEnvelope::decode_2718`) instead of `TransactionSigned::network_decode`
-  - `OpPreTxAdjust` / `OpPostTxExtras` instead of `NoPreTxAdjust` / `NoPostTxExtras`
-  - OP-specific `ChainConfig` fields (`canyon_time` → `shanghai_time`, `ecotone_time` → `cancun_time`, `isthmus_time` → `prague_time`)
-
-All other utilities (`assert_block_equals_golden`, `seed_cache_db`, `parse_fire_block_for`, `decode_hex`, `RunOutcome`) come from `reth_firehose_tests::` directly.
-
-#### Key differences from the Ethereum reference (`reth-firehose-tests`)
-
-| Aspect | Ethereum (`reth-firehose-tests`) | Base (`base-firehose-tests`) |
-|---|---|---|
-| Chain spec | `Arc<ChainSpec>` from `Genesis` | `Arc<BaseChainSpec>` from genesis |
-| EVM config | `EthEvmConfig::new(chain_spec)` | `BaseEvmConfig::new(chain_spec)` |
-| Primitives | `EthPrimitives` | `BasePrimitives` |
-| Tx decode | `TransactionSigned::network_decode` | `OpTxEnvelope::decode_2718` |
-| Pre/post hooks | `NoPreTxAdjust` / `NoPostTxExtras` | `OpPreTxAdjust` / `OpPostTxExtras` |
-| Trace context | `TraceContext` (shared) | `OpTraceContext` wrapping `TraceContext` |
-| Fork timestamps | `shanghai_time`, `cancun_time`, `prague_time` directly | Map `canyon_time`→`shanghai_time`, `ecotone_time`→`cancun_time`, `isthmus_time`→`prague_time` |
-
-#### Transaction decoding
-
-```rust
-use alloy_eips::eip2718::Decodable2718;
-use alloy_op_consensus::OpTxEnvelope;
-
-let tx_bytes = reth_firehose_tests::decode_hex(&prestate.input)?;
-let signed_tx = OpTxEnvelope::decode_2718(&mut tx_bytes.as_slice())
-    .context("RLP-decoding prestate.input as an OP signed transaction")?;
-```
-
-Verify that `TxTy<BasePrimitives>` is `OpTxEnvelope` (check `base-common-consensus`'s primitives alias) and use accordingly for `RecoveredBlock`.
-
-#### ChainSpec construction
-
-```rust
-use base_execution_chainspec::BaseChainSpec;
-
-let chain_spec = Arc::new(BaseChainSpec::from(prestate.genesis.clone()));
-```
-
-If `BaseChainSpec` does not implement `From<Genesis>` directly, use `BaseChainSpecBuilder` — check `crates/execution/chainspec/src/builder.rs`.
-
-#### `run_prestate` structure in `base-firehose-tests`
-
-```rust
-pub fn run_prestate(case_folder: &Path) -> eyre::Result<RunOutcome> {
-    // 1. Read and deserialize prestate.json using shared Prestate type
-    let prestate_path = case_folder.join("prestate.json");
-    let prestate: Prestate = serde_json::from_slice(&std::fs::read(&prestate_path)?)
-        .with_context(|| ...)?;
-
-    // 2. Build BaseChainSpec from genesis
-    let chain_spec = Arc::new(BaseChainSpec::from(prestate.genesis.clone()));
-    let parent_hash = chain_spec.genesis_hash();
-
-    // 3. Decode OP transaction
-    let tx_bytes = decode_hex(&prestate.input)?;
-    let signed_tx = OpTxEnvelope::decode_2718(&mut tx_bytes.as_slice())?;
-
-    // 4. Build header + block (using prestate.context fields)
-    let header = build_op_header(&prestate.context, parent_hash, &[signed_tx.clone()]);
-    let block = OpBlock { header, body: OpBlockBody { transactions: vec![signed_tx], ... } };
-    let recovered = block.try_into_recovered()?;
-
-    // 5. Seed CacheDB using shared helper
-    let mut db = CacheDB::new(EmptyDB::default());
-    seed_cache_db(&mut db, &prestate.genesis)?;  // from reth_firehose_tests
-    let mut state = State::builder()...build();
-
-    // 6. Build BaseEvmConfig
-    let evm_config = BaseEvmConfig::new(chain_spec.clone());
-
-    // 7. Build tracer with OP fork timestamps
-    let (mut tracer, buffer) = firehose_tracer::Tracer::with_buffer(
-        firehose_tracer::config::Config::default(),
-        firehose_tracer::config::ChainConfig {
-            chain_id: prestate.genesis.config.chain_id,
-            shanghai_time: prestate.genesis.config.op_config.canyon_time,
-            cancun_time:   prestate.genesis.config.op_config.ecotone_time,
-            prague_time:   prestate.genesis.config.op_config.isthmus_time,
-            verkle_time:   None,
-        },
-        "base-firehose-tests",
-        env!("CARGO_PKG_VERSION"),
-    );
-
-    // 8. Start tracer and execute
-    let mut block_tracer = FirehoseBlockTracer::start_local::<BasePrimitives>(...);
-    let exec_result = run_wrapped_block::<_, _, _, _, _>(
-        &evm_config, &mut state, &recovered, &mut block_tracer,
-        OpPreTxAdjust, OpPostTxExtras,
-    );
-    ...
-
-    // 9. Parse output using shared helper
-    let raw = buffer.get_bytes();
-    let block = parse_fire_block_for(&raw, block_number)?;  // from reth_firehose_tests
-    Ok(RunOutcome { block, raw })
-}
-```
-
-#### Test fixture format
-
-```
-crates/execution/firehose-tests/tests/cases/
-  nop_transfer/
-    prestate.json          # genesis + context + hex-encoded RLP tx
-    block.<num>.binpb      # expected Firehose Block (binary protobuf)
-```
-
-The `prestate.json` follows the same schema as the reference. For Base, the `genesis.config` must include OP hardfork timestamps (e.g., `"canyonTime": 0, "ecotoneTime": 0`) so that `BaseChainSpec` is correctly initialized.
-
-#### Golden file generation
-
-The implementor generates the `.binpb` goldens by setting `UPDATE_GOLDENS=true` (or similar env-var check inside `assert_block_equals_golden`) on first run, then committing the result.
-
----
-
 ### Implementation Plan
 
-#### Step 0 — Upstream changes to `reth-firehose-tests` in `streamingfast/reth`
+#### Step 0 — Tag the upstream changes and update base's Cargo.toml
 
-These changes must be submitted as a PR to `streamingfast/reth` (branch `firehose/2.x`) **before** the workspace tag used by `base` can be updated to include them. The implementor should:
+The `firehose/1.x` branch of `streamingfast/reth` already contains all the required public-visibility changes to `reth-firehose-tests` (verified at commit `06e46c3`). No PR is needed — the code is already there. The implementor should:
 
-0a. In `crates/firehose-tests/src/prestate.rs`, make the following items `pub`:
-  - `Prestate` struct (and its fields, which are already non-`pub(crate)`)
-  - `TraceContext` struct (and its fields)
-  - `seed_cache_db` function
-  - `build_account_info` function
-  - `parse_fire_block_for` function
-  - `decode_hex` function
-  - The three serde deserializer fns: `deser_u64_str`, `deser_opt_u128_str`, `deser_opt_u256_str` (these are referenced in `#[serde(deserialize_with = "...")]` attributes on the now-public structs and must remain accessible)
+0a. Cut a new tag on `streamingfast/reth`'s `firehose/1.x` branch (e.g. `v1.11.4-fh-2`) that captures the current HEAD (`06e46c3 Reformatted code`) which includes all the public-visibility changes.
 
-0b. In `crates/firehose-tests/src/lib.rs`, add re-exports of all newly-public items:
-  ```rust
-  pub use prestate::{
-      Prestate, TraceContext,
-      seed_cache_db, build_account_info,
-      parse_fire_block_for, decode_hex,
-  };
-  ```
+0b. Update **all** `reth`-namespaced entries in base's root `Cargo.toml` from `tag = "v1.11.4-fh-1"` to `tag = "v1.11.4-fh-2"` (or whatever tag is cut).
 
-0c. Open a PR to `streamingfast/reth` with these changes, get it merged, and cut a new tag (e.g., `v1.11.4-fh-2`) that includes these changes.
-
-0d. Update the `reth-firehose` (and related reth) entries in `base`'s root `Cargo.toml` to point at the new tag, and add `reth-firehose-tests` to `[workspace.dependencies]`:
+0c. Add `reth-firehose-tests` to `[workspace.dependencies]` in base's root `Cargo.toml`:
   ```toml
   reth-firehose-tests = { git = "https://github.com/streamingfast/reth.git", tag = "v1.11.4-fh-2" }
   ```
@@ -394,7 +202,7 @@ Check `crates/execution/evm/src/lib.rs` around line 135 for the concrete type pa
 
 The OP genesis config is accessible via `prestate.genesis.config.optimism` (or similar field from `alloy_op_genesis`). The mapping is:
 - `canyon_time` → `shanghai_time`
-- `ecotone_time` → `cancun_time`  
+- `ecotone_time` → `cancun_time`
 - `isthmus_time` → `prague_time`
 - `verkle_time` → `None`
 
@@ -408,9 +216,9 @@ Verify the exact fields available in `firehose-tracer` at the version pinned in 
 
 | Decision/Assumption | Rationale |
 |---|---|
-| Upstream `reth-firehose-tests` changes come first (Step 0) | Enables clean reuse; the alternative (copy-pasting) violates the user's explicit feedback |
+| Step 0 = tag branch + update Cargo.toml (no PR needed) | All Part 1 changes already exist on `firehose/1.x` branch HEAD (verified at commit `06e46c3`); only a new tag and Cargo.toml bump needed |
 | New tag (e.g. `v1.11.4-fh-2`) required in `streamingfast/reth` | The workspace uses tagged git deps; a new tag is the standard release mechanism |
-| `Prestate` and `TraceContext` made `pub` as-is (no generics) | The structs use concrete alloy types that are shared across Ethereum and OP Stack |
+| `Prestate` and `TraceContext` already `pub` in branch HEAD | Verified by inspection — no changes needed to reth fork |
 | OP-specific context fields go in a local `OpTraceContext` wrapping `TraceContext` | Avoids polluting Ethereum-centric struct with OP fields; `#[serde(flatten)]` provides transparent JSON merging |
 | `assert_block_equals_golden` re-exported from `reth-firehose-tests` | Already public and fully generic; no reason to duplicate |
 | `RunOutcome` re-exported from `reth-firehose-tests` | Already public and fully generic |
@@ -424,8 +232,8 @@ Verify the exact fields available in `firehose-tracer` at the version pinned in 
 ## State Tracker
 
 **Last Updated:** 2026-05-13
-**Current Step:** Phase 5 — Spec Review & Acceptance (Revision 2)
-**Status:** Spec revised per Dev Feedback, awaiting approval
+**Current Step:** Done — planned
+**Status:** Spec updated per Dev Feedback; Part 1 removed (already done on branch); Step 0 updated to "tag + Cargo.toml bump"
 
 | Step | Status | Notes |
 |---|---|---|
@@ -434,4 +242,5 @@ Verify the exact fields available in `firehose-tracer` at the version pinned in 
 | Phase 3 — Challenging Dialogue | Skipped | Sufficient info from codebase + reference to write spec without questions |
 | Phase 4 — Specification Writing | Done | Full spec written above |
 | Phase 5 — Spec Review (Round 1) | Done | User rejected: requested reuse of reth-firehose-tests generic parts |
-| Phase 5 — Spec Review (Round 2) | In Progress | Revised spec: Part 1 = upstream changes to reth-firehose-tests; Part 2 = thin base-firehose-tests layer |
+| Phase 5 — Spec Review (Round 2) | Done | Revised spec: Part 1 = upstream changes to reth-firehose-tests; Part 2 = thin base-firehose-tests layer |
+| Dev Feedback — Verify reth fork | Done | Cloned v1.11.4-fh-1 tag and firehose/1.x branch; confirmed Part 1 changes already on branch at commit 06e46c3; no v1.11.4-fh-2 tag yet; Part 1 removed from spec; Step 0 updated to "cut new tag + update Cargo.toml" |
