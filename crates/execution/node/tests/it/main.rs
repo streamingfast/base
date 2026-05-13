@@ -1,6 +1,4 @@
-#![allow(missing_docs)]
-
-mod builder;
+//! Integration tests for the execution node.
 
 mod priority;
 

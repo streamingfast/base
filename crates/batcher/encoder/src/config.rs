@@ -1,6 +1,9 @@
 //! Encoder configuration and its validation error type.
 
-use crate::{BatchType, DaType};
+use base_consensus_genesis::RollupConfig;
+use base_protocol::BatchType;
+
+use crate::DaType;
 
 /// Configuration for the [`BatchEncoder`](crate::BatchEncoder).
 #[derive(Debug, Clone)]
@@ -70,6 +73,22 @@ pub struct EncoderConfig {
     ///
     /// Default: `0.6` (matches op-batcher's `--approx-compr-ratio` default).
     pub approx_compr_ratio: f64,
+
+    /// Maximum serialized size of a single L1 calldata transaction in bytes.
+    ///
+    /// When set, the calldata frame packing path accumulates frames until adding
+    /// the next frame would exceed this limit, then cuts the transaction at that point.
+    /// At least one frame is always included regardless of size, so oversized frames
+    /// are still submitted (governed by [`max_frame_size`] instead).
+    ///
+    /// This is a no-op when [`da_type`] is [`DaType::Blob`], since the blob size is
+    /// the binding constraint for blob DA.
+    ///
+    /// Default: `None` (no cap; op-batcher equivalent default is 120,000 bytes).
+    ///
+    /// [`max_frame_size`]: EncoderConfig::max_frame_size
+    /// [`da_type`]: EncoderConfig::da_type
+    pub max_l1_tx_size_bytes: Option<usize>,
 }
 
 impl Default for EncoderConfig {
@@ -83,6 +102,7 @@ impl Default for EncoderConfig {
             batch_type: BatchType::Single,
             da_type: DaType::Blob,
             approx_compr_ratio: 0.6,
+            max_l1_tx_size_bytes: None,
         }
     }
 }
@@ -111,6 +131,32 @@ impl EncoderConfig {
                 approx_compr_ratio: self.approx_compr_ratio,
             });
         }
+        Ok(())
+    }
+
+    /// Validate the configuration against the active rollup state.
+    ///
+    /// `next_l2_timestamp` should be the timestamp of the next L2 block the
+    /// batcher may encode. Span batches are only valid once Fjord is active for
+    /// that next block.
+    pub fn validate_for_rollup_config(
+        &self,
+        rollup_config: &RollupConfig,
+        next_l2_timestamp: u64,
+    ) -> Result<(), EncoderConfigError> {
+        self.validate()?;
+
+        if matches!(self.batch_type, BatchType::Span)
+            && !rollup_config.is_fjord_active(next_l2_timestamp)
+        {
+            return rollup_config.hardforks.fjord_time.map_or(
+                Err(EncoderConfigError::SpanBatchRequiresScheduledFjord { next_l2_timestamp }),
+                |fjord_time| {
+                    Err(EncoderConfigError::SpanBatchBeforeFjord { next_l2_timestamp, fjord_time })
+                },
+            );
+        }
+
         Ok(())
     }
 }
@@ -155,10 +201,31 @@ pub enum EncoderConfigError {
         /// The configured approximate compression ratio.
         approx_compr_ratio: f64,
     },
+    /// `batch_type == BatchType::Span` before Fjord activates.
+    #[error(
+        "span batches require Fjord to be active for the next L2 block; \
+         next_l2_timestamp ({next_l2_timestamp}) is before fjord_time ({fjord_time})"
+    )]
+    SpanBatchBeforeFjord {
+        /// The timestamp of the next L2 block the batcher may encode.
+        next_l2_timestamp: u64,
+        /// The configured Fjord activation timestamp.
+        fjord_time: u64,
+    },
+    /// `batch_type == BatchType::Span` but Fjord is not scheduled.
+    #[error(
+        "span batches require Fjord to be scheduled and active for the next L2 block; \
+         next_l2_timestamp is {next_l2_timestamp}"
+    )]
+    SpanBatchRequiresScheduledFjord {
+        /// The timestamp of the next L2 block the batcher may encode.
+        next_l2_timestamp: u64,
+    },
 }
 
 #[cfg(test)]
 mod tests {
+    use base_consensus_genesis::HardForkConfig;
     use rstest::rstest;
 
     use super::*;
@@ -213,5 +280,53 @@ mod tests {
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, EncoderConfigError::InvalidApproxComprRatio { .. }));
         assert!(err.to_string().contains("approx_compr_ratio"));
+    }
+
+    fn rollup_config_with(block_time: u64, fjord_time: Option<u64>) -> RollupConfig {
+        RollupConfig {
+            block_time,
+            hardforks: HardForkConfig { fjord_time, ..HardForkConfig::default() },
+            ..RollupConfig::default()
+        }
+    }
+
+    #[test]
+    fn validate_for_rollup_config_allows_single_before_fjord() {
+        let cfg = EncoderConfig::default();
+        let rollup_config = rollup_config_with(2, Some(100));
+
+        assert!(cfg.validate_for_rollup_config(&rollup_config, 98).is_ok());
+    }
+
+    #[test]
+    fn validate_for_rollup_config_rejects_span_before_fjord() {
+        let cfg = EncoderConfig { batch_type: BatchType::Span, ..EncoderConfig::default() };
+        let rollup_config = rollup_config_with(2, Some(100));
+
+        let err = cfg.validate_for_rollup_config(&rollup_config, 98).unwrap_err();
+        assert!(matches!(
+            err,
+            EncoderConfigError::SpanBatchBeforeFjord { next_l2_timestamp: 98, fjord_time: 100 }
+        ));
+    }
+
+    #[test]
+    fn validate_for_rollup_config_allows_span_at_fjord_activation() {
+        let cfg = EncoderConfig { batch_type: BatchType::Span, ..EncoderConfig::default() };
+        let rollup_config = rollup_config_with(2, Some(100));
+
+        assert!(cfg.validate_for_rollup_config(&rollup_config, 100).is_ok());
+    }
+
+    #[test]
+    fn validate_for_rollup_config_rejects_unscheduled_fjord_for_span() {
+        let cfg = EncoderConfig { batch_type: BatchType::Span, ..EncoderConfig::default() };
+        let rollup_config = rollup_config_with(2, None);
+
+        let err = cfg.validate_for_rollup_config(&rollup_config, 2).unwrap_err();
+        assert!(matches!(
+            err,
+            EncoderConfigError::SpanBatchRequiresScheduledFjord { next_l2_timestamp: 2 }
+        ));
     }
 }

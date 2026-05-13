@@ -4,16 +4,16 @@ use alloc::{boxed::Box, fmt::Debug, string::ToString, sync::Arc, vec, vec::Vec};
 
 use alloy_consensus::{Eip658Value, Receipt};
 use alloy_eips::{BlockNumHash, eip2718::Encodable2718};
+use alloy_genesis::ChainConfig;
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rlp::Encodable;
 use alloy_rpc_types_engine::PayloadAttributes;
 use async_trait::async_trait;
-use base_alloy_rpc_types_engine::OpPayloadAttributes;
-use base_consensus_genesis::{L1ChainConfig, RollupConfig};
+use base_common_consensus::Predeploys;
+use base_common_rpc_types_engine::BasePayloadAttributes;
+use base_consensus_genesis::RollupConfig;
 use base_consensus_upgrades::{Hardfork, Hardforks};
-use base_protocol::{
-    DEPOSIT_EVENT_ABI_HASH, L1BlockInfoTx, L2BlockInfo, Predeploys, decode_deposit,
-};
+use base_protocol::{Deposits, L1BlockInfoTx, L2BlockInfo};
 use tracing::warn;
 
 use crate::{
@@ -31,7 +31,7 @@ where
     /// The rollup config.
     rollup_cfg: Arc<RollupConfig>,
     /// The L1 config.
-    l1_cfg: Arc<L1ChainConfig>,
+    l1_cfg: Arc<ChainConfig>,
     /// The system config fetcher.
     config_fetcher: L2P,
     /// The L1 receipts fetcher.
@@ -46,7 +46,7 @@ where
     /// Create a new [`StatefulAttributesBuilder`] with the given epoch.
     pub const fn new(
         rcfg: Arc<RollupConfig>,
-        l1_cfg: Arc<L1ChainConfig>,
+        l1_cfg: Arc<ChainConfig>,
         sys_cfg_fetcher: L2P,
         receipts: L1P,
     ) -> Self {
@@ -69,7 +69,7 @@ where
         &mut self,
         l2_parent: L2BlockInfo,
         epoch: BlockNumHash,
-    ) -> PipelineResult<OpPayloadAttributes> {
+    ) -> PipelineResult<BasePayloadAttributes> {
         let l1_header;
         let deposit_transactions: Vec<Bytes>;
 
@@ -196,7 +196,7 @@ where
             parent_beacon_root = Some(l1_header.parent_beacon_block_root.unwrap_or_default());
         }
 
-        Ok(OpPayloadAttributes {
+        Ok(BasePayloadAttributes {
             payload_attributes: PayloadAttributes {
                 timestamp: next_l2_time,
                 prev_randao: l1_header.mix_hash,
@@ -227,7 +227,7 @@ where
 ///
 /// Successful deposits must be emitted by the deposit contract and have the correct event
 /// signature. So the receipt address must equal the specified deposit contract and the first topic
-/// must be the [`DEPOSIT_EVENT_ABI_HASH`].
+/// must be the [`Deposits::EVENT_ABI_HASH`].
 async fn derive_deposits(
     block_hash: B256,
     receipts: &[Receipt],
@@ -242,13 +242,13 @@ async fn derive_deposits(
         for l in &r.logs {
             let curr_index = global_index;
             global_index += 1;
-            if l.data.topics().first().is_none_or(|i| *i != DEPOSIT_EVENT_ABI_HASH) {
+            if l.data.topics().first().is_none_or(|i| *i != Deposits::EVENT_ABI_HASH) {
                 continue;
             }
             if l.address != deposit_contract {
                 continue;
             }
-            let decoded = decode_deposit(block_hash, curr_index, l)?;
+            let decoded = Deposits::decode(block_hash, curr_index, l)?;
             res.push(decoded);
         }
     }
@@ -261,9 +261,9 @@ mod tests {
 
     use alloy_consensus::Header;
     use alloy_primitives::{B256, Log, LogData, U64, U256, address};
-    use base_consensus_genesis::{CONFIG_UPDATE_TOPIC, HardForkConfig, SystemConfig};
-    use base_consensus_registry::L1Config;
-    use base_protocol::{BlockInfo, DepositError};
+    use base_consensus_genesis::{HardForkConfig, SystemConfig, SystemConfigUpdate};
+    use base_consensus_registry::Sepolia;
+    use base_protocol::{BlockInfo, DepositDecodeError};
 
     use super::*;
     use crate::{
@@ -299,7 +299,7 @@ mod tests {
             address: deposit_contract,
             data: LogData::new_unchecked(
                 vec![
-                    DEPOSIT_EVENT_ABI_HASH,
+                    Deposits::EVENT_ABI_HASH,
                     B256::from_slice(&from_bytes),
                     B256::from_slice(&to_bytes),
                     B256::default(),
@@ -354,11 +354,11 @@ mod tests {
         let deposit_contract = address!("1111111111111111111111111111111111111111");
         let mut invalid = generate_valid_receipt();
         invalid.logs[0].data =
-            LogData::new_unchecked(vec![DEPOSIT_EVENT_ABI_HASH], Bytes::default());
+            LogData::new_unchecked(vec![Deposits::EVENT_ABI_HASH], Bytes::default());
         let receipts = vec![generate_valid_receipt(), generate_valid_receipt(), invalid];
         let result = derive_deposits(B256::default(), &receipts, deposit_contract).await;
         let downcasted = result.unwrap_err();
-        assert_eq!(downcasted, DepositError::UnexpectedTopicsLen(1).into());
+        assert_eq!(downcasted, DepositDecodeError::UnexpectedTopicsLen(1).into());
     }
 
     #[tokio::test]
@@ -372,7 +372,7 @@ mod tests {
     #[tokio::test]
     async fn test_prepare_payload_block_mismatch_epoch_reset() {
         let cfg = Arc::new(RollupConfig::default());
-        let l1_cfg = Arc::new(L1Config::sepolia().into());
+        let l1_cfg = Arc::new(Sepolia::l1_config());
         let l2_number = 1;
         let mut fetcher = TestSystemConfigL2Fetcher::default();
         fetcher.insert(l2_number, SystemConfig::default());
@@ -398,7 +398,7 @@ mod tests {
     #[tokio::test]
     async fn test_prepare_payload_block_mismatch() {
         let cfg = Arc::new(RollupConfig::default());
-        let l1_cfg = Arc::new(L1Config::sepolia().into());
+        let l1_cfg = Arc::new(Sepolia::l1_config());
         let l2_number = 1;
         let mut fetcher = TestSystemConfigL2Fetcher::default();
         fetcher.insert(l2_number, SystemConfig::default());
@@ -425,7 +425,7 @@ mod tests {
         let block_time = 10;
         let timestamp = 100;
         let cfg = Arc::new(RollupConfig { block_time, ..Default::default() });
-        let l1_cfg = Arc::new(L1Config::sepolia().into());
+        let l1_cfg = Arc::new(Sepolia::l1_config());
         let l2_number = 1;
         let mut fetcher = TestSystemConfigL2Fetcher::default();
         fetcher.insert(l2_number, SystemConfig::default());
@@ -457,7 +457,7 @@ mod tests {
         let block_time = 10;
         let timestamp = 100;
         let cfg = Arc::new(RollupConfig { block_time, ..Default::default() });
-        let l1_cfg = Arc::new(L1Config::sepolia().into());
+        let l1_cfg = Arc::new(Sepolia::l1_config());
         let l2_number = 1;
         let mut fetcher = TestSystemConfigL2Fetcher::default();
         fetcher.insert(l2_number, SystemConfig::default());
@@ -480,7 +480,7 @@ mod tests {
         };
         let next_l2_time = l2_parent.block_info.timestamp + block_time;
         let payload = builder.prepare_payload_attributes(l2_parent, epoch).await.unwrap();
-        let expected = OpPayloadAttributes {
+        let expected = BasePayloadAttributes {
             payload_attributes: PayloadAttributes {
                 timestamp: next_l2_time,
                 prev_randao,
@@ -509,7 +509,7 @@ mod tests {
             hardforks: HardForkConfig { canyon_time: Some(0), ..Default::default() },
             ..Default::default()
         });
-        let l1_cfg = Arc::new(L1Config::sepolia().into());
+        let l1_cfg = Arc::new(Sepolia::l1_config());
         let l2_number = 1;
         let mut fetcher = TestSystemConfigL2Fetcher::default();
         fetcher.insert(l2_number, SystemConfig::default());
@@ -532,7 +532,7 @@ mod tests {
         };
         let next_l2_time = l2_parent.block_info.timestamp + block_time;
         let payload = builder.prepare_payload_attributes(l2_parent, epoch).await.unwrap();
-        let expected = OpPayloadAttributes {
+        let expected = BasePayloadAttributes {
             payload_attributes: PayloadAttributes {
                 timestamp: next_l2_time,
                 prev_randao,
@@ -561,7 +561,7 @@ mod tests {
             hardforks: HardForkConfig { ecotone_time: Some(102), ..Default::default() },
             ..Default::default()
         });
-        let l1_cfg = Arc::new(L1Config::sepolia().into());
+        let l1_cfg = Arc::new(Sepolia::l1_config());
         let l2_number = 1;
         let mut fetcher = TestSystemConfigL2Fetcher::default();
         fetcher.insert(l2_number, SystemConfig::default());
@@ -585,7 +585,7 @@ mod tests {
         };
         let next_l2_time = l2_parent.block_info.timestamp + block_time;
         let payload = builder.prepare_payload_attributes(l2_parent, epoch).await.unwrap();
-        let expected = OpPayloadAttributes {
+        let expected = BasePayloadAttributes {
             payload_attributes: PayloadAttributes {
                 timestamp: next_l2_time,
                 prev_randao,
@@ -614,7 +614,7 @@ mod tests {
             hardforks: HardForkConfig { fjord_time: Some(102), ..Default::default() },
             ..Default::default()
         });
-        let l1_cfg = Arc::new(L1Config::sepolia().into());
+        let l1_cfg = Arc::new(Sepolia::l1_config());
         let l2_number = 1;
         let mut fetcher = TestSystemConfigL2Fetcher::default();
         fetcher.insert(l2_number, SystemConfig::default());
@@ -637,7 +637,7 @@ mod tests {
         };
         let next_l2_time = l2_parent.block_info.timestamp + block_time;
         let payload = builder.prepare_payload_attributes(l2_parent, epoch).await.unwrap();
-        let expected = OpPayloadAttributes {
+        let expected = BasePayloadAttributes {
             payload_attributes: PayloadAttributes {
                 timestamp: next_l2_time,
                 prev_randao,
@@ -666,7 +666,7 @@ mod tests {
             l1_system_config_address: sys_config_addr,
             ..Default::default()
         });
-        let l1_cfg = Arc::new(L1Config::sepolia().into());
+        let l1_cfg = Arc::new(Sepolia::l1_config());
         let l2_number = 1;
         let mut fetcher = TestSystemConfigL2Fetcher::default();
         fetcher.insert(l2_number, SystemConfig::default());
@@ -681,7 +681,7 @@ mod tests {
         // causing update_with_receipts to return an error.
         let bad_log = Log {
             address: sys_config_addr,
-            data: LogData::new_unchecked(vec![CONFIG_UPDATE_TOPIC], Bytes::default()),
+            data: LogData::new_unchecked(vec![SystemConfigUpdate::TOPIC], Bytes::default()),
         };
         let bad_receipt = Receipt {
             status: Eip658Value::Eip658(true),

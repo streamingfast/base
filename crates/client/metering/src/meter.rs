@@ -9,9 +9,9 @@ use std::{
 use alloy_consensus::{BlockHeader, Transaction as _};
 use alloy_primitives::{Address, B256, U256};
 use base_bundles::{BundleExtensions, BundleTxs, ParsedBundle, TransactionResult};
-use base_execution_chainspec::OpChainSpec;
-use base_execution_evm::{OpEvmConfig, OpNextBlockEnvAttributes};
-use base_revm::L1BlockInfo;
+use base_common_evm::L1BlockInfo;
+use base_execution_chainspec::BaseChainSpec;
+use base_execution_evm::{BaseEvmConfig, OpNextBlockEnvAttributes};
 use eyre::{Result as EyreResult, eyre};
 use reth_evm::{ConfigureEvm, execute::BlockBuilder};
 use reth_primitives_traits::{Account, SealedHeader};
@@ -27,19 +27,18 @@ use crate::{metrics::Metrics, transaction::validate_tx};
 pub(crate) fn compute_pending_trie_input<SP>(
     state_provider: &SP,
     hashed_state: HashedPostState,
-    metrics: &Metrics,
 ) -> EyreResult<PendingTrieInput>
 where
     SP: reth_provider::StateProvider + ?Sized,
 {
-    metrics.pending_trie_cache_misses.increment(1);
+    Metrics::pending_trie_cache_misses().increment(1);
     let start = Instant::now();
 
     let (_state_root, trie_updates) =
         state_provider.state_root_with_updates(hashed_state.clone())?;
 
     let elapsed = start.elapsed();
-    metrics.pending_trie_compute_duration.record(elapsed.as_secs_f64());
+    Metrics::pending_trie_compute_duration().record(elapsed.as_secs_f64());
 
     Ok(PendingTrieInput { trie_updates, hashed_state })
 }
@@ -110,77 +109,66 @@ pub struct MeterBundleOutput {
     pub total_time_us: u128,
     /// State root calculation time in microseconds
     pub state_root_time_us: u128,
-    /// Best-effort count of account trie nodes attributed to bundle state changes during state
-    /// root calculation.
-    ///
-    /// `reth` does not expose "all account trie nodes hashed for just this bundle" directly, so
-    /// we derive this by combining bundle-owned account leaves from `HashedPostState` with account
-    /// branch/removal updates from `TrieUpdates`.
-    pub state_root_account_node_count: u64,
-    /// Best-effort count of storage trie nodes attributed to bundle state changes during state
-    /// root calculation.
-    ///
-    /// Like the account count, this is derived from two `reth` views of the work: bundle-owned
-    /// storage leaves from `HashedPostState` plus storage branch/removal updates from
-    /// `TrieUpdates`, with non-bundle artifacts filtered out below.
-    pub state_root_storage_node_count: u64,
+    /// Count of account leaves in the bundle's `HashedPostState`: one per modified account that
+    /// survives in the post-state trie. Proportional to gas (each account touch costs gas) and
+    /// does not reflect trie depth.
+    pub state_root_account_leaf_count: u64,
+    /// Count of account branch/removal nodes emitted by `TrieUpdates` during state root
+    /// calculation. These are intermediate trie nodes that were rebuilt or removed, and their
+    /// count scales with trie depth — the structural cost that gas does not price.
+    pub state_root_account_branch_count: u64,
+    /// Count of storage slot leaves in the bundle's `HashedPostState`: one per modified non-zero
+    /// storage slot. Like account leaves, proportional to gas and does not reflect trie depth.
+    pub state_root_storage_leaf_count: u64,
+    /// Count of storage branch/removal nodes emitted by `TrieUpdates` during state root
+    /// calculation, restricted to tries the bundle actually modified. Like account branches,
+    /// these scale with trie depth.
+    pub state_root_storage_branch_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct StateRootTrieNodeCounts {
-    account_trie_nodes: u64,
-    storage_trie_nodes: u64,
+    account_leaves: u64,
+    account_branches: u64,
+    storage_leaves: u64,
+    storage_branches: u64,
 }
 
-/// Counts trie nodes represented on the hashed post-state leaf side.
+/// Counts surviving leaves in the bundle's `HashedPostState`.
 ///
-/// `reth` splits "work done for a state root" into two different surfaces:
-/// - `HashedPostState`: surviving leaves in the bundle delta.
-/// - `TrieUpdates`: branch/removal updates emitted while rebuilding affected trie paths.
-///
-/// This helper handles the leaf side of that split. The account count includes changed account
-/// leaves that remain in the post-state trie.
-///
-/// The storage count includes changed storage slot leaves that remain in the post-state trie.
-/// Deleted accounts, zero-valued storage removals, and pure storage wipes are not counted here,
-/// because reth represents them as overlay deletions rather than emitted leaves.
-///
+/// These are the values that changed, not intermediate trie structure. Account leaves are one per
+/// modified surviving account; storage leaves are one per modified non-zero storage slot. Deleted
+/// accounts and zero-valued storage removals are represented through trie updates, not here.
 fn count_state_root_leaf_nodes(hashed_state: &HashedPostState) -> StateRootTrieNodeCounts {
-    let account_trie_nodes =
+    let account_leaves =
         hashed_state.accounts.values().filter(|account| account.is_some()).count() as u64;
-    let storage_trie_nodes = hashed_state
+    let storage_leaves = hashed_state
         .storages
         .values()
         .map(|storage| storage.storage.values().filter(|value| !value.is_zero()).count())
         .sum::<usize>() as u64;
 
-    StateRootTrieNodeCounts { account_trie_nodes, storage_trie_nodes }
+    StateRootTrieNodeCounts { account_leaves, storage_leaves, ..Default::default() }
 }
 
-/// Adds trie-structure counts emitted by state root calculation.
+/// Adds branch/removal counts from `TrieUpdates` emitted during state root calculation.
 ///
-/// These counts cover account/storage branch updates and removals plus storage trie deletion
-/// markers. Empty-path roots are excluded because reth filters those out of `TrieUpdates`, and a
-/// root can be either a branch or a leaf depending on trie shape.
-///
-/// The `changed_storage_tries` filter is intentional. `reth` records `StorageTrieUpdates` for any
-/// account whose storage root was considered, including `deleted()` markers for empty-storage
-/// accounts and cached pending-state tries we prepended via `prepend_cached`. Those entries are
-/// useful for trie persistence, but they are not a defensible attribution of bundle-local storage
-/// hashing work. Restricting storage-side structural attribution to tries present in the bundle's
-/// own `HashedPostState` keeps these counts aligned with bundle-owned storage changes.
+/// These are intermediate trie nodes that were rebuilt or removed — the structural work whose cost
+/// scales with trie depth. The `changed_storage_tries` filter restricts storage-side attribution
+/// to tries the bundle actually modified, excluding cached pending-state tries and empty-storage
+/// deletion markers.
 fn add_state_root_trie_update_counts(
     counts: &mut StateRootTrieNodeCounts,
     changed_storage_tries: &HashSet<B256>,
     trie_updates: &reth_trie_common::updates::TrieUpdates,
 ) {
-    counts.account_trie_nodes = counts.account_trie_nodes.saturating_add(
+    counts.account_branches = counts.account_branches.saturating_add(
         trie_updates
             .account_nodes_ref()
             .len()
             .saturating_add(trie_updates.removed_nodes_ref().len()) as u64,
     );
-    counts.storage_trie_nodes = counts.storage_trie_nodes.saturating_add(
+    counts.storage_branches = counts.storage_branches.saturating_add(
         trie_updates
             .storage_tries_ref()
             .iter()
@@ -198,7 +186,7 @@ fn add_state_root_trie_update_counts(
 /// Returns [`MeterBundleOutput`] containing transaction results and aggregated metrics.
 pub fn meter_bundle<SP>(
     state_provider: SP,
-    chain_spec: Arc<OpChainSpec>,
+    chain_spec: Arc<BaseChainSpec>,
     bundle: ParsedBundle,
     header: &SealedHeader,
     parent_beacon_block_root: Option<B256>,
@@ -213,18 +201,20 @@ where
 
     // Get pending trie input before starting timers. This ensures we only measure
     // the bundle's incremental I/O cost, not I/O from pending flashblocks.
-    let metrics = Metrics::default();
     let pending_trie = pending_state
         .as_ref()
         .map(|ps| -> EyreResult<PendingTrieInput> {
             // Use cached trie input if available, otherwise compute it
-            if let Some(ref cached) = ps.trie_input {
-                metrics.pending_trie_cache_hits.increment(1);
-                Ok(cached.clone())
-            } else {
-                let hashed = state_provider.hashed_post_state(&ps.bundle_state);
-                compute_pending_trie_input(&state_provider, hashed, &metrics)
-            }
+            ps.trie_input.as_ref().map_or_else(
+                || {
+                    let hashed = state_provider.hashed_post_state(&ps.bundle_state);
+                    compute_pending_trie_input(&state_provider, hashed)
+                },
+                |cached| {
+                    Metrics::pending_trie_cache_hits().increment(1);
+                    Ok(cached.clone())
+                },
+            )
         })
         .transpose()?;
 
@@ -313,7 +303,7 @@ where
 
     let total_start = Instant::now();
     {
-        let evm_config = OpEvmConfig::optimism(chain_spec);
+        let evm_config = BaseEvmConfig::optimism(chain_spec);
         let mut builder = evm_config.builder_for_next_block(&mut db, header, attributes)?;
 
         // Cap the base fee at MIN_BASEFEE so transactions aren't rejected for
@@ -377,11 +367,11 @@ where
     // Gets the number of storage slots modified from every account
     let storage_slots_modified: usize =
         bundle_update.state().values().map(|account| account.storage.len()).sum();
-    metrics.storage_slots_modified.record(storage_slots_modified as f64);
+    Metrics::storage_slots_modified().record(storage_slots_modified as f64);
 
     // Gets the number of accounts modified
     let accounts_modified: usize = bundle_update.state().len();
-    metrics.accounts_modified.record(accounts_modified as f64);
+    Metrics::accounts_modified().record(accounts_modified as f64);
     // `state_root_*_with_updates` reports structural trie updates for the entire overlay we hand
     // to `reth`, not just the bundle delta. When the bundle made no state changes, those updates
     // can come entirely from cached pending trie nodes or root-maintenance bookkeeping. In that
@@ -440,8 +430,10 @@ where
         bundle_hash,
         total_time_us,
         state_root_time_us,
-        state_root_account_node_count: trie_node_counts.account_trie_nodes,
-        state_root_storage_node_count: trie_node_counts.storage_trie_nodes,
+        state_root_account_leaf_count: trie_node_counts.account_leaves,
+        state_root_account_branch_count: trie_node_counts.account_branches,
+        state_root_storage_leaf_count: trie_node_counts.storage_leaves,
+        state_root_storage_branch_count: trie_node_counts.storage_branches,
     })
 }
 
@@ -451,8 +443,9 @@ mod tests {
     use alloy_primitives::{Address, Bytes, keccak256, utils::Unit};
     use alloy_sol_types::SolCall;
     use base_bundles::{Bundle, ParsedBundle};
-    use base_execution_primitives::OpTransactionSigned;
-    use base_node_runner::test_utils::{Account, SimpleStorage, TestHarness};
+    use base_common_consensus::BaseTransactionSigned;
+    use base_node_runner::test_utils::TestHarness;
+    use base_test_utils::{Account, SimpleStorage};
     use eyre::Context;
     use reth_provider::StateProviderFactory;
     use reth_revm::{bytecode::Bytecode, state::AccountInfo};
@@ -460,7 +453,7 @@ mod tests {
 
     use super::*;
 
-    fn create_parsed_bundle(txs: Vec<OpTransactionSigned>) -> eyre::Result<ParsedBundle> {
+    fn create_parsed_bundle(txs: Vec<BaseTransactionSigned>) -> eyre::Result<ParsedBundle> {
         let txs: Vec<Bytes> = txs.iter().map(|tx| Bytes::from(tx.encoded_2718())).collect();
 
         let bundle = Bundle {
@@ -507,8 +500,10 @@ mod tests {
         // Even empty bundles have some EVM setup overhead
         assert!(output.total_time_us > 0);
         assert!(output.state_root_time_us > 0);
-        assert_eq!(output.state_root_account_node_count, 0);
-        assert_eq!(output.state_root_storage_node_count, 0);
+        assert_eq!(output.state_root_account_leaf_count, 0);
+        assert_eq!(output.state_root_account_branch_count, 0);
+        assert_eq!(output.state_root_storage_leaf_count, 0);
+        assert_eq!(output.state_root_storage_branch_count, 0);
         assert_eq!(output.bundle_hash, keccak256([]));
 
         Ok(())
@@ -532,7 +527,7 @@ mod tests {
             .max_priority_fee_per_gas(1)
             .into_eip1559();
 
-        let tx = OpTransactionSigned::Eip1559(
+        let tx = BaseTransactionSigned::Eip1559(
             signed_tx.as_eip1559().expect("eip1559 transaction").clone(),
         );
         let tx_hash = tx.tx_hash();
@@ -558,8 +553,11 @@ mod tests {
         let result = &output.results[0];
         assert!(output.total_time_us > 0);
         assert!(output.state_root_time_us > 0);
-        assert!(output.state_root_account_node_count > 0);
-        assert_eq!(output.state_root_storage_node_count, 0);
+        assert!(
+            output.state_root_account_leaf_count > 0 || output.state_root_account_branch_count > 0
+        );
+        assert_eq!(output.state_root_storage_leaf_count, 0);
+        assert_eq!(output.state_root_storage_branch_count, 0);
 
         assert_eq!(result.from_address, Account::Alice.address());
         assert_eq!(result.to_address, Some(to));
@@ -602,7 +600,7 @@ mod tests {
             .input(SimpleStorage::setValueCall { v: U256::from(42) }.abi_encode())
             .into_eip1559();
 
-        let tx = OpTransactionSigned::Eip1559(
+        let tx = BaseTransactionSigned::Eip1559(
             signed_tx.as_eip1559().expect("eip1559 transaction").clone(),
         );
 
@@ -624,9 +622,11 @@ mod tests {
         )?;
 
         assert_eq!(output.results.len(), 1);
-        assert!(output.state_root_account_node_count > 0);
         assert!(
-            output.state_root_storage_node_count > 0,
+            output.state_root_account_leaf_count > 0 || output.state_root_account_branch_count > 0
+        );
+        assert!(
+            output.state_root_storage_leaf_count > 0 || output.state_root_storage_branch_count > 0,
             "storage-writing transactions should attribute storage trie work"
         );
 
@@ -708,7 +708,7 @@ mod tests {
             .max_priority_fee_per_gas(1)
             .into_eip1559();
 
-        let tx_1 = OpTransactionSigned::Eip1559(
+        let tx_1 = BaseTransactionSigned::Eip1559(
             signed_tx_1.as_eip1559().expect("eip1559 transaction").clone(),
         );
 
@@ -724,7 +724,7 @@ mod tests {
             .max_priority_fee_per_gas(2)
             .into_eip1559();
 
-        let tx_2 = OpTransactionSigned::Eip1559(
+        let tx_2 = BaseTransactionSigned::Eip1559(
             signed_tx_2.as_eip1559().expect("eip1559 transaction").clone(),
         );
 
@@ -807,7 +807,7 @@ mod tests {
             .max_priority_fee_per_gas(1)
             .into_eip1559();
 
-        let tx = OpTransactionSigned::Eip1559(
+        let tx = BaseTransactionSigned::Eip1559(
             signed_tx.as_eip1559().expect("eip1559 transaction").clone(),
         );
 
@@ -864,7 +864,7 @@ mod tests {
             .max_priority_fee_per_gas(0)
             .into_eip1559();
 
-        let tx = OpTransactionSigned::Eip1559(
+        let tx = BaseTransactionSigned::Eip1559(
             signed_tx.as_eip1559().expect("eip1559 transaction").clone(),
         );
         let parsed_bundle = create_parsed_bundle(vec![tx])?;
@@ -946,7 +946,7 @@ mod tests {
             .max_priority_fee_per_gas(0)
             .into_eip1559();
 
-        let tx = OpTransactionSigned::Eip1559(
+        let tx = BaseTransactionSigned::Eip1559(
             signed_tx.as_eip1559().expect("eip1559 transaction").clone(),
         );
         let parsed_bundle = create_parsed_bundle(vec![tx])?;
@@ -1049,7 +1049,7 @@ mod tests {
             .max_priority_fee_per_gas(0)
             .into_eip1559();
 
-        let tx = OpTransactionSigned::Eip1559(
+        let tx = BaseTransactionSigned::Eip1559(
             signed_tx.as_eip1559().expect("eip1559 transaction").clone(),
         );
 
@@ -1102,7 +1102,7 @@ mod tests {
             .max_priority_fee_per_gas(0)
             .into_eip1559();
 
-        let tx = OpTransactionSigned::Eip1559(
+        let tx = BaseTransactionSigned::Eip1559(
             signed_tx.as_eip1559().expect("eip1559 transaction").clone(),
         );
 
@@ -1160,7 +1160,7 @@ mod tests {
             .max_priority_fee_per_gas(1)
             .into_eip1559();
 
-        let tx = OpTransactionSigned::Eip1559(
+        let tx = BaseTransactionSigned::Eip1559(
             signed_tx.as_eip1559().expect("eip1559 transaction").clone(),
         );
 
@@ -1232,7 +1232,7 @@ mod tests {
             .state_by_block_hash(latest.hash())
             .context("getting state provider for trie")?;
         let hashed = state_provider.hashed_post_state(&bundle_state);
-        let trie_input = compute_pending_trie_input(&state_provider, hashed, &Metrics::default())?;
+        let trie_input = compute_pending_trie_input(&state_provider, hashed)?;
         drop(state_provider);
 
         let pending_state = PendingState { bundle_state, trie_input: Some(trie_input) };
@@ -1250,7 +1250,7 @@ mod tests {
             .max_priority_fee_per_gas(0)
             .into_eip1559();
 
-        let tx = OpTransactionSigned::Eip1559(
+        let tx = BaseTransactionSigned::Eip1559(
             signed_tx.as_eip1559().expect("eip1559 transaction").clone(),
         );
         let parsed_bundle = create_parsed_bundle(vec![tx])?;

@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::BlockNumberOrTag;
 use async_trait::async_trait;
-use base_alloy_consensus::OpBlock;
-use base_alloy_network::Base;
 use base_batcher_source::{PollingSource, SourceError};
+use base_common_consensus::BaseBlock;
+use base_common_network::Base;
 
 /// Polling source that fetches the latest unsafe head block from an L2 RPC.
 ///
@@ -43,7 +43,7 @@ impl RpcPollingSource {
 
 #[async_trait]
 impl PollingSource for RpcPollingSource {
-    async fn unsafe_head(&self) -> Result<OpBlock, SourceError> {
+    async fn unsafe_head(&self) -> Result<BaseBlock, SourceError> {
         let sequential = *self.next_sequential.lock().unwrap();
 
         if let Some(n) = sequential {

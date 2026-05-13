@@ -17,12 +17,11 @@ workspace = true
 # Alloy
 alloy-eips.workspace = true
 alloy-chains.workspace = true
-alloy-genesis.workspace = true
 alloy-sol-types.workspace = true
 alloy-consensus.workspace = true
 alloy-hardforks.workspace = true
 alloy-primitives.workspace = true
-base-alloy-chains.workspace = true
+base-common-chains.workspace = true
 
 # Misc
 tracing.workspace = true
@@ -36,7 +35,8 @@ arbitrary = { workspace = true, features = ["derive"], optional = true }
 serde = { workspace = true, optional = true }
 
 [dev-dependencies]
-serde_json.workspace = true
+rstest.workspace = true
+serde_json = { workspace = true, features = ["std"] }
 rand = { workspace = true, features = ["thread_rng"] }
 arbitrary = { workspace = true, features = ["derive"] }
 toml = { workspace = true, features = ["parse", "serde"] }
@@ -48,7 +48,6 @@ std = [
 	"alloy-chains/std",
 	"alloy-consensus/std",
 	"alloy-eips/std",
-	"alloy-genesis/std",
 	"alloy-primitives/std",
 	"alloy-sol-types/std",
 	"derive_more/std",
@@ -72,6 +71,6 @@ serde = [
 	"alloy-eips/serde",
 	"alloy-hardforks/serde",
 	"alloy-primitives/serde",
-	"base-alloy-chains/serde",
+	"base-common-chains/serde",
 	"dep:serde",
 ]

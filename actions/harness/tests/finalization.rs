@@ -2,7 +2,7 @@
 
 use base_action_harness::{
     ActionL2Source, ActionTestHarness, Batcher, BatcherConfig, L1MinerConfig, SharedL1Chain,
-    TestRollupConfigBuilder, block_info_from,
+    TestRollupConfigBuilder,
 };
 use base_batcher_encoder::{DaType, EncoderConfig};
 
@@ -25,7 +25,7 @@ async fn finalization_advances_with_multiple_l2_blocks_per_epoch() {
 
     let mut blocks = Vec::new();
     for _ in 0..3 {
-        let block = sequencer.build_next_block_with_single_transaction();
+        let block = sequencer.build_next_block_with_single_transaction().await;
         blocks.push(block);
     }
     // All blocks should reference epoch 0.
@@ -49,8 +49,7 @@ async fn finalization_advances_with_multiple_l2_blocks_per_epoch() {
     assert_eq!(node.l2_finalized_number(), 0);
 
     // Derive all 3 L2 blocks.
-    for i in 1..=3u64 {
-        node.act_l1_head_signal(h.l1.block_info_at(i)).await;
+    for _ in 1..=3u64 {
         node.run_until_idle().await;
     }
     assert_eq!(node.l2_safe_number(), 3, "safe head should reach L2 block 3");
@@ -105,7 +104,7 @@ async fn finalization_advances_incrementally_with_l1_epochs() {
     let mut blocks = Vec::new();
     let mut last_epoch_0_number = 0u64;
     for i in 1..=6u64 {
-        let block = sequencer.build_next_block_with_single_transaction();
+        let block = sequencer.build_next_block_with_single_transaction().await;
         let head = sequencer.head();
         blocks.push(block);
         if head.l1_origin.number == 0 {
@@ -131,8 +130,7 @@ async fn finalization_advances_incrementally_with_l1_epochs() {
 
     // Signal and derive all L1 blocks: block 1 is the epoch-providing block,
     // blocks 2-7 contain batches.
-    for i in 1..=(1 + 6) {
-        node.act_l1_head_signal(h.l1.block_info_at(i)).await;
+    for _ in 1..=(1 + 6) {
         node.run_until_idle().await;
     }
     assert_eq!(node.l2_safe_number(), 6, "safe head should reach L2 block 6");
@@ -174,8 +172,8 @@ async fn finalization_does_not_exceed_safe_head() {
     let l1_chain = SharedL1Chain::from_blocks(h.l1.chain().to_vec());
     let mut sequencer = h.create_l2_sequencer(l1_chain);
 
-    let block1 = sequencer.build_next_block_with_single_transaction();
-    let block2 = sequencer.build_next_block_with_single_transaction();
+    let block1 = sequencer.build_next_block_with_single_transaction().await;
+    let block2 = sequencer.build_next_block_with_single_transaction().await;
 
     // Submit each block via the batcher.
     let mut batcher = Batcher::new(ActionL2Source::new(), &h.rollup_config, batcher_cfg.clone());
@@ -194,8 +192,7 @@ async fn finalization_does_not_exceed_safe_head() {
     node.initialize().await;
 
     // Derive only 2 L2 blocks.
-    for i in 1..=2u64 {
-        node.act_l1_head_signal(h.l1.block_info_at(i)).await;
+    for _ in 1..=2u64 {
         node.run_until_idle().await;
     }
     assert_eq!(node.l2_safe_number(), 2, "safe head should be 2");
@@ -232,8 +229,8 @@ async fn finalization_reorg_clears_state() {
     let l1_chain = SharedL1Chain::from_blocks(h.l1.chain().to_vec());
     let mut sequencer = h.create_l2_sequencer(l1_chain);
 
-    let block1 = sequencer.build_next_block_with_single_transaction();
-    let block2 = sequencer.build_next_block_with_single_transaction();
+    let block1 = sequencer.build_next_block_with_single_transaction().await;
+    let block2 = sequencer.build_next_block_with_single_transaction().await;
 
     // Submit and mine.
     let mut batcher = Batcher::new(ActionL2Source::new(), &h.rollup_config, batcher_cfg.clone());
@@ -249,8 +246,7 @@ async fn finalization_reorg_clears_state() {
     node.initialize().await;
 
     // Derive both L2 blocks.
-    for i in 1..=2u64 {
-        node.act_l1_head_signal(h.l1.block_info_at(i)).await;
+    for _ in 1..=2u64 {
         node.run_until_idle().await;
     }
     assert_eq!(node.l2_safe_number(), 2);
@@ -266,12 +262,9 @@ async fn finalization_reorg_clears_state() {
     assert_eq!(node.l2_finalized_number(), 2, "pre-reset finalized = 2");
 
     // Simulate a reorg by resetting the pipeline to genesis.
-    let l1_genesis = block_info_from(h.l1.chain().first().expect("genesis always present"));
     let l2_genesis = h.l2_genesis();
-    let genesis_sys_cfg = rollup_cfg.genesis.system_config.unwrap_or_default();
 
-    node.act_reset(l1_genesis, l2_genesis, genesis_sys_cfg).await;
-    node.run_until_idle().await;
+    node.act_reset(l2_genesis).await;
 
     // After reset, finalized head should be back to genesis (block 0).
     assert_eq!(
@@ -287,7 +280,7 @@ async fn finalization_reorg_clears_state() {
     // Build a new L2 block on the fresh fork.
     let l1_chain_fresh = SharedL1Chain::from_blocks(h.l1.chain().to_vec());
     let mut sequencer_fresh = h.create_l2_sequencer(l1_chain_fresh);
-    let block1_fresh = sequencer_fresh.build_next_block_with_single_transaction();
+    let block1_fresh = sequencer_fresh.build_next_block_with_single_transaction().await;
 
     // Register the block hash before mining so the node can validate it.
     node.register_block_hash(1, block1_fresh.header.hash_slow());
@@ -302,7 +295,6 @@ async fn finalization_reorg_clears_state() {
     chain.push(h.l1.tip().clone());
 
     let l1_block_1_new = h.l1.block_info_at(1);
-    node.act_l1_head_signal(l1_block_1_new).await;
     node.run_until_idle().await;
 
     assert_eq!(node.l2_safe_number(), 1, "safe head re-derived to 1");
@@ -357,7 +349,7 @@ async fn finalization_does_not_regress() {
 
     let mut blocks = Vec::new();
     for _ in 0..6 {
-        let block = sequencer.build_next_block_with_single_transaction();
+        let block = sequencer.build_next_block_with_single_transaction().await;
         blocks.push(block);
     }
 
@@ -377,8 +369,7 @@ async fn finalization_does_not_regress() {
     node.initialize().await;
 
     // Derive all L2 blocks. L1 block 1 is epoch-providing, blocks 2-7 have batches.
-    for i in 1..=(1 + 6) {
-        node.act_l1_head_signal(h.l1.block_info_at(i)).await;
+    for _ in 1..=(1 + 6) {
         node.run_until_idle().await;
     }
     assert_eq!(node.l2_safe_number(), 6, "safe head should be 6");

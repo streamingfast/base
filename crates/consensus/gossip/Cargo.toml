@@ -20,23 +20,22 @@ base-consensus-peers.workspace = true
 base-consensus-genesis.workspace = true
 
 # Alloy
-alloy-rlp = { workspace = true, features = ["std"] }
 alloy-eips = { workspace = true, features = ["std"] }
 alloy-consensus = { workspace = true, features = ["std"] }
 alloy-rpc-types-engine = { workspace = true, features = ["std"] }
 alloy-primitives = { workspace = true, features = ["k256", "getrandom"] }
 
 # Base Alloy
-base-alloy-consensus = { workspace = true, features = ["k256"] }
-base-alloy-rpc-types-engine = { workspace = true, features = ["std", "serde"] }
+base-common-consensus = { workspace = true, features = ["k256"] }
+base-common-rpc-types-engine = { workspace = true, features = ["std", "serde"] }
 
 # Networking
 snap.workspace = true
 futures.workspace = true
 libp2p-stream.workspace = true
 ipnet = { workspace = true, features = ["serde"] }
-openssl = { workspace = true, features = ["vendored"] }
 discv5 = { workspace = true, features = ["libp2p"] }
+openssl = { workspace = true, features = ["vendored"] }
 libp2p-identity = { workspace = true, features = ["secp256k1"] }
 libp2p = { workspace = true, features = ["macros", "tokio", "tcp", "dns", "noise", "gossipsub", "ping", "yamux", "identify"] }
 
@@ -54,15 +53,20 @@ metrics = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile.workspace = true
 multihash.workspace = true
+alloy-rlp = { workspace = true, features = ["std"] }
 serde_json = { workspace = true, features = ["std"] }
-alloy-chains = { workspace = true, features = ["std"] }
-
 rand = { workspace = true, features = ["thread_rng"] }
+alloy-chains = { workspace = true, features = ["std"] }
 arbitrary = { workspace = true, features = ["derive"] }
 alloy-primitives = { workspace = true, features = ["arbitrary"] }
-base-alloy-consensus = { workspace = true, features = ["arbitrary", "k256"] }
+base-common-consensus = { workspace = true, features = ["arbitrary", "k256"] }
 alloy-consensus = { workspace = true, features = ["arbitrary", "k256", "std"] }
 
 [features]
 default = []
-metrics = [ "base-consensus-disc/metrics", "dep:metrics", "libp2p/metrics" ]
+metrics = [
+	"base-consensus-disc/metrics",
+	"base-metrics/metrics",
+	"dep:metrics",
+	"libp2p/metrics",
+]

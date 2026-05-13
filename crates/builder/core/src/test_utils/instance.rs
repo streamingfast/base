@@ -11,13 +11,13 @@ use std::sync::{Arc, LazyLock};
 use alloy_primitives::B256;
 use alloy_provider::{Identity, ProviderBuilder, RootProvider};
 use async_trait::async_trait;
-use base_alloy_flashblocks::FlashblocksPayloadV1;
-use base_alloy_network::Base;
-use base_execution_chainspec::OpChainSpec;
+use base_common_flashblocks::FlashblocksPayloadV1;
+use base_common_network::Base;
+use base_execution_chainspec::BaseChainSpec;
 use base_execution_rpc::OpEthApiBuilder;
-use base_node_core::{OpEngineValidatorBuilder, args::RollupArgs, node::OpPoolBuilder};
+use base_execution_txpool::BasePooledTransaction;
+use base_node_core::{BasePayloadValidatorBuilder, args::RollupArgs, node::BasePoolBuilder};
 use base_node_runner::{BaseNode, test_utils::init_silenced_tracing};
-use base_txpool::BasePooledTransaction;
 use futures::{FutureExt, StreamExt};
 use nanoid::nanoid;
 use parking_lot::Mutex;
@@ -61,7 +61,7 @@ pub fn clear_otel_env_vars() {
 /// This node uses IPC as the communication channel for the RPC server Engine API.
 #[derive(Debug)]
 pub struct LocalInstance {
-    node_config: NodeConfig<OpChainSpec>,
+    node_config: NodeConfig<BaseChainSpec>,
     builder_config: BuilderConfig,
     runtime: Option<Runtime>,
     exit_future: NodeExitFuture,
@@ -81,8 +81,10 @@ impl<P: core::fmt::Debug> core::fmt::Debug for PoolHandle<P> {
     }
 }
 
+/// Trait for submitting transactions to the pool from outside the node.
 #[async_trait]
 pub trait ExternalTransactionPool: Send + Sync + core::fmt::Debug {
+    /// Submits a pooled transaction as if it arrived from an external peer.
     async fn add_external_transaction(&self, tx: BasePooledTransaction) -> eyre::Result<()>;
 }
 
@@ -116,7 +118,7 @@ impl LocalInstance {
     /// make sure that sender accounts are funded.
     pub async fn new_with_node_config(
         builder_config: BuilderConfig,
-        node_config: NodeConfig<OpChainSpec>,
+        node_config: NodeConfig<BaseChainSpec>,
     ) -> eyre::Result<Self> {
         clear_otel_env_vars();
         init_silenced_tracing();
@@ -133,14 +135,14 @@ impl LocalInstance {
         let gas_limit_config = builder_config.gas_limit_config.clone();
         let metering_provider = Arc::clone(&builder_config.metering_provider);
 
-        let addons: base_node_runner::BaseAddOns<_, OpEthApiBuilder, OpEngineValidatorBuilder> =
+        let addons: base_node_runner::BaseAddOns<_, OpEthApiBuilder, BasePayloadValidatorBuilder> =
             base_node
                 .add_ons_builder()
                 .with_da_config(da_config.clone())
                 .with_gas_limit_config(gas_limit_config.clone())
                 .build();
 
-        let node_builder = NodeBuilder::<_, OpChainSpec>::new(node_config.clone())
+        let node_builder = NodeBuilder::<_, BaseChainSpec>::new(node_config.clone())
             .with_database(create_test_db(node_config.clone()))
             .with_launch_context(runtime.clone())
             .with_types::<BaseNode>()
@@ -196,14 +198,17 @@ impl LocalInstance {
         Self::new(BuilderConfig::for_tests()).await
     }
 
-    pub const fn node_config(&self) -> &NodeConfig<OpChainSpec> {
+    /// Returns the Reth node configuration.
+    pub const fn node_config(&self) -> &NodeConfig<BaseChainSpec> {
         &self.node_config
     }
 
+    /// Returns the builder configuration.
     pub const fn builder_config(&self) -> &BuilderConfig {
         &self.builder_config
     }
 
+    /// Returns the WebSocket URL for the flashblocks publisher.
     pub fn flashblocks_ws_url(&self) -> String {
         let ipaddr = self.builder_config.flashblocks_ws_addr.ip();
         let ipaddr = if ipaddr.is_unspecified() {
@@ -215,38 +220,47 @@ impl LocalInstance {
         format!("ws://{ipaddr}:{port}/")
     }
 
+    /// Spawns a background task that listens for flashblock payloads over WebSocket.
     pub fn spawn_flashblocks_listener(&self) -> FlashblocksListener {
         FlashblocksListener::new(self.flashblocks_ws_url())
     }
 
+    /// Returns the IPC socket path for the regular JSON-RPC server.
     pub fn rpc_ipc(&self) -> &str {
         &self.node_config.rpc.ipcpath
     }
 
+    /// Returns the IPC socket path for the authenticated Engine API server.
     pub fn auth_ipc(&self) -> &str {
         &self.node_config.rpc.auth_ipc_path
     }
 
+    /// Creates an IPC-based [`EngineApi`] client for this instance.
     pub fn engine_api(&self) -> EngineApi<Ipc> {
         EngineApi::<Ipc>::with_ipc(self.auth_ipc())
     }
 
+    /// Returns a reference to the transaction pool observer.
     pub const fn pool(&self) -> &TransactionPoolObserver {
         &self.pool_observer
     }
 
+    /// Returns a cloned handle for submitting external transactions to the pool.
     pub fn pool_handle(&self) -> Arc<dyn ExternalTransactionPool> {
         Arc::clone(&self.pool_handle)
     }
 
+    /// Returns a reference to the shared metering provider.
     pub fn metering_provider(&self) -> &SharedMeteringProvider {
         &self.metering_provider
     }
 
+    /// Creates a [`ChainDriver`] connected to this local instance.
     pub async fn driver(&self) -> eyre::Result<ChainDriver<Ipc>> {
         ChainDriver::<Ipc>::local(self).await
     }
 
+    /// Creates an alloy provider connected to this instance over IPC.
     pub async fn provider(&self) -> eyre::Result<RootProvider<Base>> {
         ProviderBuilder::<Identity, Identity, Base>::default()
             .connect_ipc(self.rpc_ipc().to_string().into())
@@ -277,15 +291,18 @@ impl Future for LocalInstance {
     }
 }
 
-pub fn default_node_config() -> NodeConfig<OpChainSpec> {
+/// Returns the default Reth node configuration used in tests.
+pub fn default_node_config() -> NodeConfig<BaseChainSpec> {
     node_config_with_chain_spec(chain_spec())
 }
 
-fn chain_spec() -> Arc<OpChainSpec> {
-    static CHAIN_SPEC: LazyLock<Arc<OpChainSpec>> = LazyLock::new(|| {
+/// Returns the default test chain spec, lazily initialized from the embedded
+/// genesis template.
+pub fn chain_spec() -> Arc<BaseChainSpec> {
+    static CHAIN_SPEC: LazyLock<Arc<BaseChainSpec>> = LazyLock::new(|| {
         let genesis = include_str!("./artifacts/genesis.json.tmpl");
         let genesis = serde_json::from_str(genesis).expect("invalid genesis JSON");
-        let chain_spec = OpChainSpec::from_genesis(genesis);
+        let chain_spec = BaseChainSpec::from_genesis(genesis);
         Arc::new(chain_spec)
     });
 
@@ -294,24 +311,24 @@ fn chain_spec() -> Arc<OpChainSpec> {
 
 /// Returns a chain spec identical to the default test chain spec but with
 /// `BaseUpgrade::V1` activated at genesis (timestamp 0).
-pub fn chain_spec_with_base_v1() -> Arc<OpChainSpec> {
-    use base_alloy_chains::BaseUpgrade;
+pub fn chain_spec_with_base_v1() -> Arc<BaseChainSpec> {
+    use base_common_chains::BaseUpgrade;
     use reth_chainspec::ForkCondition;
 
     let genesis = include_str!("./artifacts/genesis.json.tmpl");
     let genesis = serde_json::from_str(genesis).expect("invalid genesis JSON");
-    let mut spec = OpChainSpec::from_genesis(genesis);
+    let mut spec = BaseChainSpec::from_genesis(genesis);
     spec.inner.hardforks.insert(BaseUpgrade::V1, ForkCondition::Timestamp(0));
     Arc::new(spec)
 }
 
 /// Returns a node config using a chain spec with `BaseUpgrade::V1` activated
 /// at genesis.
-pub fn default_node_config_with_base_v1() -> NodeConfig<OpChainSpec> {
+pub fn default_node_config_with_base_v1() -> NodeConfig<BaseChainSpec> {
     node_config_with_chain_spec(chain_spec_with_base_v1())
 }
 
-fn node_config_with_chain_spec(spec: Arc<OpChainSpec>) -> NodeConfig<OpChainSpec> {
+fn node_config_with_chain_spec(spec: Arc<BaseChainSpec>) -> NodeConfig<BaseChainSpec> {
     let tempdir = std::env::temp_dir();
     let random_id = nanoid!();
 
@@ -344,14 +361,14 @@ fn node_config_with_chain_spec(spec: Arc<OpChainSpec>) -> NodeConfig<OpChainSpec
         pprof_dumps_path: Some(pprof_dumps_path),
     };
 
-    NodeConfig::<OpChainSpec>::new(spec)
+    NodeConfig::<BaseChainSpec>::new(spec)
         .with_datadir_args(datadir)
         .with_rpc(rpc)
         .with_network(network)
 }
 
-fn pool_component() -> OpPoolBuilder<BasePooledTransaction> {
-    OpPoolBuilder::<BasePooledTransaction>::default()
+fn pool_component() -> BasePoolBuilder<BasePooledTransaction> {
+    BasePoolBuilder::<BasePooledTransaction>::default()
 }
 
 /// A utility for listening to flashblocks WebSocket messages during tests.
@@ -360,8 +377,11 @@ fn pool_component() -> OpPoolBuilder<BasePooledTransaction> {
 /// during test execution, eliminating the need for duplicate WebSocket listening code.
 #[derive(Debug)]
 pub struct FlashblocksListener {
+    /// All flashblock payloads received so far.
     pub flashblocks: Arc<Mutex<Vec<FlashblocksPayloadV1>>>,
+    /// Token used to signal the listener task to stop.
     pub cancellation_token: CancellationToken,
+    /// Handle to the spawned listener task.
     pub handle: JoinHandle<eyre::Result<()>>,
 }
 

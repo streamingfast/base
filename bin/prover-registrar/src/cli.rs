@@ -10,17 +10,20 @@ use std::{
 };
 
 use alloy_primitives::Address;
-use alloy_provider::RootProvider;
+use alloy_provider::ProviderBuilder;
 use alloy_signer_local::PrivateKeySigner;
+use base_balance_monitor::BalanceMonitorLayer;
 use base_cli_utils::RuntimeManager;
 use base_health::HealthServer;
 use base_proof_tee_nitro_attestation_prover::{
     AttestationProofProvider, BoundlessProver, DirectProver,
 };
 use base_proof_tee_registrar::{
-    AwsDiscoveryConfig, AwsTargetGroupDiscovery, BoundlessConfig, DriverConfig, ProverClient,
-    ProvingConfig, RegistrarConfig, RegistrarError, RegistrarMetrics, RegistrationDriver,
-    RegistryContractClient,
+    AwsDiscoveryConfig, AwsTargetGroupDiscovery, BoundlessConfig, CrlConfig,
+    DEFAULT_CRL_FETCH_TIMEOUT_SECS, DEFAULT_MAX_ATTESTATION_AGE_SECS, DEFAULT_MAX_CONCURRENCY,
+    DEFAULT_MAX_RECOVERY_ATTEMPTS, DEFAULT_MAX_TX_RETRIES, DEFAULT_TX_RETRY_DELAY_SECS,
+    DEFAULT_UNHEALTHY_REGISTRATION_WINDOW_SECS, DriverConfig, ProverClient, ProvingConfig,
+    RegistrarConfig, RegistrarError, RegistrarMetrics, RegistrationDriver, RegistryContractClient,
 };
 use base_tx_manager::{BaseTxMetrics, SignerConfig, SimpleTxManager, TxManagerConfig};
 use clap::{Args, Parser, ValueEnum};
@@ -106,6 +109,32 @@ pub(crate) struct Cli {
     #[arg(long, env = cli_env!("PROVER_TIMEOUT_SECS"), default_value_t = 30)]
     prover_timeout_secs: u64,
 
+    /// Maximum number of instances to process concurrently within a single
+    /// registration cycle. Each instance may trigger a ~20-minute proof
+    /// generation, so this limits concurrent proof work.
+    #[arg(long, env = cli_env!("MAX_CONCURRENCY"), default_value_t = DEFAULT_MAX_CONCURRENCY)]
+    max_concurrency: usize,
+
+    // ── Tx Retry ──────────────────────────────────────────────────────────────
+    /// Maximum number of transaction submission retries for transient errors.
+    #[arg(long, env = cli_env!("MAX_TX_RETRIES"), default_value_t = DEFAULT_MAX_TX_RETRIES)]
+    max_tx_retries: u32,
+
+    /// Delay between transaction submission retries, in seconds.
+    #[arg(long, env = cli_env!("TX_RETRY_DELAY_SECS"), default_value_t = DEFAULT_TX_RETRY_DELAY_SECS)]
+    tx_retry_delay_secs: u64,
+
+    // ── Unhealthy Registration Window ─────────────────────────────────────
+    /// Duration (seconds) after EC2 launch during which unhealthy instances
+    /// are still eligible for registration. New instances may fail ALB health
+    /// checks while the application initializes. Set to 0 to disable.
+    #[arg(long, env = cli_env!("UNHEALTHY_REGISTRATION_WINDOW_SECS"), default_value_t = DEFAULT_UNHEALTHY_REGISTRATION_WINDOW_SECS)]
+    unhealthy_registration_window_secs: u64,
+
+    // ── CRL Checking ───────────────────────────────────────────────────────────
+    #[command(flatten)]
+    crl: CrlArgs,
+
     // ── Health Server ─────────────────────────────────────────────────────────
     #[command(flatten)]
     health: HealthArgs,
@@ -147,17 +176,13 @@ struct BoundlessArgs {
     )]
     boundless_private_key: Option<String>,
 
-    /// IPFS URL of the Nitro attestation verifier ELF uploaded via `nitro-attest-cli`.
+    /// HTTP(S) URL of the Nitro attestation verifier ELF (e.g. Pinata IPFS gateway URL).
     #[arg(
         long,
         env = cli_env!("BOUNDLESS_VERIFIER_PROGRAM_URL"),
         required_if_eq("proving_mode", "boundless")
     )]
     boundless_verifier_program_url: Option<Url>,
-
-    /// Maximum price in wei per cycle for Boundless proof requests.
-    #[arg(long, env = cli_env!("BOUNDLESS_MAX_PRICE"), default_value_t = 1_000_000)]
-    boundless_max_price: u64,
 
     /// Interval between Boundless fulfillment status checks, in seconds.
     #[arg(long, env = cli_env!("BOUNDLESS_POLL_INTERVAL_SECS"), default_value_t = 5)]
@@ -167,9 +192,53 @@ struct BoundlessArgs {
     #[arg(long, env = cli_env!("BOUNDLESS_TIMEOUT_SECS"), default_value_t = 600)]
     boundless_timeout_secs: u64,
 
+    /// Maximum number of deterministic request-ID slots to probe when
+    /// recovering in-flight proofs after an instance rotation.
+    #[arg(
+        long,
+        env = cli_env!("BOUNDLESS_MAX_RECOVERY_ATTEMPTS"),
+        default_value_t = DEFAULT_MAX_RECOVERY_ATTEMPTS
+    )]
+    boundless_max_recovery_attempts: u32,
+
     /// `NitroEnclaveVerifier` contract address for certificate caching (optional).
     #[arg(long, env = cli_env!("NITRO_VERIFIER_ADDRESS"))]
     nitro_verifier_address: Option<Address>,
+
+    /// Maximum age (in seconds) of a recovered proof's attestation timestamp
+    /// before it is considered stale. Should be slightly below the on-chain
+    /// `MAX_AGE` to account for clock skew. Defaults to 3300 s (55 minutes).
+    #[arg(
+        long,
+        env = cli_env!("MAX_ATTESTATION_AGE_SECS"),
+        default_value_t = DEFAULT_MAX_ATTESTATION_AGE_SECS
+    )]
+    max_attestation_age_secs: u64,
+}
+
+/// CRL (Certificate Revocation List) checking CLI arguments.
+#[derive(Args)]
+struct CrlArgs {
+    /// Enable on-demand CRL checking at registration time.
+    /// When enabled, intermediate certificates are checked against CRL
+    /// distribution points before signer registration. Revoked certificates
+    /// trigger a `revokeCert` transaction on-chain.
+    #[arg(long, env = cli_env!("CRL_CHECK_ENABLED"), default_value_t = false)]
+    crl_check_enabled: bool,
+
+    /// `NitroEnclaveVerifier` contract address for `revokeCert` calls.
+    /// Required when `--crl-check-enabled` is set.
+    #[arg(long, env = cli_env!("CRL_NITRO_VERIFIER_ADDRESS"))]
+    crl_nitro_verifier_address: Option<Address>,
+
+    /// HTTP timeout for CRL fetches from AWS S3 endpoints, in seconds.
+    #[arg(
+        long,
+        env = cli_env!("CRL_FETCH_TIMEOUT_SECS"),
+        default_value_t = DEFAULT_CRL_FETCH_TIMEOUT_SECS,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    crl_fetch_timeout_secs: u64,
 }
 
 /// Parse a hex-encoded secp256k1 private key string into a [`PrivateKeySigner`].
@@ -195,7 +264,7 @@ fn parse_image_id(s: &str) -> std::result::Result<[u32; 8], RegistrarError> {
 
     let mut id = [0u32; 8];
     for (i, chunk) in bytes.chunks_exact(4).enumerate() {
-        id[i] = u32::from_be_bytes(chunk.try_into().unwrap());
+        id[i] = u32::from_le_bytes(chunk.try_into().unwrap());
     }
     Ok(id)
 }
@@ -247,10 +316,13 @@ impl Cli {
                             )
                         })?,
                     image_id: parse_image_id(image_id_hex)?,
-                    max_price: self.boundless.boundless_max_price,
                     poll_interval: Duration::from_secs(self.boundless.boundless_poll_interval_secs),
                     timeout: Duration::from_secs(self.boundless.boundless_timeout_secs),
                     nitro_verifier_address: self.boundless.nitro_verifier_address,
+                    max_recovery_attempts: self.boundless.boundless_max_recovery_attempts,
+                    max_attestation_age: Duration::from_secs(
+                        self.boundless.max_attestation_age_secs,
+                    ),
                 }))
             }
             ProvingMode::Direct => {
@@ -273,9 +345,32 @@ impl Cli {
             ));
         }
 
+        if self.max_concurrency == 0 {
+            return Err(RegistrarError::Config("--max-concurrency must be greater than 0".into()));
+        }
+
+        if self.tx_retry_delay_secs == 0 {
+            return Err(RegistrarError::Config(
+                "--tx-retry-delay-secs must be greater than 0".into(),
+            ));
+        }
+
         if self.health.port == 0 {
             return Err(RegistrarError::Config("health server port must be non-zero".into()));
         }
+
+        // Validate CRL config: if enabled, verifier address is required.
+        if self.crl.crl_check_enabled && self.crl.crl_nitro_verifier_address.is_none() {
+            return Err(RegistrarError::Config(
+                "--crl-nitro-verifier-address is required when --crl-check-enabled is set".into(),
+            ));
+        }
+
+        let crl = CrlConfig {
+            enabled: self.crl.crl_check_enabled,
+            nitro_verifier_address: self.crl.crl_nitro_verifier_address,
+            fetch_timeout: Duration::from_secs(self.crl.crl_fetch_timeout_secs),
+        };
 
         let health_addr = self.health.socket_addr();
 
@@ -289,7 +384,14 @@ impl Cli {
             proving,
             poll_interval: Duration::from_secs(self.poll_interval_secs),
             prover_timeout: Duration::from_secs(self.prover_timeout_secs),
+            max_concurrency: self.max_concurrency,
+            max_tx_retries: self.max_tx_retries,
+            tx_retry_delay: Duration::from_secs(self.tx_retry_delay_secs),
+            unhealthy_registration_window: Duration::from_secs(
+                self.unhealthy_registration_window_secs,
+            ),
             health_addr,
+            crl,
         })
     }
 
@@ -315,15 +417,55 @@ impl Cli {
         let signal_handle = RuntimeManager::install_signal_handler(cancel.clone());
 
         // ── 2. Metrics recorder (if enabled) ─────────────────────────────────
+        let metrics_enabled = metrics_config.enabled;
         metrics_config
             .init_with(|| {
                 base_cli_utils::register_version_metrics!();
-                RegistrarMetrics::record_startup(env!("CARGO_PKG_VERSION"));
+                RegistrarMetrics::up().set(1.0);
             })
             .wrap_err("failed to install Prometheus recorder")?;
 
         // ── 3. Build L1 provider and tx manager ──────────────────────────────
-        let provider = RootProvider::new_http(config.l1_rpc_url.clone());
+        let l1_addr = config.signing.address();
+        let provider = if metrics_enabled {
+            let (layer, balance_rx) = BalanceMonitorLayer::new(
+                l1_addr,
+                cancel.clone(),
+                BalanceMonitorLayer::DEFAULT_POLL_INTERVAL,
+            );
+            let provider =
+                ProviderBuilder::new().layer(layer).connect_http(config.l1_rpc_url.clone());
+            tokio::spawn(async move {
+                let mut rx = balance_rx;
+                while rx.changed().await.is_ok() {
+                    RegistrarMetrics::account_balance_wei().set(f64::from(*rx.borrow_and_update()));
+                }
+            });
+            info!(%l1_addr, "L1 balance monitor started");
+
+            if let ProvingConfig::Boundless(ref boundless) = config.proving {
+                let bl_addr = boundless.signer.address();
+                let (bl_layer, bl_balance_rx) = BalanceMonitorLayer::new(
+                    bl_addr,
+                    cancel.clone(),
+                    BalanceMonitorLayer::DEFAULT_POLL_INTERVAL,
+                );
+                let _bl_provider =
+                    ProviderBuilder::new().layer(bl_layer).connect_http(boundless.rpc_url.clone());
+                tokio::spawn(async move {
+                    let mut rx = bl_balance_rx;
+                    while rx.changed().await.is_ok() {
+                        RegistrarMetrics::boundless_balance_wei()
+                            .set(f64::from(*rx.borrow_and_update()));
+                    }
+                });
+                info!(%bl_addr, "Boundless balance monitor started");
+            }
+
+            provider
+        } else {
+            ProviderBuilder::new().connect_http(config.l1_rpc_url.clone())
+        };
 
         let tx_manager = SimpleTxManager::new(
             provider,
@@ -362,10 +504,13 @@ impl Cli {
                 signer: boundless.signer.clone(),
                 verifier_program_url: boundless.verifier_program_url.clone(),
                 image_id: boundless.image_id,
-                max_price: boundless.max_price,
                 poll_interval: boundless.poll_interval,
                 timeout: boundless.timeout,
                 trusted_certs_prefix_len: DEFAULT_TRUSTED_CERTS_PREFIX,
+                max_recovery_attempts: boundless.max_recovery_attempts,
+                max_attestation_age: boundless.max_attestation_age,
+                submit_lock: Arc::new(tokio::sync::Mutex::new(())),
+                recovery_blocked: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             }),
             ProvingConfig::Direct { ref elf_path } => {
                 let elf = std::fs::read(elf_path).map_err(|e| {
@@ -393,6 +538,11 @@ impl Cli {
             registry_address: config.tee_prover_registry_address,
             poll_interval: config.poll_interval,
             cancel: cancel.clone(),
+            max_concurrency: config.max_concurrency,
+            max_tx_retries: config.max_tx_retries,
+            tx_retry_delay: config.tx_retry_delay,
+            unhealthy_registration_window: config.unhealthy_registration_window,
+            crl: config.crl,
         };
 
         // Mark the service as ready. This signals "initialised and running", not
@@ -459,10 +609,9 @@ mod tests {
     const TEST_BOUNDLESS_RPC: &str = "http://localhost:9545";
     const TEST_BOUNDLESS_KEY: &str =
         "0202020202020202020202020202020202020202020202020202020202020202";
-    const TEST_VERIFIER_URL: &str =
-        "ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+    const TEST_VERIFIER_URL: &str = "https://gateway.pinata.cloud/ipfs/bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
     const TEST_IMAGE_ID: &str =
-        "0x0000000100000002000000030000000400000005000000060000000700000008";
+        "0x0100000002000000030000000400000005000000060000000700000008000000";
     const TEST_ELF_PATH: &str = "/tmp/guest.elf";
     const TEST_SIGNER_ENDPOINT: &str = "http://localhost:8546";
     const TEST_SIGNER_ADDR: &str = "0x0000000000000000000000000000000000000002";
@@ -614,6 +763,8 @@ mod tests {
     #[case::zero_poll_interval("--poll-interval-secs", "0")]
     #[case::zero_prover_timeout("--prover-timeout-secs", "0")]
     #[case::zero_boundless_timeout("--boundless-timeout-secs", "0")]
+    #[case::zero_max_concurrency("--max-concurrency", "0")]
+    #[case::zero_tx_retry_delay("--tx-retry-delay-secs", "0")]
     fn zero_duration_fails_into_config(#[case] flag: &str, #[case] value: &str) {
         let mut args = boundless_args();
         args.extend([flag, value]);
@@ -632,10 +783,17 @@ mod tests {
     // ── Field value checks ──────────────────────────────────────────────
 
     #[rstest]
-    fn default_durations() {
+    fn default_durations_and_concurrency() {
         let config = Cli::parse_from(boundless_args()).into_config().unwrap();
         assert_eq!(config.poll_interval, Duration::from_secs(DEFAULT_POLL_INTERVAL_SECS));
         assert_eq!(config.prover_timeout, Duration::from_secs(DEFAULT_PROVER_TIMEOUT_SECS));
+        assert_eq!(config.max_concurrency, DEFAULT_MAX_CONCURRENCY);
+        assert_eq!(config.max_tx_retries, DEFAULT_MAX_TX_RETRIES);
+        assert_eq!(config.tx_retry_delay, Duration::from_secs(DEFAULT_TX_RETRY_DELAY_SECS));
+        assert_eq!(
+            config.unhealthy_registration_window,
+            Duration::from_secs(DEFAULT_UNHEALTHY_REGISTRATION_WINDOW_SECS),
+        );
     }
 
     #[rstest]
@@ -695,8 +853,8 @@ mod tests {
     // ── parse_image_id unit tests ───────────────────────────────────────
 
     #[rstest]
-    #[case::with_prefix("0x0000000100000002000000030000000400000005000000060000000700000008", [1,2,3,4,5,6,7,8])]
-    #[case::without_prefix("0000000100000002000000030000000400000005000000060000000700000008", [1,2,3,4,5,6,7,8])]
+    #[case::with_prefix("0x0100000002000000030000000400000005000000060000000700000008000000", [1,2,3,4,5,6,7,8])]
+    #[case::without_prefix("0100000002000000030000000400000005000000060000000700000008000000", [1,2,3,4,5,6,7,8])]
     fn parse_image_id_valid(#[case] input: &str, #[case] expected: [u32; 8]) {
         assert_eq!(parse_image_id(input).unwrap(), expected);
     }
@@ -707,5 +865,61 @@ mod tests {
     #[case::empty("")]
     fn parse_image_id_invalid(#[case] input: &str) {
         assert!(parse_image_id(input).is_err());
+    }
+
+    // ── CRL config validation tests ─────────────────────────────────────
+
+    /// A test address for `--crl-nitro-verifier-address`.
+    const TEST_CRL_VERIFIER_ADDR: &str = "0x0000000000000000000000000000000000000099";
+
+    #[rstest]
+    fn crl_enabled_without_verifier_address_fails() {
+        let mut args = boundless_args();
+        args.extend(["--crl-check-enabled"]);
+        let result = Cli::parse_from(args).into_config();
+        assert!(result.is_err(), "CRL enabled without --crl-nitro-verifier-address should fail");
+    }
+
+    #[rstest]
+    fn crl_enabled_with_zero_timeout_fails() {
+        let mut args = boundless_args();
+        args.extend([
+            "--crl-check-enabled",
+            "--crl-nitro-verifier-address",
+            TEST_CRL_VERIFIER_ADDR,
+            "--crl-fetch-timeout-secs",
+            "0",
+        ]);
+        let result = Cli::try_parse_from(args);
+        assert!(result.is_err(), "--crl-fetch-timeout-secs 0 should be rejected by clap");
+    }
+
+    #[rstest]
+    fn crl_enabled_with_valid_config_parses() {
+        let mut args = boundless_args();
+        args.extend([
+            "--crl-check-enabled",
+            "--crl-nitro-verifier-address",
+            TEST_CRL_VERIFIER_ADDR,
+        ]);
+        let config = Cli::parse_from(args).into_config().unwrap();
+        assert!(config.crl.enabled);
+        assert!(config.crl.nitro_verifier_address.is_some());
+        assert_eq!(config.crl.fetch_timeout, Duration::from_secs(DEFAULT_CRL_FETCH_TIMEOUT_SECS));
+    }
+
+    #[rstest]
+    fn crl_disabled_by_default() {
+        let config = Cli::parse_from(boundless_args()).into_config().unwrap();
+        assert!(!config.crl.enabled);
+        assert!(config.crl.nitro_verifier_address.is_none());
+    }
+
+    #[rstest]
+    fn crl_disabled_allows_missing_verifier_address() {
+        // When CRL is disabled (default), not providing
+        // --crl-nitro-verifier-address should be fine.
+        let config = Cli::parse_from(boundless_args()).into_config().unwrap();
+        assert!(!config.crl.enabled);
     }
 }

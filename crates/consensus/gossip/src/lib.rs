@@ -9,9 +9,6 @@
 
 #[macro_use]
 extern crate tracing;
-// Used in tests
-#[allow(unused_extern_crates)]
-extern crate alloy_rlp;
 
 mod metrics;
 pub use metrics::Metrics;
@@ -57,4 +54,4 @@ pub use driver::GossipDriver;
 mod block_validity;
 pub use block_validity::BlockInvalidError;
 #[cfg(test)]
-pub(crate) use block_validity::tests::*;
+pub use block_validity::tests::*;

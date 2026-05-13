@@ -77,9 +77,9 @@ impl JwtValidator {
         use alloy_provider::RootProvider;
         use alloy_transport_http::Http;
         use backon::{ExponentialBuilder, Retryable};
-        use base_alloy_network::Base;
-        use base_alloy_provider::OpEngineApi;
-        use base_consensus_engine::{HyperAuthClient, OpEngineClient};
+        use base_common_network::Base;
+        use base_common_provider::BaseEngineApi;
+        use base_consensus_engine::{BaseEngineClient, HyperAuthClient};
         use tracing::{debug, error};
 
         // Convert WebSocket URLs to HTTP for validation.
@@ -87,7 +87,7 @@ impl JwtValidator {
         // ws:// -> http:// and wss:// -> https:// for the capability exchange.
         let http_url = Self::normalize_engine_url(engine_url)?;
 
-        let engine = OpEngineClient::<RootProvider, RootProvider<Base>>::rpc_client::<Base>(
+        let engine = BaseEngineClient::<RootProvider, RootProvider<Base>>::rpc_client::<Base>(
             http_url,
             self.secret,
         )
@@ -95,7 +95,7 @@ impl JwtValidator {
         .map_err(|e| JwtValidationError::CapabilityExchange(e.to_string()))?;
 
         let exchange = || async {
-            match <RootProvider<Base> as OpEngineApi<
+            match <RootProvider<Base> as BaseEngineApi<
                 Base,
                 Http<HyperAuthClient>,
             >>::exchange_capabilities(&engine, vec![])

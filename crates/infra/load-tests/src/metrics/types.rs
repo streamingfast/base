@@ -8,26 +8,29 @@ use serde::{Deserialize, Serialize};
 pub struct TransactionMetrics {
     /// Transaction hash.
     pub tx_hash: TxHash,
-    /// Time from submission to confirmation.
-    pub latency: Duration,
+    /// Time from submission to block production.
+    pub block_latency: Option<Duration>,
+    /// Time from submission to sequencer acceptance.
+    pub flashblocks_latency: Option<Duration>,
     /// Gas used by the transaction.
     pub gas_used: u64,
     /// Gas price in wei.
     pub gas_price: u128,
     /// Block number where transaction was included.
-    pub block_number: u64,
+    pub block_number: Option<u64>,
 }
 
 impl TransactionMetrics {
     /// Creates new transaction metrics.
     pub const fn new(
         tx_hash: TxHash,
-        latency: Duration,
+        block_latency: Option<Duration>,
+        flashblocks_latency: Option<Duration>,
         gas_used: u64,
         gas_price: u128,
-        block_number: u64,
+        block_number: Option<u64>,
     ) -> Self {
-        Self { tx_hash, latency, gas_used, gas_price, block_number }
+        Self { tx_hash, block_latency, flashblocks_latency, gas_used, gas_price, block_number }
     }
 
     /// Returns the transaction cost in wei.
@@ -91,4 +94,17 @@ pub struct GasMetrics {
     pub total_cost_wei: u128,
     /// Average gas price in wei.
     pub avg_gas_price: u128,
+}
+
+/// Aggregated flashblocks latency percentiles.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FlashblocksLatencyMetrics {
+    /// Transactions with flashblocks data.
+    pub count: u64,
+    /// Median latency.
+    pub p50: Duration,
+    /// 90th percentile latency.
+    pub p90: Duration,
+    /// 99th percentile latency.
+    pub p99: Duration,
 }

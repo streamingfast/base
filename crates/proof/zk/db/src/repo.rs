@@ -21,15 +21,15 @@ impl ProofRequestRepo {
 
     /// Create a new proof request and return its UUID
     pub async fn create(&self, req: CreateProofRequest) -> Result<Uuid> {
-        let id = Uuid::new_v4();
+        let id = req.session_id.unwrap_or_else(Uuid::new_v4);
 
         sqlx::query(
             r#"
             INSERT INTO proof_requests (
                 id, start_block_number, number_of_blocks_to_prove,
-                sequence_window, proof_type, status
+                sequence_window, proof_type, status, prover_address, l1_head
             )
-            VALUES ($1, $2, $3, $4, $5, $6)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             "#,
         )
         .bind(id)
@@ -52,15 +52,21 @@ impl ProofRequestRepo {
         )
         .bind(req.proof_type.as_str())
         .bind(ProofStatus::Created.as_str())
+        .bind(&req.prover_address)
+        .bind(&req.l1_head)
         .execute(&self.pool)
         .await?;
 
         Ok(id)
     }
 
-    /// Atomically create a proof request and outbox entry in a transaction
+    /// Atomically create a proof request and outbox entry in a transaction.
+    ///
+    /// When a `session_id` is provided in the request, it is used as the proof
+    /// request UUID and the insert uses `ON CONFLICT (id) DO NOTHING` so that
+    /// duplicate submissions return the existing request ID without error.
     pub async fn create_with_outbox(&self, req: CreateProofRequest) -> Result<Uuid> {
-        let id = Uuid::new_v4();
+        let id = req.session_id.unwrap_or_else(Uuid::new_v4);
 
         // Serialize request params as JSON for outbox
         let request_params = serde_json::json!({
@@ -69,19 +75,20 @@ impl ProofRequestRepo {
             "sequence_window": req.sequence_window,
             "proof_type": req.proof_type.as_str(),
             "prover_address": req.prover_address,
+            "l1_head": req.l1_head,
         });
 
         // Start transaction
         let mut tx = self.pool.begin().await?;
 
-        // Insert proof request
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             INSERT INTO proof_requests (
                 id, start_block_number, number_of_blocks_to_prove,
-                sequence_window, proof_type, status
+                sequence_window, proof_type, status, prover_address, l1_head
             )
-            VALUES ($1, $2, $3, $4, $5, $6)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (id) DO NOTHING
             "#,
         )
         .bind(id)
@@ -104,10 +111,16 @@ impl ProofRequestRepo {
         )
         .bind(req.proof_type.as_str())
         .bind(ProofStatus::Created.as_str())
+        .bind(&req.prover_address)
+        .bind(&req.l1_head)
         .execute(&mut *tx)
         .await?;
 
-        // Insert outbox entry
+        if result.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(id);
+        }
+
         sqlx::query(
             r#"
             INSERT INTO proof_request_outbox (proof_request_id, request_params)
@@ -134,6 +147,7 @@ impl ProofRequestRepo {
                 sequence_window, proof_type,
                 stark_receipt, snark_receipt,
                 status, error_message,
+                prover_address, l1_head,
                 created_at, updated_at, completed_at
             FROM proof_requests
             WHERE id = $1
@@ -197,8 +211,8 @@ impl ProofRequestRepo {
         Ok(())
     }
 
-    /// Update receipt only if current status is non-terminal (PENDING/RUNNING)
-    /// Returns true if update succeeded, false if already terminal
+    /// Update receipt only if current status is non-terminal (PENDING/RUNNING).
+    /// Returns true if update succeeded, false if already terminal.
     pub async fn update_receipt_if_non_terminal(&self, update: UpdateReceipt) -> Result<bool> {
         let result = sqlx::query(
             r#"
@@ -226,8 +240,8 @@ impl ProofRequestRepo {
         Ok(updated)
     }
 
-    /// Update status only if current status is non-terminal
-    /// Returns true if update succeeded, false if already terminal
+    /// Update status only if current status is non-terminal.
+    /// Returns true if update succeeded, false if already terminal.
     pub async fn update_status_if_non_terminal(
         &self,
         id: Uuid,
@@ -256,9 +270,9 @@ impl ProofRequestRepo {
         Ok(updated)
     }
 
-    /// Atomically claim a task by transitioning it from CREATED to PENDING
-    /// Returns true if the task was successfully claimed (was in CREATED state)
-    /// Returns false if the task was already claimed or doesn't exist
+    /// Atomically claim a task by transitioning it from CREATED to PENDING.
+    /// Returns true if the task was successfully claimed (was in CREATED state).
+    /// Returns false if the task was already claimed or doesn't exist.
     pub async fn atomic_claim_task(&self, id: Uuid) -> Result<bool> {
         let result = sqlx::query(
             r#"
@@ -285,9 +299,9 @@ impl ProofRequestRepo {
         let row = sqlx::query(
             r#"
             INSERT INTO proof_sessions (
-                proof_request_id, session_type, backend_session_id, status
+                proof_request_id, session_type, backend_session_id, status, metadata
             )
-            VALUES ($1, $2, $3, $4)
+            VALUES ($1, $2, $3, $4, $5)
             RETURNING id
             "#,
         )
@@ -295,6 +309,7 @@ impl ProofRequestRepo {
         .bind(session.session_type.as_str())
         .bind(&session.backend_session_id)
         .bind(SessionStatus::Running.as_str())
+        .bind(&session.metadata)
         .fetch_one(&self.pool)
         .await?;
 
@@ -367,7 +382,8 @@ impl ProofRequestRepo {
             r#"
             SELECT id, start_block_number, number_of_blocks_to_prove,
                    sequence_window, proof_type, stark_receipt, snark_receipt,
-                   status, error_message, created_at, updated_at, completed_at
+                   status, error_message, prover_address, l1_head,
+                   created_at, updated_at, completed_at
             FROM proof_requests
             WHERE status = $1
             ORDER BY created_at ASC
@@ -380,15 +396,15 @@ impl ProofRequestRepo {
         rows.iter().map(row_to_proof_request).collect()
     }
 
-    /// Get proof requests that are stuck in PENDING without any sessions
-    /// These are likely orphaned due to crashes before session creation
+    /// Get proof requests that are stuck in PENDING without any sessions.
+    /// These are likely orphaned due to crashes before session creation.
     pub async fn get_stuck_requests(&self, stuck_timeout_mins: i32) -> Result<Vec<ProofRequest>> {
         let rows = sqlx::query(
             r#"
             SELECT
                 pr.id, pr.start_block_number, pr.number_of_blocks_to_prove,
                 pr.sequence_window, pr.proof_type, pr.stark_receipt, pr.snark_receipt,
-                pr.status, pr.error_message,
+                pr.status, pr.error_message, pr.prover_address, pr.l1_head,
                 pr.created_at, pr.updated_at, pr.completed_at
             FROM proof_requests pr
             WHERE pr.status = 'PENDING'
@@ -429,8 +445,8 @@ impl ProofRequestRepo {
         Ok(())
     }
 
-    /// Update a proof session only if it's still in RUNNING state (non-terminal)
-    /// Returns true if the session was updated, false if it was already in a terminal state
+    /// Update a proof session only if it's still in RUNNING state (non-terminal).
+    /// Returns true if the session was updated, false if already terminal.
     pub async fn update_proof_session_if_non_terminal(
         &self,
         update: UpdateProofSession,
@@ -617,6 +633,7 @@ impl ProofRequestRepo {
                     sequence_window, proof_type,
                     stark_receipt, snark_receipt,
                     status, error_message,
+                    prover_address, l1_head,
                     created_at, updated_at, completed_at
                 FROM proof_requests
                 WHERE status = $1
@@ -636,6 +653,7 @@ impl ProofRequestRepo {
                     sequence_window, proof_type,
                     stark_receipt, snark_receipt,
                     status, error_message,
+                    prover_address, l1_head,
                     created_at, updated_at, completed_at
                 FROM proof_requests
                 ORDER BY created_at DESC
@@ -652,8 +670,8 @@ impl ProofRequestRepo {
 
     // ========== Outbox Methods ==========
 
-    /// Create an outbox entry for background task processing
-    /// This should be called in the same transaction as creating the proof request
+    /// Create an outbox entry for background task processing.
+    /// This should be called in the same transaction as creating the proof request.
     pub async fn create_outbox_entry(&self, entry: CreateOutboxEntry) -> Result<i64> {
         let row = sqlx::query(
             r#"
@@ -775,6 +793,8 @@ fn row_to_proof_request(row: &sqlx::postgres::PgRow) -> Result<ProofRequest> {
         snark_receipt: row.get("snark_receipt"),
         status,
         error_message: row.get("error_message"),
+        prover_address: row.get("prover_address"),
+        l1_head: row.get("l1_head"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         completed_at: row.get("completed_at"),

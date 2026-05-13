@@ -1,7 +1,12 @@
 //! Metrics collection for latency, throughput, and gas usage.
 
 mod types;
-pub use types::{GasMetrics, LatencyMetrics, ThroughputMetrics, TransactionMetrics};
+pub use types::{
+    FlashblocksLatencyMetrics, GasMetrics, LatencyMetrics, ThroughputMetrics, TransactionMetrics,
+};
+
+mod rolling_window;
+pub use rolling_window::RollingWindow;
 
 mod collector;
 pub use collector::MetricsCollector;

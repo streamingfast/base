@@ -7,12 +7,13 @@ use std::{
 };
 
 use alloy_eips::BlockNumberOrTag;
+use alloy_genesis::ChainConfig as GenesisChainConfig;
 use alloy_provider::RootProvider;
-use base_alloy_chains::BaseChainConfig;
-use base_alloy_network::Base;
+use base_common_chains::ChainConfig;
+use base_common_network::Base;
 use base_consensus_derive::{Pipeline, SignalReceiver, StatefulAttributesBuilder};
 use base_consensus_engine::{Engine, EngineClient, EngineState};
-use base_consensus_genesis::{L1ChainConfig, RollupConfig};
+use base_consensus_genesis::RollupConfig;
 use base_consensus_providers::{
     AlloyChainProvider, AlloyL2ChainProvider, OnlineBeaconClient, OnlineBlobProvider,
     OnlinePipeline,
@@ -26,23 +27,25 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     AlloyL1BlockFetcher, Conductor, ConductorClient, DelayedL1OriginSelectorProvider,
     DelegateDerivationActor, DerivationActor, DerivationDelegateClient, DerivationError,
-    EngineActor, EngineActorRequest, EngineConfig, EngineProcessor, EngineRpcProcessor,
-    L1OriginSelector, L1WatcherActor, L1WatcherQueryProcessor, NetworkActor, NetworkBuilder,
-    NetworkConfig, NodeActor, NodeMode, PayloadBuilder, QueuedDerivationEngineClient,
-    QueuedEngineDerivationClient, QueuedEngineRpcClient, QueuedL1WatcherDerivationClient,
-    QueuedNetworkEngineClient, QueuedSequencerAdminAPIClient, QueuedSequencerEngineClient,
-    RecoveryModeGuard, RpcActor, RpcContext, SequencerActor, SequencerConfig,
+    EngineActor, EngineActorRequest, EngineConfig, EngineProcessor, EngineProcessorOptions,
+    EngineRpcProcessor, L1OriginSelector, L1WatcherActor, L1WatcherQueryProcessor, NetworkActor,
+    NetworkBuilder, NetworkConfig, NodeActor, NodeMode, PayloadBuilder,
+    QueuedDerivationEngineClient, QueuedEngineDerivationClient, QueuedEngineRpcClient,
+    QueuedL1WatcherDerivationClient, QueuedNetworkEngineClient, QueuedSequencerAdminAPIClient,
+    QueuedSequencerEngineClient, RecoveryModeGuard, RpcActor, RpcContext, SequencerActor,
+    SequencerConfig,
     actors::{BlockStream, NetworkInboundData, QueuedUnsafePayloadGossipClient},
 };
 
 const DERIVATION_PROVIDER_CACHE_SIZE: usize = 1024;
-pub(crate) const HEAD_STREAM_POLL_INTERVAL: u64 = 4;
+/// Poll interval in seconds for the head block stream.
+pub const HEAD_STREAM_POLL_INTERVAL: u64 = 4;
 
 /// The configuration for the L1 chain.
 #[derive(Debug, Clone)]
 pub struct L1Config {
     /// The L1 chain configuration.
-    pub chain_config: Arc<L1ChainConfig>,
+    pub chain_config: Arc<GenesisChainConfig>,
     /// Whether to trust the L1 RPC.
     pub trust_rpc: bool,
     /// The L1 beacon client.
@@ -64,9 +67,9 @@ pub struct L1Config {
 impl L1Config {
     /// Returns the recommended finalized-block poll interval for the given L1 chain.
     pub const fn default_finalized_poll_interval(l1_chain_id: u64) -> Duration {
-        const ETH_MAINNET_L1: u64 = BaseChainConfig::mainnet().l1_chain_id;
-        const ETH_SEPOLIA_L1: u64 = BaseChainConfig::sepolia().l1_chain_id;
-        const DEVNET_L1: u64 = BaseChainConfig::devnet().l1_chain_id;
+        const ETH_MAINNET_L1: u64 = ChainConfig::mainnet().l1_chain_id;
+        const ETH_SEPOLIA_L1: u64 = ChainConfig::sepolia().l1_chain_id;
+        const DEVNET_L1: u64 = ChainConfig::devnet().l1_chain_id;
 
         match l1_chain_id {
             // Ethereum mainnet and Sepolia: poll once per L1 epoch (32 slots × 12 s).
@@ -84,23 +87,23 @@ impl L1Config {
 #[derive(Debug)]
 pub struct RollupNode {
     /// The rollup configuration.
-    pub(crate) config: Arc<RollupConfig>,
+    pub config: Arc<RollupConfig>,
     /// The L1 configuration.
-    pub(crate) l1_config: L1Config,
+    pub l1_config: L1Config,
     /// The L2 EL provider.
-    pub(crate) l2_provider: RootProvider<Base>,
+    pub l2_provider: RootProvider<Base>,
     /// Whether to trust the L2 RPC.
-    pub(crate) l2_trust_rpc: bool,
+    pub l2_trust_rpc: bool,
     /// The [`EngineConfig`] for the node.
-    pub(crate) engine_config: EngineConfig,
+    pub engine_config: EngineConfig,
     /// The [`RpcBuilder`] for the node.
-    pub(crate) rpc_builder: Option<RpcBuilder>,
+    pub rpc_builder: Option<RpcBuilder>,
     /// The P2P [`NetworkConfig`] for the node.
-    pub(crate) p2p_config: NetworkConfig,
+    pub p2p_config: NetworkConfig,
     /// The [`SequencerConfig`] for the node.
-    pub(crate) sequencer_config: SequencerConfig,
+    pub sequencer_config: SequencerConfig,
     /// Optional derivation delegate provider.
-    pub(crate) derivation_delegate_provider: Option<DerivationDelegateClient>,
+    pub derivation_delegate_provider: Option<DerivationDelegateClient>,
     /// Optional path to the safe head database.
     ///
     /// When set, the node records L1→L2 safe head mappings to a persistent redb database and
@@ -109,7 +112,7 @@ pub struct RollupNode {
     ///
     /// If the path is set but the database cannot be opened (e.g., bad permissions, disk
     /// error, or corrupted file), the node **fails to start** with an error.
-    pub(crate) safedb_path: Option<PathBuf>,
+    pub safedb_path: Option<PathBuf>,
 }
 
 /// A RollupNode-level derivation actor wrapper.
@@ -236,14 +239,18 @@ impl RollupNode {
         let (engine_queue_length_tx, engine_queue_length_rx) = watch::channel(0);
         let engine = Engine::new(engine_state, engine_state_tx, engine_queue_length_tx);
 
+        let mode = self.mode();
         let engine_processor = EngineProcessor::new(
             Arc::clone(&engine_client),
             Arc::clone(&self.config),
             derivation_client,
             engine,
-            if self.mode().is_sequencer() { Some(unsafe_head_tx) } else { None },
-            conductor,
-            self.sequencer_config.sequencer_stopped,
+            EngineProcessorOptions {
+                node_mode: mode,
+                unsafe_head_tx: if mode.is_sequencer() { Some(unsafe_head_tx) } else { None },
+                conductor,
+                sequencer_stopped: self.sequencer_config.sequencer_stopped,
+            },
         );
 
         let engine_rpc_processor = EngineRpcProcessor::new(

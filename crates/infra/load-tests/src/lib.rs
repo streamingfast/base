@@ -3,29 +3,35 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 mod config;
-pub use config::{PrecompileTarget, TestConfig, TxTypeConfig, WeightedTxType, WorkloadConfig};
+pub use config::{
+    OsakaTarget, PrecompileTarget, TestConfig, TxTypeConfig, WeightedTxType, WorkloadConfig,
+};
+
+mod devnet;
+pub use devnet::{HARDHAT_TEST_KEYS, devnet_funder, ensure_funder_balance, is_local_rpc};
 
 mod utils;
-pub use utils::{BaselineError, Result, init_tracing};
+pub use utils::{BaselineError, Result};
 
 mod rpc;
 pub use rpc::{ReceiptProvider, RpcClient, WalletProvider, create_wallet_provider};
 
 mod metrics;
 pub use metrics::{
-    GasMetrics, LatencyMetrics, MetricsAggregator, MetricsCollector, MetricsSummary,
-    ThroughputMetrics, TransactionMetrics,
+    FlashblocksLatencyMetrics, GasMetrics, LatencyMetrics, MetricsAggregator, MetricsCollector,
+    MetricsSummary, RollingWindow, ThroughputMetrics, TransactionMetrics,
 };
 
 mod workload;
 pub use workload::{
-    AccountPool, CalldataPayload, Erc20Payload, FundedAccount, Payload, PrecompileLooper,
-    PrecompilePayload, SeededRng, StoragePayload, TransferPayload, UniswapV2Payload,
-    UniswapV3Payload, WorkloadGenerator, parse_precompile_id,
+    AccountPool, CalldataPayload, Erc20Payload, FundedAccount, OsakaPayload, Payload,
+    PrecompileLooper, PrecompilePayload, SeededRng, StoragePayload, TransferPayload,
+    UniswapV2Payload, UniswapV3Payload, WorkloadGenerator, parse_precompile_id,
 };
 
 mod runner;
 pub use runner::{
-    AdaptiveBackoff, Confirmer, ConfirmerHandle, DEFAULT_MAX_GAS_PRICE, LoadConfig, LoadRunner,
-    RateLimiter, TxConfig, TxType,
+    AdaptiveBackoff, BlockFirstSeen, BlockWatcher, Confirmer, ConfirmerHandle,
+    DEFAULT_MAX_GAS_PRICE, DisplaySnapshot, FlashblockTimes, FlashblockTracker, LoadConfig,
+    LoadRunner, LoadTestDisplay, RateLimiter, TxConfig, TxType,
 };

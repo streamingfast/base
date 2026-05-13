@@ -2,12 +2,11 @@
 
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
-use base_alloy_consensus::{OpReceipt, OpTxEnvelope, OpTxType};
-use base_alloy_evm::{OpBlockExecutor, OpTxResult};
-use base_execution_chainspec::OpChainSpec;
+use base_common_consensus::{BaseReceipt, BaseTxEnvelope, OpTxType};
+use base_common_evm::{BaseBlockExecutor, BaseTxResult, OpHaltReason, OpTransaction};
+use base_execution_chainspec::BaseChainSpec;
 use base_execution_evm::OpRethReceiptBuilder;
 use base_flashblocks::{FlashblocksAPI, FlashblocksState};
-use base_revm::{OpHaltReason, OpTransaction};
 use reth_errors::BlockExecutionError;
 use reth_evm::{
     Evm, RecoveredTx,
@@ -35,7 +34,7 @@ impl<P> FlashblocksCachedExecutionProvider<P> {
     }
 }
 
-impl<P> CachedExecutionProvider<OpTxResult<OpHaltReason, OpTxType>>
+impl<P> CachedExecutionProvider<BaseTxResult<OpHaltReason, OpTxType>>
     for FlashblocksCachedExecutionProvider<P>
 where
     P: BlockNumReader,
@@ -46,7 +45,7 @@ where
         parent_block_hash: &B256,
         prev_cached_hash: Option<&B256>,
         tx_hash: &B256,
-    ) -> Option<OpTxResult<OpHaltReason, OpTxType>> {
+    ) -> Option<BaseTxResult<OpHaltReason, OpTxType>> {
         let flashblocks_state = self.flashblocks_state.as_ref()?;
 
         // if block_number is not found, we can't use cached execution
@@ -113,7 +112,7 @@ impl<TxResult> CachedExecutionProvider<TxResult> for NoopCachedExecutionProvider
 /// Executor that fetches cached execution results for transactions.
 #[derive(Debug)]
 pub struct CachedExecutor<E, C> {
-    executor: OpBlockExecutor<E, OpRethReceiptBuilder, Arc<OpChainSpec>>,
+    executor: BaseBlockExecutor<E, OpRethReceiptBuilder, Arc<BaseChainSpec>>,
     cached_execution_provider: C,
     txs: Vec<B256>,
     position_by_hash: HashMap<B256, usize>,
@@ -124,7 +123,7 @@ pub struct CachedExecutor<E, C> {
 impl<E, C> CachedExecutor<E, C> {
     /// Creates a new [`CachedExecutor`].
     pub fn new(
-        executor: OpBlockExecutor<E, OpRethReceiptBuilder, Arc<OpChainSpec>>,
+        executor: BaseBlockExecutor<E, OpRethReceiptBuilder, Arc<BaseChainSpec>>,
         cached_execution_provider: C,
         txs: Vec<B256>,
         parent_block_hash: B256,
@@ -146,12 +145,12 @@ impl<'a, DB, E, C> BlockExecutor for CachedExecutor<E, C>
 where
     DB: Database + alloy_evm::Database + 'a,
     E: Evm<DB = &'a mut State<DB>, Tx = OpTransaction<TxEnv>>,
-    C: CachedExecutionProvider<OpTxResult<E::HaltReason, OpTxType>>,
+    C: CachedExecutionProvider<BaseTxResult<E::HaltReason, OpTxType>>,
 {
-    type Transaction = OpTxEnvelope;
-    type Receipt = OpReceipt;
+    type Transaction = BaseTxEnvelope;
+    type Receipt = BaseReceipt;
     type Evm = E;
-    type Result = OpTxResult<E::HaltReason, OpTxType>;
+    type Result = BaseTxResult<E::HaltReason, OpTxType>;
 
     fn receipts(&self) -> &[Self::Receipt] {
         self.executor.receipts()

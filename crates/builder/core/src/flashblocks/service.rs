@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
 use base_builder_publish::WebSocketPublisher;
-use base_execution_evm::OpEvmConfig;
+use base_execution_evm::BaseEvmConfig;
 use base_node_core::{
-    OpConsensusBuilder, OpExecutorBuilder, OpNetworkBuilder, node::OpPoolBuilder,
+    BaseConsensusBuilder, BaseExecutorBuilder, BaseNetworkBuilder, node::BasePoolBuilder,
 };
-use base_node_runner::{BaseNode, OpNodeTypes, PayloadServiceBuilder as BasePayloadServiceBuilder};
+use base_node_runner::{
+    BaseNode, BaseNodeTypes, PayloadServiceBuilder as BasePayloadServiceBuilder,
+};
 use derive_more::Debug;
-use reth_basic_payload_builder::BasicPayloadJobGeneratorConfig;
 use reth_node_api::NodeTypes;
 use reth_node_builder::{
     BuilderContext,
@@ -20,7 +21,6 @@ use tracing::info;
 use super::{PayloadHandler, generator::BlockPayloadJobGenerator, payload::OpPayloadBuilder};
 use crate::{
     BuilderConfig,
-    metrics::BuilderMetrics,
     traits::{NodeBounds, PoolBounds},
 };
 
@@ -42,26 +42,21 @@ impl FlashblocksServiceBuilder {
         Node: NodeBounds,
         Pool: PoolBounds,
     {
-        let metrics = Arc::new(BuilderMetrics::default());
         let (built_payload_tx, built_payload_rx) = tokio::sync::mpsc::channel(16);
 
         let ws_pub: Arc<WebSocketPublisher> =
             WebSocketPublisher::new(self.0.flashblocks_ws_addr)?.into();
         let payload_builder = OpPayloadBuilder::new(
-            OpEvmConfig::optimism(ctx.chain_spec()),
+            BaseEvmConfig::optimism(ctx.chain_spec()),
             pool,
             ctx.provider().clone(),
             self.0.clone(),
             built_payload_tx,
             ws_pub,
-            metrics,
         );
-        let payload_job_config = BasicPayloadJobGeneratorConfig::default();
-
         let payload_generator = BlockPayloadJobGenerator::with_builder(
             ctx.provider().clone(),
             ctx.task_executor().clone(),
-            payload_job_config,
             payload_builder,
             true,
             self.0.block_time_leeway,
@@ -83,9 +78,7 @@ impl FlashblocksServiceBuilder {
     }
 }
 
-impl<Node, Pool>
-    PayloadServiceBuilder<Node, Pool, base_execution_firehose::OpFirehoseEvmConfig<OpEvmConfig>>
-    for FlashblocksServiceBuilder
+impl<Node, Pool> PayloadServiceBuilder<Node, Pool, BaseEvmConfig> for FlashblocksServiceBuilder
 where
     Node: NodeBounds,
     Pool: PoolBounds,
@@ -94,7 +87,7 @@ where
         self,
         ctx: &BuilderContext<Node>,
         pool: Pool,
-        _: base_execution_firehose::OpFirehoseEvmConfig<OpEvmConfig>,
+        _: BaseEvmConfig,
     ) -> eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypes>::Payload>> {
         self.spawn_payload_builder_service(ctx, pool)
     }
@@ -102,15 +95,15 @@ where
 
 impl BasePayloadServiceBuilder for FlashblocksServiceBuilder {
     type ComponentsBuilder = ComponentsBuilder<
-        OpNodeTypes,
-        OpPoolBuilder,
+        BaseNodeTypes,
+        BasePoolBuilder,
         Self,
-        OpNetworkBuilder,
-        OpExecutorBuilder,
-        OpConsensusBuilder,
+        BaseNetworkBuilder,
+        BaseExecutorBuilder,
+        BaseConsensusBuilder,
     >;
 
     fn build_components(self, base_node: &BaseNode) -> Self::ComponentsBuilder {
-        base_node.components::<OpNodeTypes>().payload(self)
+        base_node.components::<BaseNodeTypes>().payload(self)
     }
 }

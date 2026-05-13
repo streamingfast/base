@@ -5,17 +5,11 @@
 
 use std::time::Instant;
 
-use base_alloy_rpc_types_engine::OpExecutionPayloadEnvelope;
+use base_common_rpc_types_engine::BaseExecutionPayloadEnvelope;
 
 use crate::{
-    UnsafePayloadGossipClient,
-    actors::{
-        SequencerEngineClient,
-        sequencer::{
-            conductor::Conductor,
-            metrics::{inc_seal_step_retry, update_seal_step_duration},
-        },
-    },
+    Metrics, UnsafePayloadGossipClient,
+    actors::{SequencerEngineClient, sequencer::conductor::Conductor},
 };
 
 /// Tracks where a sealed payload is in the commit → gossip → insert pipeline.
@@ -51,14 +45,14 @@ impl SealState {
 #[derive(Debug)]
 pub struct PayloadSealer {
     /// The sealed execution payload being driven through the pipeline.
-    pub envelope: OpExecutionPayloadEnvelope,
+    pub envelope: BaseExecutionPayloadEnvelope,
     /// Current pipeline stage.
     pub state: SealState,
 }
 
 impl PayloadSealer {
     /// Creates a new sealer starting at the [`SealState::Sealed`] stage.
-    pub const fn new(envelope: OpExecutionPayloadEnvelope) -> Self {
+    pub const fn new(envelope: BaseExecutionPayloadEnvelope) -> Self {
         Self { envelope, state: SealState::Sealed }
     }
 
@@ -110,8 +104,8 @@ impl PayloadSealer {
         };
 
         match &result {
-            Ok(_) => update_seal_step_duration(step_label, step_start.elapsed()),
-            Err(_) => inc_seal_step_retry(step_label),
+            Ok(_) => Metrics::sequencer_seal_step_duration(step_label).set(step_start.elapsed()),
+            Err(_) => Metrics::sequencer_seal_step_retries_total(step_label).increment(1),
         }
 
         result

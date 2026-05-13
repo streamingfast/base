@@ -4,9 +4,9 @@ use std::{sync::Arc, time::Instant};
 
 use alloy_rpc_types_eth::Block;
 use async_trait::async_trait;
-use base_alloy_rpc_types::Transaction;
+use base_common_rpc_types::Transaction;
 use base_consensus_genesis::RollupConfig;
-use base_protocol::{L2BlockInfo, OpAttributesWithParent};
+use base_protocol::{AttributesWithParent, L2BlockInfo};
 
 use crate::{
     ConsolidateTaskError, EngineClient, EngineState, EngineTaskExt, SynchronizeTask,
@@ -17,7 +17,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub enum ConsolidateInput {
     /// Consolidate based on derived attributes.
-    Attributes(Box<OpAttributesWithParent>),
+    Attributes(Box<AttributesWithParent>),
     /// Derivation Delegation: consolidate based on safe L2 block info.
     BlockInfo(L2BlockInfo),
 }
@@ -28,8 +28,8 @@ impl From<L2BlockInfo> for ConsolidateInput {
     }
 }
 
-impl From<OpAttributesWithParent> for ConsolidateInput {
-    fn from(v: OpAttributesWithParent) -> Self {
+impl From<AttributesWithParent> for ConsolidateInput {
+    fn from(v: AttributesWithParent) -> Self {
         Self::Attributes(Box::new(v))
     }
 }
@@ -89,7 +89,7 @@ impl<EngineClient_: EngineClient> ConsolidateTask<EngineClient_> {
     async fn execute_build_and_seal_tasks(
         &self,
         state: &mut EngineState,
-        attributes: &OpAttributesWithParent,
+        attributes: &AttributesWithParent,
     ) -> Result<(), ConsolidateTaskError> {
         build_and_seal(
             state,
@@ -117,18 +117,17 @@ impl<EngineClient_: EngineClient> ConsolidateTask<EngineClient_> {
 
         let fcu_start = Instant::now();
 
-        // We intentionally set unsafe_head and cross_unsafe_head to safe_l2 to ensure the
-        // engine observes a self-consistent head state. This is required to correctly handle
-        // reorgs (where unsafe may be ahead on a non-canonical fork) and to trigger EL sync when
-        // the local unsafe head lags behind the safe head.
+        // We intentionally set unsafe_head to safe_l2 to ensure the engine observes a
+        // self-consistent head state. This is required to correctly handle reorgs (where unsafe
+        // may be ahead on a non-canonical fork) and to trigger EL sync when the local unsafe head
+        // lags behind the safe head.
         SynchronizeTask::new(
             Arc::clone(&self.client),
             Arc::clone(&self.cfg),
             EngineSyncStateUpdate {
                 unsafe_head: Some(*safe_l2),
-                cross_unsafe_head: Some(*safe_l2),
-                safe_head: Some(*safe_l2),
                 local_safe_head: Some(*safe_l2),
+                safe_head: Some(*safe_l2),
                 ..Default::default()
             },
         )
@@ -207,8 +206,8 @@ impl<EngineClient_: EngineClient> ConsolidateTask<EngineClient_> {
 
                     // Apply a transient update to the safe head.
                     state.sync_state = state.sync_state.apply_update(EngineSyncStateUpdate {
-                        safe_head: Some(block_info),
                         local_safe_head: Some(block_info),
+                        safe_head: Some(block_info),
                         ..Default::default()
                     });
 
@@ -230,8 +229,8 @@ impl<EngineClient_: EngineClient> ConsolidateTask<EngineClient_> {
                         Arc::clone(&self.client),
                         Arc::clone(&self.cfg),
                         EngineSyncStateUpdate {
-                            safe_head: Some(block_info),
                             local_safe_head: Some(block_info),
+                            safe_head: Some(block_info),
                             ..Default::default()
                         },
                     )

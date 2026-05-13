@@ -20,7 +20,7 @@ Upgrade activation flows through three layers:
 
 ### 1. Add the variant to the `BaseUpgrade` enum
 
-**File:** [`crates/alloy/chains/src/hardfork.rs`](../../crates/alloy/chains/src/hardfork.rs)
+**File:** [`crates/common/chains/src/upgrade.rs`](../../crates/common/chains/src/upgrade.rs)
 
 Inside the `hardfork!` macro, append the new variant after the current last entry:
 
@@ -74,7 +74,7 @@ Update `check_base_upgrade_from_str` in the test module to include the new upgra
 
 ### 2. Add the `BaseChainUpgrades` index arm
 
-**File:** [`crates/alloy/chains/src/chain.rs`](../../crates/alloy/chains/src/chain.rs)
+**File:** [`crates/common/chains/src/chain.rs`](../../crates/common/chains/src/chain.rs)
 
 Add `V1` to the `use BaseUpgrade::{...}` import and add a match arm to `Index<BaseUpgrade>`:
 
@@ -98,7 +98,7 @@ impl Index<BaseUpgrade> for BaseChainUpgrades {
 
 ### 3. Add the config field and nested struct
 
-**File:** [`crates/consensus/genesis/src/chain/hardfork.rs`](https://github.com/base/base/blob/main/crates/consensus/genesis/src/chain/hardfork.rs)
+**File:** [`crates/common/genesis/src/chain/hardfork.rs`](https://github.com/base/base/blob/main/crates/common/genesis/src/chain/hardfork.rs)
 
 For standard upgrades (flat timestamp field), add directly to `HardForkConfig`:
 
@@ -134,7 +134,7 @@ Also update `HardForkConfig::iter()` to include the new entry, and re-export any
 
 ### 4. Add activation methods to `RollupConfig`
 
-**File:** [`crates/consensus/genesis/src/rollup.rs`](https://github.com/base/base/blob/main/crates/consensus/genesis/src/rollup.rs)
+**File:** [`crates/common/genesis/src/rollup.rs`](https://github.com/base/base/blob/main/crates/common/genesis/src/rollup.rs)
 
 Add `is_X_active` and `is_first_X_block` after the previous upgrade's methods.
 
@@ -196,7 +196,7 @@ For **cascading** upgrades, replace the previous arm's `unwrap_or(ForkCondition:
 
 ### 5. Add the trait method
 
-**File:** [`crates/alloy/chains/src/hardforks.rs`](../../crates/alloy/chains/src/hardforks.rs)
+**File:** [`crates/common/chains/src/upgrades.rs`](../../crates/common/chains/src/upgrades.rs)
 
 ```rust
 /// Returns `true` if [`V1`](BaseUpgrade::V1) is active at given block timestamp.
@@ -210,9 +210,9 @@ fn is_base_v1_active_at_timestamp(&self, timestamp: u64) -> bool {
 ### 6. Update timestamp constants and test fixtures
 
 **Files:**
-- [`crates/alloy/chains/src/hardfork.rs`](../../crates/alloy/chains/src/hardfork.rs) (mainnet, sepolia, devnet constants)
-- [`crates/alloy/chains/src/lib.rs`](../../crates/alloy/chains/src/lib.rs)
-- [`crates/consensus/registry/src/test_utils/mod.rs`](https://github.com/base/base/blob/main/crates/consensus/registry/src/test_utils/mod.rs)
+- [`crates/common/chains/src/upgrade.rs`](../../crates/common/chains/src/upgrade.rs) (mainnet, sepolia, devnet constants)
+- [`crates/common/chains/src/lib.rs`](../../crates/common/chains/src/lib.rs)
+- [`crates/common/chains/src/test_utils.rs`](https://github.com/base/base/blob/main/crates/common/chains/src/test_utils.rs)
 
 Add named constants once an activation timestamp is confirmed:
 
@@ -244,7 +244,7 @@ Until an activation timestamp is confirmed, leave `base: None` and the chain arr
 
 ### 7. Update the default rollup config
 
-**File:** [`crates/consensus/registry/src/test_utils/mod.rs`](https://github.com/base/base/blob/main/crates/consensus/registry/src/test_utils/mod.rs)
+**File:** [`crates/common/chains/src/test_utils.rs`](https://github.com/base/base/blob/main/crates/common/chains/src/test_utils.rs)
 
 The `default_rollup_config()` function sets all upgrades active at genesis for dev use. Add the new upgrade:
 
@@ -260,7 +260,7 @@ hardforks: HardForkConfig {
 
 ### 8. Verify the upgrade consistency tests
 
-**File:** [`crates/consensus/registry/tests/hardfork_consistency.rs`](https://github.com/base/base/blob/main/crates/consensus/registry/tests/hardfork_consistency.rs)
+**File:** [`crates/common/chains/tests/hardfork_consistency.rs`](https://github.com/base/base/blob/main/crates/common/chains/tests/hardfork_consistency.rs)
 
 These tests assert that `BaseChainConfig::mainnet().upgrade_activation(fork)` matches `BaseChainUpgrades::mainnet().upgrade_activation(fork)` for every `BaseUpgrade` variant. They should pass without changes as long as both sides consistently return `ForkCondition::Never` for an unscheduled upgrade or the same timestamp once scheduled.
 
@@ -280,7 +280,7 @@ Skip this section if the upgrade only affects protocol-level behavior (batch dec
 
 ### 9. Add the `OpSpecId` variant
 
-**File:** [`crates/execution/revm/src/spec.rs`](https://github.com/base/base/blob/main/crates/execution/revm/src/spec.rs)
+**File:** [`crates/common/evm/src/spec.rs`](https://github.com/base/base/blob/main/crates/common/evm/src/spec.rs)
 
 ```rust
 pub enum OpSpecId {
@@ -297,24 +297,21 @@ Extend `into_eth_spec()` — if no new Ethereum EL upgrade is paired, reuse the 
 Self::ISTHMUS | Self::JOVIAN | Self::BASE_V1 => SpecId::PRAGUE,
 ```
 
-Add the string name and wire up `FromStr` and `From<OpSpecId> for &'static str`:
+Add a `#[strum(serialize = "...")]` attribute on the new variant with its canonical string name:
 
 ```rust
-// name module
-pub const BASE_V1: &str = "V1";
-
-// FromStr
-name::BASE_V1 => Ok(Self::BASE_V1),
-
-// From<OpSpecId> for &'static str
-OpSpecId::BASE_V1 => name::BASE_V1,
+/// Base V1 spec id.
+#[strum(serialize = "V1")]
+BASE_V1,
 ```
+
+`FromStr` and `From<OpSpecId> for &'static str` are derived automatically.
 
 ---
 
 ### 10. Route precompiles
 
-**File:** [`crates/execution/revm/src/precompiles.rs`](https://github.com/base/base/blob/main/crates/execution/revm/src/precompiles.rs)
+**File:** [`crates/common/evm/src/precompiles.rs`](https://github.com/base/base/blob/main/crates/common/evm/src/precompiles.rs)
 
 If the upgrade introduces new precompiles, add a new `pub fn base_v1()` method on `BasePrecompiles`. If it reuses the previous set, extend the existing arm in `new_with_spec`:
 
@@ -330,7 +327,7 @@ OpSpecId::BASE_V1 => Self::base_v1(),
 
 ### 11. Update spec resolution
 
-**File:** [`crates/alloy/evm/src/spec_id.rs`](https://github.com/base/base/blob/main/crates/alloy/evm/src/spec_id.rs)
+**File:** [`crates/common/evm/src/spec_id.rs`](https://github.com/base/base/blob/main/crates/common/evm/src/spec_id.rs)
 
 Add the new upgrade as the first check (newest upgrade wins):
 
@@ -344,7 +341,7 @@ pub fn spec_by_timestamp_after_bedrock(chain_spec: impl BaseUpgrades, timestamp:
 }
 ```
 
-**File:** [`crates/consensus/genesis/src/rollup.rs`](https://github.com/base/base/blob/main/crates/consensus/genesis/src/rollup.rs)
+**File:** [`crates/common/genesis/src/rollup.rs`](https://github.com/base/base/blob/main/crates/common/genesis/src/rollup.rs)
 
 Same pattern in the `#[cfg(feature = "revm")] impl RollupConfig` block:
 
@@ -362,7 +359,7 @@ pub fn spec_id(&self, timestamp: u64) -> base_revm::OpSpecId {
 
 ### 12. Update the reth `ChainHardforks` builder
 
-**File:** [`crates/execution/hardforks/src/chain.rs`](https://github.com/base/base/blob/main/crates/execution/hardforks/src/chain.rs)
+**File:** [`crates/common/chains/src/chain.rs`](https://github.com/base/base/blob/main/crates/common/chains/src/chain.rs)
 
 Append the new upgrade in `to_chain_hardforks()`. If it pairs with a new Ethereum upgrade (like Canyon→Shanghai), push both; if not, push only the Base upgrade entry:
 
@@ -378,9 +375,9 @@ forks.push((BaseUpgrade::V1.boxed(), self[BaseUpgrade::V1]));  // <-- add
 
 ### Always required
 
-- [ ] `BaseUpgrade` variant added in `hardfork.rs`; all four chain arrays updated
+- [ ] `BaseUpgrade` variant added in `upgrade.rs`; all four chain arrays updated
 - [ ] `Index<BaseUpgrade>` arm added in `chain.rs`
-- [ ] Config field (flat or nested struct) added to `HardForkConfig` in `hardfork.rs`; `iter()` updated; new types re-exported
+- [ ] Config field (flat or nested struct) added to `HardForkConfig` in `upgrade.rs`; `iter()` updated; new types re-exported
 - [ ] `is_X_active` + `is_first_X_block` added to `RollupConfig`; `upgrade_activation` arm added; previous terminal upgrade cascades to new one (unless standalone)
 - [ ] `is_X_active_at_timestamp` added to `BaseUpgrades` trait
 - [ ] Timestamp constants added to `mainnet.rs`, `sepolia.rs`, `devnet_0_sepolia_dev_0.rs`; re-exported from `lib.rs`
@@ -390,8 +387,8 @@ forks.push((BaseUpgrade::V1.boxed(), self[BaseUpgrade::V1]));  // <-- add
 
 ### Required when EVM execution changes
 
-- [ ] `OpSpecId` variant added with `into_eth_spec`, `FromStr`, `From<&str>`, `name::X`
+- [ ] `OpSpecId` variant added with `into_eth_spec` mapping and `#[strum(serialize = "...")]` attribute
 - [ ] Precompile match arm updated (or new precompile set added)
-- [ ] `spec_by_timestamp_after_bedrock` updated (`alloy/evm/src/spec_id.rs`)
+- [ ] `spec_by_timestamp_after_bedrock` updated (`core/evm/src/spec_id.rs`)
 - [ ] `RollupConfig::spec_id` updated (`consensus/genesis/src/rollup.rs`)
-- [ ] `to_chain_hardforks` updated (`execution/hardforks/src/chain.rs`)
+- [ ] `to_chain_hardforks` updated (`execution/upgrades/src/chain.rs`)

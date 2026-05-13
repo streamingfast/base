@@ -2,7 +2,9 @@
 
 use core::{net::SocketAddr, time::Duration};
 
-use base_builder_core::{BuilderConfig, ExecutionMeteringMode, SharedMeteringProvider};
+use base_builder_core::{
+    BuilderConfig, ExecutionMeteringMode, RejectionCache, SharedMeteringProvider,
+};
 use base_builder_metering::MeteringStore;
 use base_node_core::args::RollupArgs;
 
@@ -97,9 +99,27 @@ pub struct Args {
     #[arg(long = "builder.max-uncompressed-block-size")]
     pub max_uncompressed_block_size: Option<u64>,
 
+    /// Duration in milliseconds to wait for metering data before including a transaction.
+    /// Transactions younger than this without metering data will be skipped.
+    #[arg(long = "builder.metering-wait-duration-ms")]
+    pub metering_wait_duration_ms: Option<u64>,
+
     /// Buffer size for tx data store (LRU eviction when full)
     #[arg(long = "builder.tx-data-store-buffer-size", default_value = "10000")]
     pub tx_data_store_buffer_size: usize,
+
+    /// TTL in seconds for entries in the metering store cache.
+    /// Stale entries are evicted after this duration.
+    #[arg(long = "builder.metering-store-ttl-secs", default_value = "30")]
+    pub metering_store_ttl_secs: u64,
+
+    /// Maximum number of entries in the rejection cache for permanently rejected transactions
+    #[arg(long = "builder.rejection-cache-max-capacity", default_value = "100000")]
+    pub rejection_cache_max_capacity: u64,
+
+    /// TTL in seconds for entries in the rejection cache
+    #[arg(long = "builder.rejection-cache-ttl-secs", default_value = "1800")]
+    pub rejection_cache_ttl_secs: u64,
 
     /// Inverted sampling frequency in blocks. 1 - each block, 100 - every 100th block.
     #[arg(long = "telemetry.sampling-ratio", env = "SAMPLING_RATIO", default_value = "100")]
@@ -116,6 +136,7 @@ impl Args {
         MeteringStore::new(
             self.enable_resource_metering || self.execution_metering_mode.is_enabled(),
             self.tx_data_store_buffer_size,
+            Duration::from_secs(self.metering_store_ttl_secs),
         )
     }
 }
@@ -135,7 +156,11 @@ impl Default for Args {
             extra_block_deadline_secs: 20,
             enable_resource_metering: false,
             max_uncompressed_block_size: None,
+            metering_wait_duration_ms: None,
             tx_data_store_buffer_size: 10000,
+            metering_store_ttl_secs: 30,
+            rejection_cache_max_capacity: 100_000,
+            rejection_cache_ttl_secs: 1800,
             sampling_ratio: 100,
             flashblocks: FlashblocksArgs::default(),
         }
@@ -174,7 +199,12 @@ impl Args {
             state_root_gas_anchor_us: self.state_root_gas_anchor_us,
             execution_metering_mode: self.execution_metering_mode,
             max_uncompressed_block_size: self.max_uncompressed_block_size,
+            metering_wait_duration: self.metering_wait_duration_ms.map(Duration::from_millis),
             metering_provider,
+            rejection_cache: RejectionCache::new(
+                self.rejection_cache_max_capacity,
+                Duration::from_secs(self.rejection_cache_ttl_secs),
+            ),
         })
     }
 }
@@ -248,7 +278,8 @@ mod tests {
         use alloy_primitives::{B256, TxHash, U256};
         use base_bundles::MeterBundleResponse;
 
-        let metering_provider: SharedMeteringProvider = Arc::new(MeteringStore::new(true, 100));
+        let metering_provider: SharedMeteringProvider =
+            Arc::new(MeteringStore::new(true, 100, Duration::from_secs(30)));
         let args = Args { enable_resource_metering: true, ..Default::default() };
         let config = args
             .into_builder_config(Arc::clone(&metering_provider))
@@ -269,13 +300,70 @@ mod tests {
                 total_gas_used: 21000,
                 total_execution_time_us: 500,
                 state_root_time_us: 100,
-                state_root_account_node_count: 0,
-                state_root_storage_node_count: 0,
+                state_root_account_leaf_count: 0,
+                state_root_account_branch_count: 0,
+                state_root_storage_leaf_count: 0,
+                state_root_storage_branch_count: 0,
             },
         );
 
         let result = config.metering_provider.get(&tx_hash);
         assert_eq!(result.unwrap().total_execution_time_us, 500);
+    }
+
+    #[rstest]
+    #[case::some_duration(Some(500), Some(Duration::from_millis(500)))]
+    #[case::none(None, None)]
+    #[case::zero(Some(0), Some(Duration::from_millis(0)))]
+    fn metering_wait_duration_maps_correctly(
+        #[case] input: Option<u64>,
+        #[case] expected: Option<Duration>,
+    ) {
+        let args = Args { metering_wait_duration_ms: input, ..Default::default() };
+        let config = convert(args);
+        assert_eq!(config.metering_wait_duration, expected);
+    }
+
+    #[test]
+    fn metering_store_ttl_propagates_to_store() {
+        use alloy_primitives::{B256, TxHash, U256};
+        use base_builder_core::MeteringProvider;
+        use base_bundles::MeterBundleResponse;
+
+        let args = Args {
+            metering_store_ttl_secs: 60,
+            enable_resource_metering: true,
+            ..Default::default()
+        };
+        let store = args.build_metering_store();
+        let tx_hash = TxHash::random();
+        store.insert(
+            tx_hash,
+            MeterBundleResponse {
+                bundle_hash: B256::ZERO,
+                bundle_gas_price: U256::ZERO,
+                coinbase_diff: U256::ZERO,
+                eth_sent_to_coinbase: U256::ZERO,
+                gas_fees: U256::ZERO,
+                results: vec![],
+                state_block_number: 0,
+                state_flashblock_index: None,
+                total_gas_used: 21000,
+                total_execution_time_us: 0,
+                state_root_time_us: 0,
+                state_root_account_leaf_count: 0,
+                state_root_account_branch_count: 0,
+                state_root_storage_leaf_count: 0,
+                state_root_storage_branch_count: 0,
+            },
+        );
+        assert!(store.get(&tx_hash).is_some(), "entry should be present within TTL");
+    }
+
+    #[test]
+    fn metering_store_ttl_defaults_to_30s() {
+        let args = Args::default();
+        assert_eq!(args.metering_store_ttl_secs, 30);
     }
 
     #[test]

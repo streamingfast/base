@@ -1,29 +1,38 @@
 //! Rollup and L1 chain configuration registry.
 
+use alloy_chains::NamedChain;
+use alloy_genesis::ChainConfig as GenesisChainConfig;
 use alloy_primitives::{Address, map::HashMap};
-use base_alloy_chains::BaseChainConfig;
-use base_consensus_genesis::{L1ChainConfig, RollupConfig};
+use base_common_chains::ChainConfig;
+use base_consensus_genesis::RollupConfig;
 use spin::Lazy;
 
-use crate::L1Config;
+use crate::{Holesky, Hoodi, Mainnet, Sepolia};
 
-/// Rollup configurations derived from [`BaseChainConfig`] instances.
+/// Rollup configurations derived from [`ChainConfig`] instances.
 static ROLLUP_CONFIGS: Lazy<HashMap<u64, RollupConfig>> = Lazy::new(|| {
     let mut map = HashMap::default();
-    for cfg in BaseChainConfig::all() {
+    for cfg in ChainConfig::all() {
         map.insert(cfg.chain_id, RollupConfig::from(cfg));
     }
     map
 });
 
 /// L1 chain configurations built from known L1 genesis data.
-static L1_CONFIGS: Lazy<HashMap<u64, L1ChainConfig>> = Lazy::new(L1Config::build_l1_configs);
+static L1_CONFIGS: Lazy<HashMap<u64, GenesisChainConfig>> = Lazy::new(|| {
+    let mut map = HashMap::default();
+    map.insert(NamedChain::Mainnet.into(), Mainnet::l1_config());
+    map.insert(NamedChain::Sepolia.into(), Sepolia::l1_config());
+    map.insert(NamedChain::Holesky.into(), Holesky::l1_config());
+    map.insert(NamedChain::Hoodi.into(), Hoodi::l1_config());
+    map
+});
 
 /// A registry of chain configurations for Base networks.
 ///
 /// Provides access to rollup configs, L1 chain configs, and the unsafe block signer
 /// for supported chain IDs. Rollup configs are derived from the compile-time
-/// [`BaseChainConfig`] instances in `base-alloy-chains`.
+/// [`ChainConfig`] instances in `base-common-chains`.
 #[derive(Debug)]
 pub struct Registry;
 
@@ -38,14 +47,14 @@ impl Registry {
         ROLLUP_CONFIGS.get(&chain.id())
     }
 
-    /// Returns an [`L1ChainConfig`] for the given L1 chain ID.
-    pub fn l1_config(chain_id: u64) -> Option<&'static L1ChainConfig> {
+    /// Returns a [`GenesisChainConfig`] for the given L1 chain ID.
+    pub fn l1_config(chain_id: u64) -> Option<&'static GenesisChainConfig> {
         L1_CONFIGS.get(&chain_id)
     }
 
     /// Returns the `unsafe_block_signer` address for the given chain ID.
     pub fn unsafe_block_signer(chain_id: u64) -> Option<Address> {
-        BaseChainConfig::by_chain_id(chain_id)?.unsafe_block_signer
+        ChainConfig::by_chain_id(chain_id)?.unsafe_block_signer
     }
 }
 
@@ -56,7 +65,7 @@ mod tests {
         holesky::{HOLESKY_BPO1_TIMESTAMP, HOLESKY_BPO2_TIMESTAMP},
         sepolia::{SEPOLIA_BPO1_TIMESTAMP, SEPOLIA_BPO2_TIMESTAMP},
     };
-    use base_alloy_chains::BaseChainConfig;
+    use base_common_chains::ChainConfig;
 
     use super::*;
 
@@ -86,11 +95,11 @@ mod tests {
     #[test]
     fn test_rollup_config_derived_from_chain_config() {
         let mainnet = Registry::rollup_config(8453).unwrap();
-        let expected = RollupConfig::from(BaseChainConfig::mainnet());
+        let expected = RollupConfig::from(ChainConfig::mainnet());
         assert_eq!(*mainnet, expected);
 
         let sepolia = Registry::rollup_config(84532).unwrap();
-        let expected = RollupConfig::from(BaseChainConfig::sepolia());
+        let expected = RollupConfig::from(ChainConfig::sepolia());
         assert_eq!(*sepolia, expected);
     }
 
@@ -109,14 +118,25 @@ mod tests {
         let base_mainnet = Registry::rollup_config(8453).unwrap();
         assert_eq!(
             base_mainnet.hardforks.jovian_time,
-            Some(BaseChainConfig::mainnet().jovian_timestamp)
+            Some(ChainConfig::mainnet().jovian_timestamp)
         );
 
         let base_sepolia = Registry::rollup_config(84532).unwrap();
         assert_eq!(
             base_sepolia.hardforks.jovian_time,
-            Some(BaseChainConfig::sepolia().jovian_timestamp)
+            Some(ChainConfig::sepolia().jovian_timestamp)
         );
+    }
+
+    #[test]
+    fn test_l1_config_all_chains() {
+        // All four known L1 chains must be present.
+        assert!(Registry::l1_config(NamedChain::Mainnet.into()).is_some());
+        assert!(Registry::l1_config(NamedChain::Sepolia.into()).is_some());
+        assert!(Registry::l1_config(NamedChain::Holesky.into()).is_some());
+        assert!(Registry::l1_config(NamedChain::Hoodi.into()).is_some());
+        // Unknown chain IDs must return None.
+        assert!(Registry::l1_config(99999).is_none());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use alloy_consensus::Header;
-use base_execution_primitives::OpTransactionSigned;
+use base_common_consensus::BaseTransactionSigned;
 use reth_storage_api::EmptyBodyStorage;
 
 /// Base storage implementation.
-pub type OpStorage<T = OpTransactionSigned, H = Header> = EmptyBodyStorage<T, H>;
+pub type BaseStorage<T = BaseTransactionSigned, H = Header> = EmptyBodyStorage<T, H>;

@@ -9,7 +9,7 @@ use alloc::string::{String, ToString};
 use base_consensus_derive::{PipelineError, PipelineErrorKind};
 use base_proof_mpt::{OrderedListWalkerError, TrieNodeError};
 use base_proof_preimage::errors::PreimageOracleError;
-use base_protocol::{FromBlockError, OpBlockConversionError};
+use base_protocol::{BaseBlockConversionError, FromBlockError};
 use thiserror::Error;
 
 /// Error from an oracle-backed provider.
@@ -71,7 +71,7 @@ pub enum OracleProviderError {
     /// formats fails due to incompatible data structures, missing OP-specific
     /// fields, or version mismatches between block formats.
     #[error("Op block conversion error: {0}")]
-    OpBlockConversion(OpBlockConversionError),
+    BaseBlockConversion(BaseBlockConversionError),
     /// RLP (Recursive Length Prefix) encoding or decoding error.
     ///
     /// This error occurs when parsing or encoding RLP data fails due to
@@ -110,6 +110,13 @@ pub enum OracleProviderError {
     /// * `0` - The unknown chain ID that was encountered
     #[error("Unknown chain ID: {0}")]
     UnknownChainId(u64),
+    /// Blob KZG commitment verification failed.
+    ///
+    /// This error occurs when the KZG commitment computed from a reconstructed
+    /// blob does not match the commitment fetched from the oracle. This indicates
+    /// that the blob field elements were tampered with or corrupted.
+    #[error("Blob verification failed: {0}")]
+    BlobVerification(String),
 }
 
 impl From<OracleProviderError> for PipelineErrorKind {

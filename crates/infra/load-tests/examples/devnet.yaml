@@ -7,8 +7,14 @@
 # RPC endpoint for local devnet
 rpc: http://localhost:8545
 
+# WebSocket RPC endpoint for block latency tracking
+rpc_ws_url: "ws://localhost:8546"
+
+# Flashblocks websocket url (flashblock latency tracking)
+flashblocks_ws_url: "ws://localhost:7111"
+
 # Number of sender accounts
-sender_count: 10
+sender_count: 100
 
 # Target gas per second (~100 simple transfers)
 target_gps: 2100000

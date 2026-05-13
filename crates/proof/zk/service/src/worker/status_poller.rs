@@ -2,9 +2,9 @@ use std::time::Duration;
 
 use base_zk_db::ProofRequestRepo;
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{Instrument, error, info};
 
-use crate::proof_request_manager::ProofRequestManager;
+use crate::{metrics, proof_request_manager::ProofRequestManager};
 
 /// Background worker that polls proving backends for status updates
 /// on RUNNING proof requests.
@@ -55,10 +55,21 @@ impl StatusPoller {
         if !running_requests.is_empty() {
             info!(count = running_requests.len(), "Polling status for RUNNING proof requests");
 
-            // Process each RUNNING proof request
-            for proof_request in running_requests {
-                // Sync sessions and update proof status
-                if let Err(e) = self.manager.sync_and_update_proof_status(&proof_request).await {
+            // Process each RUNNING proof request.
+            // Terminal metrics (proof_requests_completed, proof_request_duration_ms) are
+            // emitted inside sync_and_update_proof_status, so they fire regardless of
+            // whether the transition is triggered by this poller or by a GetProof RPC.
+            for proof_request in &running_requests {
+                let poll_span = tracing::info_span!(
+                    "poll_proof_status",
+                    proof_request_id = %proof_request.id,
+                );
+                if let Err(e) = self
+                    .manager
+                    .sync_and_update_proof_status(proof_request)
+                    .instrument(poll_span)
+                    .await
+                {
                     error!(
                         proof_request_id = %proof_request.id,
                         error = %e,
@@ -79,6 +90,8 @@ impl StatusPoller {
             );
 
             for request in stuck_requests {
+                let proof_type_label = metrics::proof_type_label(request.proof_type);
+
                 error!(
                     proof_request_id = %request.id,
                     status = %request.status,
@@ -101,6 +114,9 @@ impl StatusPoller {
                         error = %e,
                         "Failed to mark stuck request as failed"
                     );
+                } else {
+                    metrics::inc_stuck_requests(proof_type_label);
+                    metrics::inc_proof_requests_completed("failed", proof_type_label);
                 }
             }
         }

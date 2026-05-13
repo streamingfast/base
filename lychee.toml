@@ -8,7 +8,6 @@ cache_exclude_status = [429]
 accept = [200, 403, 429, 502, 503] # 403 is often returned by private repos instead of 404; 429 is rate limiting; 502/503 is transient GitHub unavailability
 exclude_path = [
     "crates/utilities/test-utils/contracts/",
-    "crates/shared/primitives/contracts/",
     "docs/specs/",
     "README\\.md",
 ]
@@ -16,6 +15,13 @@ exclude = [
     # Internal / placeholder
     'foo.bar',
     'localhost',
+
+    # Links to files moved or renamed (not yet on main)
+    'https://github\.com/base/base/blob/main/crates/execution/upgrades',
+    'https://github\.com/base/base/blob/main/crates/common/evm/src/spec_id\.rs',
+    'https://github\.com/base/base/blob/main/crates/common/evm/src/precompiles\.rs',
+    'https://github\.com/base/base/blob/main/crates/consensus/genesis/src/chain/hardfork\.rs',
+    'https://github\.com/base/base/blob/main/crates/consensus/genesis/src/rollup\.rs',
 
     # Shields.io badges that query live GitHub stats (flaky, not real links)
     'https://img.shields.io/github/commit-activity/w/base/base',

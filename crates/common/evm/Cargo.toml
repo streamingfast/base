@@ -1,0 +1,73 @@
+[package]
+name = "base-common-evm"
+description = "EVM implementation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# alloy
+alloy-evm.workspace = true
+alloy-eips.workspace = true
+alloy-consensus.workspace = true
+alloy-primitives.workspace = true
+
+# base
+base-common-flz.workspace = true
+base-common-chains.workspace = true
+base-common-consensus = { workspace = true, features = ["evm"] }
+
+# revm
+revm.workspace = true
+
+# misc
+auto_impl.workspace = true
+thiserror.workspace = true
+strum = { workspace = true, features = ["derive"] }
+serde = { workspace = true, optional = true }
+
+# reth
+reth-evm = { workspace = true, optional = true }
+
+[dev-dependencies]
+rstest.workspace = true
+sha2 = { workspace = true, default-features = false }
+alloy-hardforks.workspace = true
+alloy-sol-types = { workspace = true, default-features = false }
+alloy-primitives = { workspace = true, default-features = false }
+serde_json = { workspace = true, default-features = false, features = ["alloc", "preserve_order"] }
+
+[features]
+default = [ "blst", "c-kzg", "portable", "secp256k1", "std" ]
+std = [
+	"alloy-consensus/std",
+	"alloy-eips/std",
+	"alloy-evm/std",
+	"alloy-primitives/std",
+	"base-common-consensus/std",
+	"base-common-flz/std",
+	"revm/std",
+	"serde?/std",
+	"thiserror/std",
+]
+serde = [ "alloy-primitives/serde", "dep:serde", "revm/serde" ]
+reth = [ "dep:reth-evm", "std" ]
+bn = [ "revm/bn" ]
+blst = [ "revm/blst" ]
+c-kzg = [ "revm/c-kzg" ]
+portable = [ "revm/portable" ]
+secp256k1 = [ "revm/secp256k1" ]
+memory_limit = [ "revm/memory_limit" ]
+optional_no_base_fee = [ "revm/optional_no_base_fee" ]
+optional_eip3541 = [ "revm/optional_eip3541" ]
+optional_eip3607 = [ "revm/optional_eip3607" ]
+optional_fee_charge = [ "revm/optional_fee_charge" ]
+optional_balance_check = [ "revm/optional_balance_check" ]
+optional_block_gas_limit = [ "revm/optional_block_gas_limit" ]

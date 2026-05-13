@@ -10,7 +10,7 @@ use base_batcher_core::ThrottleConfig;
 use base_batcher_service::{BatcherConfig, BatcherService};
 use base_cli_utils::{LogConfig, RuntimeManager};
 use base_runtime::TokioRuntime;
-use clap::{Args, Parser};
+use clap::{Args, Parser, ValueEnum};
 use tracing::info;
 use url::Url;
 
@@ -38,7 +38,7 @@ impl Cli {
         base_cli_utils::MetricsConfig::from(self.args.metrics.clone()).init_with(|| {
             base_cli_utils::register_version_metrics!();
         })?;
-        RuntimeManager::run_until_ctrl_c(self.args.exec())
+        RuntimeManager::new().run_until_ctrl_c(self.args.exec())
     }
 }
 
@@ -99,6 +99,22 @@ pub(crate) struct BatcherArgs {
     /// Number of frames (blobs) per L1 transaction.
     #[arg(long = "target-num-frames", default_value = "1", env = "BATCHER_TARGET_NUM_FRAMES")]
     pub target_num_frames: usize,
+
+    /// Batch encoding mode.
+    ///
+    /// Accepts `single` / `0` and `span` / `1`. Span batches require Fjord
+    /// to be active for the next L2 block at startup.
+    #[arg(long = "batch-type", default_value = "single", env = "BATCHER_BATCH_TYPE")]
+    batch_type: BatchTypeArg,
+    /// Data availability mode for L1 submissions.
+    ///
+    /// Accepts `blobs` (default) or `calldata`.
+    #[arg(
+        long = "data-availability-type",
+        default_value = "blobs",
+        env = "BATCHER_DATA_AVAILABILITY_TYPE"
+    )]
+    da_type: base_batcher_encoder::DaType,
 
     /// Approximate compression ratio used for span batch size estimation.
     ///
@@ -164,6 +180,14 @@ pub(crate) struct BatcherArgs {
     )]
     pub check_recent_txs_depth: u64,
 
+    /// Maximum serialized size of a single L1 calldata transaction in bytes.
+    ///
+    /// Safety cap that prevents oversized calldata transactions from being rejected
+    /// by the mempool. No-op for blob DA. Equivalent to op-batcher's
+    /// `--max-l1-tx-size-bytes` (default 120,000 bytes). Omit to disable the cap.
+    #[arg(long = "max-l1-tx-size-bytes", env = "BATCHER_MAX_L1_TX_SIZE_BYTES")]
+    pub max_l1_tx_size_bytes: Option<usize>,
+
     /// Bind address for the admin JSON-RPC API (default: 127.0.0.1).
     ///
     /// Only takes effect when `--admin-port` is also set.
@@ -177,6 +201,14 @@ pub(crate) struct BatcherArgs {
     /// When absent (default), the admin API is disabled.
     #[arg(long = "admin-port", env = "BATCHER_ADMIN_PORT")]
     pub admin_port: Option<u16>,
+
+    /// Start in a stopped state, deferring batch submission until `admin_startBatcher` is called.
+    ///
+    /// The batcher connects to all endpoints and is fully observable but will not
+    /// submit any batches until activated via the admin API. Useful for staged
+    /// rollouts, controlled restarts, and debugging.
+    #[arg(long = "stopped", env = "BATCHER_STOPPED")]
+    pub stopped: bool,
 
     /// Logging configuration.
     #[command(flatten)]
@@ -196,8 +228,10 @@ impl BatcherArgs {
             max_channel_duration: self.max_channel_duration,
             sub_safety_margin: self.sub_safety_margin,
             target_num_frames: self.target_num_frames,
+            batch_type: self.batch_type.into(),
+            da_type: self.da_type,
             approx_compr_ratio: self.approx_compr_ratio,
-            ..base_batcher_encoder::EncoderConfig::default()
+            max_l1_tx_size_bytes: self.max_l1_tx_size_bytes,
         };
         encoder_config.validate()?;
         Ok(BatcherConfig {
@@ -223,6 +257,7 @@ impl BatcherArgs {
             },
             check_recent_txs_depth: self.check_recent_txs_depth,
             admin_addr: self.admin_port.map(|port| SocketAddr::new(self.admin_addr, port)),
+            stopped: self.stopped,
         })
     }
 
@@ -240,5 +275,104 @@ impl BatcherArgs {
 
         let service = BatcherService::new(config);
         service.setup(rt).await?.run().await
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BatchTypeArg {
+    #[value(alias = "0")]
+    Single,
+    #[value(alias = "1")]
+    Span,
+}
+
+impl From<BatchTypeArg> for base_protocol::BatchType {
+    fn from(value: BatchTypeArg) -> Self {
+        match value {
+            BatchTypeArg::Single => Self::Single,
+            BatchTypeArg::Span => Self::Span,
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    fn base_args() -> Vec<&'static str> {
+        vec![
+            "base-batcher",
+            "--l1-rpc-url",
+            "http://localhost:8545",
+            "--l2-rpc-url",
+            "http://localhost:9545",
+            "--rollup-rpc-url",
+            "http://localhost:7545",
+            "--private-key",
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ]
+    }
+
+    fn parse_cli(extra: &[&'static str]) -> Cli {
+        let mut args = base_args();
+        args.extend_from_slice(extra);
+        Cli::try_parse_from(args).expect("CLI should parse")
+    }
+
+    #[test]
+    fn into_config_defaults_to_single_batches_and_blobs() {
+        let cli = parse_cli(&[]);
+        let config = cli.args.into_config().expect("config should build");
+
+        assert_eq!(config.encoder_config.batch_type, base_protocol::BatchType::Single);
+    }
+
+    #[test]
+    fn into_config_accepts_numeric_span_alias() {
+        let cli = parse_cli(&["--batch-type", "1"]);
+        let config = cli.args.into_config().expect("config should build");
+
+        assert_eq!(config.encoder_config.batch_type, base_protocol::BatchType::Span);
+    }
+
+    #[test]
+    fn into_config_defaults_to_blob_da() {
+        let cli = parse_cli(&[]);
+        let config = cli.args.into_config().expect("config should build");
+
+        assert_eq!(config.encoder_config.da_type, base_batcher_encoder::DaType::Blob);
+    }
+
+    #[test]
+    fn into_config_accepts_calldata_da_mode() {
+        let cli = parse_cli(&["--data-availability-type", "calldata"]);
+        let config = cli.args.into_config().expect("config should build");
+
+        assert_eq!(config.encoder_config.da_type, base_batcher_encoder::DaType::Calldata);
+    }
+
+    #[test]
+    fn cli_rejects_auto_da_mode_for_now() {
+        let mut args = base_args();
+        args.extend_from_slice(["--data-availability-type", "auto"].as_slice());
+
+        assert!(Cli::try_parse_from(args).is_err());
+    }
+
+    #[test]
+    fn stopped_defaults_to_false() {
+        let cli = parse_cli(&[]);
+        let config = cli.args.into_config().expect("config should build");
+
+        assert!(!config.stopped);
+    }
+
+    #[test]
+    fn stopped_flag_sets_stopped_in_config() {
+        let cli = parse_cli(&["--stopped"]);
+        let config = cli.args.into_config().expect("config should build");
+
+        assert!(config.stopped);
     }
 }

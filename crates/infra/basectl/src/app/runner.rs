@@ -1,7 +1,7 @@
 use std::io::Write;
 
 use anyhow::Result;
-use base_alloy_flashblocks::Flashblock;
+use base_common_flashblocks::Flashblock;
 use base_consensus_genesis::SystemConfig;
 use tokio::sync::{mpsc, watch};
 
@@ -11,34 +11,30 @@ use crate::{
     l1_client::fetch_full_system_config,
     rpc::{
         BacklogFetchResult, BlockDaInfo, ConductorNodeStatus, L1BlockInfo, L1ConnectionMode,
-        TimestampedFlashblock, fetch_initial_backlog_with_progress, run_block_fetcher,
-        run_conductor_poller, run_flashblock_ws, run_flashblock_ws_timestamped,
-        run_l1_blob_watcher, run_safe_head_poller,
+        ProofsSnapshot, TimestampedFlashblock, ValidatorNodeStatus,
+        fetch_initial_backlog_with_progress, run_block_fetcher, run_conductor_poller,
+        run_flashblock_ws, run_flashblock_ws_timestamped, run_l1_blob_watcher, run_proofs_poller,
+        run_safe_head_poller, run_validator_poller,
     },
     tui::Toast,
 };
 
-/// Launches the TUI application starting from the home view.
-pub async fn run_app(config: ChainConfig) -> Result<()> {
+/// Launches the TUI application starting from the specified view and network.
+pub async fn run_app(initial_view: ViewId, network: &str) -> Result<()> {
+    let config = ChainConfig::load(network).await?;
     let mut resources = Resources::new(config.clone());
-
     start_background_services(&config, &mut resources);
-
-    let app = App::new(resources, ViewId::Home);
-    app.run(create_view).await
-}
-
-/// Launches the TUI application starting from the specified view.
-pub async fn run_app_with_view(config: ChainConfig, initial_view: ViewId) -> Result<()> {
-    let mut resources = Resources::new(config.clone());
-
-    start_background_services(&config, &mut resources);
-
     let app = App::new(resources, initial_view);
     app.run(create_view).await
 }
 
-fn start_background_services(config: &ChainConfig, resources: &mut Resources) {
+/// Starts all background data-fetching services, wiring their channels into `resources`.
+///
+/// Spawns tokio tasks for flashblock streams, L1 blob watching, DA backlog loading,
+/// safe-head polling, system config fetching, conductor polling, validator polling,
+/// and proof monitoring. All tasks communicate back through channels stored in
+/// `resources`.
+pub fn start_background_services(config: &ChainConfig, resources: &mut Resources) {
     let (fb_tx, fb_rx) = mpsc::channel::<TimestampedFlashblock>(100);
     let (da_fb_tx, da_fb_rx) = mpsc::channel::<Flashblock>(100);
     let (sync_tx, sync_rx) = mpsc::channel::<u64>(10);
@@ -96,6 +92,7 @@ fn start_background_services(config: &ChainConfig, resources: &mut Resources) {
 
     tokio::spawn(fetch_initial_backlog_with_progress(config.rpc.to_string(), backlog_tx));
 
+    let proofs_toast_tx = toast_tx.clone();
     tokio::spawn(run_safe_head_poller(config.rpc.to_string(), sync_tx, toast_tx));
 
     let (sys_config_tx, sys_config_rx) = mpsc::channel::<SystemConfig>(1);
@@ -120,6 +117,24 @@ fn start_background_services(config: &ChainConfig, resources: &mut Resources) {
         if conductor_nodes.iter().any(|n| n.flashblocks_ws.is_some()) {
             resources.conductor.set_url_sender(conductor_nodes, fb_url_tx);
         }
+    }
+
+    if let Some(validator_nodes) = config.validators.clone() {
+        let (validator_tx, validator_rx) = mpsc::channel::<Vec<ValidatorNodeStatus>>(4);
+        resources.validators.set_channel(validator_rx);
+        tokio::spawn(run_validator_poller(validator_nodes, validator_tx));
+    }
+
+    if let Some(proofs_config) = config.proofs.clone() {
+        let (proofs_tx, proofs_rx) = mpsc::channel::<ProofsSnapshot>(4);
+        resources.proofs.set_channel(proofs_rx);
+        tokio::spawn(run_proofs_poller(
+            proofs_config,
+            config.l1_rpc.clone(),
+            config.rpc.clone(),
+            proofs_tx,
+            proofs_toast_tx,
+        ));
     }
 }
 

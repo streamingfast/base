@@ -22,6 +22,7 @@ tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "json"
 
 # metrics
 metrics.workspace = true
+base-metrics = { workspace = true, features = ["metrics"] }
 metrics-process = { workspace = true, features = ["metrics-rs"] }
 metrics-exporter-prometheus = { workspace = true, features = ["http-listener"] }
 
@@ -39,4 +40,3 @@ serde_json = { workspace = true, features = ["std"] }
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 backtrace.workspace = true
-

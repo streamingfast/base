@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Instant};
 
-use alloy_consensus::{Header, Sealed};
+use alloy_consensus::{Header, Sealed, TxReceipt};
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{
     Address, B256, BlockNumber, TxHash, U256,
@@ -11,12 +11,11 @@ use alloy_rpc_types::{BlockTransactions, Withdrawal, state::StateOverride};
 use alloy_rpc_types_engine::PayloadId;
 use alloy_rpc_types_eth::{Filter, Header as RPCHeader, Log};
 use arc_swap::Guard;
-use base_alloy_consensus::OpTxType;
-use base_alloy_evm::OpTxResult;
-use base_alloy_flashblocks::Flashblock;
-use base_alloy_network::Base;
-use base_alloy_rpc_types::{OpTransactionReceipt, Transaction};
-use base_revm::OpHaltReason;
+use base_common_consensus::OpTxType;
+use base_common_evm::{BaseTxResult, OpHaltReason};
+use base_common_flashblocks::Flashblock;
+use base_common_network::Base;
+use base_common_rpc_types::{BaseTransactionReceipt, Transaction};
 use reth_evm::eth::EthTxResult;
 use reth_revm::db::BundleState;
 use reth_rpc_convert::RpcTransaction;
@@ -26,7 +25,9 @@ use revm::{
     state::EvmState,
 };
 
-use crate::{BuildError, Metrics, PendingBlocksAPI, StateProcessorError, TransactionWithLogs};
+use crate::{
+    BuildError, PendingBlocksAPI, StateProcessorError, TransactionWithLogs, metrics::Metrics,
+};
 
 /// Builder for [`PendingBlocks`].
 #[derive(Debug)]
@@ -37,7 +38,7 @@ pub struct PendingBlocksBuilder {
     transactions: Vec<Transaction>,
     account_balances: HashMap<Address, U256>,
     transaction_count: HashMap<Address, U256>,
-    transaction_receipts: HashMap<B256, OpTransactionReceipt>,
+    transaction_receipts: HashMap<B256, BaseTransactionReceipt>,
     transactions_by_hash: HashMap<B256, Transaction>,
     transaction_state: HashMap<B256, EvmState>,
     transaction_senders: HashMap<B256, Address>,
@@ -124,7 +125,7 @@ impl PendingBlocksBuilder {
 
     /// Stores the receipt for a transaction.
     #[inline]
-    pub fn with_receipt(&mut self, hash: B256, receipt: OpTransactionReceipt) -> &Self {
+    pub fn with_receipt(&mut self, hash: B256, receipt: BaseTransactionReceipt) -> &Self {
         self.transaction_receipts.insert(hash, receipt);
         self
     }
@@ -183,6 +184,13 @@ impl PendingBlocksBuilder {
         let latest_flashblock_index =
             self.flashblocks.last().map(|fb| fb.index).ok_or(BuildError::NoFlashblocks)?;
 
+        for transaction in &self.transactions {
+            let tx_hash = transaction.tx_hash();
+            if !self.transaction_receipts.contains_key(&tx_hash) {
+                return Err(BuildError::MissingReceipt { tx_hash }.into());
+            }
+        }
+
         Ok(PendingBlocks {
             earliest_header,
             latest_header,
@@ -215,7 +223,7 @@ pub struct PendingBlocks {
 
     account_balances: HashMap<Address, U256>,
     transaction_count: HashMap<Address, U256>,
-    transaction_receipts: HashMap<B256, OpTransactionReceipt>,
+    transaction_receipts: HashMap<B256, BaseTransactionReceipt>,
     transactions_by_hash: HashMap<B256, Transaction>,
     transaction_state: HashMap<B256, EvmState>,
     transaction_senders: HashMap<B256, Address>,
@@ -228,6 +236,21 @@ pub struct PendingBlocks {
 }
 
 impl PendingBlocks {
+    fn transaction_with_logs(
+        transaction: &Transaction,
+        receipt: &BaseTransactionReceipt,
+    ) -> TransactionWithLogs {
+        TransactionWithLogs {
+            transaction: transaction.clone(),
+            logs: receipt.inner.logs().to_vec(),
+            gas_used: receipt.inner.gas_used,
+            status: receipt.inner.inner.status_or_post_state(),
+            cumulative_gas_used: receipt.inner.inner.cumulative_gas_used(),
+            contract_address: receipt.inner.contract_address,
+            logs_bloom: receipt.inner.inner.logs_bloom,
+        }
+    }
+
     /// Returns the latest block number in the pending state.
     #[inline]
     pub fn latest_block_number(&self) -> BlockNumber {
@@ -286,12 +309,11 @@ impl PendingBlocks {
     /// storage slots modified in the flashblock. Monitor `bundle_state_clone_duration` and
     /// `bundle_state_clone_size` metrics to track if this becomes a bottleneck.
     pub fn get_bundle_state(&self) -> BundleState {
-        let metrics = Metrics::default();
         let size = self.bundle_state.state.len();
         let start = Instant::now();
         let cloned = self.bundle_state.clone();
-        metrics.bundle_state_clone_duration.record(start.elapsed());
-        metrics.bundle_state_clone_size.record(size as f64);
+        Metrics::bundle_state_clone_duration().record(start.elapsed());
+        Metrics::bundle_state_clone_size().record(size as f64);
         cloned
     }
 
@@ -331,7 +353,7 @@ impl PendingBlocks {
     }
 
     /// Returns the receipt for a transaction.
-    pub fn get_receipt(&self, tx_hash: TxHash) -> Option<&OpTransactionReceipt> {
+    pub fn get_receipt(&self, tx_hash: TxHash) -> Option<&BaseTransactionReceipt> {
         self.transaction_receipts.get(&tx_hash)
     }
 
@@ -351,7 +373,7 @@ impl PendingBlocks {
     }
 
     /// Returns the receipt and state for a transaction.
-    pub fn get_op_tx_result(&self, tx_hash: &B256) -> Option<OpTxResult<OpHaltReason, OpTxType>> {
+    pub fn get_op_tx_result(&self, tx_hash: &B256) -> Option<BaseTxResult<OpHaltReason, OpTxType>> {
         let (((result, state), tx), sender) = self
             .get_transaction_result(tx_hash)
             .zip(self.get_transaction_state(tx_hash))
@@ -370,7 +392,7 @@ impl PendingBlocks {
         };
 
         let op_tx_result =
-            OpTxResult { inner: eth_tx_result, is_deposit: tx.inner.inner.is_deposit(), sender };
+            BaseTxResult { inner: eth_tx_result, is_deposit: tx.inner.inner.is_deposit(), sender };
 
         Some(op_tx_result)
     }
@@ -426,14 +448,10 @@ impl PendingBlocks {
     pub fn get_pending_transactions_with_logs(&self) -> Vec<TransactionWithLogs> {
         self.transactions
             .iter()
-            .map(|tx| {
-                let tx_hash = tx.tx_hash();
-                let logs = self
-                    .transaction_receipts
-                    .get(&tx_hash)
-                    .map(|receipt| receipt.inner.logs().to_vec())
-                    .unwrap_or_default();
-                TransactionWithLogs { transaction: tx.clone(), logs }
+            .filter_map(|tx| {
+                self.transaction_receipts
+                    .get(&tx.tx_hash())
+                    .map(|receipt| Self::transaction_with_logs(tx, receipt))
             })
             .collect()
     }
@@ -488,14 +506,38 @@ impl PendingBlocks {
         self.transactions
             .iter()
             .skip(prev_count)
-            .map(|tx| {
-                let tx_hash = tx.tx_hash();
-                let logs = self
-                    .transaction_receipts
-                    .get(&tx_hash)
-                    .map(|receipt| receipt.inner.logs().to_vec())
-                    .unwrap_or_default();
-                TransactionWithLogs { transaction: tx.clone(), logs }
+            .filter_map(|tx| {
+                self.transaction_receipts
+                    .get(&tx.tx_hash())
+                    .map(|receipt| Self::transaction_with_logs(tx, receipt))
+            })
+            .collect()
+    }
+
+    /// Returns transactions with their associated logs from only the latest flashblock (delta),
+    /// filtered to include only transactions where at least one log matches the given filter.
+    ///
+    /// When a transaction matches, all of its logs are returned (not just the matching ones).
+    /// This preserves full transaction context for subscribers who need complete log sets.
+    pub fn get_latest_flashblock_transactions_with_logs_filtered(
+        &self,
+        filter: &Filter,
+    ) -> Vec<TransactionWithLogs> {
+        let prev_count = self.previous_flashblocks_tx_count();
+
+        self.transactions
+            .iter()
+            .skip(prev_count)
+            .filter_map(|tx| {
+                let receipt = self.transaction_receipts.get(&tx.tx_hash())?;
+                let logs = receipt.inner.logs();
+
+                let has_match = logs.iter().any(|log| filter.matches(&log.inner));
+                if !has_match {
+                    return None;
+                }
+
+                Some(Self::transaction_with_logs(tx, receipt))
             })
             .collect()
     }
@@ -561,11 +603,11 @@ mod tests {
     };
     use alloy_provider::network::TransactionResponse;
     use alloy_rpc_types_engine::PayloadId;
-    use base_alloy_consensus::{OpReceipt, OpTxEnvelope, TxDeposit};
-    use base_alloy_flashblocks::{
+    use base_common_consensus::{BaseReceipt, BaseTxEnvelope, TxDeposit};
+    use base_common_flashblocks::{
         ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, Flashblock, Metadata,
     };
-    use base_alloy_rpc_types::{L1BlockInfo, OpTransactionReceipt, Transaction};
+    use base_common_rpc_types::{BaseTransactionReceipt, L1BlockInfo, Transaction};
     use revm::context_interface::result::ExecutionResult;
 
     use super::*;
@@ -608,7 +650,7 @@ mod tests {
         Transaction {
             inner: alloy_rpc_types_eth::Transaction {
                 inner: Recovered::new_unchecked(
-                    OpTxEnvelope::Legacy(alloy_consensus::Signed::new_unchecked(
+                    BaseTxEnvelope::Legacy(alloy_consensus::Signed::new_unchecked(
                         alloy_consensus::TxLegacy::default(),
                         Signature::test_signature(),
                         B256::ZERO,
@@ -636,8 +678,11 @@ mod tests {
             value: U256::ZERO,
             input: Bytes::new(),
         };
-        let envelope =
-            OpTxEnvelope::Legacy(Signed::new_unchecked(legacy, Signature::test_signature(), hash));
+        let envelope = BaseTxEnvelope::Legacy(Signed::new_unchecked(
+            legacy,
+            Signature::test_signature(),
+            hash,
+        ));
         let recovered = Recovered::new_unchecked(envelope, Address::ZERO);
         Transaction {
             inner: alloy_rpc_types_eth::Transaction {
@@ -666,7 +711,7 @@ mod tests {
         Transaction {
             inner: alloy_rpc_types_eth::Transaction {
                 inner: Recovered::new_unchecked(
-                    OpTxEnvelope::Deposit(Sealed::new_unchecked(deposit, B256::ZERO)),
+                    BaseTxEnvelope::Deposit(Sealed::new_unchecked(deposit, B256::ZERO)),
                     test_sender(),
                 ),
                 block_hash: None,
@@ -679,11 +724,11 @@ mod tests {
         }
     }
 
-    fn test_receipt(tx_hash: B256, blob_gas_used: Option<u64>) -> OpTransactionReceipt {
-        OpTransactionReceipt {
+    fn test_receipt(tx_hash: B256, blob_gas_used: Option<u64>) -> BaseTransactionReceipt {
+        BaseTransactionReceipt {
             inner: alloy_rpc_types_eth::TransactionReceipt {
                 inner: ReceiptWithBloom {
-                    receipt: OpReceipt::Legacy(Receipt {
+                    receipt: BaseReceipt::Legacy(Receipt {
                         status: alloy_consensus::Eip658Value::Eip658(true),
                         cumulative_gas_used: 21000,
                         logs: vec![],
@@ -706,8 +751,8 @@ mod tests {
         }
     }
 
-    /// Creates an [`OpTransactionReceipt`] with a single log emitted from `log_address`.
-    fn test_receipt_with_log(tx_hash: B256, log_address: Address) -> OpTransactionReceipt {
+    /// Creates an [`BaseTransactionReceipt`] with a single log emitted from `log_address`.
+    fn test_receipt_with_log(tx_hash: B256, log_address: Address) -> BaseTransactionReceipt {
         let log = Log {
             inner: PrimitiveLog {
                 address: log_address,
@@ -722,10 +767,10 @@ mod tests {
             removed: false,
         };
 
-        OpTransactionReceipt {
+        BaseTransactionReceipt {
             inner: alloy_rpc_types_eth::TransactionReceipt {
                 inner: ReceiptWithBloom {
-                    receipt: OpReceipt::Legacy(Receipt {
+                    receipt: BaseReceipt::Legacy(Receipt {
                         status: alloy_consensus::Eip658Value::Eip658(true),
                         cumulative_gas_used: 21_000,
                         logs: vec![log],
@@ -746,6 +791,21 @@ mod tests {
             },
             l1_block_info: Default::default(),
         }
+    }
+
+    fn test_receipt_with_subscription_fields(
+        tx_hash: B256,
+        log_address: Address,
+        contract_address: Address,
+        logs_bloom: Bloom,
+    ) -> BaseTransactionReceipt {
+        let mut receipt = test_receipt_with_log(tx_hash, log_address);
+        receipt.inner.inner.receipt.as_receipt_mut().status =
+            alloy_consensus::Eip658Value::Eip658(true);
+        receipt.inner.inner.receipt.as_receipt_mut().cumulative_gas_used = 42_000;
+        receipt.inner.inner.logs_bloom = logs_bloom;
+        receipt.inner.contract_address = Some(contract_address);
+        receipt
     }
 
     fn test_execution_result() -> ExecutionResult<OpHaltReason> {
@@ -788,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn get_op_tx_result_reconstructs_all_fields_for_legacy_tx() {
+    fn get_tx_result_reconstructs_all_fields_for_legacy_tx() {
         let da_footprint = 42_000u64;
         let (tx_hash, pending_blocks) =
             build_pending_blocks(test_legacy_transaction(), Some(da_footprint));
@@ -803,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn get_op_tx_result_reconstructs_all_fields_for_deposit_tx() {
+    fn get_tx_result_reconstructs_all_fields_for_deposit_tx() {
         let (tx_hash, pending_blocks) = build_pending_blocks(test_deposit_transaction(), Some(0));
 
         let result = pending_blocks.get_op_tx_result(&tx_hash).expect("should return tx result");
@@ -816,7 +876,7 @@ mod tests {
     }
 
     #[test]
-    fn get_op_tx_result_defaults_blob_gas_to_zero_when_receipt_field_is_none() {
+    fn get_tx_result_defaults_blob_gas_to_zero_when_receipt_field_is_none() {
         let (tx_hash, pending_blocks) = build_pending_blocks(test_legacy_transaction(), None);
 
         let result = pending_blocks.get_op_tx_result(&tx_hash).expect("should return tx result");
@@ -825,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn get_op_tx_result_defaults_blob_gas_to_zero_without_receipt() {
+    fn get_tx_result_defaults_blob_gas_to_zero_without_receipt() {
         let tx = test_legacy_transaction();
         let tx_hash = tx.tx_hash();
         let mut builder = PendingBlocksBuilder::default();
@@ -835,12 +895,69 @@ mod tests {
         builder.with_transaction_sender(tx_hash, test_sender());
         builder.with_transaction_state(tx_hash, Default::default());
         builder.with_transaction_result(tx_hash, test_execution_result());
-        // Intentionally skip with_receipt to test the no-receipt fallback path
-        let pending_blocks = builder.build().expect("should build pending blocks");
+        // Intentionally skip with_receipt to verify pending blocks reject incomplete transactions.
+        let err = builder.build().expect_err("build should fail without a receipt");
 
-        let result = pending_blocks.get_op_tx_result(&tx_hash).expect("should return tx result");
+        assert_eq!(err, StateProcessorError::Build(BuildError::MissingReceipt { tx_hash }));
+    }
 
-        assert_eq!(result.inner.blob_gas_used, 0);
+    fn test_receipt_with_log_and_topic(
+        tx_hash: B256,
+        log_address: Address,
+        topic0: B256,
+    ) -> BaseTransactionReceipt {
+        let log = Log {
+            inner: PrimitiveLog {
+                address: log_address,
+                data: LogData::new_unchecked(vec![topic0], Bytes::new()),
+            },
+            block_hash: Some(B256::ZERO),
+            block_number: Some(1),
+            block_timestamp: None,
+            transaction_hash: Some(tx_hash),
+            transaction_index: Some(0),
+            log_index: Some(0),
+            removed: false,
+        };
+
+        BaseTransactionReceipt {
+            inner: alloy_rpc_types_eth::TransactionReceipt {
+                inner: ReceiptWithBloom {
+                    receipt: BaseReceipt::Legacy(Receipt {
+                        status: alloy_consensus::Eip658Value::Eip658(true),
+                        cumulative_gas_used: 21_000,
+                        logs: vec![log],
+                    }),
+                    logs_bloom: Bloom::default(),
+                },
+                transaction_hash: tx_hash,
+                transaction_index: Some(0),
+                block_hash: Some(B256::ZERO),
+                block_number: Some(1),
+                gas_used: 21_000,
+                effective_gas_price: 1_000_000_000,
+                blob_gas_used: None,
+                blob_gas_price: None,
+                from: Address::ZERO,
+                to: None,
+                contract_address: None,
+            },
+            l1_block_info: Default::default(),
+        }
+    }
+
+    fn build_pending_blocks_with_topics(entries: &[(B256, Address, B256)]) -> PendingBlocks {
+        let header = Sealed::new_unchecked(Header::default(), B256::ZERO);
+        let mut builder = PendingBlocksBuilder::new();
+        builder.with_flashblocks([test_flashblock()]);
+        builder.with_header(header);
+
+        for &(hash, addr, topic) in entries {
+            builder.with_transaction(test_transaction_with_hash(hash));
+            builder.with_receipt(hash, test_receipt_with_log_and_topic(hash, addr, topic));
+        }
+
+        builder.build().expect("build should succeed")
     }
 
     #[test]
@@ -863,5 +980,220 @@ mod tests {
         assert_eq!(logs[0].address(), addr_a);
         assert_eq!(logs[1].address(), addr_b);
         assert_eq!(logs[2].address(), addr_c);
+    }
+
+    #[test]
+    fn filtered_transactions_returns_only_matching_by_address() {
+        let hash_a = B256::with_last_byte(0xAA);
+        let hash_b = B256::with_last_byte(0xBB);
+        let hash_c = B256::with_last_byte(0xCC);
+
+        let addr_a = Address::with_last_byte(0x0A);
+        let addr_b = Address::with_last_byte(0x0B);
+        let addr_c = Address::with_last_byte(0x0C);
+
+        let pending =
+            build_pending_blocks_with_logs(&[(hash_a, addr_a), (hash_b, addr_b), (hash_c, addr_c)]);
+
+        let filter = Filter::new().address(addr_b);
+        let txs = pending.get_latest_flashblock_transactions_with_logs_filtered(&filter);
+
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0].transaction.tx_hash(), hash_b);
+        assert_eq!(txs[0].logs.len(), 1);
+        assert_eq!(txs[0].logs[0].address(), addr_b);
+    }
+
+    #[test]
+    fn filtered_transactions_returns_only_matching_by_topic0() {
+        let hash_a = B256::with_last_byte(0xAA);
+        let hash_b = B256::with_last_byte(0xBB);
+
+        let addr = Address::with_last_byte(0x01);
+        let topic_transfer = B256::with_last_byte(0x01);
+        let topic_approval = B256::with_last_byte(0x02);
+
+        let pending = build_pending_blocks_with_topics(&[
+            (hash_a, addr, topic_transfer),
+            (hash_b, addr, topic_approval),
+        ]);
+
+        let filter = Filter::new().event_signature(topic_transfer);
+        let txs = pending.get_latest_flashblock_transactions_with_logs_filtered(&filter);
+
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0].transaction.tx_hash(), hash_a);
+    }
+
+    #[test]
+    fn filtered_transactions_returns_all_logs_when_any_matches() {
+        let hash_a = B256::with_last_byte(0xAA);
+        let addr_match = Address::with_last_byte(0x0A);
+        let addr_other = Address::with_last_byte(0x0B);
+
+        let log_match = Log {
+            inner: PrimitiveLog {
+                address: addr_match,
+                data: LogData::new_unchecked(vec![], Bytes::new()),
+            },
+            block_hash: Some(B256::ZERO),
+            block_number: Some(1),
+            block_timestamp: None,
+            transaction_hash: Some(hash_a),
+            transaction_index: Some(0),
+            log_index: Some(0),
+            removed: false,
+        };
+        let log_other = Log {
+            inner: PrimitiveLog {
+                address: addr_other,
+                data: LogData::new_unchecked(vec![], Bytes::new()),
+            },
+            block_hash: Some(B256::ZERO),
+            block_number: Some(1),
+            block_timestamp: None,
+            transaction_hash: Some(hash_a),
+            transaction_index: Some(0),
+            log_index: Some(1),
+            removed: false,
+        };
+
+        let receipt = BaseTransactionReceipt {
+            inner: alloy_rpc_types_eth::TransactionReceipt {
+                inner: ReceiptWithBloom {
+                    receipt: BaseReceipt::Legacy(Receipt {
+                        status: alloy_consensus::Eip658Value::Eip658(true),
+                        cumulative_gas_used: 42_000,
+                        logs: vec![log_match, log_other],
+                    }),
+                    logs_bloom: Bloom::default(),
+                },
+                transaction_hash: hash_a,
+                transaction_index: Some(0),
+                block_hash: Some(B256::ZERO),
+                block_number: Some(1),
+                gas_used: 42_000,
+                effective_gas_price: 1_000_000_000,
+                blob_gas_used: None,
+                blob_gas_price: None,
+                from: Address::ZERO,
+                to: None,
+                contract_address: None,
+            },
+            l1_block_info: Default::default(),
+        };
+
+        let header = Sealed::new_unchecked(Header::default(), B256::ZERO);
+        let mut builder = PendingBlocksBuilder::new();
+        builder.with_flashblocks([test_flashblock()]);
+        builder.with_header(header);
+        builder.with_transaction(test_transaction_with_hash(hash_a));
+        builder.with_receipt(hash_a, receipt);
+        let pending = builder.build().expect("build should succeed");
+
+        let filter = Filter::new().address(addr_match);
+        let txs = pending.get_latest_flashblock_transactions_with_logs_filtered(&filter);
+
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0].logs.len(), 2, "should return ALL logs, not just matching");
+        assert_eq!(txs[0].logs[0].address(), addr_match);
+        assert_eq!(txs[0].logs[1].address(), addr_other);
+    }
+
+    #[test]
+    fn filtered_transactions_returns_none_when_no_match() {
+        let hash_a = B256::with_last_byte(0xAA);
+        let addr_a = Address::with_last_byte(0x0A);
+        let addr_unrelated = Address::with_last_byte(0xFF);
+
+        let pending = build_pending_blocks_with_logs(&[(hash_a, addr_a)]);
+
+        let filter = Filter::new().address(addr_unrelated);
+        let txs = pending.get_latest_flashblock_transactions_with_logs_filtered(&filter);
+
+        assert!(txs.is_empty());
+    }
+
+    #[test]
+    fn filtered_transactions_populates_gas_used() {
+        let hash_a = B256::with_last_byte(0xAA);
+        let addr_a = Address::with_last_byte(0x0A);
+
+        let pending = build_pending_blocks_with_logs(&[(hash_a, addr_a)]);
+
+        let filter = Filter::new().address(addr_a);
+        let txs = pending.get_latest_flashblock_transactions_with_logs_filtered(&filter);
+
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0].gas_used, 21_000);
+    }
+
+    #[test]
+    fn unfiltered_transactions_populates_gas_used() {
+        let hash_a = B256::with_last_byte(0xAA);
+        let addr_a = Address::with_last_byte(0x0A);
+
+        let pending = build_pending_blocks_with_logs(&[(hash_a, addr_a)]);
+
+        let txs = pending.get_latest_flashblock_transactions_with_logs();
+
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0].gas_used, 21_000);
+    }
+
+    #[test]
+    fn unfiltered_transactions_populate_receipt_fields() {
+        let tx_hash = B256::with_last_byte(0xAA);
+        let log_address = Address::with_last_byte(0x0A);
+        let contract_address = Address::with_last_byte(0x0B);
+        let logs_bloom: Bloom = [0x22; 256].into();
+
+        let header = Sealed::new_unchecked(Header::default(), B256::ZERO);
+        let mut builder = PendingBlocksBuilder::new();
+        builder.with_flashblocks([test_flashblock()]);
+        builder.with_header(header);
+        builder.with_transaction(test_transaction_with_hash(tx_hash));
+        builder.with_receipt(
+            tx_hash,
+            test_receipt_with_subscription_fields(
+                tx_hash,
+                log_address,
+                contract_address,
+                logs_bloom,
+            ),
+        );
+        let pending = builder.build().expect("build should succeed");
+
+        let txs = pending.get_latest_flashblock_transactions_with_logs();
+
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0].status, alloy_consensus::Eip658Value::Eip658(true));
+        assert_eq!(txs[0].cumulative_gas_used, 42_000);
+        assert_eq!(txs[0].contract_address, Some(contract_address));
+        assert_eq!(txs[0].logs_bloom, logs_bloom);
+    }
+
+    #[test]
+    fn filtered_transactions_with_combined_address_and_topic() {
+        let hash_a = B256::with_last_byte(0xAA);
+        let hash_b = B256::with_last_byte(0xBB);
+        let hash_c = B256::with_last_byte(0xCC);
+
+        let addr_usdc = Address::with_last_byte(0x0A);
+        let addr_weth = Address::with_last_byte(0x0B);
+        let topic_transfer = B256::with_last_byte(0x01);
+        let topic_approval = B256::with_last_byte(0x02);
+
+        let pending = build_pending_blocks_with_topics(&[
+            (hash_a, addr_usdc, topic_transfer),
+            (hash_b, addr_usdc, topic_approval),
+            (hash_c, addr_weth, topic_transfer),
+        ]);
+
+        let filter = Filter::new().address(addr_usdc).event_signature(topic_transfer);
+        let txs = pending.get_latest_flashblock_transactions_with_logs_filtered(&filter);
+
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0].transaction.tx_hash(), hash_a);
     }
 }

@@ -4,8 +4,8 @@ use core::cmp::max;
 
 use alloy_consensus::BlockHeader;
 use alloy_eips::calc_next_block_base_fee;
-use base_alloy_chains::BaseUpgrades;
-use base_alloy_consensus::{EIP1559ParamError, HoloceneExtraData, JovianExtraData};
+use base_common_chains::Upgrades;
+use base_common_consensus::{EIP1559ParamError, HoloceneExtraData, JovianExtraData};
 use reth_chainspec::{BaseFeeParams, EthChainSpec};
 
 /// Extracts the Holocene 1599 parameters from the encoded extra data from the parent header.
@@ -14,7 +14,7 @@ use reth_chainspec::{BaseFeeParams, EthChainSpec};
 ///
 /// See also [Base fee computation](https://github.com/ethereum-optimism/specs/blob/main/specs/protocol/holocene/exec-engine.md#base-fee-computation)
 pub fn decode_holocene_base_fee<H>(
-    chain_spec: impl EthChainSpec + BaseUpgrades,
+    chain_spec: impl EthChainSpec + Upgrades,
     parent: &H,
     timestamp: u64,
 ) -> Result<u64, EIP1559ParamError>
@@ -41,7 +41,7 @@ where
 /// See also [Base fee computation](https://github.com/ethereum-optimism/specs/blob/main/specs/protocol/jovian/exec-engine.md#base-fee-computation)
 /// and [Minimum base fee in block header](https://github.com/ethereum-optimism/specs/blob/main/specs/protocol/jovian/exec-engine.md#minimum-base-fee-in-block-header)
 pub fn compute_jovian_base_fee<H>(
-    chain_spec: impl EthChainSpec + BaseUpgrades,
+    chain_spec: impl EthChainSpec + Upgrades,
     parent: &H,
     timestamp: u64,
 ) -> Result<u64, EIP1559ParamError>
@@ -78,21 +78,21 @@ where
 mod tests {
     use alloc::sync::Arc;
 
-    use base_alloy_chains::BaseUpgrade;
-    use base_alloy_consensus::JovianExtraData;
+    use base_common_chains::BaseUpgrade;
+    use base_common_consensus::JovianExtraData;
     use reth_chainspec::{ChainSpec, ForkCondition, Hardfork};
 
     use super::*;
-    use crate::{BASE_SEPOLIA, OpChainSpec};
+    use crate::{BASE_SEPOLIA, BaseChainSpec};
 
     const JOVIAN_TIMESTAMP: u64 = 1900000000;
 
-    fn get_chainspec() -> Arc<OpChainSpec> {
+    fn get_chainspec() -> Arc<BaseChainSpec> {
         let mut base_sepolia_spec = BASE_SEPOLIA.inner.clone();
         base_sepolia_spec
             .hardforks
             .insert(BaseUpgrade::Jovian.boxed(), ForkCondition::Timestamp(JOVIAN_TIMESTAMP));
-        Arc::new(OpChainSpec {
+        Arc::new(BaseChainSpec {
             inner: ChainSpec {
                 chain: base_sepolia_spec.chain,
                 genesis: base_sepolia_spec.genesis,

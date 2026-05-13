@@ -4,32 +4,31 @@ use alloc::{boxed::Box, vec::Vec};
 
 use alloy_eips::BlockNumHash;
 use async_trait::async_trait;
-use base_alloy_rpc_types_engine::OpPayloadAttributes;
+use base_common_rpc_types_engine::BasePayloadAttributes;
+use base_consensus_genesis::SystemConfig;
 use base_protocol::{BlockInfo, L2BlockInfo, SingleBatch};
 
 use crate::{
     errors::{PipelineError, PipelineErrorKind},
-    traits::{
-        AttributesBuilder, AttributesProvider, OriginAdvancer, OriginProvider, SignalReceiver,
-    },
-    types::{PipelineResult, Signal},
+    traits::{AttributesBuilder, AttributesProvider, OriginAdvancer, OriginProvider, StageReset},
+    types::PipelineResult,
 };
 
 /// A mock implementation of the [`AttributesBuilder`] for testing.
 #[derive(Debug, Default)]
 pub struct TestAttributesBuilder {
     /// The attributes to return.
-    pub attributes: Vec<Result<OpPayloadAttributes, PipelineErrorKind>>,
+    pub attributes: Vec<Result<BasePayloadAttributes, PipelineErrorKind>>,
 }
 
 #[async_trait]
 impl AttributesBuilder for TestAttributesBuilder {
-    /// Prepares the [`OpPayloadAttributes`] for the next payload.
+    /// Prepares the [`BasePayloadAttributes`] for the next payload.
     async fn prepare_payload_attributes(
         &mut self,
         _l2_parent: L2BlockInfo,
         _epoch: BlockNumHash,
-    ) -> PipelineResult<OpPayloadAttributes> {
+    ) -> PipelineResult<BasePayloadAttributes> {
         match self.attributes.pop() {
             Some(Ok(attrs)) => Ok(attrs),
             Some(Err(err)) => Err(err),
@@ -67,13 +66,18 @@ impl OriginAdvancer for TestAttributesProvider {
 }
 
 #[async_trait]
-impl SignalReceiver for TestAttributesProvider {
-    async fn signal(&mut self, signal: Signal) -> PipelineResult<()> {
-        match signal {
-            Signal::FlushChannel => self.flushed = true,
-            Signal::Reset { .. } => self.reset = true,
-            _ => {}
-        }
+impl StageReset for TestAttributesProvider {
+    async fn reset(&mut self, _: BlockNumHash, _: SystemConfig) -> PipelineResult<()> {
+        self.reset = true;
+        Ok(())
+    }
+
+    async fn activate(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
+
+    async fn flush_channel(&mut self) -> PipelineResult<()> {
+        self.flushed = true;
         Ok(())
     }
 }

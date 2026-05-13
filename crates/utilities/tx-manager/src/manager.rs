@@ -34,6 +34,7 @@
 //! [`TransactionRequest`]: alloy_rpc_types_eth::TransactionRequest
 
 use std::{
+    fmt::Debug,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -47,7 +48,7 @@ use alloy_eips::{
 };
 use alloy_network::{Ethereum, EthereumWallet, NetworkWallet, TransactionBuilder};
 use alloy_primitives::{Address, B256, Bytes};
-use alloy_provider::{Provider, RootProvider};
+use alloy_provider::Provider;
 use alloy_rpc_types_eth::{TransactionReceipt, TransactionRequest};
 use alloy_transport::TransportError;
 use backon::{ConstantBuilder, Retryable};
@@ -151,15 +152,15 @@ impl BumpState {
 /// (nonce, gas, fees) are set manually on [`TransactionRequest`] without
 /// alloy fillers or `PendingTransactionBuilder`.
 #[derive(Debug, Clone)]
-pub struct SimpleTxManager {
+pub struct SimpleTxManager<P> {
     /// RPC provider for chain queries and transaction submission.
-    provider: RootProvider,
+    provider: P,
     /// Wallet used for signing transactions.
     wallet: EthereumWallet,
     /// Validated runtime configuration.
     config: TxManagerConfig,
     /// Nonce manager for sequential nonce allocation.
-    nonce_manager: NonceManager<RootProvider>,
+    nonce_manager: NonceManager<P>,
     /// Chain ID for transaction construction.
     chain_id: u64,
     /// Shutdown flag shared across the manager and any spawned background
@@ -169,11 +170,12 @@ pub struct SimpleTxManager {
     closed: Arc<AtomicBool>,
     /// Metrics collector for transaction lifecycle events.
     metrics: Arc<dyn TxMetrics>,
-    /// Builder for EIP-4844 blob transaction sidecars.
-    blob_builder: BlobTxBuilder,
 }
 
-impl SimpleTxManager {
+impl<P> SimpleTxManager<P>
+where
+    P: Provider + Clone + Debug + Send + Sync + 'static,
+{
     /// Maximum number of retry attempts for [`Self::prepare`].
     pub const PREPARE_MAX_RETRIES: usize = 30;
 
@@ -191,7 +193,7 @@ impl SimpleTxManager {
     /// be built. See [`from_wallet`](Self::from_wallet) for other error
     /// conditions.
     pub async fn new(
-        provider: RootProvider,
+        provider: P,
         signer_config: SignerConfig,
         config: TxManagerConfig,
         chain_id: u64,
@@ -216,7 +218,7 @@ impl SimpleTxManager {
     /// fails or the chain ID does not match the provider. Returns
     /// [`TxManagerError::Rpc`] if the provider is unreachable.
     pub async fn from_wallet(
-        provider: RootProvider,
+        provider: P,
         wallet: EthereumWallet,
         config: TxManagerConfig,
         chain_id: u64,
@@ -240,7 +242,6 @@ impl SimpleTxManager {
 
         let address = <EthereumWallet as NetworkWallet<Ethereum>>::default_signer_address(&wallet);
         let nonce_manager = NonceManager::new(provider.clone(), address, config.network_timeout);
-        let blob_builder = BlobTxBuilder::new();
         Ok(Self {
             provider,
             wallet,
@@ -249,12 +250,11 @@ impl SimpleTxManager {
             chain_id,
             closed: Arc::new(AtomicBool::new(false)),
             metrics,
-            blob_builder,
         })
     }
 
     /// Returns a reference to the RPC provider.
-    pub const fn provider(&self) -> &RootProvider {
+    pub const fn provider(&self) -> &P {
         &self.provider
     }
 
@@ -269,7 +269,7 @@ impl SimpleTxManager {
     }
 
     /// Returns a reference to the nonce manager.
-    pub const fn nonce_manager(&self) -> &NonceManager<RootProvider> {
+    pub const fn nonce_manager(&self) -> &NonceManager<P> {
         &self.nonce_manager
     }
 
@@ -326,6 +326,25 @@ impl SimpleTxManager {
             self.config.fee_limit_multiplier,
             self.config.fee_limit_threshold,
         )
+    }
+
+    /// Checks both gas and blob fee ceilings relative to the raw provider
+    /// estimates in `caps`.
+    ///
+    /// Calls [`check_fee_limit`](Self::check_fee_limit) for the gas fee cap,
+    /// and when `blob_fee_cap` is `Some`, also checks the blob fee cap
+    /// against [`raw_blob_baseline`](Self::raw_blob_baseline).
+    fn check_fee_limits(
+        &self,
+        fee_cap: u128,
+        blob_fee_cap: Option<u128>,
+        caps: &GasPriceCaps,
+    ) -> TxManagerResult<()> {
+        self.check_fee_limit(fee_cap, caps.raw_gas_fee_cap)?;
+        if let Some(blob_cap) = blob_fee_cap {
+            self.check_fee_limit(blob_cap, self.raw_blob_baseline(caps)?)?;
+        }
+        Ok(())
     }
 
     /// Returns the raw (pre-minimum) blob fee cap from `caps`.
@@ -564,9 +583,11 @@ impl SimpleTxManager {
         old_fee_cap: u128,
         old_blob_fee_cap: Option<u128>,
     ) -> TxManagerResult<BumpedFees> {
+        let is_blob = candidate.is_blob();
+
         // Validate consistency: old_blob_fee_cap must be Some for blob txs
         // and None for non-blob txs.
-        if old_blob_fee_cap.is_some() == candidate.blobs.is_empty() {
+        if old_blob_fee_cap.is_some() != is_blob {
             return Err(TxManagerError::Unsupported(
                 "old_blob_fee_cap must be Some for blob transactions and None for non-blob transactions"
                     .into(),
@@ -574,13 +595,12 @@ impl SimpleTxManager {
         }
 
         // Step 1: Fetch fresh network fees.
-        let caps = self.suggest_gas_price_caps_for(!candidate.blobs.is_empty()).await?;
+        let caps = self.suggest_gas_price_caps_for(is_blob).await?;
 
         // Step 2: Derive effective base fee from the caps.
         let new_base_fee = FeeCalculator::base_fee_from_caps(caps.gas_fee_cap, caps.gas_tip_cap);
 
         // Step 3: Compute bumped tip and fee cap.
-        let is_blob = !candidate.blobs.is_empty();
         let (bumped_tip, bumped_fee_cap) = FeeCalculator::update_fees(
             old_tip,
             old_fee_cap,
@@ -589,25 +609,14 @@ impl SimpleTxManager {
             is_blob,
         );
 
-        // Step 4: Enforce fee ceiling.
-        self.check_fee_limit(bumped_fee_cap, caps.raw_gas_fee_cap)?;
+        // Step 4: Bump blob fee cap separately with 100% minimum.
+        let blob_fee_cap = old_blob_fee_cap.map(|old_blob| {
+            let threshold = FeeCalculator::calc_threshold_value(old_blob, true);
+            caps.blob_fee_cap.map_or(threshold, |network_blob| threshold.max(network_blob))
+        });
 
-        // Step 5: Bump blob fee cap separately with 100% minimum.
-        let blob_fee_cap = match old_blob_fee_cap {
-            Some(old_blob) => {
-                let threshold = FeeCalculator::calc_threshold_value(old_blob, true);
-                let bumped_blob =
-                    caps.blob_fee_cap.map_or(threshold, |network_blob| threshold.max(network_blob));
-
-                // Enforce fee ceiling on blob fee cap using the raw
-                // (pre-minimum) blob fee cap as the baseline, mirroring
-                // the gas fee cap ceiling in Step 4.
-                self.check_fee_limit(bumped_blob, self.raw_blob_baseline(&caps)?)?;
-
-                Some(bumped_blob)
-            }
-            None => None,
-        };
+        // Step 5: Enforce fee ceilings on gas and blob fee caps.
+        self.check_fee_limits(bumped_fee_cap, blob_fee_cap, &caps)?;
 
         info!(
             %old_tip,
@@ -675,7 +684,7 @@ impl SimpleTxManager {
         nonce_override: Option<u64>,
         cached_sidecar: Option<Arc<BlobTransactionSidecarEip7594>>,
     ) -> TxManagerResult<PreparedTx> {
-        let is_blob = !candidate.blobs.is_empty();
+        let is_blob = candidate.is_blob();
 
         // Blob transactions must have a recipient address (no contract creation).
         if is_blob && candidate.to.is_none() {
@@ -711,16 +720,7 @@ impl SimpleTxManager {
                 (caps.gas_tip_cap.max(fo.gas_tip_cap), caps.gas_fee_cap.max(fo.gas_fee_cap))
             });
 
-        // Step 3: Check fee limits.
-        //
-        // The `suggested` parameter is the raw gas_fee_cap computed from
-        // the provider's values before enforcing our configured minimums
-        // (`min_tip_cap`, `min_basefee`). This detects when enforced
-        // minimums or fee overrides inflate the fee cap beyond
-        // `fee_limit_multiplier × raw_provider_fee_cap`.
-        self.check_fee_limit(fee_cap, caps.raw_gas_fee_cap)?;
-
-        // Step 3b: Compute blob fee cap with config minimum and override floor.
+        // Step 3: Compute blob fee cap with config minimum and override floor.
         let blob_fee_cap = if is_blob {
             let network = caps.blob_fee_cap.ok_or_else(|| {
                 TxManagerError::Unsupported(
@@ -733,10 +733,14 @@ impl SimpleTxManager {
             None
         };
 
-        // Step 3c: Enforce blob fee ceiling (mirrors Step 3 for gas fee cap).
-        if let Some(blob_cap) = blob_fee_cap {
-            self.check_fee_limit(blob_cap, self.raw_blob_baseline(&caps)?)?;
-        }
+        // Step 3b: Check fee limits.
+        //
+        // The `suggested` parameter is the raw gas_fee_cap computed from
+        // the provider's values before enforcing our configured minimums
+        // (`min_tip_cap`, `min_basefee`). This detects when enforced
+        // minimums or fee overrides inflate the fee cap beyond
+        // `fee_limit_multiplier × raw_provider_fee_cap`.
+        self.check_fee_limits(fee_cap, blob_fee_cap, &caps)?;
 
         // Step 4: Build TransactionRequest.
         let from = self.sender_address();
@@ -761,7 +765,7 @@ impl SimpleTxManager {
         let built_sidecar = if is_blob {
             let sidecar = match cached_sidecar {
                 Some(cached) => cached,
-                None => Arc::new(self.blob_builder.build_sidecar(Arc::clone(&candidate.blobs))?),
+                None => Arc::new(BlobTxBuilder::build_sidecar(&candidate.blobs)?),
             };
             tx_request.sidecar = Some((*sidecar).clone().into());
             tx_request.populate_blob_hashes();
@@ -988,7 +992,7 @@ impl SimpleTxManager {
             // For other errors, reset only if nothing was ever published.
             // Once a transaction is pending, the next send_tx will re-sync
             // via the chain's pending nonce anyway.
-            Err(_) => send_state.successful_publish_count() == 0,
+            Err(_) => !send_state.has_published(),
         }
     }
 
@@ -1014,7 +1018,7 @@ impl SimpleTxManager {
             // nonce is re-fetched, but advance_nonce() pops
             // returned_nonces first, reissuing the same invalid value.
             Ok(_) | Err(TxManagerError::NonceTooHigh | TxManagerError::NonceTooLow) => false,
-            Err(_) => send_state.successful_publish_count() == 0,
+            Err(_) => !send_state.has_published(),
         }
     }
 
@@ -1081,19 +1085,11 @@ impl SimpleTxManager {
                 return Ok(receipt);
             }
 
-            // Respond immediately to the should_bump_fees flag set by
-            // process_send_error on retryable errors (e.g. Underpriced,
-            // ReplacementUnderpriced), rather than waiting for the next
-            // resubmission timer tick.
-            //
-            // Clear the flag before attempting the bump so that a failed
-            // attempt (e.g. RPC timeout) does not immediately re-trigger
-            // on the next loop iteration — instead, the loop falls through
-            // to tokio::select! which waits for the resubmission timer or
-            // a receipt, providing natural backoff. If a new retryable
-            // error occurs later, process_send_error will re-set the flag.
-            if send_state.should_bump_fees() {
-                send_state.clear_bump_fees();
+            // Respond immediately to the bump-fees flag set by
+            // process_send_error on retryable errors, rather than waiting
+            // for the next resubmission timer tick. take_bump_fees clears
+            // the flag atomically so a failed bump does not re-trigger.
+            if send_state.take_bump_fees() {
                 if let Some(abort) =
                     self.try_fee_bump(candidate, send_state, &receipt_tx, &mut bump).await
                 {
@@ -1145,6 +1141,14 @@ impl SimpleTxManager {
     /// Performs a fee bump attempt and applies the result to the tracked state.
     ///
     /// Returns `Some(error)` if the send loop must abort, `None` to continue.
+    ///
+    /// When a bump attempt yields a non-retryable error but the
+    /// receipt-polling task has already recorded a mined tx on
+    /// `send_state`, the abort is suppressed so the send loop can
+    /// deliver the receipt on the next iteration. This avoids a
+    /// false-negative failure report when, for example, a fee bump
+    /// publish gets `NonceTooLow` because the original tx was already
+    /// confirmed.
     async fn try_fee_bump(
         &self,
         candidate: &TxCandidate,
@@ -1152,7 +1156,48 @@ impl SimpleTxManager {
         receipt_tx: &mpsc::Sender<TransactionReceipt>,
         state: &mut BumpState,
     ) -> Option<TxManagerError> {
+        // If the receipt-polling task has already detected the original tx
+        // on-chain, skip the fee bump entirely. This avoids a race where
+        // `estimate_gas` on the replacement tx reverts because the
+        // original calldata has already executed (e.g. `GameAlreadyExists`),
+        // producing noisy error logs even though the proposal will succeed.
+        if send_state.is_waiting_for_confirmation() {
+            info!("skipping fee bump — original tx already mined, awaiting confirmation");
+            return None;
+        }
+
         let result = self.handle_fee_bump(candidate, send_state, receipt_tx, state).await;
+        Self::apply_bump_result_with_suppression(result, state, send_state)
+    }
+
+    /// Applies a fee bump result with mined-tx suppression.
+    ///
+    /// If the bump failed with a non-retryable error *but* the original
+    /// tx was already mined ([`SendState::is_waiting_for_confirmation`]),
+    /// the error is suppressed and logged at `info` level (not `error`).
+    /// This prevents false-positive alerts in the benign "tx confirmed
+    /// while we were bumping" case.
+    ///
+    /// On success or retryable error, delegates directly to
+    /// [`apply_bump_result`](Self::apply_bump_result).
+    fn apply_bump_result_with_suppression(
+        result: TxManagerResult<BumpState>,
+        state: &mut BumpState,
+        send_state: &SendState,
+    ) -> Option<TxManagerError> {
+        // Check for mined-tx suppression *before* apply_bump_result so
+        // the `error!` log inside that function is never emitted for the
+        // benign "tx already confirmed" case.
+        if let Err(ref e) = result
+            && !e.is_retryable()
+            && send_state.is_waiting_for_confirmation()
+        {
+            info!(
+                error = %e,
+                "fee bump failed but original tx already mined, suppressing abort"
+            );
+            return None;
+        }
         Self::apply_bump_result(result, state)
     }
 
@@ -1185,14 +1230,7 @@ impl SimpleTxManager {
         let bumped =
             self.increase_gas_price(candidate, old.tip, old.fee_cap, old.blob_fee_cap).await?;
 
-        // Build fee overrides including blob fee cap and gas limit floor.
-        // The gas limit floor ensures the limit never decreases across bumps,
-        // avoiding a full candidate clone.
-        let mut fee_override = FeeOverride::new(bumped.gas_tip_cap, bumped.gas_fee_cap)
-            .with_gas_limit_floor(old.gas_limit);
-        if let Some(blob_cap) = bumped.blob_fee_cap {
-            fee_override = fee_override.with_blob_fee_cap(blob_cap);
-        }
+        let fee_override = bumped.to_fee_override(old.gas_limit);
 
         // Rebuild transaction with bumped fees as overrides and the fresh
         // caps to avoid a redundant provider round-trip.
@@ -1214,10 +1252,10 @@ impl SimpleTxManager {
 
         // Record the bump and log only after the transaction has been
         // successfully published to avoid inflating the count on failure.
-        send_state.record_fee_bump();
+        let bump_count = send_state.record_fee_bump();
         self.metrics.record_gas_bump();
         info!(
-            bump_count = %send_state.bump_count(),
+            bump_count = %bump_count,
             old_tip = %old.tip,
             new_tip = %prepared.gas_tip_cap,
             old_fee_cap = %old.fee_cap,
@@ -1308,7 +1346,7 @@ impl SimpleTxManager {
 
                 // AlreadyKnown on resubmission is a success — the tx is in
                 // the mempool from a prior publish. Return the previous hash.
-                if classified.is_already_known() && send_state.successful_publish_count() > 0 {
+                if classified.is_already_known() && send_state.has_published() {
                     let hash = last_tx_hash.ok_or_else(|| {
                         TxManagerError::InvalidConfig(
                             "AlreadyKnown but no prior tx hash available — caller must track the hash from publish_tx".into(),
@@ -1369,7 +1407,7 @@ impl SimpleTxManager {
     ///   RPC load is proportional to `bump_count × 1/interval`.
     pub fn wait_for_tx(
         send_state: Arc<SendState>,
-        provider: RootProvider,
+        provider: P,
         tx_hash: B256,
         config: TxManagerConfig,
         receipt_tx: mpsc::Sender<TransactionReceipt>,
@@ -1397,7 +1435,7 @@ impl SimpleTxManager {
     /// the `confirmation_timeout` deadline is exceeded.
     pub async fn wait_mined(
         send_state: &SendState,
-        provider: &RootProvider,
+        provider: &P,
         tx_hash: B256,
         config: &TxManagerConfig,
         closed: &AtomicBool,
@@ -1459,7 +1497,7 @@ impl SimpleTxManager {
     /// Returns [`TxManagerError::Rpc`] if provider calls fail.
     pub async fn query_receipt(
         send_state: &SendState,
-        provider: &RootProvider,
+        provider: &P,
         tx_hash: B256,
         num_confirmations: u64,
         network_timeout: Duration,
@@ -1557,7 +1595,10 @@ impl SimpleTxManager {
     }
 }
 
-impl TxManager for SimpleTxManager {
+impl<P> TxManager for SimpleTxManager<P>
+where
+    P: Provider + Clone + Debug + Send + Sync + 'static,
+{
     async fn send(&self, candidate: TxCandidate) -> SendResponse {
         self.send_tx(candidate, None).await
     }
@@ -1608,9 +1649,11 @@ mod tests {
     use rstest::rstest;
 
     use super::{BumpState, PreparedTx, SimpleTxManager, TxEnvelope};
-    use crate::{GasPriceCaps, NoopTxMetrics, TxCandidate, TxManagerConfig, TxManagerError};
+    use crate::{
+        GasPriceCaps, NoopTxMetrics, SendState, TxCandidate, TxManagerConfig, TxManagerError,
+    };
 
-    async fn setup() -> (SimpleTxManager, alloy_node_bindings::AnvilInstance) {
+    async fn setup() -> (SimpleTxManager<RootProvider>, alloy_node_bindings::AnvilInstance) {
         let anvil = Anvil::new().spawn();
         let url = anvil.endpoint_url();
         let provider = RootProvider::new_http(url);
@@ -1674,7 +1717,7 @@ mod tests {
             sidecar: None,
         };
 
-        let abort = SimpleTxManager::apply_bump_result(input, &mut state);
+        let abort = SimpleTxManager::<RootProvider>::apply_bump_result(input, &mut state);
 
         assert_eq!(abort.is_some(), abort_expected);
         assert_eq!(state.tip, expected_tip);
@@ -1683,6 +1726,162 @@ mod tests {
         assert_eq!(state.gas_limit, expected_gas_limit);
         assert_eq!(state.tx_hash, expected_hash);
     }
+
+    // ── apply_bump_result_with_suppression ───────────────────────────
+    //
+    // Tests for `apply_bump_result_with_suppression`, which is the
+    // extracted helper that `try_fee_bump` calls. When a non-retryable
+    // error occurs but the original tx is already mined, the abort is
+    // suppressed so the send loop can deliver the receipt.
+
+    /// Threshold used for `SendState` construction in suppression tests.
+    const SUPPRESSION_NONCE_TOO_LOW_THRESHOLD: u64 = 3;
+
+    /// Hash recorded as a mined tx when simulating a confirmed original.
+    const MINED_TX_HASH: B256 = B256::repeat_byte(0xAA);
+
+    /// Default initial `BumpState` for suppression tests.
+    fn default_bump_state() -> BumpState {
+        BumpState {
+            tip: 100,
+            fee_cap: 1000,
+            blob_fee_cap: None,
+            gas_limit: 21_000,
+            tx_hash: B256::ZERO,
+            nonce: 0,
+            sidecar: None,
+        }
+    }
+
+    /// Creates a `SendState` and optionally marks a tx as mined.
+    fn suppression_send_state(tx_mined: bool) -> SendState {
+        let state =
+            SendState::new(SUPPRESSION_NONCE_TOO_LOW_THRESHOLD).expect("should create send state");
+        if tx_mined {
+            state.tx_mined(MINED_TX_HASH);
+        }
+        state
+    }
+
+    /// Non-retryable errors are suppressed when the original tx is
+    /// mined, and propagated when it is not.
+    #[rstest]
+    #[case::nonce_too_low_mined_suppressed(
+        TxManagerError::NonceTooLow,
+        true,  // tx is mined
+        false, // abort suppressed → no abort
+    )]
+    #[case::nonce_too_low_not_mined_propagates(
+        TxManagerError::NonceTooLow,
+        false, // tx is NOT mined
+        true,  // abort propagates
+    )]
+    #[case::fee_limit_exceeded_mined_suppressed(
+        TxManagerError::FeeLimitExceeded { fee: 500, ceiling: 100 },
+        true,
+        false,
+    )]
+    #[case::fee_limit_exceeded_not_mined_propagates(
+        TxManagerError::FeeLimitExceeded { fee: 500, ceiling: 100 },
+        false,
+        true,
+    )]
+    #[case::insufficient_funds_mined_suppressed(TxManagerError::InsufficientFunds, true, false)]
+    #[case::insufficient_funds_not_mined_propagates(TxManagerError::InsufficientFunds, false, true)]
+    #[case::execution_reverted_mined_suppressed(
+        TxManagerError::ExecutionReverted { reason: Some("revert".into()), data: None },
+        true,
+        false,
+    )]
+    #[case::execution_reverted_not_mined_propagates(
+        TxManagerError::ExecutionReverted { reason: Some("revert".into()), data: None },
+        false,
+        true,
+    )]
+    #[case::channel_closed_mined_suppressed(TxManagerError::ChannelClosed, true, false)]
+    #[case::channel_closed_not_mined_propagates(TxManagerError::ChannelClosed, false, true)]
+    fn bump_result_with_suppression_non_retryable(
+        #[case] error: TxManagerError,
+        #[case] tx_mined: bool,
+        #[case] abort_expected: bool,
+    ) {
+        let send_state = suppression_send_state(tx_mined);
+        assert_eq!(send_state.is_waiting_for_confirmation(), tx_mined);
+
+        let mut state = default_bump_state();
+
+        let abort = SimpleTxManager::<RootProvider>::apply_bump_result_with_suppression(
+            Err(error),
+            &mut state,
+            &send_state,
+        );
+
+        assert_eq!(
+            abort.is_some(),
+            abort_expected,
+            "abort_expected={abort_expected}, tx_mined={tx_mined}",
+        );
+    }
+
+    /// Retryable errors are never aborted by `apply_bump_result`, so
+    /// suppression is irrelevant — the send loop continues regardless.
+    #[rstest]
+    #[case::rpc_error_mined(TxManagerError::Rpc("transient".into()), true)]
+    #[case::rpc_error_not_mined(TxManagerError::Rpc("transient".into()), false)]
+    #[case::underpriced_mined(TxManagerError::Underpriced, true)]
+    #[case::underpriced_not_mined(TxManagerError::Underpriced, false)]
+    #[case::replacement_underpriced_mined(TxManagerError::ReplacementUnderpriced, true)]
+    #[case::fee_too_low_not_mined(TxManagerError::FeeTooLow, false)]
+    fn bump_result_with_suppression_retryable_never_aborts(
+        #[case] error: TxManagerError,
+        #[case] tx_mined: bool,
+    ) {
+        let send_state = suppression_send_state(tx_mined);
+        let mut state = default_bump_state();
+
+        let abort = SimpleTxManager::<RootProvider>::apply_bump_result_with_suppression(
+            Err(error),
+            &mut state,
+            &send_state,
+        );
+
+        assert!(abort.is_none(), "retryable errors should never cause an abort");
+    }
+
+    /// Success results pass through to `apply_bump_result` and update
+    /// state, regardless of mined state.
+    #[rstest]
+    #[case::success_not_mined(false)]
+    #[case::success_mined(true)]
+    fn bump_result_with_suppression_success_never_aborts(#[case] tx_mined: bool) {
+        let send_state = suppression_send_state(tx_mined);
+
+        let new_state = BumpState {
+            tip: 200,
+            fee_cap: 2000,
+            blob_fee_cap: None,
+            gas_limit: 50_000,
+            tx_hash: B256::with_last_byte(0x42),
+            nonce: 0,
+            sidecar: None,
+        };
+
+        let mut state = default_bump_state();
+
+        let abort = SimpleTxManager::<RootProvider>::apply_bump_result_with_suppression(
+            Ok(new_state),
+            &mut state,
+            &send_state,
+        );
+
+        assert!(abort.is_none(), "success should never cause an abort");
+        // State should be updated to the new values.
+        assert_eq!(state.tip, 200);
+        assert_eq!(state.fee_cap, 2000);
+        assert_eq!(state.tx_hash, B256::with_last_byte(0x42));
+    }
+
+    // ── should_reset_nonce_on_send_error ───────────────────────────────
 
     #[rstest]
     #[case::error_before_first_publish(false, Err(TxManagerError::SendTimeout), None, true)]
@@ -1709,7 +1908,11 @@ mod tests {
             send_state.record_successful_publish();
         }
         assert_eq!(
-            SimpleTxManager::should_reset_nonce_on_send_error(&result, &send_state, nonce_override,),
+            SimpleTxManager::<RootProvider>::should_reset_nonce_on_send_error(
+                &result,
+                &send_state,
+                nonce_override,
+            ),
             expected,
         );
     }
@@ -1731,7 +1934,10 @@ mod tests {
         if has_publish {
             send_state.record_successful_publish();
         }
-        assert_eq!(SimpleTxManager::should_return_reserved_nonce(&result, &send_state,), expected,);
+        assert_eq!(
+            SimpleTxManager::<RootProvider>::should_return_reserved_nonce(&result, &send_state,),
+            expected,
+        );
     }
 
     #[tokio::test]
@@ -1752,7 +1958,7 @@ mod tests {
         };
 
         let prepared = manager
-            .prepare_with_initial_caps(&candidate, None, Some(caps.clone()), None, None)
+            .prepare_with_initial_caps(&candidate, None, Some(caps), None, None)
             .await
             .expect("should prepare tx using supplied caps");
         let tx = decode_eip1559(&prepared);

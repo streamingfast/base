@@ -4,10 +4,9 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 pub mod cli;
-pub mod firehose;
 
 use base_bundle_extension::BundleExtension;
-use base_execution_cli::{Cli, chainspec::OpChainSpecParser};
+use base_execution_cli::Cli;
 use base_flashblocks::FlashblocksConfig;
 use base_flashblocks_node::FlashblocksExtension;
 use base_metering::{MeteringConfig, MeteringExtension, MeteringResourceLimits};
@@ -17,9 +16,7 @@ use base_tx_forwarding::TxForwardingExtension;
 use base_txpool_rpc::{TxPoolRpcConfig, TxPoolRpcExtension};
 use base_txpool_tracing::{TxPoolExtension, TxpoolConfig};
 
-use crate::firehose::FirehoseExtension;
-
-type NodeCli = Cli<OpChainSpecParser, cli::Args>;
+type NodeCli = Cli<cli::Args>;
 
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
@@ -28,13 +25,10 @@ fn main() {
     base_cli_utils::init_common!();
     base_reth_cli::init_reth!();
 
-    firehose::init();
-
     let cli = base_cli_utils::parse_cli!(NodeCli);
 
     cli.run(|builder, args| async move {
         let mut runner = BaseNodeRunner::new(args.rollup_args.clone());
-        runner.install_ext::<FirehoseExtension>(());
 
         // Create flashblocks config first so we can share its state with metering
         let flashblocks_config: Option<FlashblocksConfig> = (&args).into();
@@ -71,6 +65,10 @@ fn main() {
         runner.install_ext::<TxForwardingExtension>((&args).into());
         runner.install_ext::<FlashblocksExtension>(flashblocks_config);
         runner.install_ext::<ProofsHistoryExtension>(args.rollup_args);
+        runner.add_started_callback(|| {
+            base_cli_utils::register_version_metrics!();
+            Ok(())
+        });
 
         runner.run(builder).await
     })

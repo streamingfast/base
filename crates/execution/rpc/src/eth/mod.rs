@@ -15,9 +15,9 @@ use std::{
 };
 
 use alloy_primitives::U256;
-use base_alloy_network::Base;
+use base_common_network::Base;
 use eyre::WrapErr;
-pub use receipt::{OpReceiptBuilder, OpReceiptFieldsBuilder};
+pub use receipt::{BaseReceiptBuilder, ReceiptFieldsBuilder};
 use reth_chainspec::{EthereumHardforks, Hardforks};
 use reth_evm::ConfigureEvm;
 use reth_node_api::{FullNodeComponents, FullNodeTypes, HeaderTy, NodeTypes};
@@ -40,7 +40,7 @@ use reth_tasks::{
 
 use crate::{
     OpEthApiError, SequencerClient,
-    eth::{receipt::OpReceiptConverter, transaction::OpTxInfoMapper},
+    eth::{receipt::BaseReceiptConverter, transaction::BaseTxInfoMapper},
 };
 
 /// Adapter for [`EthApiInner`], which holds all the data required to serve core `eth_` API.
@@ -287,13 +287,13 @@ impl<N: RpcNodeCore, Rpc: RpcConvert> OpEthApiInner<N, Rpc> {
     }
 }
 
-/// Converter for OP RPC types.
-pub type OpRpcConvert<N, NetworkT> = RpcConverter<
+/// Converter for Base RPC types.
+pub type BaseRpcConvert<N, NetworkT> = RpcConverter<
     NetworkT,
     <N as FullNodeComponents>::Evm,
-    OpReceiptConverter<<N as FullNodeTypes>::Provider>,
+    BaseReceiptConverter<<N as FullNodeTypes>::Provider>,
     (),
-    OpTxInfoMapper<<N as FullNodeTypes>::Provider>,
+    BaseTxInfoMapper<<N as FullNodeTypes>::Provider>,
 >;
 
 /// Builds [`OpEthApi`] for Base.
@@ -358,17 +358,17 @@ where
             Types: NodeTypes<ChainSpec: Hardforks + EthereumHardforks>,
         >,
     NetworkT: RpcTypes,
-    OpRpcConvert<N, NetworkT>: RpcConvert<Network = NetworkT>,
-    OpEthApi<N, OpRpcConvert<N, NetworkT>>:
+    BaseRpcConvert<N, NetworkT>: RpcConvert<Network = NetworkT>,
+    OpEthApi<N, BaseRpcConvert<N, NetworkT>>:
         FullEthApiServer<Provider = N::Provider, Pool = N::Pool>,
 {
-    type EthApi = OpEthApi<N, OpRpcConvert<N, NetworkT>>;
+    type EthApi = OpEthApi<N, BaseRpcConvert<N, NetworkT>>;
 
     async fn build_eth_api(self, ctx: EthApiCtx<'_, N>) -> eyre::Result<Self::EthApi> {
         let Self { sequencer_url, sequencer_headers, min_suggested_priority_fee, .. } = self;
         let rpc_converter =
-            RpcConverter::new(OpReceiptConverter::new(ctx.components.provider().clone()))
-                .with_mapper(OpTxInfoMapper::new(ctx.components.provider().clone()));
+            RpcConverter::new(BaseReceiptConverter::new(ctx.components.provider().clone()))
+                .with_mapper(BaseTxInfoMapper::new(ctx.components.provider().clone()));
 
         let sequencer_client = if let Some(url) = sequencer_url {
             Some(

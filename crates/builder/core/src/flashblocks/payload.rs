@@ -6,22 +6,22 @@ use std::{
 };
 
 use alloy_consensus::{
-    BlockBody, EMPTY_OMMER_ROOT_HASH, Header, Transaction, constants::EMPTY_WITHDRAWALS, proofs,
+    BlockBody, EMPTY_OMMER_ROOT_HASH, Header, Transaction, TxReceipt, constants::EMPTY_WITHDRAWALS,
+    proofs,
 };
 use alloy_eips::{Encodable2718, eip7685::EMPTY_REQUESTS_HASH, merge::BEACON_NONCE};
 use alloy_evm::Database;
-use alloy_primitives::{Address, B256, U256, map::foldhash::HashMap};
+use alloy_primitives::{Address, B256, Bloom, U256, logs_bloom, map::foldhash::HashMap};
 use base_access_lists::{FlashblockAccessList, FlashblockAccessListBuilder};
-use base_alloy_chains::BaseUpgrades;
-use base_alloy_consensus::OpReceipt;
-use base_alloy_flashblocks::{
+use base_builder_publish::WebSocketPublisher;
+use base_common_chains::Upgrades;
+use base_common_consensus::{BaseReceipt, BaseTransactionSigned};
+use base_common_flashblocks::{
     ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, FlashblocksPayloadV1,
 };
-use base_builder_publish::WebSocketPublisher;
 use base_execution_consensus::{calculate_receipt_root_no_memo_optimism, isthmus};
-use base_execution_evm::{OpEvmConfig, OpNextBlockEnvAttributes};
+use base_execution_evm::{BaseEvmConfig, OpNextBlockEnvAttributes};
 use base_execution_payload_builder::{OpBuiltPayload, OpPayloadBuilderAttributes};
-use base_execution_primitives::OpTransactionSigned;
 use either::Either;
 use eyre::WrapErr as _;
 use reth_basic_payload_builder::BuildOutcome;
@@ -32,8 +32,8 @@ use reth_payload_primitives::PayloadBuilderAttributes;
 use reth_payload_util::BestPayloadTransactions;
 use reth_primitives_traits::RecoveredBlock;
 use reth_provider::{
-    BlockExecutionOutput, BlockExecutionResult, ExecutionOutcome, HashedPostStateProvider,
-    ProviderError, StateRootProvider, StorageRootProvider,
+    BlockExecutionOutput, BlockExecutionResult, HashedPostStateProvider, ProviderError,
+    StateRootProvider, StorageRootProvider,
 };
 use reth_revm::{
     State, database::StateProviderDatabase, db::states::bundle_state::BundleRetention,
@@ -48,14 +48,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, metadata::Level, span, warn};
 
 use crate::{
-    BuilderConfig, ExecutionInfo, PayloadBuilder, ResourceLimits,
+    BuilderConfig, BuilderMetrics, ExecutionInfo, PayloadBuilder, ResourceLimits,
     flashblocks::{
         FlashblocksExtraCtx,
         best_txs::BestFlashblocksTxs,
         context::OpPayloadBuilderCtx,
         generator::{BlockCell, BuildArguments},
     },
-    metrics::BuilderMetrics,
     traits::{ClientBounds, PoolBounds},
 };
 
@@ -89,7 +88,7 @@ pub struct FlashblocksExecutionInfo {
 #[derive(Debug, Clone)]
 pub(super) struct OpPayloadBuilder<Pool, Client> {
     /// The type responsible for creating the evm.
-    pub evm_config: OpEvmConfig,
+    pub evm_config: BaseEvmConfig,
     /// The transaction pool
     pub pool: Pool,
     /// Node client
@@ -102,22 +101,19 @@ pub(super) struct OpPayloadBuilder<Pool, Client> {
     pub ws_pub: Arc<WebSocketPublisher>,
     /// System configuration for the builder
     pub config: BuilderConfig,
-    /// The metrics for the builder
-    pub metrics: Arc<BuilderMetrics>,
 }
 
 impl<Pool, Client> OpPayloadBuilder<Pool, Client> {
     /// `OpPayloadBuilder` constructor.
     pub(super) const fn new(
-        evm_config: OpEvmConfig,
+        evm_config: BaseEvmConfig,
         pool: Pool,
         client: Client,
         config: BuilderConfig,
         payload_tx: mpsc::Sender<OpBuiltPayload>,
         ws_pub: Arc<WebSocketPublisher>,
-        metrics: Arc<BuilderMetrics>,
     ) -> Self {
-        Self { evm_config, pool, client, payload_tx, ws_pub, config, metrics }
+        Self { evm_config, pool, client, payload_tx, ws_pub, config }
     }
 }
 
@@ -126,7 +122,7 @@ where
     Pool: Clone + Send + Sync,
     Client: Clone + Send + Sync,
 {
-    type Attributes = OpPayloadBuilderAttributes<OpTransactionSigned>;
+    type Attributes = OpPayloadBuilderAttributes<BaseTransactionSigned>;
     type BuiltPayload = OpBuiltPayload;
 
     fn try_build(
@@ -159,7 +155,7 @@ where
     fn get_op_payload_builder_ctx(
         &self,
         config: reth_basic_payload_builder::PayloadConfig<
-            OpPayloadBuilderAttributes<base_alloy_consensus::OpTxEnvelope>,
+            OpPayloadBuilderAttributes<base_common_consensus::BaseTxEnvelope>,
         >,
         cancel: CancellationToken,
         extra: FlashblocksExtraCtx,
@@ -203,7 +199,6 @@ where
             evm_env,
             block_env_attributes,
             cancel,
-            metrics: Default::default(),
             extra,
             builder_config: self.config.clone(),
         })
@@ -219,7 +214,7 @@ where
     /// a result indicating success with the payload or an error in case of failure.
     async fn build_payload(
         &self,
-        args: BuildArguments<OpPayloadBuilderAttributes<OpTransactionSigned>, OpBuiltPayload>,
+        args: BuildArguments<OpPayloadBuilderAttributes<BaseTransactionSigned>, OpBuiltPayload>,
         best_payload: BlockCell<OpBuiltPayload>,
     ) -> Result<(), PayloadBuilderError> {
         let block_build_start_time = Instant::now();
@@ -262,8 +257,8 @@ where
 
         let mut info = execute_pre_steps(&mut state, &ctx)?;
         let sequencer_tx_time = sequencer_tx_start_time.elapsed();
-        ctx.metrics.sequencer_tx_duration.record(sequencer_tx_time);
-        ctx.metrics.sequencer_tx_gauge.set(sequencer_tx_time);
+        BuilderMetrics::sequencer_tx_duration().record(sequencer_tx_time);
+        BuilderMetrics::sequencer_tx_gauge().set(sequencer_tx_time);
 
         // We adjust our flashblocks timings based on time_drift if dynamic adjustment enable
         let (flashblocks_per_block, first_flashblock_offset) =
@@ -288,15 +283,21 @@ where
         );
 
         // not emitting flashblock if no_tx_pool in FCU, it's just syncing
+        //
+        // Published at flashblock_index 0. Regular flashblocks start at
+        // index 1, so a client resuming from (block_number, 0) will skip
+        // this fallback via the strictly-greater-than comparison in
+        // `RingBuffer::entries_after`, but still receive all subsequent
+        // flashblocks for the same block.
         if !ctx.attributes().no_tx_pool {
-            let flashblock_byte_size =
-                self.ws_pub.publish(&fb_payload).map_err(PayloadBuilderError::other)?;
-            ctx.metrics.flashblock_byte_size_histogram.record(flashblock_byte_size as f64);
-            ctx.metrics
-                .first_flashblock_time_offset
+            let flashblock_byte_size = self
+                .ws_pub
+                .publish(&fb_payload, ctx.block_number(), 0)
+                .map_err(PayloadBuilderError::other)?;
+            BuilderMetrics::flashblock_byte_size_histogram().record(flashblock_byte_size as f64);
+            BuilderMetrics::first_flashblock_time_offset()
                 .record(first_flashblock_offset.as_millis() as f64);
-            ctx.metrics
-                .reduced_flashblocks_number
+            BuilderMetrics::reduced_flashblocks_number()
                 .record(self.config.flashblocks_per_block().saturating_sub(flashblocks_per_block)
                     as f64);
         } else {
@@ -304,8 +305,8 @@ where
                 target: "payload_builder",
                 "No transaction pool, skipping transaction pool processing",
             );
-            ctx.metrics.payload_num_tx.record(info.executed_transactions.len() as f64);
-            ctx.metrics.payload_num_tx_gauge.set(info.executed_transactions.len() as f64);
+            BuilderMetrics::payload_num_tx().record(info.executed_transactions.len() as f64);
+            BuilderMetrics::payload_num_tx_gauge().set(info.executed_transactions.len() as f64);
         }
 
         // fcu just arrived late, not syncing
@@ -328,8 +329,8 @@ where
         if skip_flashblocks_building {
             finalized_cell.set(payload);
             let total_block_building_time = block_build_start_time.elapsed();
-            ctx.metrics.total_block_built_duration.record(total_block_building_time);
-            ctx.metrics.total_block_built_gauge.set(total_block_building_time);
+            BuilderMetrics::total_block_built_duration().record(total_block_building_time);
+            BuilderMetrics::total_block_built_gauge().set(total_block_building_time);
 
             return Ok(());
         }
@@ -375,9 +376,12 @@ where
         ctx = ctx.with_cancel(fb_cancel.clone()).with_extra_ctx(extra);
 
         // Create best_transaction iterator
-        let mut best_txs = BestFlashblocksTxs::new(BestPayloadTransactions::new(
-            self.pool.best_transactions_with_attributes(ctx.best_transaction_attributes()),
-        ));
+        let mut best_txs = BestFlashblocksTxs::new(
+            BestPayloadTransactions::new(
+                self.pool.best_transactions_with_attributes(ctx.best_transaction_attributes()),
+            ),
+            self.config.rejection_cache.clone(),
+        );
         let interval = self.config.flashblocks_interval;
         let (tx, mut rx) = mpsc::channel((self.config.flashblocks_per_block() + 1) as usize);
 
@@ -570,8 +574,8 @@ where
             self.pool.best_transactions_with_attributes(ctx.best_transaction_attributes()),
         ));
         let transaction_pool_fetch_time = best_txs_start_time.elapsed();
-        ctx.metrics.transaction_pool_fetch_duration.record(transaction_pool_fetch_time);
-        ctx.metrics.transaction_pool_fetch_gauge.set(transaction_pool_fetch_time);
+        BuilderMetrics::transaction_pool_fetch_duration().record(transaction_pool_fetch_time);
+        BuilderMetrics::transaction_pool_fetch_gauge().set(transaction_pool_fetch_time);
 
         let tx_execution_start_time = Instant::now();
         let limits = ResourceLimits {
@@ -588,6 +592,21 @@ where
         let diag = ctx
             .execute_best_transactions(info, state, best_txs, &limits)
             .wrap_err("failed to execute best transactions")?;
+
+        // Evict permanently rejected transactions from the iterator and pool.
+        // The rejection cache (inside best_txs) prevents re-entry on P2P re-gossip.
+        if !diag.permanently_rejected_txs.is_empty() {
+            let rejected_count = diag.permanently_rejected_txs.len();
+            best_txs.mark_rejected(&diag.permanently_rejected_txs);
+            self.config.metering_provider.remove(&diag.permanently_rejected_txs);
+            self.pool.remove_transactions(diag.permanently_rejected_txs.clone());
+            info!(
+                target: "payload_builder",
+                count = rejected_count,
+                "evicted permanently rejected transactions from pool",
+            );
+        }
+
         // Extract last transactions
         let new_transactions = info.executed_transactions[info.extra.last_flashblock_index..]
             .iter()
@@ -627,20 +646,20 @@ where
         }
 
         let payload_transaction_simulation_time = tx_execution_start_time.elapsed();
-        ctx.metrics
-            .payload_transaction_simulation_duration
+        BuilderMetrics::payload_transaction_simulation_duration()
             .record(payload_transaction_simulation_time);
-        ctx.metrics.payload_transaction_simulation_gauge.set(payload_transaction_simulation_time);
+        BuilderMetrics::payload_transaction_simulation_gauge()
+            .set(payload_transaction_simulation_time);
 
         let total_block_built_duration = Instant::now();
         let build_result = build_block(state, ctx, info, ctx.attributes().no_tx_pool);
         let total_block_built_duration = total_block_built_duration.elapsed();
-        ctx.metrics.total_block_built_duration.record(total_block_built_duration);
-        ctx.metrics.total_block_built_gauge.set(total_block_built_duration);
+        BuilderMetrics::total_block_built_duration().record(total_block_built_duration);
+        BuilderMetrics::total_block_built_gauge().set(total_block_built_duration);
 
         match build_result {
             Err(err) => {
-                ctx.metrics.invalid_built_blocks_count.increment(1);
+                BuilderMetrics::invalid_built_blocks_count().increment(1);
                 Err(err).wrap_err("failed to build payload")
             }
             Ok((new_payload, mut fb_payload)) => {
@@ -659,7 +678,7 @@ where
                     } else {
                         let size = self
                             .ws_pub
-                            .publish(&fb_payload)
+                            .publish(&fb_payload, ctx.block_number(), flashblock_index)
                             .wrap_err("failed to publish flashblock via websocket")?;
                         (false, size)
                     }
@@ -684,10 +703,11 @@ where
                 best_payload.set(new_payload);
 
                 // Record flashblock build duration
-                ctx.metrics.flashblock_build_duration.record(flashblock_build_start_time.elapsed());
-                ctx.metrics.flashblock_byte_size_histogram.record(flashblock_byte_size as f64);
-                ctx.metrics
-                    .flashblock_num_tx_histogram
+                BuilderMetrics::flashblock_build_duration()
+                    .record(flashblock_build_start_time.elapsed());
+                BuilderMetrics::flashblock_byte_size_histogram()
+                    .record(flashblock_byte_size as f64);
+                BuilderMetrics::flashblock_num_tx_histogram()
                     .record(info.executed_transactions.len() as f64);
 
                 // Update bundle_state for next iteration
@@ -730,7 +750,12 @@ where
                 } else {
                     0
                 };
-                ctx.metrics.record_flashblock_diagnostics(flashblock_index, &diag, info, &limits);
+                BuilderMetrics::record_flashblock_diagnostics(
+                    flashblock_index,
+                    &diag,
+                    info,
+                    &limits,
+                );
                 info!(
                     target: "payload_builder",
                     message = "Flashblock built",
@@ -766,21 +791,20 @@ where
         span: &tracing::Span,
         message: &str,
     ) {
-        ctx.metrics.block_built_success.increment(1);
-        ctx.metrics.flashblock_count.record(ctx.flashblock_index() as f64);
-        ctx.metrics
-            .missing_flashblocks_count
+        BuilderMetrics::block_built_success().increment(1);
+        BuilderMetrics::flashblock_count().record(ctx.flashblock_index() as f64);
+        BuilderMetrics::missing_flashblocks_count()
             .record(flashblocks_per_block.saturating_sub(ctx.flashblock_index()) as f64);
-        ctx.metrics.payload_num_tx.record(info.executed_transactions.len() as f64);
-        ctx.metrics.payload_num_tx_gauge.set(info.executed_transactions.len() as f64);
+        BuilderMetrics::payload_num_tx().record(info.executed_transactions.len() as f64);
+        BuilderMetrics::payload_num_tx_gauge().set(info.executed_transactions.len() as f64);
 
         // Record cumulative state root gas for the block
         if info.cumulative_state_root_gas > 0 {
-            ctx.metrics.block_state_root_gas.record(info.cumulative_state_root_gas as f64);
+            BuilderMetrics::block_state_root_gas().record(info.cumulative_state_root_gas as f64);
         }
 
         // Record cumulative uncompressed block size
-        ctx.metrics.block_uncompressed_size.record(info.cumulative_uncompressed_bytes as f64);
+        BuilderMetrics::block_uncompressed_size().record(info.cumulative_uncompressed_bytes as f64);
 
         debug!(
             target: "payload_builder",
@@ -841,7 +865,7 @@ where
             return (0, Duration::ZERO);
         };
 
-        self.metrics.flashblocks_time_drift.record(
+        BuilderMetrics::flashblocks_time_drift().record(
             self.config.block_time.as_millis().saturating_sub(time_drift.as_millis()) as f64,
         );
         debug!(
@@ -872,7 +896,7 @@ where
     Pool: PoolBounds,
     Client: ClientBounds,
 {
-    type Attributes = OpPayloadBuilderAttributes<OpTransactionSigned>;
+    type Attributes = OpPayloadBuilderAttributes<BaseTransactionSigned>;
     type BuiltPayload = OpBuiltPayload;
 
     async fn try_build(
@@ -888,7 +912,7 @@ where
 #[derive(Debug, Serialize, Deserialize)]
 struct FlashblocksMetadata {
     /// Receipts for transactions in this flashblock (removed in Base 1.0)
-    receipts: Option<HashMap<B256, OpReceipt>>,
+    receipts: Option<HashMap<B256, BaseReceipt>>,
     /// Changed account balances (removed in Base 1.0)
     new_account_balances: Option<HashMap<Address, U256>>,
     /// The block number this flashblock belongs to
@@ -897,7 +921,7 @@ struct FlashblocksMetadata {
     access_list: Option<FlashblockAccessList>,
 }
 
-fn execute_pre_steps<DB>(
+pub(crate) fn execute_pre_steps<DB>(
     state: &mut State<DB>,
     ctx: &OpPayloadBuilderCtx,
 ) -> Result<ExecutionInfo, PayloadBuilderError>
@@ -916,7 +940,7 @@ where
     Ok(info)
 }
 
-pub(super) fn build_block<DB, P>(
+pub(crate) fn build_block<DB, P>(
     state: &mut State<DB>,
     ctx: &OpPayloadBuilderCtx,
     info: &mut ExecutionInfo,
@@ -931,8 +955,8 @@ where
     let state_merge_start_time = Instant::now();
     state.merge_transitions(BundleRetention::Reverts);
     let state_transition_merge_time = state_merge_start_time.elapsed();
-    ctx.metrics.state_transition_merge_duration.record(state_transition_merge_time);
-    ctx.metrics.state_transition_merge_gauge.set(state_transition_merge_time);
+    BuilderMetrics::state_transition_merge_duration().record(state_transition_merge_time);
+    BuilderMetrics::state_transition_merge_gauge().set(state_transition_merge_time);
 
     let block_number = ctx.block_number();
     let expected = ctx.parent().number + 1;
@@ -947,36 +971,12 @@ where
         ));
     }
 
-    let execution_outcome = ExecutionOutcome::new(
-        state.bundle_state.clone(),
-        vec![info.receipts.clone()],
-        block_number,
-        vec![],
+    let receipts_root = calculate_receipt_root_no_memo_optimism(
+        &info.receipts,
+        &ctx.chain_spec,
+        ctx.attributes().timestamp(),
     );
-
-    let receipts_root = execution_outcome
-        .generic_receipts_root_slow(block_number, |receipts| {
-            calculate_receipt_root_no_memo_optimism(
-                receipts,
-                &ctx.chain_spec,
-                ctx.attributes().timestamp(),
-            )
-        })
-        .ok_or_else(|| {
-            PayloadBuilderError::Other(
-                eyre::eyre!(
-                    "receipts and block number not in range, block number {}",
-                    block_number
-                )
-                .into(),
-            )
-        })?;
-    let logs_bloom = execution_outcome.block_logs_bloom(block_number).ok_or_else(|| {
-        PayloadBuilderError::Other(
-            eyre::eyre!("logs bloom and block number not in range, block number {}", block_number)
-                .into(),
-        )
-    })?;
+    let logs_bloom: Bloom = logs_bloom(info.receipts.iter().flat_map(|r| r.logs()));
 
     // TODO: maybe recreate state with bundle in here
     // calculate the state root
@@ -987,21 +987,18 @@ where
 
     if calculate_state_root {
         let state_provider = state.database.as_ref();
-        hashed_state = state_provider.hashed_post_state(execution_outcome.state());
-        (state_root, trie_output) = {
-            state.database.as_ref().state_root_with_updates(hashed_state.clone()).inspect_err(
-                |err| {
-                    warn!(target: "payload_builder",
+        hashed_state = state_provider.hashed_post_state(&state.bundle_state);
+        (state_root, trie_output) =
+            state_provider.state_root_with_updates(hashed_state.clone()).inspect_err(|err| {
+                warn!(target: "payload_builder",
                     parent_header=%ctx.parent().hash(),
-                        %err,
-                        "failed to calculate state root for payload"
-                    );
-                },
-            )?
-        };
+                    %err,
+                    "failed to calculate state root for payload"
+                );
+            })?;
         let state_root_calculation_time = state_root_start_time.elapsed();
-        ctx.metrics.state_root_calculation_duration.record(state_root_calculation_time);
-        ctx.metrics.state_root_calculation_gauge.set(state_root_calculation_time);
+        BuilderMetrics::state_root_calculation_duration().record(state_root_calculation_time);
+        BuilderMetrics::state_root_calculation_gauge().set(state_root_calculation_time);
     }
 
     let mut requests_hash = None;
@@ -1013,7 +1010,7 @@ where
             // withdrawals root field in block header is used for storage root of L2 predeploy
             // `l2tol1-message-passer`
             Some(
-                isthmus::withdrawals_root(execution_outcome.state(), state.database.as_ref())
+                isthmus::withdrawals_root(&state.bundle_state, state.database.as_ref())
                     .map_err(PayloadBuilderError::other)?,
             )
         } else if ctx.chain_spec.is_canyon_active_at_timestamp(ctx.attributes().timestamp()) {
@@ -1053,7 +1050,7 @@ where
     };
 
     // seal the block
-    let block = alloy_consensus::Block::<OpTransactionSigned>::new(
+    let block = alloy_consensus::Block::<BaseTransactionSigned>::new(
         header,
         BlockBody {
             transactions: info.executed_transactions.clone(),
@@ -1111,7 +1108,7 @@ where
         .iter()
         .zip(new_receipts.iter())
         .map(|(tx, receipt)| (tx.tx_hash(), receipt.clone()))
-        .collect::<HashMap<B256, OpReceipt>>();
+        .collect::<HashMap<B256, BaseReceipt>>();
 
     // finalize and build the FAL
     let fal_builder = std::mem::take(&mut info.extra.access_list_builder);
@@ -1183,12 +1180,169 @@ where
 
 #[cfg(test)]
 mod tests {
-    use alloy_consensus::Receipt;
-    use alloy_primitives::{Address, B256, Log, U256, map::foldhash::HashMap};
-    use base_alloy_consensus::OpReceipt;
-    use base_alloy_flashblocks::Metadata;
+    use std::sync::Arc;
 
-    use super::FlashblocksMetadata;
+    use alloy_consensus::{Header, Receipt};
+    use alloy_primitives::{Address, B256, Log, U256, map::foldhash::HashMap};
+    use base_common_consensus::BaseReceipt;
+    use base_common_flashblocks::Metadata;
+    use base_execution_chainspec::BaseChainSpec;
+    use reth_chainspec::ChainSpec;
+    use reth_primitives_traits::SealedHeader;
+    use reth_provider::noop::NoopProvider;
+    use reth_revm::{State, database::StateProviderDatabase};
+
+    use super::{FlashblocksMetadata, build_block};
+    use crate::{ExecutionInfo, flashblocks::context::OpPayloadBuilderCtx};
+
+    /// Creates a minimal [`BaseChainSpec`] with all L1 hardforks through Cancun
+    /// active at genesis but **no** OP-specific hardforks (Bedrock, Canyon,
+    /// Ecotone, Holocene, Isthmus, Jovian are all absent).
+    ///
+    /// This keeps `build_block` on the simplest code paths: no blob fields,
+    /// default extra data, no withdrawals root calculation.
+    fn minimal_chain_spec() -> Arc<BaseChainSpec> {
+        let genesis: serde_json::Value = serde_json::json!({
+            "config": { "chainId": 901 },
+            "gasLimit": "0x1C9C380",
+            "timestamp": "0x0"
+        });
+        let genesis = serde_json::from_value(genesis).expect("valid genesis");
+
+        let inner =
+            ChainSpec::builder().chain(901.into()).genesis(genesis).cancun_activated().build();
+
+        Arc::new(BaseChainSpec { inner })
+    }
+
+    /// Builds a sealed genesis header consistent with [`minimal_chain_spec`].
+    fn genesis_header() -> Arc<SealedHeader> {
+        let header = Header { gas_limit: 30_000_000, timestamp: 0, ..Default::default() };
+        Arc::new(SealedHeader::seal_slow(header))
+    }
+
+    /// Verify that [`build_block`] produces a valid empty block when called
+    /// with no transactions and `calculate_state_root = false`.
+    ///
+    /// This exercises the full block-assembly path (receipts root, logs bloom,
+    /// header construction, flashblocks payload) using only in-memory state —
+    /// no node, no disk, no network.
+    #[test]
+    fn build_block_empty_no_state_root() {
+        let chain_spec = minimal_chain_spec();
+        let parent = genesis_header();
+        let ctx = OpPayloadBuilderCtx::for_test(chain_spec, Arc::clone(&parent));
+
+        let db = StateProviderDatabase::new(NoopProvider::default());
+        let mut state = State::builder().with_database(db).with_bundle_update().build();
+        let mut info = ExecutionInfo::default();
+
+        let (payload, fb_payload) =
+            build_block::<_, NoopProvider>(&mut state, &ctx, &mut info, false)
+                .expect("build_block should succeed for an empty block");
+
+        // Block number must be parent + 1.
+        assert_eq!(payload.block().number, parent.number + 1, "block number should be parent + 1");
+
+        // No transactions were executed, so gas used must be zero.
+        assert_eq!(payload.block().gas_used, 0, "empty block should use zero gas");
+
+        // The flashblocks payload must reference the same block.
+        assert_eq!(fb_payload.diff.block_hash, payload.block().hash(), "hash mismatch");
+    }
+
+    /// Verify that [`build_block`] exercises the state root calculation path
+    /// when `calculate_state_root = true`.
+    ///
+    /// With [`NoopProvider`], both `hashed_post_state` and
+    /// `state_root_with_updates` return defaults, so the state root ends up
+    /// as [`B256::ZERO`].  The important property under test is that the
+    /// `calculate_state_root = true` branch runs without error and the
+    /// resulting header carries the computed root.
+    #[test]
+    fn build_block_empty_with_state_root() {
+        let chain_spec = minimal_chain_spec();
+        let parent = genesis_header();
+        let ctx = OpPayloadBuilderCtx::for_test(chain_spec, Arc::clone(&parent));
+
+        let db = StateProviderDatabase::new(NoopProvider::default());
+        let mut state = State::builder().with_database(db).with_bundle_update().build();
+        let mut info = ExecutionInfo::default();
+
+        let (payload, _fb_payload) =
+            build_block::<_, NoopProvider>(&mut state, &ctx, &mut info, true)
+                .expect("build_block with state root should succeed");
+
+        // NoopProvider returns B256::default() for all state root queries,
+        // which equals B256::ZERO.
+        assert_eq!(
+            payload.block().state_root,
+            B256::ZERO,
+            "NoopProvider should yield a zero state root"
+        );
+
+        assert_eq!(payload.block().number, parent.number + 1);
+    }
+
+    /// [`build_block`] must return an error when the EVM environment's block
+    /// number does not match `parent.number + 1`.
+    ///
+    /// In production this would indicate a bug in context construction or a
+    /// stale parent header.  The guard at the top of `build_block` exists to
+    /// catch exactly this class of misconfiguration.
+    #[test]
+    fn build_block_rejects_block_number_mismatch() {
+        let chain_spec = minimal_chain_spec();
+        let parent = genesis_header();
+        let mut ctx = OpPayloadBuilderCtx::for_test(chain_spec, Arc::clone(&parent));
+
+        // Tamper with the EVM block number so it disagrees with parent + 1.
+        // parent.number is 0, so the expected block number is 1.
+        // Setting it to 99 should trigger the mismatch guard.
+        ctx.evm_env.block_env.number = U256::from(99);
+
+        let db = StateProviderDatabase::new(NoopProvider::default());
+        let mut state = State::builder().with_database(db).with_bundle_update().build();
+        let mut info = ExecutionInfo::default();
+
+        let err = build_block::<_, NoopProvider>(&mut state, &ctx, &mut info, false)
+            .expect_err("build_block should fail on block number mismatch");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("block number mismatch"),
+            "error should mention block number mismatch, got: {msg}"
+        );
+    }
+
+    /// [`build_block`] must return an error when the payload attributes lack
+    /// a `parent_beacon_block_root`.
+    ///
+    /// The flashblocks payload construction unconditionally reads this field,
+    /// so a `None` value is an unrecoverable configuration error that should
+    /// surface clearly rather than panicking.
+    #[test]
+    fn build_block_rejects_missing_beacon_block_root() {
+        let chain_spec = minimal_chain_spec();
+        let parent = genesis_header();
+        let mut ctx = OpPayloadBuilderCtx::for_test(chain_spec, Arc::clone(&parent));
+
+        // Clear the parent beacon block root that for_test() sets.
+        ctx.config.attributes.payload_attributes.parent_beacon_block_root = None;
+
+        let db = StateProviderDatabase::new(NoopProvider::default());
+        let mut state = State::builder().with_database(db).with_bundle_update().build();
+        let mut info = ExecutionInfo::default();
+
+        let err = build_block::<_, NoopProvider>(&mut state, &ctx, &mut info, false)
+            .expect_err("build_block should fail without beacon block root");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("parent beacon block root not found"),
+            "error should mention missing beacon block root, got: {msg}"
+        );
+    }
 
     /// Pin the JSON field names and structure of [`FlashblocksMetadata`].
     ///
@@ -1200,7 +1354,7 @@ mod tests {
         let tx_hash = B256::from([0xAA; 32]);
         let address = Address::from([0xBB; 20]);
 
-        let receipt = OpReceipt::Eip1559(Receipt {
+        let receipt = BaseReceipt::Eip1559(Receipt {
             status: true.into(),
             cumulative_gas_used: 21_000,
             logs: Vec::<Log>::new(),

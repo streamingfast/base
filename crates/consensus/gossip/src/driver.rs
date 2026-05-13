@@ -7,12 +7,12 @@ use std::{
 };
 
 use alloy_primitives::{Address, hex};
-use base_alloy_rpc_types_engine::OpNetworkPayloadEnvelope;
+use base_common_rpc_types_engine::NetworkPayloadEnvelope;
 use base_consensus_genesis::RollupConfig;
-use base_consensus_peers::{EnrValidation, PeerMonitoring, enr_to_multiaddr};
+use base_consensus_peers::{EnrValidation, PeerMonitoring, PeerUtils};
 use derive_more::Debug;
 use discv5::Enr;
-use futures::{AsyncReadExt, AsyncWriteExt, stream::StreamExt};
+use futures::{AsyncWriteExt, stream::StreamExt};
 use libp2p::{
     Multiaddr, PeerId, Swarm, TransportError,
     gossipsub::{IdentTopic, MessageId},
@@ -116,7 +116,7 @@ where
     pub fn publish(
         &mut self,
         selector: impl FnOnce(&BlockHandler) -> IdentTopic,
-        payload: Option<OpNetworkPayloadEnvelope>,
+        payload: Option<NetworkPayloadEnvelope>,
     ) -> Result<Option<MessageId>, PublishError> {
         let Some(payload) = payload else {
             return Ok(None);
@@ -155,14 +155,6 @@ where
                 info!(target: "gossip", peer_id = %peer_id, "Received a sync request, spawning a new task to handle it");
 
                 tokio::spawn(async move {
-                    let mut buffer = Vec::new();
-                    let Ok(bytes_received) = inbound_stream.read_to_end(&mut buffer).await else {
-                        error!(target: "gossip", peer_id = %peer_id, "Failed to read the sync request");
-                        return;
-                    };
-
-                    debug!(target: "gossip", bytes_received, peer_id = %peer_id, payload = ?buffer, "Received inbound sync request");
-
                     // We return: not found (1), version (0). `<https://specs.optimism.io/protocol/rollup-node-p2p.html#payload_by_number>`
                     // Response format: <response> = <res><version><payload>
                     // No payload is returned.
@@ -237,7 +229,7 @@ where
             trace!(target: "gossip", chain_id = %self.handler.rollup_config.l2_chain_id.id(), validation = %validation, "Invalid Base ENR");
             return;
         }
-        let Some(multiaddr) = enr_to_multiaddr(&enr) else {
+        let Some(multiaddr) = PeerUtils::enr_to_multiaddr(&enr) else {
             debug!(target: "gossip", enr = ?enr, "Failed to extract tcp socket from enr");
             Metrics::dial_peer_error("invalid_enr").increment(1.0);
             return;
@@ -284,7 +276,7 @@ where
         }
     }
 
-    fn handle_gossip_event(&mut self, event: Event) -> Option<OpNetworkPayloadEnvelope> {
+    fn handle_gossip_event(&mut self, event: Event) -> Option<NetworkPayloadEnvelope> {
         match event {
             Event::Gossipsub(e) => return self.handle_gossipsub_event(*e),
             Event::Ping(libp2p::ping::Event { peer, result, .. }) => {
@@ -341,7 +333,7 @@ where
     fn handle_gossipsub_event(
         &mut self,
         event: libp2p::gossipsub::Event,
-    ) -> Option<OpNetworkPayloadEnvelope> {
+    ) -> Option<NetworkPayloadEnvelope> {
         match event {
             libp2p::gossipsub::Event::Message {
                 propagation_source: src,
@@ -381,7 +373,7 @@ where
     }
 
     /// Handles the [`SwarmEvent<Event>`].
-    pub fn handle_event(&mut self, event: SwarmEvent<Event>) -> Option<OpNetworkPayloadEnvelope> {
+    pub fn handle_event(&mut self, event: SwarmEvent<Event>) -> Option<NetworkPayloadEnvelope> {
         match event {
             SwarmEvent::Behaviour(behavior_event) => {
                 return self.handle_gossip_event(behavior_event);

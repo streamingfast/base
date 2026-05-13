@@ -1,0 +1,84 @@
+//! Reth compatibility implementations for RPC types.
+
+use core::convert::Infallible;
+
+use alloy_consensus::{SignableTransaction, error::ValueError};
+use alloy_evm::{
+    EvmEnv,
+    env::BlockEnvironment,
+    rpc::{EthTxEnvError, TryIntoTxEnv},
+};
+use alloy_network::TxSigner;
+use alloy_primitives::{Address, Bytes};
+use alloy_signer::Signature;
+use base_common_consensus::{BaseTransaction, BaseTransactionInfo, BaseTxEnvelope};
+use base_common_evm::OpTransaction as OpRevm;
+use reth_rpc_convert::{
+    SignTxRequestError, SignableTxRequest, TryIntoSimTx, transaction::FromConsensusTx,
+};
+use revm::context::TxEnv;
+
+use crate::{BaseTransactionRequest, Transaction};
+
+impl<T: BaseTransaction + alloy_consensus::Transaction> FromConsensusTx<T> for Transaction<T> {
+    type TxInfo = BaseTransactionInfo;
+    type Err = Infallible;
+
+    fn from_consensus_tx(
+        tx: T,
+        signer: Address,
+        tx_info: BaseTransactionInfo,
+    ) -> Result<Self, Infallible> {
+        Ok(Self::from_transaction(
+            alloy_consensus::transaction::Recovered::new_unchecked(tx, signer),
+            tx_info,
+        ))
+    }
+}
+
+impl<Block: BlockEnvironment> TryIntoTxEnv<OpRevm<TxEnv>, Block> for BaseTransactionRequest {
+    type Err = EthTxEnvError;
+
+    fn try_into_tx_env<Spec>(
+        self,
+        evm_env: &EvmEnv<Spec, Block>,
+    ) -> Result<OpRevm<TxEnv>, Self::Err> {
+        Ok(OpRevm {
+            base: self.as_ref().clone().try_into_tx_env(evm_env)?,
+            enveloped_tx: Some(Bytes::new()),
+            deposit: Default::default(),
+        })
+    }
+}
+
+impl TryIntoSimTx<BaseTxEnvelope> for BaseTransactionRequest {
+    fn try_into_sim_tx(self) -> Result<BaseTxEnvelope, ValueError<Self>> {
+        let tx = self
+            .build_typed_tx()
+            .map_err(|request| ValueError::new(request, "Required fields missing"))?;
+
+        // Create an empty signature for the transaction.
+        let signature = Signature::new(Default::default(), Default::default(), false);
+
+        Ok(tx.into_signed(signature).into())
+    }
+}
+
+impl SignableTxRequest<BaseTxEnvelope> for BaseTransactionRequest {
+    async fn try_build_and_sign(
+        self,
+        signer: impl TxSigner<Signature> + Send,
+    ) -> Result<BaseTxEnvelope, SignTxRequestError> {
+        let mut tx =
+            self.build_typed_tx().map_err(|_| SignTxRequestError::InvalidTransactionRequest)?;
+
+        // sanity check: deposit transactions must not be signed by the user
+        if tx.is_deposit() {
+            return Err(SignTxRequestError::InvalidTransactionRequest);
+        }
+
+        let signature = signer.sign_transaction(&mut tx).await?;
+
+        Ok(tx.into_signed(signature).into())
+    }
+}

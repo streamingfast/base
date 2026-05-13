@@ -11,7 +11,7 @@ use base_consensus_derive::{
     ActivationSignal, Pipeline, PipelineError, PipelineErrorKind, ResetError, ResetSignal,
     SignalReceiver, StepResult,
 };
-use base_protocol::{L2BlockInfo, OpAttributesWithParent};
+use base_protocol::{AttributesWithParent, L2BlockInfo};
 
 /// High-level abstraction for the driver's derivation pipeline.
 ///
@@ -31,7 +31,7 @@ where
     async fn produce_payload(
         &mut self,
         l2_safe_head: L2BlockInfo,
-    ) -> Result<OpAttributesWithParent, PipelineErrorKind> {
+    ) -> Result<AttributesWithParent, PipelineErrorKind> {
         // As we start the safe head at the disputed block's parent, we step the pipeline until the
         // first attributes are produced. All batches at and before the safe head will be
         // dropped, so the first payload will always be the disputed one.
@@ -58,22 +58,9 @@ where
                         }
                         PipelineErrorKind::Reset(e) => {
                             warn!(target: "client_derivation_driver", error = ?e, "Failed to step derivation pipeline due to reset");
-                            let system_config = self
-                                .system_config_by_number(l2_safe_head.block_info.number)
-                                .await?;
 
                             if matches!(e, ResetError::HoloceneActivation) {
-                                let l1_origin =
-                                    self.origin().ok_or(PipelineError::MissingOrigin.crit())?;
-                                self.signal(
-                                    ActivationSignal {
-                                        l2_safe_head,
-                                        l1_origin,
-                                        system_config: Some(system_config),
-                                    }
-                                    .signal(),
-                                )
-                                .await?;
+                                self.signal(ActivationSignal { l2_safe_head }.signal()).await?;
                             } else {
                                 // Flushes cache if a reorg is detected.
                                 if matches!(e, ResetError::ReorgDetected(_, _)) {
@@ -82,17 +69,7 @@ where
 
                                 // Reset the pipeline to the initial L2 safe head and L1 origin,
                                 // and try again.
-                                let l1_origin =
-                                    self.origin().ok_or(PipelineError::MissingOrigin.crit())?;
-                                self.signal(
-                                    ResetSignal {
-                                        l2_safe_head,
-                                        l1_origin,
-                                        system_config: Some(system_config),
-                                    }
-                                    .signal(),
-                                )
-                                .await?;
+                                self.signal(ResetSignal { l2_safe_head }.signal()).await?;
                             }
                         }
                         PipelineErrorKind::Critical(_) => {

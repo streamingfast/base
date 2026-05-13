@@ -9,7 +9,7 @@ use alloy_transport_http::{Http, reqwest as alloy_reqwest};
 use thiserror::Error;
 use tracing::warn;
 
-use crate::{SequencerClientError, SequencerMetrics};
+use crate::{SequencerClientError, metrics::SequencerMetrics};
 
 /// Sequencer client error
 #[derive(Error, Debug)]
@@ -47,9 +47,8 @@ pub struct SequencerClient {
 
 impl SequencerClientInner {
     /// Creates a new instance with the given endpoint and client.
-    pub(crate) fn new(sequencer_endpoint: String, client: Client) -> Self {
-        let metrics = SequencerMetrics::default();
-        Self { sequencer_endpoint, client, metrics }
+    pub const fn new(sequencer_endpoint: String, client: Client) -> Self {
+        Self { sequencer_endpoint, client }
     }
 }
 
@@ -130,11 +129,6 @@ impl SequencerClient {
         &self.inner.client
     }
 
-    /// Returns a reference to the [`SequencerMetrics`] for tracking client metrics.
-    fn metrics(&self) -> &SequencerMetrics {
-        &self.inner.metrics
-    }
-
     /// Sends a [`alloy_rpc_client::RpcCall`] request to the sequencer endpoint.
     pub async fn request<Params: RpcSend, Resp: RpcRecv>(
         &self,
@@ -166,19 +160,18 @@ impl SequencerClient {
                     "Failed to forward transaction to sequencer",
                 );
             })?;
-        self.metrics().record_forward_latency(start.elapsed());
+        SequencerMetrics::record_forward_latency(start.elapsed());
         Ok(tx_hash)
     }
 }
 
+/// Inner state of a [`SequencerClient`].
 #[derive(Debug)]
-struct SequencerClientInner {
+pub struct SequencerClientInner {
     /// The endpoint of the sequencer
-    sequencer_endpoint: String,
-    /// The client
-    client: Client,
-    // Metrics for tracking sequencer forwarding
-    metrics: SequencerMetrics,
+    pub sequencer_endpoint: String,
+    /// The RPC client
+    pub client: Client,
 }
 
 #[cfg(test)]

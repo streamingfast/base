@@ -5,25 +5,30 @@ use alloy_eips::eip2718::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_provider::{Provider, ProviderBuilder, network::TransactionResponse};
 use alloy_rpc_types_eth::BlockNumberOrTag;
+use alloy_sol_types::sol;
 use anyhow::Result;
-use base_alloy_consensus::OpTxEnvelope;
-use base_alloy_flashblocks::Flashblock;
-use base_alloy_network::Base;
-use base_consensus_rpc::{ConductorApiClient, OpP2PApiClient, RollupNodeApiClient};
+use base_common_consensus::BaseTxEnvelope;
+use base_common_flashblocks::Flashblock;
+use base_common_network::Base;
+use base_consensus_rpc::{BaseP2PApiClient, ConductorApiClient, RollupNodeApiClient};
 use futures::{StreamExt, stream};
-use jsonrpsee::http_client::HttpClientBuilder;
+use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::connect_async;
 use tracing::warn;
+use url::Url;
 
-use crate::{config::ConductorNodeConfig, tui::Toast};
+use crate::{
+    config::{ConductorNodeConfig, ProofsConfig, ValidatorNodeConfig},
+    tui::Toast,
+};
 
 const CONCURRENT_BLOCK_FETCHES: usize = 16;
 const WS_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const WS_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 
 /// Fetches the safe and latest L2 block numbers.
-pub(crate) async fn fetch_safe_and_latest(l2_rpc: &str) -> Result<(u64, u64)> {
+pub async fn fetch_safe_and_latest(l2_rpc: &str) -> Result<(u64, u64)> {
     let provider = ProviderBuilder::new().connect(l2_rpc).await?;
 
     let safe_block = provider
@@ -58,7 +63,7 @@ async fn fetch_raw_block_info<P: Provider<Base>>(
 }
 
 /// Polls the L2 safe head block number at regular intervals.
-pub(crate) async fn run_safe_head_poller(
+pub async fn run_safe_head_poller(
     l2_rpc: String,
     tx: mpsc::Sender<u64>,
     toast_tx: mpsc::Sender<Toast>,
@@ -182,7 +187,7 @@ async fn run_flashblock_ws_inner<T: Send + 'static>(
 }
 
 /// Subscribes to flashblocks via WebSocket and forwards raw flashblocks.
-pub(crate) async fn run_flashblock_ws(
+pub async fn run_flashblock_ws(
     mut url_rx: watch::Receiver<String>,
     tx: mpsc::Sender<Flashblock>,
     toast_tx: mpsc::Sender<Toast>,
@@ -192,7 +197,7 @@ pub(crate) async fn run_flashblock_ws(
 
 /// A flashblock paired with its local receive timestamp.
 #[derive(Debug)]
-pub(crate) struct TimestampedFlashblock {
+pub struct TimestampedFlashblock {
     /// The decoded flashblock.
     pub flashblock: Flashblock,
     /// Local time when this flashblock was received.
@@ -200,7 +205,7 @@ pub(crate) struct TimestampedFlashblock {
 }
 
 /// Subscribes to flashblocks via WebSocket and forwards timestamped flashblocks.
-pub(crate) async fn run_flashblock_ws_timestamped(
+pub async fn run_flashblock_ws_timestamped(
     mut url_rx: watch::Receiver<String>,
     tx: mpsc::Sender<TimestampedFlashblock>,
     toast_tx: mpsc::Sender<Toast>,
@@ -219,7 +224,7 @@ pub(crate) async fn run_flashblock_ws_timestamped(
 /// The task exits immediately if no such nodes exist.
 /// Summary of the initial DA backlog between safe and latest blocks.
 #[derive(Debug, Clone)]
-pub(crate) struct InitialBacklog {
+pub struct InitialBacklog {
     /// Safe L2 block number.
     pub safe_block: u64,
     /// Total DA bytes across all backlog blocks.
@@ -228,7 +233,7 @@ pub(crate) struct InitialBacklog {
 
 /// Progress update during initial backlog fetch.
 #[derive(Debug, Clone)]
-pub(crate) struct BacklogProgress {
+pub struct BacklogProgress {
     /// Number of blocks fetched so far.
     pub current_block: u64,
     /// Total number of blocks to fetch.
@@ -237,7 +242,7 @@ pub(crate) struct BacklogProgress {
 
 /// Individual block data from backlog fetch.
 #[derive(Debug, Clone)]
-pub(crate) struct BacklogBlock {
+pub struct BacklogBlock {
     /// L2 block number.
     pub block_number: u64,
     /// DA bytes contributed by this block.
@@ -248,7 +253,7 @@ pub(crate) struct BacklogBlock {
 
 /// Result of initial backlog fetch - either progress or complete.
 #[derive(Debug, Clone)]
-pub(crate) enum BacklogFetchResult {
+pub enum BacklogFetchResult {
     /// Incremental progress update.
     Progress(BacklogProgress),
     /// A single fetched block.
@@ -260,7 +265,7 @@ pub(crate) enum BacklogFetchResult {
 }
 
 /// Fetches the initial DA backlog, sending progress updates and block data.
-pub(crate) async fn fetch_initial_backlog_with_progress(
+pub async fn fetch_initial_backlog_with_progress(
     l2_rpc: String,
     progress_tx: tokio::sync::mpsc::Sender<BacklogFetchResult>,
 ) {
@@ -337,7 +342,7 @@ pub(crate) async fn fetch_initial_backlog_with_progress(
 
 /// DA and gas information for a single L2 block.
 #[derive(Debug, Clone)]
-pub(crate) struct BlockDaInfo {
+pub struct BlockDaInfo {
     /// L2 block number.
     pub block_number: u64,
     /// Total DA bytes from all transactions.
@@ -347,7 +352,7 @@ pub(crate) struct BlockDaInfo {
 }
 
 /// Fetches DA info for requested block numbers and sends results back.
-pub(crate) async fn run_block_fetcher(
+pub async fn run_block_fetcher(
     l2_rpc: String,
     mut request_rx: mpsc::Receiver<u64>,
     result_tx: mpsc::Sender<BlockDaInfo>,
@@ -384,7 +389,7 @@ pub(crate) async fn run_block_fetcher(
 
 /// Information about an L1 block and its blob counts.
 #[derive(Debug, Clone)]
-pub(crate) struct L1BlockInfo {
+pub struct L1BlockInfo {
     /// L1 block number.
     pub block_number: u64,
     /// Unix timestamp of the L1 block.
@@ -397,7 +402,7 @@ pub(crate) struct L1BlockInfo {
 
 /// How the L1 watcher connects to the L1 node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum L1ConnectionMode {
+pub enum L1ConnectionMode {
     /// Connected via WebSocket subscription.
     WebSocket,
     /// Connected via HTTP polling.
@@ -409,7 +414,7 @@ fn http_to_ws(url: &str) -> String {
 }
 
 /// Watches L1 blocks for blob transactions, preferring WebSocket with polling fallback.
-pub(crate) async fn run_l1_blob_watcher(
+pub async fn run_l1_blob_watcher(
     l1_rpc: String,
     batcher_address: Address,
     result_tx: mpsc::Sender<L1BlockInfo>,
@@ -559,7 +564,7 @@ fn extract_l1_block_info(
 
 /// Summary of a single transaction within a block.
 #[derive(Debug, Clone)]
-pub(crate) struct TxSummary {
+pub struct TxSummary {
     /// Transaction hash.
     pub hash: B256,
     /// Sender address.
@@ -585,14 +590,14 @@ fn effective_priority_fee_per_gas(
 /// Decodes raw EIP-2718 encoded transaction bytes into summaries.
 ///
 /// Used to extract transaction details from flashblock stream data without RPC calls.
-pub(crate) fn decode_flashblock_transactions(
+pub fn decode_flashblock_transactions(
     raw_txs: &[Bytes],
     base_fee_per_gas: Option<u64>,
 ) -> Vec<TxSummary> {
     raw_txs
         .iter()
         .filter_map(|tx_bytes| {
-            let envelope = OpTxEnvelope::decode_2718(&mut tx_bytes.as_ref())
+            let envelope = BaseTxEnvelope::decode_2718(&mut tx_bytes.as_ref())
                 .inspect_err(|e| warn!(error = %e, "failed to decode transaction"))
                 .ok()?;
             let hash = envelope.tx_hash();
@@ -618,7 +623,7 @@ pub(crate) fn decode_flashblock_transactions(
 }
 
 /// Fetches all transactions for a given block and sends summaries through the channel.
-pub(crate) async fn fetch_block_transactions(
+pub async fn fetch_block_transactions(
     l2_rpc: String,
     block_number: u64,
     tx: mpsc::Sender<Result<Vec<TxSummary>, String>>,
@@ -673,19 +678,43 @@ pub(crate) async fn fetch_block_transactions(
 
 /// Live status snapshot for a single node in an HA conductor cluster.
 #[derive(Debug, Clone)]
-pub(crate) struct ConductorNodeStatus {
+pub struct ConductorNodeStatus {
     /// Human-readable name for this node.
     pub name: String,
+
+    // ── Conductor ────────────────────────────────────────────────────────
     /// Whether this node is the Raft leader. `None` means the node is unreachable.
     pub is_leader: Option<bool>,
-    /// Unsafe L2 block number from `optimism_syncStatus`. `None` means unreachable.
+    /// Whether the conductor's sequencer is actively sequencing (`conductor_active`).
+    /// Expected to be `false` for followers. `None` means unreachable.
+    pub conductor_active: Option<bool>,
+
+    // ── CL (consensus layer) ─────────────────────────────────────────────
+    /// Unsafe L2 block number from `optimism_syncStatus`.
     pub unsafe_l2_block: Option<u64>,
-    /// Safe L2 block number from `optimism_syncStatus`. `None` means unreachable.
+    /// Unsafe L2 block hash from `optimism_syncStatus`.
+    pub unsafe_l2_hash: Option<alloy_primitives::B256>,
+    /// Safe L2 block number from `optimism_syncStatus`.
     pub safe_l2_block: Option<u64>,
-    /// Finalized L2 block number from `optimism_syncStatus`. `None` means unreachable.
+    /// Safe L2 block hash from `optimism_syncStatus`.
+    pub safe_l2_hash: Option<alloy_primitives::B256>,
+    /// Finalized L2 block number from `optimism_syncStatus`.
     pub finalized_l2_block: Option<u64>,
-    /// Number of connected P2P peers from `opp2p_peerStats`. `None` means unreachable.
-    pub peer_count: Option<u32>,
+    /// L1 derivation cursor block number (`current_l1`).
+    pub current_l1_block: Option<u64>,
+    /// L1 chain head block number (`head_l1`). Compared with `current_l1_block` to show lag.
+    pub head_l1_block: Option<u64>,
+    /// Number of connected CL libp2p peers from `opp2p_peerStats`.
+    pub cl_peer_count: Option<u32>,
+
+    // ── EL (execution layer) ─────────────────────────────────────────────
+    /// Latest block number from `eth_blockNumber`. `None` if `el_rpc` not configured.
+    pub el_block: Option<u64>,
+    /// Whether the EL is snap-syncing (`eth_syncing` returns non-false). `None` if not
+    /// configured.
+    pub el_syncing: Option<bool>,
+    /// Number of connected EL devp2p peers from `net_peerCount`. `None` if not configured.
+    pub el_peer_count: Option<u32>,
 }
 
 /// Finds the current Raft leader and transfers leadership.
@@ -695,7 +724,7 @@ pub(crate) struct ConductorNodeStatus {
 /// is transferred to the named node via `conductor_transferLeaderToServer`.
 ///
 /// The result — `Ok(description)` or `Err(message)` — is sent to `result_tx`.
-pub(crate) async fn transfer_conductor_leader(
+pub async fn transfer_conductor_leader(
     nodes: Vec<ConductorNodeConfig>,
     target_name: Option<String>,
     result_tx: mpsc::Sender<Result<String, String>>,
@@ -748,6 +777,201 @@ pub(crate) async fn transfer_conductor_leader(
     let _ = result_tx.send(outcome.map_err(|e| e.to_string())).await;
 }
 
+/// Restarts the docker containers for a single conductor cluster node.
+///
+/// Containers are restarted in dependency order — EL → CL → conductor —
+/// waiting for each to become healthy before starting the next. This prevents
+/// op-conductor from crashing on startup because it tries to connect to the EL
+/// before the EL has bound its port.
+pub async fn restart_conductor_node(
+    node: ConductorNodeConfig,
+    result_tx: mpsc::Sender<Result<String, String>>,
+) {
+    // Dependency order: EL must be healthy before CL starts, CL before conductor.
+    let ordered: &[Option<&str>] =
+        &[node.docker_el.as_deref(), node.docker_cl.as_deref(), node.docker_conductor.as_deref()];
+    let containers: Vec<&str> = ordered.iter().filter_map(|c| *c).collect();
+
+    let outcome: anyhow::Result<String> = async {
+        if containers.is_empty() {
+            return Err(anyhow::anyhow!("no docker containers configured for {}", node.name));
+        }
+
+        for container in &containers {
+            // Restart this container.
+            let out = tokio::process::Command::new("docker")
+                .args(["restart", container])
+                .output()
+                .await
+                .map_err(|e| anyhow::anyhow!("docker restart {container}: {e}"))?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                return Err(anyhow::anyhow!(
+                    "docker restart {container} failed: {}",
+                    stderr.trim()
+                ));
+            }
+
+            // Wait until Docker reports the container as healthy (or running if
+            // no healthcheck is defined) before moving to the next dependency.
+            for _ in 0..60u32 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let status = tokio::process::Command::new("docker")
+                    .args(["inspect", "--format", "{{.State.Health.Status}}", container])
+                    .output()
+                    .await
+                    .ok()
+                    .and_then(|o| String::from_utf8(o.stdout).ok());
+                match status.as_deref().map(str::trim) {
+                    Some("healthy") => break,
+                    // Container has no healthcheck — treat "running" as ready.
+                    Some("") | None => {
+                        let running = tokio::process::Command::new("docker")
+                            .args(["inspect", "--format", "{{.State.Running}}", container])
+                            .output()
+                            .await
+                            .ok()
+                            .and_then(|o| String::from_utf8(o.stdout).ok());
+                        if running.as_deref().map(str::trim) == Some("true") {
+                            break;
+                        }
+                    }
+                    _ => {} // starting / unhealthy — keep waiting
+                }
+            }
+        }
+
+        Ok(format!("restarted {} ({})", node.name, containers.join(" → ")))
+    }
+    .await;
+
+    let _ = result_tx.send(outcome.map_err(|e| e.to_string())).await;
+}
+
+/// Peers saved when a sequencer node is paused, used to restore connectivity on unpause.
+#[derive(Debug, Clone, Default)]
+pub struct PausedPeers {
+    /// Multiaddrs of the CL peers that were connected before pausing.
+    /// Used to reconnect them on unpause via `opp2p_connectPeer`.
+    pub cl_addrs: Vec<String>,
+    /// Enode URLs of the EL peers that were connected before pausing.
+    /// Used to re-add them on unpause via `admin_addPeer`.
+    pub el_enodes: Vec<String>,
+}
+
+/// Disconnects all p2p peers from the CL and EL of a node so that neither layer
+/// can advance.  Returns the saved peer addresses so they can be restored later
+/// via [`unpause_sequencer_node`].
+pub async fn pause_sequencer_node(
+    node: ConductorNodeConfig,
+    result_tx: mpsc::Sender<Result<(String, PausedPeers), String>>,
+) {
+    const TIMEOUT: Duration = Duration::from_secs(5);
+
+    let outcome: anyhow::Result<(String, PausedPeers)> = async {
+        let cl_client = HttpClientBuilder::default()
+            .request_timeout(TIMEOUT)
+            .build(node.cl_rpc.as_str())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // Snapshot connected CL peers before disconnecting so we can restore them.
+        let dump = BaseP2PApiClient::opp2p_peers(&cl_client, true)
+            .await
+            .map_err(|e| anyhow::anyhow!("opp2p_peers: {e}"))?;
+
+        let mut cl_addrs = Vec::new();
+        for (peer_id, info) in dump.peers {
+            let _ = BaseP2PApiClient::opp2p_disconnect_peer(&cl_client, peer_id).await;
+            if let Some(addr) = info.addresses.into_iter().next() {
+                cl_addrs.push(addr);
+            }
+        }
+
+        // Remove EL peers (best-effort; skip if EL not configured).
+        let mut el_enodes = Vec::new();
+        if let Some(ref el_rpc) = node.el_rpc {
+            let el_client = HttpClientBuilder::default()
+                .request_timeout(TIMEOUT)
+                .build(el_rpc.as_str())
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            let peers: Vec<serde_json::Value> =
+                ClientT::request(&el_client, "admin_peers", rpc_params![])
+                    .await
+                    .unwrap_or_default();
+
+            for peer in &peers {
+                if let Some(enode) = peer.get("enode").and_then(|v| v.as_str()) {
+                    let _: Result<bool, _> =
+                        ClientT::request(&el_client, "admin_removePeer", rpc_params![enode]).await;
+                    el_enodes.push(enode.to_string());
+                }
+            }
+        }
+
+        let msg = format!(
+            "paused {} — disconnected {} CL peer(s), {} EL peer(s)",
+            node.name,
+            cl_addrs.len(),
+            el_enodes.len()
+        );
+        Ok((msg, PausedPeers { cl_addrs, el_enodes }))
+    }
+    .await;
+
+    let _ = result_tx.send(outcome.map_err(|e| e.to_string())).await;
+}
+
+/// Reconnects the CL and EL peers that were saved by [`pause_sequencer_node`],
+/// allowing the node to resume syncing to tip.
+pub async fn unpause_sequencer_node(
+    node: ConductorNodeConfig,
+    peers: PausedPeers,
+    result_tx: mpsc::Sender<Result<String, String>>,
+) {
+    const TIMEOUT: Duration = Duration::from_secs(5);
+
+    let outcome: anyhow::Result<String> = async {
+        let cl_client = HttpClientBuilder::default()
+            .request_timeout(TIMEOUT)
+            .build(node.cl_rpc.as_str())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let mut cl_ok = 0usize;
+        for addr in &peers.cl_addrs {
+            if BaseP2PApiClient::opp2p_connect_peer(&cl_client, addr.clone()).await.is_ok() {
+                cl_ok += 1;
+            }
+        }
+
+        let mut el_ok = 0usize;
+        if let Some(ref el_rpc) = node.el_rpc {
+            let el_client = HttpClientBuilder::default()
+                .request_timeout(TIMEOUT)
+                .build(el_rpc.as_str())
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            for enode in &peers.el_enodes {
+                let r: Result<bool, _> =
+                    ClientT::request(&el_client, "admin_addPeer", rpc_params![enode]).await;
+                if r.is_ok() {
+                    el_ok += 1;
+                }
+            }
+        }
+
+        Ok(format!(
+            "unpaused {} — reconnected {cl_ok}/{} CL peer(s), {el_ok}/{} EL peer(s)",
+            node.name,
+            peers.cl_addrs.len(),
+            peers.el_enodes.len()
+        ))
+    }
+    .await;
+
+    let _ = result_tx.send(outcome.map_err(|e| e.to_string())).await;
+}
+
 /// Polls all conductor nodes every 200 ms and forwards status snapshots.
 ///
 /// Builds one pair of HTTP clients per node (conductor RPC + CL RPC) before
@@ -755,14 +979,14 @@ pub(crate) async fn transfer_conductor_leader(
 /// fires all per-node requests concurrently via [`futures::future::join_all`].
 /// Any individual RPC that times out or errors yields `None` for that field —
 /// the node is shown as offline when `is_leader` is `None`.
-pub(crate) async fn run_conductor_poller(
+pub async fn run_conductor_poller(
     nodes: Vec<ConductorNodeConfig>,
     tx: mpsc::Sender<Vec<ConductorNodeStatus>>,
 ) {
     const POLL_INTERVAL: Duration = Duration::from_millis(200);
     const RPC_TIMEOUT: Duration = Duration::from_millis(500);
 
-    let clients: Vec<(String, _, _)> = nodes
+    let clients: Vec<(String, _, _, _)> = nodes
         .into_iter()
         .filter_map(|node| {
             let conductor_client = HttpClientBuilder::default()
@@ -779,7 +1003,16 @@ pub(crate) async fn run_conductor_poller(
                     warn!(error = %e, node = %node.name, "failed to build CL HTTP client");
                 })
                 .ok()?;
-            Some((node.name, conductor_client, cl_client))
+            let el_client = node.el_rpc.as_ref().and_then(|url| {
+                HttpClientBuilder::default()
+                    .request_timeout(RPC_TIMEOUT)
+                    .build(url.as_str())
+                    .inspect_err(|e| {
+                        warn!(error = %e, node = %node.name, "failed to build EL HTTP client");
+                    })
+                    .ok()
+            });
+            Some((node.name, conductor_client, cl_client, el_client))
         })
         .collect();
 
@@ -790,21 +1023,67 @@ pub(crate) async fn run_conductor_poller(
         interval.tick().await;
 
         let statuses = futures::future::join_all(clients.iter().map(
-            |(name, conductor_client, cl_client)| async move {
-                let is_leader = ConductorApiClient::conductor_leader(conductor_client).await.ok();
-                let sync = RollupNodeApiClient::op_sync_status(cl_client).await.ok();
-                let unsafe_l2_block = sync.as_ref().map(|s| s.unsafe_l2.block_info.number);
-                let safe_l2_block = sync.as_ref().map(|s| s.safe_l2.block_info.number);
-                let finalized_l2_block = sync.as_ref().map(|s| s.finalized_l2.block_info.number);
-                let peer_count =
-                    OpP2PApiClient::opp2p_peer_stats(cl_client).await.ok().map(|s| s.connected);
+            |(name, conductor_client, cl_client, el_client)| async move {
+                // Fire all RPCs concurrently so a single timed-out node does not
+                // stall the poll for the full sum of all call timeouts (7 × 500 ms).
+                let (
+                    is_leader,
+                    conductor_active,
+                    sync,
+                    cl_peer_stats,
+                    el_block_r,
+                    el_syncing_r,
+                    el_peers_r,
+                ) = tokio::join!(
+                    ConductorApiClient::conductor_leader(conductor_client),
+                    ConductorApiClient::conductor_active(conductor_client),
+                    RollupNodeApiClient::sync_status(cl_client),
+                    BaseP2PApiClient::opp2p_peer_stats(cl_client),
+                    async {
+                        if let Some(el) = el_client {
+                            let r: Result<alloy_primitives::U64, _> =
+                                ClientT::request(el, "eth_blockNumber", rpc_params![]).await;
+                            r.ok().map(|v| v.to::<u64>())
+                        } else {
+                            None
+                        }
+                    },
+                    async {
+                        if let Some(el) = el_client {
+                            let r: Result<serde_json::Value, _> =
+                                ClientT::request(el, "eth_syncing", rpc_params![]).await;
+                            r.ok().map(|v| !matches!(v, serde_json::Value::Bool(false)))
+                        } else {
+                            None
+                        }
+                    },
+                    async {
+                        if let Some(el) = el_client {
+                            let r: Result<alloy_primitives::U64, _> =
+                                ClientT::request(el, "net_peerCount", rpc_params![]).await;
+                            r.ok().map(|v| v.to::<u32>())
+                        } else {
+                            None
+                        }
+                    },
+                );
+
+                let sync = sync.ok();
                 ConductorNodeStatus {
                     name: name.clone(),
-                    is_leader,
-                    unsafe_l2_block,
-                    safe_l2_block,
-                    finalized_l2_block,
-                    peer_count,
+                    is_leader: is_leader.ok(),
+                    conductor_active: conductor_active.ok(),
+                    unsafe_l2_block: sync.as_ref().map(|s| s.unsafe_l2.block_info.number),
+                    unsafe_l2_hash: sync.as_ref().map(|s| s.unsafe_l2.block_info.hash),
+                    safe_l2_block: sync.as_ref().map(|s| s.safe_l2.block_info.number),
+                    safe_l2_hash: sync.as_ref().map(|s| s.safe_l2.block_info.hash),
+                    finalized_l2_block: sync.as_ref().map(|s| s.finalized_l2.block_info.number),
+                    current_l1_block: sync.as_ref().map(|s| s.current_l1.number),
+                    head_l1_block: sync.as_ref().map(|s| s.head_l1.number),
+                    cl_peer_count: cl_peer_stats.ok().map(|s| s.connected),
+                    el_block: el_block_r,
+                    el_syncing: el_syncing_r,
+                    el_peer_count: el_peers_r,
                 }
             },
         ))
@@ -814,6 +1093,357 @@ pub(crate) async fn run_conductor_poller(
             break;
         }
     }
+}
+
+/// Live status snapshot for a single validator (non-sequencing) node.
+#[derive(Debug, Clone)]
+pub struct ValidatorNodeStatus {
+    /// Human-readable name for this node.
+    pub name: String,
+
+    // ── CL (consensus layer) ─────────────────────────────────────────────
+    /// Unsafe L2 block number from `optimism_syncStatus`.
+    pub unsafe_l2_block: Option<u64>,
+    /// Unsafe L2 block hash from `optimism_syncStatus`.
+    pub unsafe_l2_hash: Option<alloy_primitives::B256>,
+    /// Safe L2 block number from `optimism_syncStatus`.
+    pub safe_l2_block: Option<u64>,
+    /// Safe L2 block hash from `optimism_syncStatus`.
+    pub safe_l2_hash: Option<alloy_primitives::B256>,
+    /// Finalized L2 block number from `optimism_syncStatus`.
+    pub finalized_l2_block: Option<u64>,
+    /// L1 derivation cursor block number (`current_l1`).
+    pub current_l1_block: Option<u64>,
+    /// L1 chain head block number (`head_l1`).
+    pub head_l1_block: Option<u64>,
+    /// Number of connected CL libp2p peers from `opp2p_peerStats`.
+    pub cl_peer_count: Option<u32>,
+
+    // ── EL (execution layer) ─────────────────────────────────────────────
+    /// Latest block number from `eth_blockNumber`. `None` if `el_rpc` not configured.
+    pub el_block: Option<u64>,
+    /// Whether the EL is snap-syncing. `None` if not configured.
+    pub el_syncing: Option<bool>,
+    /// Number of connected EL devp2p peers from `net_peerCount`. `None` if not configured.
+    pub el_peer_count: Option<u32>,
+}
+
+/// Polls all validator nodes every 200 ms and forwards status snapshots.
+pub async fn run_validator_poller(
+    nodes: Vec<ValidatorNodeConfig>,
+    tx: mpsc::Sender<Vec<ValidatorNodeStatus>>,
+) {
+    const POLL_INTERVAL: Duration = Duration::from_millis(200);
+    const RPC_TIMEOUT: Duration = Duration::from_millis(500);
+
+    let clients: Vec<(String, _, _)> = nodes
+        .into_iter()
+        .filter_map(|node| {
+            let cl_client = HttpClientBuilder::default()
+                .request_timeout(RPC_TIMEOUT)
+                .build(node.cl_rpc.as_str())
+                .inspect_err(|e| {
+                    warn!(error = %e, node = %node.name, "failed to build validator CL HTTP client");
+                })
+                .ok()?;
+            let el_client = node.el_rpc.as_ref().and_then(|url| {
+                HttpClientBuilder::default()
+                    .request_timeout(RPC_TIMEOUT)
+                    .build(url.as_str())
+                    .inspect_err(|e| {
+                        warn!(error = %e, node = %node.name, "failed to build validator EL HTTP client");
+                    })
+                    .ok()
+            });
+            Some((node.name, cl_client, el_client))
+        })
+        .collect();
+
+    let mut interval = tokio::time::interval(POLL_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        interval.tick().await;
+
+        let statuses = futures::future::join_all(clients.iter().map(
+            |(name, cl_client, el_client)| async move {
+                let (sync, cl_peer_stats, el_block_r, el_syncing_r, el_peers_r) = tokio::join!(
+                    RollupNodeApiClient::sync_status(cl_client),
+                    BaseP2PApiClient::opp2p_peer_stats(cl_client),
+                    async {
+                        if let Some(el) = el_client {
+                            let r: Result<alloy_primitives::U64, _> =
+                                ClientT::request(el, "eth_blockNumber", rpc_params![]).await;
+                            r.ok().map(|v| v.to::<u64>())
+                        } else {
+                            None
+                        }
+                    },
+                    async {
+                        if let Some(el) = el_client {
+                            let r: Result<serde_json::Value, _> =
+                                ClientT::request(el, "eth_syncing", rpc_params![]).await;
+                            r.ok().map(|v| !matches!(v, serde_json::Value::Bool(false)))
+                        } else {
+                            None
+                        }
+                    },
+                    async {
+                        if let Some(el) = el_client {
+                            let r: Result<alloy_primitives::U64, _> =
+                                ClientT::request(el, "net_peerCount", rpc_params![]).await;
+                            r.ok().map(|v| v.to::<u32>())
+                        } else {
+                            None
+                        }
+                    },
+                );
+
+                let sync = sync.ok();
+                ValidatorNodeStatus {
+                    name: name.clone(),
+                    unsafe_l2_block: sync.as_ref().map(|s| s.unsafe_l2.block_info.number),
+                    unsafe_l2_hash: sync.as_ref().map(|s| s.unsafe_l2.block_info.hash),
+                    safe_l2_block: sync.as_ref().map(|s| s.safe_l2.block_info.number),
+                    safe_l2_hash: sync.as_ref().map(|s| s.safe_l2.block_info.hash),
+                    finalized_l2_block: sync.as_ref().map(|s| s.finalized_l2.block_info.number),
+                    current_l1_block: sync.as_ref().map(|s| s.current_l1.number),
+                    head_l1_block: sync.as_ref().map(|s| s.head_l1.number),
+                    cl_peer_count: cl_peer_stats.ok().map(|s| s.connected),
+                    el_block: el_block_r,
+                    el_syncing: el_syncing_r,
+                    el_peer_count: el_peers_r,
+                }
+            },
+        ))
+        .await;
+
+        if tx.send(statuses).await.is_err() {
+            break;
+        }
+    }
+}
+
+// =============================================================================
+// Proof system contract interfaces
+// =============================================================================
+
+sol! {
+    #[sol(rpc)]
+    interface IAnchorStateRegistry {
+        function getAnchorRoot() external view returns (bytes32 root, uint256 l2SequenceNumber);
+        function respectedGameType() external view returns (uint32);
+        function paused() external view returns (bool);
+    }
+
+    #[sol(rpc)]
+    interface IDisputeGameFactory {
+        function gameCount() external view returns (uint256);
+        function gameAtIndex(uint256 index) external view returns (
+            uint32 gameType, uint64 timestamp, address proxy
+        );
+    }
+
+    #[sol(rpc)]
+    interface IAggregateVerifier {
+        function rootClaim() external pure returns (bytes32);
+        function l2SequenceNumber() external pure returns (uint256);
+        function status() external view returns (uint8);
+    }
+}
+
+/// Snapshot of proof system state, fetched periodically.
+#[derive(Debug, Clone)]
+pub struct ProofsSnapshot {
+    /// Current L1 block number.
+    pub l1_block: Option<u64>,
+    /// Current L2 latest (unsafe) block number.
+    pub l2_latest_block: Option<u64>,
+    /// Current L2 safe block number.
+    pub l2_safe_block: Option<u64>,
+    /// Current L2 finalized block number.
+    pub l2_finalized_block: Option<u64>,
+    /// Respected game type from the `AnchorStateRegistry`.
+    pub respected_game_type: Option<u32>,
+    /// Whether the proof system is paused.
+    pub system_paused: Option<bool>,
+    /// Total number of dispute games created.
+    pub total_games: Option<u64>,
+    /// Anchor L2 block number (latest finalized anchor).
+    pub anchor_l2_block: Option<u64>,
+    /// Anchor output root hash.
+    pub anchor_root: Option<B256>,
+    /// Most recent dispute game proposal.
+    pub latest_proposal: Option<LatestProposal>,
+}
+
+/// Information about the most recent dispute game proposal.
+#[derive(Debug, Clone)]
+pub struct LatestProposal {
+    /// Address of the dispute game proxy contract.
+    pub game_address: Address,
+    /// L2 block number proposed.
+    pub l2_block: u64,
+    /// Output root claimed by the proposal.
+    pub root_claim: B256,
+    /// Game status: `0`=`IN_PROGRESS`, `1`=`CHALLENGER_WINS`, `2`=`DEFENDER_WINS`.
+    pub status: u8,
+    /// L1 timestamp when the game was created.
+    pub created_at: u64,
+}
+
+/// Polls proof system state (anchor state, dispute games, chain heads) at regular
+/// intervals and sends snapshots to the TUI.
+pub async fn run_proofs_poller(
+    proofs_config: ProofsConfig,
+    l1_rpc: Url,
+    l2_rpc: Url,
+    tx: mpsc::Sender<ProofsSnapshot>,
+    toast_tx: mpsc::Sender<Toast>,
+) {
+    let l1_provider = match ProviderBuilder::new().connect(l1_rpc.as_str()).await {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            warn!(error = %e, "Failed to connect to L1 RPC for proofs poller");
+            let _ = toast_tx.try_send(Toast::warning("Proofs: L1 connection failed"));
+            return;
+        }
+    };
+
+    let l2_provider = match ProviderBuilder::new().connect(l2_rpc.as_str()).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "Failed to connect to L2 RPC for proofs poller");
+            let _ = toast_tx.try_send(Toast::warning("Proofs: L2 connection failed"));
+            return;
+        }
+    };
+
+    let asr = IAnchorStateRegistry::new(proofs_config.anchor_state_registry, &*l1_provider);
+    let factory = IDisputeGameFactory::new(proofs_config.dispute_game_factory, &*l1_provider);
+
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    loop {
+        interval.tick().await;
+
+        let snapshot = fetch_proofs_snapshot(&asr, &factory, &l1_provider, &l2_provider).await;
+
+        if tx.send(snapshot).await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn fetch_proofs_snapshot<P: Provider + Clone>(
+    asr: &IAnchorStateRegistry::IAnchorStateRegistryInstance<&P>,
+    factory: &IDisputeGameFactory::IDisputeGameFactoryInstance<&P>,
+    l1_provider: &P,
+    l2_provider: &impl Provider,
+) -> ProofsSnapshot {
+    // Fetch chain state and contract state concurrently.
+    let (chain, anchor, game_type, paused, game_count) = tokio::join!(
+        fetch_chain_heads(l1_provider, l2_provider),
+        async { asr.getAnchorRoot().call().await.ok() },
+        async { asr.respectedGameType().call().await.ok() },
+        async { asr.paused().call().await.ok() },
+        async { factory.gameCount().call().await.ok() },
+    );
+
+    let (l1_block, l2_latest, l2_safe, l2_finalized) = chain;
+
+    let total_games: Option<u64> = game_count.and_then(|c| c.try_into().ok());
+    let respected_type = game_type;
+
+    // Find and query the latest proposal for the respected game type.
+    let latest_proposal =
+        find_latest_proposal(factory, l1_provider, respected_type, total_games).await;
+
+    ProofsSnapshot {
+        l1_block,
+        l2_latest_block: l2_latest,
+        l2_safe_block: l2_safe,
+        l2_finalized_block: l2_finalized,
+        respected_game_type: respected_type,
+        system_paused: paused,
+        total_games,
+        anchor_l2_block: anchor.as_ref().map(|a| a.l2SequenceNumber.try_into().unwrap_or(0)),
+        anchor_root: anchor.map(|a| a.root),
+        latest_proposal,
+    }
+}
+
+async fn fetch_chain_heads(
+    l1: &impl Provider,
+    l2: &impl Provider,
+) -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
+    let (l1_block, l2_latest, l2_safe, l2_finalized) = tokio::join!(
+        async { l1.get_block_number().await.ok() },
+        async {
+            l2.get_block_by_number(BlockNumberOrTag::Latest)
+                .await
+                .ok()
+                .flatten()
+                .map(|b| b.header.number)
+        },
+        async {
+            l2.get_block_by_number(BlockNumberOrTag::Safe)
+                .await
+                .ok()
+                .flatten()
+                .map(|b| b.header.number)
+        },
+        async {
+            l2.get_block_by_number(BlockNumberOrTag::Finalized)
+                .await
+                .ok()
+                .flatten()
+                .map(|b| b.header.number)
+        },
+    );
+    (l1_block, l2_latest, l2_safe, l2_finalized)
+}
+
+/// Scans the most recent games in the factory to find the latest one matching the
+/// respected game type, then queries its details from the `AggregateVerifier`.
+async fn find_latest_proposal<P: Provider + Clone>(
+    factory: &IDisputeGameFactory::IDisputeGameFactoryInstance<&P>,
+    l1_provider: &P,
+    respected_type: Option<u32>,
+    total_games: Option<u64>,
+) -> Option<LatestProposal> {
+    let game_type = respected_type?;
+    let count = total_games.filter(|&c| c > 0)?;
+
+    // Scan backwards from the most recent game (max 50 games).
+    let scan_start = count - 1;
+    let scan_end = count.saturating_sub(50);
+
+    for idx in (scan_end..=scan_start).rev() {
+        let game = factory.gameAtIndex(alloy_primitives::U256::from(idx)).call().await.ok()?;
+
+        if game.gameType != game_type {
+            continue;
+        }
+
+        // Found a matching game — query its details.
+        let verifier = IAggregateVerifier::new(game.proxy, l1_provider);
+
+        let (root_claim, l2_seq, status) = tokio::join!(
+            async { verifier.rootClaim().call().await.ok() },
+            async { verifier.l2SequenceNumber().call().await.ok() },
+            async { verifier.status().call().await.ok() },
+        );
+
+        return Some(LatestProposal {
+            game_address: game.proxy,
+            l2_block: l2_seq.and_then(|s| s.try_into().ok()).unwrap_or(0),
+            root_claim: root_claim.unwrap_or_default(),
+            status: status.unwrap_or(0),
+            created_at: game.timestamp,
+        });
+    }
+
+    None
 }
 
 #[cfg(test)]

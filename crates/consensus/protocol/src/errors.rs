@@ -1,13 +1,13 @@
 //! Error types for protocol conversions.
 
 use alloy_primitives::B256;
-use base_alloy_consensus::EIP1559ParamError;
+use base_common_consensus::EIP1559ParamError;
 
 use crate::DecodeError;
 
 /// An error encountered during OP [`Block`](alloy_consensus::Block) conversion.
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
-pub enum OpBlockConversionError {
+pub enum BaseBlockConversionError {
     /// Invalid genesis hash.
     #[error("Invalid genesis hash. Expected {0}, got {1}")]
     InvalidGenesisHash(B256, B256),

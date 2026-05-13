@@ -1,4 +1,3 @@
-#![allow(missing_docs)]
 #![doc = include_str!("../README.md")]
 #![doc(
     html_logo_url = "https://avatars.githubusercontent.com/u/16627100?s=200&v=4",
@@ -34,11 +33,12 @@ pub use flashblocks::{
     BestFlashblocksTxs, BlockCell, BlockPayloadJob, BlockPayloadJobGenerator, BuildArguments,
     FlashblockDiagnostics, FlashblockSelectionOutcome, FlashblocksExecutionInfo,
     FlashblocksExtraCtx, FlashblocksServiceBuilder, OpPayloadBuilderCtx, PayloadBuilder,
-    PayloadHandler, ResolvePayload, WaitForValue,
+    PayloadHandler, RejectionCache, ResolvePayload, WaitForValue,
 };
 
 mod extension;
 pub use extension::BuilderApiExtension;
 
+/// Shared test infrastructure: local node instances, chain drivers, transaction builders, and pool observers.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;

@@ -17,6 +17,7 @@ base-consensus-genesis.workspace = true
 base-protocol = {workspace = true, features = ["serde", "std"]}
 
 # alloy
+alloy-json-rpc.workspace = true
 alloy-network.workspace = true
 alloy-pubsub.workspace = true
 alloy-transport.workspace = true
@@ -31,11 +32,11 @@ alloy-transport-ws.workspace = true
 alloy-provider = { workspace = true, features = ["ipc", "ws", "reqwest", "reqwest-rustls-tls", "engine-api"] }
 
 # base-alloy
-base-alloy-network.workspace = true
-base-alloy-provider.workspace = true
-base-alloy-rpc-types.workspace = true
-base-alloy-consensus = { workspace = true, features = ["std"] }
-base-alloy-rpc-types-engine = { workspace = true, features = ["serde", "std"] }
+base-common-network.workspace = true
+base-common-provider.workspace = true
+base-common-rpc-types.workspace = true
+base-common-consensus = { workspace = true, features = ["std"] }
+base-common-rpc-types-engine = { workspace = true, features = ["serde", "std"] }
 
 # general
 url.workspace = true
@@ -45,8 +46,8 @@ async-trait.workspace = true
 http-body-util.workspace = true
 serde = { workspace = true, features = ["std"] }
 tracing = { workspace = true, features = ["std"] }
-serde_json = { workspace = true, features = ["std"] }
 thiserror = { workspace = true, features = ["std"] }
+serde_json = { workspace = true, features = ["std"] }
 derive_more = { workspace = true, features = ["display", "deref", "from_str", "constructor"] }
 
 # metrics
@@ -59,8 +60,8 @@ tokio-tungstenite.workspace = true
 base-consensus-registry.workspace = true
 metrics-exporter-prometheus.workspace = true
 rand = {workspace = true, features = ["thread_rng"]}
-base-alloy-rpc-types = {workspace = true, features = ["arbitrary", "k256"]}
+base-common-rpc-types = {workspace = true, features = ["arbitrary", "k256"]}
 
 [features]
-metrics = [ "dep:metrics" ]
+metrics = [ "base-metrics/metrics", "dep:metrics" ]
 test-utils = [ "base-protocol/test-utils" ]

@@ -1,7 +1,4 @@
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use axum::http::Uri;
 use backoff::{ExponentialBackoff, backoff::Backoff};
@@ -80,15 +77,20 @@ impl Default for SubscriberOptions {
 
 /// Maintains a persistent websocket connection to an upstream server, automatically
 /// reconnecting with exponential backoff and monitoring liveness via ping/pong.
+///
+/// Tracks the position of the last received flashblock message. On reconnect,
+/// appends `block_number` and `flashblock_index` query parameters to the URI
+/// so the upstream publisher can replay missed entries.
 pub struct WebsocketSubscriber<F>
 where
     F: Fn(String) + Send + Sync + 'static,
 {
     uri: Uri,
+    uri_label: String,
     handler: F,
     backoff: ExponentialBackoff,
-    metrics: Arc<Metrics>,
     options: SubscriberOptions,
+    last_position: Option<(u64, u64)>,
 }
 
 impl<F> std::fmt::Debug for WebsocketSubscriber<F>
@@ -99,6 +101,7 @@ where
         f.debug_struct("WebsocketSubscriber")
             .field("uri", &self.uri)
             .field("options", &self.options)
+            .field("last_position", &self.last_position)
             .finish_non_exhaustive()
     }
 }
@@ -108,7 +111,7 @@ where
     F: Fn(String) + Send + Sync + 'static,
 {
     /// Creates a new subscriber targeting the given URI with the provided message handler.
-    pub fn new(uri: Uri, handler: F, metrics: Arc<Metrics>, options: SubscriberOptions) -> Self {
+    pub fn new(uri: Uri, handler: F, options: SubscriberOptions) -> Self {
         let backoff = ExponentialBackoff {
             initial_interval: options.backoff_initial_interval,
             max_interval: options.max_backoff_interval,
@@ -116,7 +119,8 @@ where
             ..Default::default()
         };
 
-        Self { uri, handler, backoff, metrics, options }
+        let uri_label = uri.to_string();
+        Self { uri, uri_label, handler, backoff, options, last_position: None }
     }
 
     /// Runs the subscriber loop, reconnecting on failure until the token is cancelled.
@@ -145,7 +149,7 @@ where
                                 uri = %self.uri,
                                 error = e.to_string()
                             );
-                            self.metrics.upstream_errors.increment(1);
+                            Metrics::upstream_errors().increment(1);
 
                             if let Some(duration) = self.backoff.next_backoff() {
                                 warn!(
@@ -171,46 +175,65 @@ where
         }
     }
 
+    /// Builds the connection URI, appending resume position query parameters
+    /// if a previous position is tracked.
+    fn connect_uri(&self) -> Uri {
+        let Some((block_number, flashblock_index)) = self.last_position else {
+            return self.uri.clone();
+        };
+
+        let base = self.uri.to_string();
+        let separator = if self.uri.query().is_some() { "&" } else { "?" };
+        let with_params = format!(
+            "{base}{separator}block_number={block_number}&flashblock_index={flashblock_index}"
+        );
+
+        with_params.parse().unwrap_or_else(|e| {
+            warn!(error = %e, uri = %with_params, "Failed to parse reconnect URI, falling back to base URI");
+            self.uri.clone()
+        })
+    }
+
     async fn connect_and_listen(&mut self) -> Result<(), Error> {
-        info!(message = "connecting to websocket", uri = %self.uri);
+        let connect_uri = self.connect_uri();
+        info!(message = "connecting to websocket", uri = %connect_uri);
 
-        self.metrics.upstream_connection_attempts.increment(1);
+        Metrics::upstream_connection_attempts().increment(1);
 
-        let (ws_stream, _) = match connect_async(&self.uri).await {
+        let (ws_stream, _) = match connect_async(&connect_uri).await {
             Ok(connection) => {
-                self.metrics.upstream_connection_successes.increment(1);
+                Metrics::upstream_connection_successes().increment(1);
                 connection
             }
             Err(e) => {
-                self.metrics.upstream_connection_failures.increment(1);
+                Metrics::upstream_connection_failures().increment(1);
                 return Err(e);
             }
         };
 
-        info!(message = "websocket connection established", uri = %self.uri);
+        info!(message = "websocket connection established", uri = %connect_uri);
 
-        self.metrics.upstream_connections.increment(1);
+        Metrics::upstream_connections().increment(1);
         self.backoff.reset();
 
         let (mut write, mut read) = ws_stream.split();
 
         let (ping_error_tx, mut ping_error_rx) = oneshot::channel();
         let options = self.options.clone();
-        let metrics = Arc::clone(&self.metrics);
         let mut pong_deadline = Instant::now() + options.initial_grace_period;
 
         let ping_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(options.ping_interval);
             loop {
                 interval.tick().await;
-                metrics.ping_attempts.increment(1);
+                Metrics::ping_attempts().increment(1);
                 if let Err(e) = write.send(Message::Ping(bytes::Bytes::new())).await {
                     error!(message = "failed to send ping to upstream", error = e.to_string());
-                    metrics.ping_failures.increment(1);
+                    Metrics::ping_failures().increment(1);
                     let _ = ping_error_tx.send(e);
                     break;
                 }
-                metrics.ping_sent.increment(1);
+                Metrics::ping_sent().increment(1);
             }
         });
 
@@ -242,12 +265,12 @@ where
         };
 
         ping_task.abort();
-        self.metrics.upstream_connections.decrement(1);
+        Metrics::upstream_connections().decrement(1);
         result
     }
 
     async fn handle_message(
-        &self,
+        &mut self,
         message: Result<Message, Error>,
         pong_deadline: &mut Instant,
         pong_timeout: Duration,
@@ -271,7 +294,15 @@ where
                     uri = %self.uri,
                     payload = text.as_str()
                 );
-                self.metrics.message_received_from_upstream(self.uri.to_string().as_str());
+                Metrics::upstream_messages(self.uri_label.clone()).increment(1);
+
+                // Update position tracking before calling handler so that if
+                // the connection drops immediately after, reconnection resumes
+                // from the latest delivered message rather than re-processing it.
+                if let Some(pos) = parse_flashblock_position(text.as_str()) {
+                    self.last_position = Some(pos);
+                }
+
                 (self.handler)(text.to_string());
             }
             Message::Binary(data) => {
@@ -296,6 +327,29 @@ where
     }
 }
 
+/// Extracts `(block_number, flashblock_index)` from a flashblock JSON payload.
+///
+/// Reads `metadata.block_number` and the top-level `index` field, matching the
+/// wire format of [`FlashblocksPayloadV1`]. Returns `None` if the JSON is not
+/// a valid flashblock payload or either field is missing.
+///
+/// Uses a minimal typed struct to avoid materializing the entire JSON tree.
+#[derive(serde::Deserialize)]
+struct PositionExtract {
+    index: u64,
+    metadata: MetadataExtract,
+}
+
+#[derive(serde::Deserialize)]
+struct MetadataExtract {
+    block_number: u64,
+}
+
+fn parse_flashblock_position(data: &str) -> Option<(u64, u64)> {
+    let extract: PositionExtract = serde_json::from_str(data).ok()?;
+    Some((extract.metadata.block_number, extract.index))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -313,7 +367,6 @@ mod tests {
     use tokio_tungstenite::{accept_async, tungstenite::Message};
 
     use super::*;
-    use crate::metrics::Metrics;
 
     struct MockServer {
         addr: SocketAddr,
@@ -461,8 +514,7 @@ mod tests {
             .with_pong_timeout(Duration::from_millis(200))
             .with_initial_grace_period(Duration::from_millis(50));
 
-        let mut subscriber =
-            WebsocketSubscriber::new(uri, listener_fn, Arc::new(Metrics::default()), options);
+        let mut subscriber = WebsocketSubscriber::new(uri, listener_fn, options);
 
         let subscriber_task = {
             let token_clone = shutdown.clone();
@@ -498,33 +550,21 @@ mod tests {
             }
         };
 
-        let metrics = Arc::new(Metrics::default());
-
         let token = CancellationToken::new();
         let token_clone1 = token.clone();
         let token_clone2 = token.clone();
 
         let uri1 = server1.uri();
         let listener_clone1 = listener.clone();
-        let metrics_clone1 = Arc::clone(&metrics);
 
-        let mut subscriber1 = WebsocketSubscriber::new(
-            uri1.clone(),
-            listener_clone1,
-            metrics_clone1,
-            SubscriberOptions::default(),
-        );
+        let mut subscriber1 =
+            WebsocketSubscriber::new(uri1.clone(), listener_clone1, SubscriberOptions::default());
 
         let uri2 = server2.uri();
         let listener_clone2 = listener.clone();
-        let metrics_clone2 = Arc::clone(&metrics);
 
-        let mut subscriber2 = WebsocketSubscriber::new(
-            uri2.clone(),
-            listener_clone2,
-            metrics_clone2,
-            SubscriberOptions::default(),
-        );
+        let mut subscriber2 =
+            WebsocketSubscriber::new(uri2.clone(), listener_clone2, SubscriberOptions::default());
 
         let task1 = tokio::spawn(async move {
             subscriber1.run(token_clone1).await;
@@ -567,5 +607,62 @@ mod tests {
         assert!(messages.contains(&"Another message from server 2".to_string()));
 
         assert!(!messages.is_empty());
+    }
+
+    #[test]
+    fn parse_flashblock_position_valid() {
+        let payload = r#"{"index":4,"metadata":{"block_number":123},"diff":{}}"#;
+        assert_eq!(parse_flashblock_position(payload), Some((123, 4)));
+    }
+
+    #[test]
+    fn parse_flashblock_position_missing_metadata() {
+        let payload = r#"{"index":0,"diff":{}}"#;
+        assert_eq!(parse_flashblock_position(payload), None);
+    }
+
+    #[test]
+    fn parse_flashblock_position_invalid_json() {
+        assert_eq!(parse_flashblock_position("not json"), None);
+    }
+
+    #[test]
+    fn parse_flashblock_position_missing_index() {
+        let payload = r#"{"metadata":{"block_number":123}}"#;
+        assert_eq!(parse_flashblock_position(payload), None);
+    }
+
+    #[test]
+    fn connect_uri_without_position() {
+        let uri: Uri = "ws://localhost:9999/ws".parse().unwrap();
+        let subscriber =
+            WebsocketSubscriber::new(uri.clone(), |_: String| {}, SubscriberOptions::default());
+        assert_eq!(subscriber.connect_uri(), uri);
+    }
+
+    #[test]
+    fn connect_uri_with_position() {
+        let uri: Uri = "ws://localhost:9999/ws".parse().unwrap();
+        let mut subscriber =
+            WebsocketSubscriber::new(uri, |_: String| {}, SubscriberOptions::default());
+        subscriber.last_position = Some((100, 5));
+        let connect_uri = subscriber.connect_uri();
+        assert_eq!(
+            connect_uri.to_string(),
+            "ws://localhost:9999/ws?block_number=100&flashblock_index=5"
+        );
+    }
+
+    #[test]
+    fn connect_uri_with_existing_query() {
+        let uri: Uri = "ws://localhost:9999/ws?token=abc".parse().unwrap();
+        let mut subscriber =
+            WebsocketSubscriber::new(uri, |_: String| {}, SubscriberOptions::default());
+        subscriber.last_position = Some((200, 3));
+        let connect_uri = subscriber.connect_uri();
+        assert_eq!(
+            connect_uri.to_string(),
+            "ws://localhost:9999/ws?token=abc&block_number=200&flashblock_index=3"
+        );
     }
 }

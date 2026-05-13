@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use alloy_primitives::Bytes;
-pub use base_protocol::BatchType;
 use base_protocol::{ChannelId, DERIVATION_VERSION_0, Frame};
 
 /// Identifies a batch submission for receipt tracking.
@@ -21,11 +20,13 @@ pub struct SubmissionId(pub u64);
 /// The driver uses this field on each [`BatchSubmission`] to determine whether
 /// frames should be packed into EIP-4844 blobs or sent as transaction calldata.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum DaType {
     /// Frames are packed into EIP-4844 blobs (default).
     ///
     /// Multiple submissions may be packed into a single blob payload per L1 transaction.
     #[default]
+    #[cfg_attr(feature = "clap", value(name = "blobs", alias = "blob"))]
     Blob,
     /// Each frame is sent as a single calldata transaction
     /// (`[DERIVATION_VERSION_0] ++ frame.encode()`).

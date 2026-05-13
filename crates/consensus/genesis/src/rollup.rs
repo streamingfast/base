@@ -3,26 +3,9 @@
 use alloy_chains::Chain;
 use alloy_hardforks::{EthereumHardfork, EthereumHardforks, ForkCondition};
 use alloy_primitives::Address;
-use base_alloy_chains::{BaseUpgrade, BaseUpgrades};
+use base_common_chains::{BaseUpgrade, ChainConfig, Upgrades};
 
-use crate::{BaseFeeConfig, ChainGenesis, HardForkConfig, base_fee_config};
-
-/// The max rlp bytes per channel for the Bedrock hardfork.
-pub const MAX_RLP_BYTES_PER_CHANNEL_BEDROCK: u64 = 10_000_000;
-
-/// The max rlp bytes per channel for the Fjord hardfork.
-pub const MAX_RLP_BYTES_PER_CHANNEL_FJORD: u64 = 100_000_000;
-
-/// The max sequencer drift when the Fjord hardfork is active.
-pub const FJORD_MAX_SEQUENCER_DRIFT: u64 = 1800;
-
-/// The channel timeout once the Granite hardfork is active.
-pub const GRANITE_CHANNEL_TIMEOUT: u64 = 50;
-
-#[cfg(feature = "serde")]
-const fn default_granite_channel_timeout() -> u64 {
-    GRANITE_CHANNEL_TIMEOUT
-}
+use crate::{ChainGenesis, FeeConfig, HardForkConfig};
 
 /// The Rollup configuration.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -46,7 +29,10 @@ pub struct RollupConfig {
     /// Number of L1 blocks between when a channel can be opened and when it can be closed.
     pub channel_timeout: u64,
     /// The channel timeout after the Granite hardfork.
-    #[cfg_attr(feature = "serde", serde(default = "default_granite_channel_timeout"))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(default = "RollupConfig::default_granite_channel_timeout")
+    )]
     pub granite_channel_timeout: u64,
     /// The L1 chain ID
     pub l1_chain_id: u64,
@@ -75,17 +61,17 @@ pub struct RollupConfig {
     )]
     pub blobs_enabled_l1_timestamp: Option<u64>,
     /// `chain_op_config` is the chain-specific EIP1559 config for the rollup.
-    #[cfg_attr(feature = "serde", serde(default = "BaseFeeConfig::base_mainnet"))]
-    pub chain_op_config: BaseFeeConfig,
+    #[cfg_attr(feature = "serde", serde(default = "FeeConfig::base_mainnet"))]
+    pub chain_op_config: FeeConfig,
 }
 
 #[cfg(feature = "arbitrary")]
 impl<'a> arbitrary::Arbitrary<'a> for RollupConfig {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        use base_alloy_chains::BaseChainConfig;
+        use base_common_chains::ChainConfig;
         let chain_op_config = match u32::arbitrary(u)? % 2 {
-            0 => BaseFeeConfig::from(BaseChainConfig::mainnet()),
-            _ => BaseFeeConfig::from(BaseChainConfig::sepolia()),
+            0 => FeeConfig::from(ChainConfig::mainnet()),
+            _ => FeeConfig::from(ChainConfig::sepolia()),
         };
 
         Ok(Self {
@@ -117,7 +103,7 @@ impl Default for RollupConfig {
             max_sequencer_drift: 0,
             seq_window_size: 0,
             channel_timeout: 0,
-            granite_channel_timeout: GRANITE_CHANNEL_TIMEOUT,
+            granite_channel_timeout: Self::GRANITE_CHANNEL_TIMEOUT,
             l1_chain_id: 0,
             l2_chain_id: Chain::from_id(0),
             hardforks: HardForkConfig::default(),
@@ -126,7 +112,7 @@ impl Default for RollupConfig {
             l1_system_config_address: Address::ZERO,
             protocol_versions_address: Address::ZERO,
             blobs_enabled_l1_timestamp: None,
-            chain_op_config: base_fee_config(0),
+            chain_op_config: FeeConfig::from_chain_id(0),
         }
     }
 }
@@ -264,7 +250,7 @@ impl RollupConfig {
     /// Returns the max sequencer drift for the given timestamp.
     pub fn max_sequencer_drift(&self, timestamp: u64) -> u64 {
         if self.is_fjord_active(timestamp) {
-            FJORD_MAX_SEQUENCER_DRIFT
+            Self::FJORD_MAX_SEQUENCER_DRIFT
         } else {
             self.max_sequencer_drift
         }
@@ -273,9 +259,9 @@ impl RollupConfig {
     /// Returns the max rlp bytes per channel for the given timestamp.
     pub fn max_rlp_bytes_per_channel(&self, timestamp: u64) -> u64 {
         if self.is_fjord_active(timestamp) {
-            MAX_RLP_BYTES_PER_CHANNEL_FJORD
+            Self::MAX_RLP_BYTES_PER_CHANNEL_FJORD
         } else {
-            MAX_RLP_BYTES_PER_CHANNEL_BEDROCK
+            Self::MAX_RLP_BYTES_PER_CHANNEL_BEDROCK
         }
     }
 
@@ -343,7 +329,7 @@ impl EthereumHardforks for RollupConfig {
     }
 }
 
-impl BaseUpgrades for RollupConfig {
+impl Upgrades for RollupConfig {
     fn upgrade_activation(&self, fork: BaseUpgrade) -> ForkCondition {
         match fork {
             BaseUpgrade::Bedrock => ForkCondition::Block(0),
@@ -398,6 +384,25 @@ impl BaseUpgrades for RollupConfig {
 }
 
 impl RollupConfig {
+    /// The max rlp bytes per channel for the Bedrock hardfork.
+    pub const MAX_RLP_BYTES_PER_CHANNEL_BEDROCK: u64 = 10_000_000;
+
+    /// The max rlp bytes per channel for the Fjord hardfork.
+    pub const MAX_RLP_BYTES_PER_CHANNEL_FJORD: u64 = 100_000_000;
+
+    /// The max sequencer drift when the Fjord hardfork is active.
+    pub const FJORD_MAX_SEQUENCER_DRIFT: u64 = 1800;
+
+    /// The channel timeout once the Granite hardfork is active.
+    pub const GRANITE_CHANNEL_TIMEOUT: u64 = 50;
+
+    /// Helper method for deserializing a default granite channel timeout.
+    #[cfg(feature = "serde")]
+    pub const fn default_granite_channel_timeout() -> u64 {
+        Self::GRANITE_CHANNEL_TIMEOUT
+    }
+
+    /// The activation banner for the Base V1 hardfork, printed when the first block of the fork is built or processed.
     const BASE_V1_ACTIVATION_BANNER: &str = include_str!("../static/base_v1_activation_banner.txt");
 
     /// Logs hardfork activation when building or processing the first block of a fork.
@@ -419,6 +424,28 @@ impl RollupConfig {
                 tracing::info!(target: "upgrades", "{line}");
             }
             tracing::info!(target: "upgrades", block_number, "Activating base v1 upgrade");
+        }
+    }
+}
+
+impl From<&ChainConfig> for RollupConfig {
+    fn from(cfg: &ChainConfig) -> Self {
+        Self {
+            genesis: ChainGenesis::from(cfg),
+            block_time: cfg.block_time,
+            max_sequencer_drift: cfg.max_sequencer_drift,
+            seq_window_size: cfg.seq_window_size,
+            channel_timeout: cfg.channel_timeout,
+            granite_channel_timeout: Self::GRANITE_CHANNEL_TIMEOUT,
+            l1_chain_id: cfg.l1_chain_id,
+            l2_chain_id: Chain::from_id(cfg.chain_id),
+            hardforks: HardForkConfig::from(cfg),
+            batch_inbox_address: cfg.batch_inbox_address,
+            deposit_contract_address: cfg.deposit_contract_address,
+            l1_system_config_address: cfg.system_config_address,
+            protocol_versions_address: cfg.protocol_versions_address,
+            blobs_enabled_l1_timestamp: None,
+            chain_op_config: FeeConfig::from(cfg),
         }
     }
 }
@@ -599,10 +626,10 @@ mod tests {
 
     #[test]
     fn test_base_v1_active() {
-        use crate::BaseHardforkConfig;
+        use crate::HardforkConfig;
         let mut config = RollupConfig::default();
         assert!(!config.is_base_v1_active(0));
-        config.hardforks.base = BaseHardforkConfig { v1: Some(10) };
+        config.hardforks.base = HardforkConfig { v1: Some(10) };
         // V1 does not cascade upward to existing forks
         assert!(!config.is_regolith_active(10));
         assert!(!config.is_canyon_active(10));
@@ -613,7 +640,7 @@ mod tests {
 
     #[test]
     fn test_is_first_fork_block() {
-        use crate::BaseHardforkConfig;
+        use crate::HardforkConfig;
         let cfg = RollupConfig {
             hardforks: HardForkConfig {
                 regolith_time: Some(10),
@@ -626,7 +653,7 @@ mod tests {
                 pectra_blob_schedule_time: Some(80),
                 isthmus_time: Some(90),
                 jovian_time: Some(100),
-                base: BaseHardforkConfig { v1: Some(110) },
+                base: HardforkConfig { v1: Some(110) },
             },
             block_time: 2,
             ..Default::default()
@@ -696,7 +723,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.channel_timeout(0), 100);
-        assert_eq!(config.channel_timeout(10), GRANITE_CHANNEL_TIMEOUT);
+        assert_eq!(config.channel_timeout(10), RollupConfig::GRANITE_CHANNEL_TIMEOUT);
         config.hardforks.granite_time = None;
         assert_eq!(config.channel_timeout(10), 100);
     }
@@ -707,7 +734,7 @@ mod tests {
         assert_eq!(config.max_sequencer_drift(0), 100);
         config.hardforks.fjord_time = Some(10);
         assert_eq!(config.max_sequencer_drift(0), 100);
-        assert_eq!(config.max_sequencer_drift(10), FJORD_MAX_SEQUENCER_DRIFT);
+        assert_eq!(config.max_sequencer_drift(10), RollupConfig::FJORD_MAX_SEQUENCER_DRIFT);
     }
 
     #[test]
@@ -795,7 +822,7 @@ mod tests {
             max_sequencer_drift: 600,
             seq_window_size: 3600,
             channel_timeout: 300,
-            granite_channel_timeout: GRANITE_CHANNEL_TIMEOUT,
+            granite_channel_timeout: RollupConfig::GRANITE_CHANNEL_TIMEOUT,
             l1_chain_id: 3151908,
             l2_chain_id: Chain::from_id(1337),
             hardforks: HardForkConfig {
@@ -811,7 +838,7 @@ mod tests {
             l1_system_config_address: address!("94ee52a9d8edd72a85dea7fae3ba6d75e4bf1710"),
             protocol_versions_address: Address::ZERO,
             blobs_enabled_l1_timestamp: None,
-            chain_op_config: base_fee_config(0),
+            chain_op_config: FeeConfig::from_chain_id(0),
         };
 
         let deserialized: RollupConfig = serde_json::from_str(raw).unwrap();
@@ -819,6 +846,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "serde")]
     fn test_rollup_config_unknown_field() {
         let raw: &str = r#"
         {

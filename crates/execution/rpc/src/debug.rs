@@ -8,13 +8,13 @@ use alloy_primitives::B256;
 use alloy_rlp::Encodable;
 use alloy_rpc_types_debug::ExecutionWitness;
 use async_trait::async_trait;
-use base_alloy_chains::BaseUpgrades;
+use base_common_chains::Upgrades;
 use base_execution_payload_builder::{
-    OpAttributes, OpPayloadPrimitives,
-    builder::{OpBuilder, OpPayloadBuilderCtx},
+    Attributes, PayloadPrimitives,
+    builder::{Builder, OpPayloadBuilderCtx},
 };
-use base_execution_trie::{OpProofsStorage, OpProofsStore};
-use base_txpool::BasePooledTransaction;
+use base_execution_trie::{BaseProofsStorage, BaseProofsStore};
+use base_execution_txpool::BasePooledTransaction;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee_core::RpcResult;
 use jsonrpsee_types::error::ErrorObject;
@@ -37,7 +37,7 @@ use tokio::sync::{Semaphore, oneshot};
 
 use crate::{
     metrics::{DebugApiExtMetrics, DebugApis},
-    state::OpStateProviderFactory,
+    state::BaseStateProviderFactory,
 };
 
 /// Represents the current proofs sync status.
@@ -79,15 +79,15 @@ impl<Eth, Storage, Provider, EvmConfig, Attrs> DebugApiExt<Eth, Storage, Provide
 where
     Eth: FullEthApi + Send + Sync + 'static,
     ErrorObject<'static>: From<Eth::Error>,
-    Storage: OpProofsStore + Clone + 'static,
-    Provider: BlockReaderIdExt + NodePrimitivesProvider<Primitives: OpPayloadPrimitives>,
+    Storage: BaseProofsStore + Clone + 'static,
+    Provider: BlockReaderIdExt + NodePrimitivesProvider<Primitives: PayloadPrimitives>,
     EvmConfig: ConfigureEvm<Primitives = Provider::Primitives> + 'static,
 {
     /// Creates a new instance of the `DebugApiExt`.
     pub fn new(
         provider: Provider,
         eth_api: Eth,
-        preimage_store: OpProofsStorage<Storage>,
+        preimage_store: BaseProofsStorage<Storage>,
         task_spawner: Box<dyn TaskSpawner>,
         evm_config: EvmConfig,
     ) -> Self {
@@ -108,39 +108,37 @@ where
 pub struct DebugApiExtInner<Eth: FullEthApi, Storage, Provider, EvmConfig, Attrs> {
     provider: Provider,
     eth_api: Eth,
-    storage: OpProofsStorage<Storage>,
-    state_provider_factory: OpStateProviderFactory<Eth, Storage>,
+    storage: BaseProofsStorage<Storage>,
+    state_provider_factory: BaseStateProviderFactory<Eth, Storage>,
     evm_config: EvmConfig,
     task_spawner: Box<dyn TaskSpawner>,
     semaphore: Semaphore,
     _attrs: PhantomData<Attrs>,
-    metrics: DebugApiExtMetrics,
 }
 
 impl<Eth, P, Provider, EvmConfig, Attrs> DebugApiExtInner<Eth, P, Provider, EvmConfig, Attrs>
 where
     Eth: FullEthApi + Send + Sync + 'static,
     ErrorObject<'static>: From<Eth::Error>,
-    P: OpProofsStore + Clone + 'static,
-    Provider: NodePrimitivesProvider<Primitives: OpPayloadPrimitives>,
+    P: BaseProofsStore + Clone + 'static,
+    Provider: NodePrimitivesProvider<Primitives: PayloadPrimitives>,
 {
     fn new(
         provider: Provider,
         eth_api: Eth,
-        storage: OpProofsStorage<P>,
+        storage: BaseProofsStorage<P>,
         task_spawner: Box<dyn TaskSpawner>,
         evm_config: EvmConfig,
     ) -> Self {
         Self {
             provider,
             storage: storage.clone(),
-            state_provider_factory: OpStateProviderFactory::new(eth_api.clone(), storage),
+            state_provider_factory: BaseStateProviderFactory::new(eth_api.clone(), storage),
             eth_api,
             evm_config,
             task_spawner,
             semaphore: Semaphore::new(3),
             _attrs: PhantomData,
-            metrics: DebugApiExtMetrics::new(),
         }
     }
 }
@@ -149,9 +147,9 @@ impl<Eth, P, Provider, EvmConfig, Attrs> DebugApiExt<Eth, P, Provider, EvmConfig
 where
     Eth: FullEthApi + Send + Sync + 'static,
     ErrorObject<'static>: From<Eth::Error>,
-    P: OpProofsStore + Clone + 'static,
+    P: BaseProofsStore + Clone + 'static,
     Provider: BlockReaderIdExt
-        + NodePrimitivesProvider<Primitives: OpPayloadPrimitives>
+        + NodePrimitivesProvider<Primitives: PayloadPrimitives>
         + HeaderProvider<Header = <Provider::Primitives as NodePrimitives>::BlockHeader>,
 {
     fn parent_header(
@@ -171,146 +169,140 @@ impl<Eth, P, Provider, EvmConfig, Attrs, N> DebugApiOverrideServer<Attrs::RpcPay
 where
     Eth: FullEthApi + Send + Sync + 'static,
     ErrorObject<'static>: From<Eth::Error>,
-    P: OpProofsStore + Clone + 'static,
-    Attrs: OpAttributes<Transaction = TxTy<EvmConfig::Primitives>>,
-    N: OpPayloadPrimitives,
+    P: BaseProofsStore + Clone + 'static,
+    Attrs: Attributes<Transaction = TxTy<EvmConfig::Primitives>>,
+    N: PayloadPrimitives,
     EvmConfig: ConfigureEvm<
             Primitives = N,
             NextBlockEnvCtx: BuildNextEnv<Attrs, N::BlockHeader, Provider::ChainSpec>,
         > + 'static,
     Provider: BlockReaderIdExt<Header = N::BlockHeader>
         + StateProviderFactory
-        + ChainSpecProvider<ChainSpec: BaseUpgrades>
+        + ChainSpecProvider<ChainSpec: Upgrades>
         + NodePrimitivesProvider<Primitives = N>
         + HeaderProvider<Header = N::BlockHeader>
         + Clone
         + 'static,
-    base_alloy_consensus::OpPooledTransaction:
-        TryFrom<<N as OpPayloadPrimitives>::_TX, Error: core::error::Error>,
-    <N as OpPayloadPrimitives>::_TX: From<base_alloy_consensus::OpPooledTransaction>,
+    base_common_consensus::BasePooledTransaction:
+        TryFrom<<N as PayloadPrimitives>::_TX, Error: core::error::Error>,
+    <N as PayloadPrimitives>::_TX: From<base_common_consensus::BasePooledTransaction>,
 {
     async fn execute_payload(
         &self,
         parent_block_hash: B256,
         attributes: Attrs::RpcPayloadAttributes,
     ) -> RpcResult<ExecutionWitness> {
-        self.inner
-            .metrics
-            .record_operation_async(DebugApis::DebugExecutePayload, async {
-                let _permit = self.inner.semaphore.acquire().await;
+        DebugApiExtMetrics::record_operation_async(DebugApis::DebugExecutePayload, async {
+            let _permit = self.inner.semaphore.acquire().await;
 
-                let parent_header = self.parent_header(parent_block_hash).to_rpc_result()?;
+            let parent_header = self.parent_header(parent_block_hash).to_rpc_result()?;
 
-                let (tx, rx) = oneshot::channel();
-                let this = Arc::clone(&self.inner);
-                self.inner.task_spawner.spawn_blocking_task(Box::pin(async move {
-                    let result = async {
-                        let parent_hash = parent_header.hash();
-                        let attributes = Attrs::try_new(parent_hash, attributes, 3)
-                            .map_err(PayloadBuilderError::other)?;
+            let (tx, rx) = oneshot::channel();
+            let this = Arc::clone(&self.inner);
+            self.inner.task_spawner.spawn_blocking_task(Box::pin(async move {
+                let result = async {
+                    let parent_hash = parent_header.hash();
+                    let attributes = Attrs::try_new(parent_hash, attributes, 3)
+                        .map_err(PayloadBuilderError::other)?;
 
-                        let config =
-                            PayloadConfig { parent_header: Arc::new(parent_header), attributes };
-                        let ctx = OpPayloadBuilderCtx {
-                            evm_config: this.evm_config.clone(),
-                            chain_spec: this.provider.chain_spec(),
-                            config,
-                            cancel: Default::default(),
-                            best_payload: Default::default(),
-                            builder_config: Default::default(),
-                        };
-
-                        let state_provider = this
-                            .state_provider_factory
-                            .state_provider(Some(BlockId::Hash(parent_hash.into())))
-                            .await
-                            .map_err(PayloadBuilderError::other)?;
-
-                        let builder = OpBuilder::new(|_| {
-                            NoopPayloadTransactions::<
-                                BasePooledTransaction<
-                                    <N as OpPayloadPrimitives>::_TX,
-                                    base_alloy_consensus::OpPooledTransaction,
-                                >,
-                            >::default()
-                        });
-
-                        builder.witness(state_provider, &ctx).map_err(PayloadBuilderError::other)
+                    let config =
+                        PayloadConfig { parent_header: Arc::new(parent_header), attributes };
+                    let ctx = OpPayloadBuilderCtx {
+                        evm_config: this.evm_config.clone(),
+                        chain_spec: this.provider.chain_spec(),
+                        config,
+                        cancel: Default::default(),
+                        best_payload: Default::default(),
+                        builder_config: Default::default(),
                     };
 
-                    let _ = tx.send(result.await);
-                }));
+                    let state_provider = this
+                        .state_provider_factory
+                        .state_provider(Some(BlockId::Hash(parent_hash.into())))
+                        .await
+                        .map_err(PayloadBuilderError::other)?;
 
-                rx.await
-                    .map_err(|err| internal_rpc_err(err.to_string()))?
-                    .map_err(|err| internal_rpc_err(err.to_string()))
-            })
-            .await
+                    let builder = Builder::new(|_| {
+                        NoopPayloadTransactions::<
+                            BasePooledTransaction<
+                                <N as PayloadPrimitives>::_TX,
+                                base_common_consensus::BasePooledTransaction,
+                            >,
+                        >::default()
+                    });
+
+                    builder.witness(state_provider, &ctx).map_err(PayloadBuilderError::other)
+                };
+
+                let _ = tx.send(result.await);
+            }));
+
+            rx.await
+                .map_err(|err| internal_rpc_err(err.to_string()))?
+                .map_err(|err| internal_rpc_err(err.to_string()))
+        })
+        .await
     }
 
     async fn execution_witness(&self, block_id: BlockNumberOrTag) -> RpcResult<ExecutionWitness> {
-        self.inner
-            .metrics
-            .record_operation_async(DebugApis::DebugExecutionWitness, async {
-                let _permit = self.inner.semaphore.acquire().await;
+        DebugApiExtMetrics::record_operation_async(DebugApis::DebugExecutionWitness, async {
+            let _permit = self.inner.semaphore.acquire().await;
 
-                let block = self
-                    .inner
-                    .eth_api
-                    .recovered_block(block_id.into())
-                    .await?
-                    .ok_or(EthApiError::HeaderNotFound(block_id.into()))?;
+            let block = self
+                .inner
+                .eth_api
+                .recovered_block(block_id.into())
+                .await?
+                .ok_or(EthApiError::HeaderNotFound(block_id.into()))?;
 
-                let this = Arc::clone(&self.inner);
-                let block_number = block.header().number();
+            let this = Arc::clone(&self.inner);
+            let block_number = block.header().number();
 
-                let state_provider = this
-                    .state_provider_factory
-                    .state_provider(Some(BlockId::Number(block.parent_num_hash().number.into())))
-                    .await
-                    .map_err(EthApiError::from)?;
-                let db = StateProviderDatabase::new(&state_provider);
-                let block_executor = this.eth_api.evm_config().executor(db);
+            let state_provider = this
+                .state_provider_factory
+                .state_provider(Some(BlockId::Number(block.parent_num_hash().number.into())))
+                .await
+                .map_err(EthApiError::from)?;
+            let db = StateProviderDatabase::new(&state_provider);
+            let block_executor = this.eth_api.evm_config().executor(db);
 
-                let mut witness_record = ExecutionWitnessRecord::default();
+            let mut witness_record = ExecutionWitnessRecord::default();
 
-                let _ = block_executor
-                    .execute_with_state_closure(&block, |statedb: &State<_>| {
-                        witness_record.record_executed_state(statedb);
-                    })
-                    .map_err(EthApiError::from)?;
+            let _ = block_executor
+                .execute_with_state_closure(&block, |statedb: &State<_>| {
+                    witness_record.record_executed_state(statedb);
+                })
+                .map_err(EthApiError::from)?;
 
-                let ExecutionWitnessRecord { hashed_state, codes, keys, lowest_block_number } =
-                    witness_record;
+            let ExecutionWitnessRecord { hashed_state, codes, keys, lowest_block_number } =
+                witness_record;
 
-                let state = state_provider
-                    .witness(Default::default(), hashed_state)
-                    .map_err(EthApiError::from)?;
-                let mut exec_witness =
-                    ExecutionWitness { state, codes, keys, ..Default::default() };
+            let state = state_provider
+                .witness(Default::default(), hashed_state)
+                .map_err(EthApiError::from)?;
+            let mut exec_witness = ExecutionWitness { state, codes, keys, ..Default::default() };
 
-                // If there were no calls to the BLOCKHASH opcode, return only the
-                // parent header.
-                let smallest =
-                    lowest_block_number.unwrap_or_else(|| block_number.saturating_sub(1));
+            // If there were no calls to the BLOCKHASH opcode, return only the
+            // parent header.
+            let smallest = lowest_block_number.unwrap_or_else(|| block_number.saturating_sub(1));
 
-                let range = smallest..block_number;
-                exec_witness.headers = self
-                    .inner
-                    .provider
-                    .headers_range(range)
-                    .map_err(EthApiError::from)?
-                    .into_iter()
-                    .map(|header| {
-                        let mut serialized_header = Vec::new();
-                        header.encode(&mut serialized_header);
-                        serialized_header.into()
-                    })
-                    .collect();
+            let range = smallest..block_number;
+            exec_witness.headers = self
+                .inner
+                .provider
+                .headers_range(range)
+                .map_err(EthApiError::from)?
+                .into_iter()
+                .map(|header| {
+                    let mut serialized_header = Vec::new();
+                    header.encode(&mut serialized_header);
+                    serialized_header.into()
+                })
+                .collect();
 
-                Ok(exec_witness)
-            })
-            .await
+            Ok(exec_witness)
+        })
+        .await
     }
 
     async fn proofs_sync_status(&self) -> RpcResult<ProofsSyncStatus> {

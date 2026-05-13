@@ -5,9 +5,10 @@
 //! path):
 //!
 //! * [`OpPostTxExtras`] — re-emits the three fee-vault balance changes that
-//!   [`base_revm::OpHandler::reward_beneficiary`] applies via `Journal::balance_incr` during
-//!   revm's post_execution phase. Revm fires no inspector hooks in that phase, so without this
-//!   the L1FeeVault / BaseFeeVault / OperatorFeeVault credits would be invisible to the tracer.
+//!   [`base_common_evm::OpHandler::reward_beneficiary`] applies via `Journal::balance_incr`
+//!   during revm's post_execution phase. Revm fires no inspector hooks in that phase, so without
+//!   this the L1FeeVault / BaseFeeVault / OperatorFeeVault credits would be invisible to the
+//!   tracer.
 //!
 //! * [`OpPreTxAdjust`] — patches the per-tx [`firehose_tracer::types::TxEvent`] before it
 //!   reaches the tracer. OP deposit transaction envelopes carry no nonce field
@@ -17,11 +18,8 @@
 
 use alloy_evm::Evm as _;
 use alloy_primitives::{Address, Bytes, U256};
-use base_alloy_evm::OpEvm;
-use base_revm::{
-    BASE_FEE_RECIPIENT, DEPOSIT_TRANSACTION_TYPE, L1_FEE_RECIPIENT, OPERATOR_FEE_RECIPIENT,
-    OpContext, OpSpecId, OpTxTr,
-};
+use base_common_consensus::Predeploys;
+use base_common_evm::{BaseEvm, DEPOSIT_TRANSACTION_TYPE, OpSpecId, OpTxTr};
 use firehose_tracer::firehose_debug;
 use firehose_tracer::pb::sf::ethereum::r#type::v2::balance_change::Reason;
 use firehose_tracer::types::{TxEvent, TxType};
@@ -34,12 +32,14 @@ use reth_revm::revm::{
     interpreter::{InterpreterResult, interpreter::EthInterpreter},
 };
 
+use base_common_evm::OpContext;
+
 /// Emits the three OP Stack fee vault balance changes that `OpHandler::reward_beneficiary`
 /// applies via `Journal::balance_incr` during revm's post_execution phase.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpPostTxExtras;
 
-impl<DB, I, P> PostTxExtras<OpEvm<DB, I, P>> for OpPostTxExtras
+impl<DB, I, P> PostTxExtras<BaseEvm<DB, I, P>> for OpPostTxExtras
 where
     DB: alloy_evm::Database,
     I: Inspector<OpContext<DB>, EthInterpreter> + FirehoseInspectorApi,
@@ -47,7 +47,7 @@ where
 {
     fn emit_post_tx_extras(
         &self,
-        evm: &mut OpEvm<DB, I, P>,
+        evm: &mut BaseEvm<DB, I, P>,
         gas_used: u64,
         base_fee: u64,
     ) {
@@ -123,9 +123,9 @@ where
         // gate, pre-London basefee, etc.).
         let (db, inspector, _) = evm.components_mut();
         for (vault, amount) in [
-            (BASE_FEE_RECIPIENT, base_fee_amount),
-            (L1_FEE_RECIPIENT, l1_cost),
-            (OPERATOR_FEE_RECIPIENT, operator_fee_cost),
+            (Predeploys::BASE_FEE_VAULT, base_fee_amount),
+            (Predeploys::L1_FEE_VAULT, l1_cost),
+            (Predeploys::OPERATOR_FEE_VAULT, operator_fee_cost),
         ] {
             if amount.is_zero() {
                 firehose_debug!(
@@ -160,7 +160,7 @@ where
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpPreTxAdjust;
 
-impl<DB, I, P> PreTxAdjust<OpEvm<DB, I, P>> for OpPreTxAdjust
+impl<DB, I, P> PreTxAdjust<BaseEvm<DB, I, P>> for OpPreTxAdjust
 where
     DB: alloy_evm::Database,
     I: Inspector<OpContext<DB>, EthInterpreter> + FirehoseInspectorApi,
@@ -168,7 +168,7 @@ where
 {
     fn adjust_tx_event(
         &self,
-        evm: &mut OpEvm<DB, I, P>,
+        evm: &mut BaseEvm<DB, I, P>,
         tx_event: &mut TxEvent,
         sender: Address,
     ) {

@@ -60,8 +60,8 @@ use alloy_rpc_types::{
     state::{EvmOverrides, StateOverride, StateOverridesBuilder},
 };
 use alloy_rpc_types_eth::{Filter, Log};
-use base_alloy_network::Base;
-use base_alloy_rpc_types::OpTransactionRequest;
+use base_common_network::Base;
+use base_common_rpc_types::BaseTransactionRequest;
 use jsonrpsee::{
     core::{RpcResult, async_trait},
     proc_macros::rpc,
@@ -78,7 +78,7 @@ use tokio::{sync::broadcast::error::RecvError, time};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{debug, trace, warn};
 
-use crate::{FlashblocksAPI, Metrics, PendingBlocksAPI};
+use crate::{FlashblocksAPI, PendingBlocksAPI, metrics::Metrics};
 
 /// Max configured timeout for `eth_sendRawTransactionSync` in milliseconds.
 const MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS: u64 = 6_000;
@@ -130,7 +130,7 @@ pub trait EthApiOverride {
     #[method(name = "call")]
     async fn call(
         &self,
-        transaction: OpTransactionRequest,
+        transaction: BaseTransactionRequest,
         block_number: Option<BlockId>,
         state_overrides: Option<StateOverride>,
         block_overrides: Option<Box<BlockOverrides>>,
@@ -140,7 +140,7 @@ pub trait EthApiOverride {
     #[method(name = "estimateGas")]
     async fn estimate_gas(
         &self,
-        transaction: OpTransactionRequest,
+        transaction: BaseTransactionRequest,
         block_number: Option<BlockId>,
         overrides: Option<StateOverride>,
     ) -> RpcResult<U256>;
@@ -149,7 +149,7 @@ pub trait EthApiOverride {
     #[method(name = "simulateV1")]
     async fn simulate_v1(
         &self,
-        opts: SimulatePayload<OpTransactionRequest>,
+        opts: SimulatePayload<BaseTransactionRequest>,
         block_number: Option<BlockId>,
     ) -> RpcResult<Vec<SimulatedBlock<RpcBlock<Base>>>>;
 
@@ -171,13 +171,12 @@ pub struct EthApiExt<Eth: EthApiTypes, FB> {
     eth_api: Eth,
     eth_filter: EthFilter<Eth>,
     flashblocks_state: Arc<FB>,
-    metrics: Metrics,
 }
 
 impl<Eth: EthApiTypes, FB> EthApiExt<Eth, FB> {
     /// Creates a new extended Eth API instance with flashblocks support.
-    pub fn new(eth_api: Eth, eth_filter: EthFilter<Eth>, flashblocks_state: Arc<FB>) -> Self {
-        Self { eth_api, eth_filter, flashblocks_state, metrics: Metrics::default() }
+    pub const fn new(eth_api: Eth, eth_filter: EthFilter<Eth>, flashblocks_state: Arc<FB>) -> Self {
+        Self { eth_api, eth_filter, flashblocks_state }
     }
 }
 
@@ -199,7 +198,7 @@ where
         );
 
         if number.is_pending() {
-            self.metrics.rpc_get_block_by_number.increment(1);
+            Metrics::rpc_get_block_by_number().increment(1);
             let pending_blocks = self.flashblocks_state.get_pending_blocks();
             if pending_blocks.as_ref().is_some() {
                 return Ok(pending_blocks.get_block(full));
@@ -233,7 +232,7 @@ where
         // Fall back to flashblocks for pending transactions
         let pending_blocks = self.flashblocks_state.get_pending_blocks();
         if let Some(fb_receipt) = pending_blocks.get_transaction_receipt(tx_hash) {
-            self.metrics.rpc_get_transaction_receipt.increment(1);
+            Metrics::rpc_get_transaction_receipt().increment(1);
             return Ok(Some(fb_receipt));
         }
 
@@ -251,7 +250,7 @@ where
         );
         let block_id = block_number.unwrap_or_default();
         if block_id.is_pending() {
-            self.metrics.rpc_get_balance.increment(1);
+            Metrics::rpc_get_balance().increment(1);
             let pending_blocks = self.flashblocks_state.get_pending_blocks();
             if let Some(balance) = pending_blocks.get_balance(address) {
                 return Ok(balance);
@@ -273,7 +272,7 @@ where
 
         let block_id = block_number.unwrap_or_default();
         if block_id.is_pending() {
-            self.metrics.rpc_get_transaction_count.increment(1);
+            Metrics::rpc_get_transaction_count().increment(1);
             let pending_blocks = self.flashblocks_state.get_pending_blocks();
             let canon_block = pending_blocks.get_canonical_block_number();
             let fb_count = pending_blocks.get_transaction_count(address);
@@ -312,7 +311,7 @@ where
         // Fall back to flashblocks for pending transactions
         let pending_blocks = self.flashblocks_state.get_pending_blocks();
         if let Some(fb_transaction) = pending_blocks.get_transaction_by_hash(tx_hash) {
-            self.metrics.rpc_get_transaction_by_hash.increment(1);
+            Metrics::rpc_get_transaction_by_hash().increment(1);
             return Ok(Some(fb_transaction));
         }
 
@@ -377,7 +376,7 @@ where
 
     async fn call(
         &self,
-        transaction: OpTransactionRequest,
+        transaction: BaseTransactionRequest,
         block_number: Option<BlockId>,
         state_overrides: Option<StateOverride>,
         block_overrides: Option<Box<BlockOverrides>>,
@@ -394,7 +393,7 @@ where
         let mut pending_overrides = EvmOverrides::default();
         // If the call is to pending block use cached override (if it exists)
         if block_id.is_pending() {
-            self.metrics.rpc_call.increment(1);
+            Metrics::rpc_call().increment(1);
             let pending_blocks = self.flashblocks_state.get_pending_blocks();
             block_id = pending_blocks.get_canonical_block_number().into();
             pending_overrides.state = pending_blocks.get_state_overrides();
@@ -420,7 +419,7 @@ where
 
     async fn estimate_gas(
         &self,
-        transaction: OpTransactionRequest,
+        transaction: BaseTransactionRequest,
         block_number: Option<BlockId>,
         overrides: Option<StateOverride>,
     ) -> RpcResult<U256> {
@@ -435,7 +434,7 @@ where
         let mut pending_overrides = EvmOverrides::default();
         // If the call is to pending block use cached override (if it exists)
         if block_id.is_pending() {
-            self.metrics.rpc_estimate_gas.increment(1);
+            Metrics::rpc_estimate_gas().increment(1);
             let pending_blocks = self.flashblocks_state.get_pending_blocks();
             block_id = pending_blocks.get_canonical_block_number().into();
             pending_overrides.state = pending_blocks.get_state_overrides();
@@ -453,7 +452,7 @@ where
 
     async fn simulate_v1(
         &self,
-        opts: SimulatePayload<OpTransactionRequest>,
+        opts: SimulatePayload<BaseTransactionRequest>,
         block_number: Option<BlockId>,
     ) -> RpcResult<Vec<SimulatedBlock<RpcBlock<Eth::NetworkTypes>>>> {
         debug!(
@@ -466,14 +465,14 @@ where
 
         // If the call is to pending block use cached override (if it exists)
         if block_id.is_pending() {
-            self.metrics.rpc_simulate_v1.increment(1);
+            Metrics::rpc_simulate_v1().increment(1);
             let pending_blocks = self.flashblocks_state.get_pending_blocks();
             block_id = pending_blocks.get_canonical_block_number().into();
             pending_overrides.state = pending_blocks.get_state_overrides();
         }
 
         // Prepend flashblocks pending overrides to the block state calls
-        let mut block_state_calls: Vec<SimBlock<OpTransactionRequest>> = Vec::new();
+        let mut block_state_calls: Vec<SimBlock<BaseTransactionRequest>> = Vec::new();
         for sim_block in opts.block_state_calls {
             let mut state_overrides_builder =
                 StateOverridesBuilder::new(pending_overrides.state.clone().unwrap_or_default());
@@ -513,7 +512,7 @@ where
         }
 
         // Mixed query: toBlock is pending, so we need to combine historical + pending logs
-        self.metrics.rpc_get_logs.increment(1);
+        Metrics::rpc_get_logs().increment(1);
         let mut all_logs = Vec::new();
 
         let pending_blocks = self.flashblocks_state.get_pending_blocks();
@@ -559,7 +558,7 @@ where
         );
 
         if number.is_pending() {
-            self.metrics.rpc_get_block_transaction_count_by_number.increment(1);
+            Metrics::rpc_get_block_transaction_count_by_number().increment(1);
             let pending_blocks = self.flashblocks_state.get_pending_blocks();
             if let Some(block) = pending_blocks.get_block(false) {
                 let count = block.transactions.len();
