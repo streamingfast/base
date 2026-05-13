@@ -3,7 +3,7 @@
 ### Changes
 
 * Update workspace version to `v0.8.0`.
-* Update all `streamingfast/reth` dependencies from `branch = "release/reth-1.x"` to `tag = "v1.11.4-fh"`.
+* Update all `streamingfast/reth` dependencies from `branch = "release/reth-1.x"` to `tag = "v1.11.4-fh-1"`.
 
 ## v0.7.6-fh
 
