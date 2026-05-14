@@ -3008,6 +3008,7 @@ dependencies = [
  "base-execution-chainspec",
  "base-execution-consensus",
  "base-execution-evm",
+ "base-execution-firehose",
  "base-execution-payload-builder",
  "base-execution-rpc",
  "base-execution-trie",

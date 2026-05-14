@@ -4,6 +4,7 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 pub mod cli;
+pub mod firehose;
 
 use base_bundle_extension::BundleExtension;
 use base_execution_cli::Cli;
@@ -16,6 +17,8 @@ use base_tx_forwarding::TxForwardingExtension;
 use base_txpool_rpc::{TxPoolRpcConfig, TxPoolRpcExtension};
 use base_txpool_tracing::{TxPoolExtension, TxpoolConfig};
 
+use crate::firehose::FirehoseExtension;
+
 type NodeCli = Cli<cli::Args>;
 
 #[global_allocator]
@@ -25,10 +28,13 @@ fn main() {
     base_cli_utils::init_common!();
     base_reth_cli::init_reth!();
 
+    firehose::init();
+
     let cli = base_cli_utils::parse_cli!(NodeCli);
 
     cli.run(|builder, args| async move {
         let mut runner = BaseNodeRunner::new(args.rollup_args.clone());
+        runner.install_ext::<FirehoseExtension>(());
 
         // Create flashblocks config first so we can share its state with metering
         let flashblocks_config: Option<FlashblocksConfig> = (&args).into();
