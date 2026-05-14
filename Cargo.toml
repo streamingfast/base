@@ -648,13 +648,64 @@ ark-bls12-381 = { version = "0.5.0", default-features = false }
 
 # Firehose tracer (defined by the streamingfast reth fork, release/reth-1.x branch).
 reth-firehose = { git = "https://github.com/streamingfast/reth.git", tag = "v1.11.4-fh-1" }
-firehose-tracer = "5.0.0"
+firehose-tracer = "5.1.1"
 
 [patch.crates-io]
 # Route EVM system calls (EIP-4788, EIP-2935, ...) through the Inspector when inspect mode
 # is enabled — without this, the Firehose inspector misses system-call state changes.
 # Mirrors the patch applied on the streamingfast reth fork at release/reth-1.x.
 alloy-evm = { git = "https://github.com/streamingfast/evm.git", branch = "sf/v0.27.3" }
+# The crates.io SP1 v6.1.0 release is partially broken: several crates were never
+# published (only v6.2.0 exists), and the ones that did publish 6.1.0 incorrectly pin
+# `sp1-derive = "6.2.0"`, which generates derive code calling methods (e.g.
+# `MachineAir::column_names`) that don't exist on the 6.1.0 traits. On top of that,
+# letting any 6.1.0 SP1 crate resolve from crates.io brings in a parallel copy of every
+# `slop-*` crate from the registry, so types from the registry copies don't satisfy
+# trait bounds defined in the git-workspace copies (and vice versa).
+#
+# Redirect the entire SP1 v6.1.0 dependency surface to the v6.1.0 git tag so all
+# `sp1-*` and `slop-*` crates resolve from a single consistent workspace.
+sp1-core-executor = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+sp1-core-executor-runner = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+sp1-core-machine = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+sp1-hypercube = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+sp1-derive = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+sp1-jit = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+sp1-primitives = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+sp1-prover = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+sp1-prover-types = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+sp1-verifier = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+sp1-recursion-circuit = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+sp1-recursion-machine = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+sp1-recursion-compiler = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+sp1-recursion-executor = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+sp1-recursion-gnark-ffi = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-air = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-dft = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-fri = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-alloc = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-bn254 = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-whir = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-utils = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-commit = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-matrix = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-tensor = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-jagged = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-stacked = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-algebra = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-futures = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-sumcheck = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-basefold = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-symmetric = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-poseidon2 = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-baby-bear = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-primitives = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-challenger = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-koala-bear = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-multilinear = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-merkle-tree = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-maybe-rayon = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
+slop-basefold-prover = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
 
 [patch."https://github.com/paradigmxyz/reth"]
 reth-db = { git = "https://github.com/streamingfast/reth.git", tag = "v1.11.4-fh-1" }

@@ -45,6 +45,10 @@ alloy-eip7928.workspace = true
 alloy-consensus.workspace = true
 alloy-primitives.workspace = true
 
+base-execution-firehose.workspace = true
+reth-firehose.workspace = true
+firehose-tracer.workspace = true
+
 eyre.workspace = true
 tokio.workspace = true
 tracing.workspace = true

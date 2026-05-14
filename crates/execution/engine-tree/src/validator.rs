@@ -505,7 +505,7 @@ where
             if reth_firehose::is_tracer_initialized() {
                 let sealed = self.convert_to_block(input)?;
                 let tracer =
-                    reth_firehose::FirehoseBlockTracer::start::<OpPrimitives>(&sealed, None);
+                    reth_firehose::FirehoseBlockTracer::start::<BasePrimitives>(&sealed, None);
                 let is_genesis = tracer.is_genesis();
                 firehose_tracer::firehose_debug!(
                     "validator: firehose tracer initialized (block={}, is_genesis={})",
@@ -531,12 +531,13 @@ where
         // We pick based on whether a live tracer guard is available for this block (see Firehose
         // preamble above for when the guard is `None` — notably the block-1 genesis marker).
         let (output, senders, receipt_root_rx) = match fh_tracer.as_mut() {
-            Some(tracer) => match self
-                .execute_and_trace_block(state_provider, env, &input, tracer, &mut handle)
-            {
-                Ok(output) => output,
-                Err(err) => return self.handle_execution_error(input, err, &parent_block),
-            },
+            Some(tracer) => {
+                match self.execute_and_trace_block(state_provider, env, &input, tracer, &mut handle)
+                {
+                    Ok(output) => output,
+                    Err(err) => return self.handle_execution_error(input, err, &parent_block),
+                }
+            }
             None => match self.execute_block(state_provider, env, &input, &mut handle) {
                 Ok(output) => output,
                 Err(err) => return self.handle_execution_error(input, err, &parent_block),
@@ -908,10 +909,10 @@ where
         env: ExecutionEnv<Evm>,
         input: &BlockOrPayload<T>,
         tracer: &mut reth_firehose::FirehoseBlockTracer,
-        handle: &mut PayloadHandle<impl ExecutableTxFor<Evm>, Err, OpReceipt>,
+        handle: &mut PayloadHandle<impl ExecutableTxFor<Evm>, Err, BaseReceipt>,
     ) -> Result<
         (
-            BlockExecutionOutput<OpReceipt>,
+            BlockExecutionOutput<BaseReceipt>,
             Vec<Address>,
             tokio::sync::oneshot::Receiver<(B256, alloy_primitives::Bloom)>,
         ),
@@ -920,12 +921,12 @@ where
     where
         S: StateProvider + Send,
         Err: core::error::Error + Send + Sync + 'static,
-        V: PayloadValidator<T, Block = OpBlock>,
+        V: PayloadValidator<T, Block = BaseBlock>,
         T: PayloadTypes<
-                BuiltPayload: BuiltPayload<Primitives = OpPrimitives>,
-                ExecutionData = OpExecutionData,
+                BuiltPayload: BuiltPayload<Primitives = BasePrimitives>,
+                ExecutionData = ExecutionData,
             >,
-        Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = OpPrimitives>,
+        Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = BasePrimitives>,
     {
         debug!(target: "engine::tree::payload_validator", "Executing block (with Firehose tracing)");
 
@@ -937,10 +938,9 @@ where
                 .build()
         });
 
-        let ctx =
-            self.execution_ctx_for(input).map_err(|e: <Evm as ConfigureEvm>::Error| {
-                InsertBlockErrorKind::Other(Box::new(e))
-            })?;
+        let ctx = self
+            .execution_ctx_for(input)
+            .map_err(|e: <Evm as ConfigureEvm>::Error| InsertBlockErrorKind::Other(Box::new(e)))?;
 
         // Install the Firehose inspector on the EVM — the inspector borrows the tracer until the
         // executor is consumed in `finish()`.
@@ -948,7 +948,7 @@ where
         let inspector = tracer.inspector();
         let evm = self.evm_config.evm_with_env_and_inspector(&mut db, env.evm_env, inspector);
 
-        let op_executor = OpBlockExecutor::new(
+        let op_executor = BaseBlockExecutor::new(
             evm,
             ctx,
             self.provider.chain_spec(),
@@ -957,9 +957,8 @@ where
 
         // Pre-materialize withdrawals so the Firehose wrapper can emit them as part of the
         // end-of-block event.
-        let withdrawals = input
-            .withdrawals()
-            .map(|w| alloy_eips::eip4895::Withdrawals::new(w.to_vec()));
+        let withdrawals =
+            input.withdrawals().map(|w| alloy_eips::eip4895::Withdrawals::new(w.to_vec()));
         let mut executor = reth_firehose::FirehoseWrappedExecutor::with_hooks(
             op_executor,
             withdrawals,
