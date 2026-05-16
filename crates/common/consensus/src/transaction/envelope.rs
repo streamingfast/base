@@ -679,31 +679,6 @@ pub(super) mod serde_bincode_compat {
     }
 }
 
-impl SignatureFields for BaseTxEnvelope {
-    fn signature_fields(&self) -> (B256, B256, Bytes) {
-        let sig = match self.signature() {
-            Some(sig) => sig,
-            // Deposit transactions have no signature; return zero values.
-            None => return (B256::ZERO, B256::ZERO, Bytes::new()),
-        };
-        let y_parity = sig.v() as u64;
-        let v = match self {
-            // Legacy without EIP-155: V = 27 or 28
-            // Legacy with EIP-155: V = chain_id * 2 + 35 + y_parity
-            Self::Legacy(signed) => {
-                signed.tx().chain_id.map_or_else(|| 27 + y_parity, |chain_id| chain_id * 2 + 35 + y_parity)
-            }
-            // Typed transactions (EIP-2930, EIP-1559, EIP-7702): V = 0 or 1
-            _ => y_parity,
-        };
-        (
-            B256::new(sig.r().to_be_bytes::<32>()),
-            B256::new(sig.s().to_be_bytes::<32>()),
-            u64_to_trimmed_bytes(v),
-        )
-    }
-}
-
 impl InMemorySize for BaseTxEnvelope {
     fn size(&self) -> usize {
         match self {
