@@ -1,7 +1,7 @@
 # Firehose Integration Tests for Base Transactions
 
 mode: feature
-state: planned
+state: review
 root_git: .worktrees/feature/firehose-integration-tests
 worktree: .worktrees/feature/firehose-integration-tests
 branch: feature/firehose-integration-tests
@@ -60,13 +60,11 @@ The new `base-firehose-tests` crate depends on `reth-firehose-tests` and provide
 
 The `firehose/1.x` branch of `streamingfast/reth` already contains all the required public-visibility changes to `reth-firehose-tests` (verified at commit `06e46c3`). No PR is needed — the code is already there. The implementor should:
 
-0a. Cut a new tag on `streamingfast/reth`'s `firehose/1.x` branch (e.g. `v1.11.4-fh-2`) that captures the current HEAD (`06e46c3 Reformatted code`) which includes all the public-visibility changes.
-
-0b. Update **all** `reth`-namespaced entries in base's root `Cargo.toml` from `tag = "v1.11.4-fh-1"` to `tag = "v1.11.4-fh-2"` (or whatever tag is cut).
+0b. Update **all** `reth`-namespaced entries in base's root `Cargo.toml` from `tag = "v1.11.4-fh-1"` to branch `firehose/1.x`
 
 0c. Add `reth-firehose-tests` to `[workspace.dependencies]` in base's root `Cargo.toml`:
   ```toml
-  reth-firehose-tests = { git = "https://github.com/streamingfast/reth.git", tag = "v1.11.4-fh-2" }
+  reth-firehose-tests = { git = "https://github.com/streamingfast/reth.git", <branch ...> }
   ```
 
 #### Step 1 — Create crate skeleton at `crates/execution/firehose-tests/`
@@ -231,9 +229,9 @@ Verify the exact fields available in `firehose-tracer` at the version pinned in 
 
 ## State Tracker
 
-**Last Updated:** 2026-05-13
-**Current Step:** Done — planned
-**Status:** Spec updated per Dev Feedback; Part 1 removed (already done on branch); Step 0 updated to "tag + Cargo.toml bump"
+**Last Updated:** 2026-05-16
+**Current Step:** Done — ready for review
+**Status:** Implementation complete; `cargo test -p base-firehose-tests --test prestate` passes (`nop_transfer ... ok`)
 
 | Step | Status | Notes |
 |---|---|---|
@@ -244,3 +242,7 @@ Verify the exact fields available in `firehose-tracer` at the version pinned in 
 | Phase 5 — Spec Review (Round 1) | Done | User rejected: requested reuse of reth-firehose-tests generic parts |
 | Phase 5 — Spec Review (Round 2) | Done | Revised spec: Part 1 = upstream changes to reth-firehose-tests; Part 2 = thin base-firehose-tests layer |
 | Dev Feedback — Verify reth fork | Done | Cloned v1.11.4-fh-1 tag and firehose/1.x branch; confirmed Part 1 changes already on branch at commit 06e46c3; no v1.11.4-fh-2 tag yet; Part 1 removed from spec; Step 0 updated to "cut new tag + update Cargo.toml" |
+| Step 0 — Update workspace deps to branch | Done | All reth deps changed from tag v1.11.4-fh-1 → branch firehose/1.x; reth-firehose-tests + base-firehose-tests added to workspace; firehose-tracer bumped to 5.1.1 |
+| Step 1–7 — Crate implementation | Done | crates/execution/firehose-tests/ created with src/lib.rs, src/prestate.rs, tests/prestate.rs, tests/cases/nop_transfer/ (prestate.json + block.2099.binpb), examples/generate_golden.rs |
+| SignatureFields for BaseTxEnvelope | Done | Added to crates/common/consensus/src/reth_compat.rs; deposit txs return (B256::ZERO, B256::ZERO, Bytes::new()) |
+| Tests | Done | `cargo test -p base-firehose-tests --test prestate` → `test nop_transfer ... ok` |
