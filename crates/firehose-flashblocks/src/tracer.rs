@@ -51,6 +51,19 @@ impl FlashblocksTracerHandle {
     pub fn new(config: firehose_tracer::config::Config, chain_config: ChainConfig) -> Self {
         let lock = stdout_lock();
         let writer: Box<dyn Write + Send> = Box::new(SynchronizedStdout::new(lock));
+        Self::with_writer(config, chain_config, writer)
+    }
+
+    /// Constructs the dedicated tracer with a custom writer.
+    ///
+    /// Useful in tests where output must be captured to a buffer rather than written to stdout.
+    /// The caller is responsible for ensuring stdout serialisation when using a custom writer in
+    /// combination with the global live-block tracer.
+    pub fn with_writer(
+        config: firehose_tracer::config::Config,
+        chain_config: ChainConfig,
+        writer: Box<dyn Write + Send>,
+    ) -> Self {
         let mut tracer = Tracer::new_with_writer(config, writer);
         tracer.on_blockchain_init(
             FLASHBLOCK_TRACER_ID,

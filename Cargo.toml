@@ -360,6 +360,7 @@ reth-tasks = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.4" }
 reth-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.4" }
 reth-codecs = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.4" }
 reth-db-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.4" }
+reth-db-models = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.4" }
 reth-discv4 = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.4" }
 reth-discv5 = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.4" }
 reth-metrics = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.4" }
@@ -733,6 +734,7 @@ reth-provider = { git = "https://github.com/streamingfast/reth.git", branch = "f
 reth-cli-util = { git = "https://github.com/streamingfast/reth.git", branch = "firehose/1.x" }
 reth-node-api = { git = "https://github.com/streamingfast/reth.git", branch = "firehose/1.x" }
 reth-db-common = { git = "https://github.com/streamingfast/reth.git", branch = "firehose/1.x" }
+reth-db-models = { git = "https://github.com/streamingfast/reth.git", branch = "firehose/1.x" }
 reth-rpc-layer = { git = "https://github.com/streamingfast/reth.git", branch = "firehose/1.x" }
 reth-node-core = { git = "https://github.com/streamingfast/reth.git", branch = "firehose/1.x" }
 reth-consensus = { git = "https://github.com/streamingfast/reth.git", branch = "firehose/1.x" }

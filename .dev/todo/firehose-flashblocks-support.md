@@ -51,7 +51,21 @@ The `evm-firehose-tracer-rs` dependency (`firehose-tracer`) might requires some 
 
 ## Dev Feedback
 
-Ok we have implemented the necesary changes requested in plan on `streamingfast/reth`, update to `branch firehose/1.x` to benefit from it. Adjust plan now with this new information
+**Implementation feedback**
+- Run an analysis in a subagent using Opus high effort to analyze if this flashblocks worktree branch is equivalent in semantic behavior (both should emit the same sequence of FIRE ... events when presented against the same state and sequence of flashblocks) from our Geth implementation https://github.com/streamingfast/go-ethereum/tree/release/optimism-1.x-fh3.0/node/flashblock (out of scope: differences in architecture, code layout).
+- Launch a subagent sonnet to add a test framework at a highish level so we can prove most of the implementation work. This new framework will be put crates/firehose-flashblocks/tests since those will be more like integration tests.
+
+  What I want to see in the tests
+  - Top-level test cases have nice abstraction to "stream" events out, define helpers to help construct easily the various flashblocks possible sequence something like vec![flashBase(<good defaults, easy extensibility>), flashDelta(), ...]
+  (or as iterable).
+  - The test framework spins up a WebSocket server that stream test case events out on connected peers
+  - The test case runner configures the Flashblock infrastructure against a local state database, if you can look at task feature/firehose-integration-tests (its a git branch), it contains important pieces we could re-use here.
+  - The test case runner validates the sequence of `FIRE` elements, we will need to decode them
+  - The test case defines the expected sequence using a vec![...] with helpers to showcase.
+  - We will probably need to disable some verification of the block also since we might not be constructing a fully valid block.
+  - We can start all test from a common genesis which act as both genesis block and genesis state
+
+  *DO NOT* add tests coverage here, perform the simplest possible test first which is to emit a flashBase and checking that a corresponding FIRE is emitted
 
 ## Spec & Implementation
 
@@ -729,11 +743,87 @@ existing `FirehoseExtension` wiring. The implementor should align with that patt
 
 ---
 
+## Semantic Equivalence Analysis (Rust vs Go)
+
+Comparing `FirehoseFlashblocksProcessor` (Rust) against the Go implementation at
+`streamingfast/go-ethereum/tree/release/optimism-1.x-fh3.0/node/flashblock/`.
+
+**Verdict: Functionally equivalent for the core tracing path. Four known behavioral divergences,
+all documented below. None affect correctness of the emitted transaction traces.**
+
+### Behavioral Equivalences
+
+Both implementations:
+- Subscribe via WebSocket to `FlashblocksPayloadV1` messages
+- Validate flashblock sequence (must be strictly monotonic within a block)
+- Carry EVM state across flashblocks (accumulated_db / bundle state)
+- Bootstrap from canonical chain provider when there is a gap in block numbers
+- Apply pre-execution changes (EIP-4788, etc.) only on the first flashblock (index=0)
+- Execute each flashblock's transactions through a traced EVM executor
+- Emit one `FIRE BLOCK` partial per flashblock via `on_block_start` + `on_block_end`
+- Pass `idx = 0` for the base flashblock to the firehose tracer (both Go and Rust)
+
+### Behavioral Divergences
+
+**1. `is_final` flag (important)**
+
+Go: Uses peek-ahead (`LastSentIndex` + next message's block number) to determine if the
+current flashblock is the last one for a block. When the next base message arrives for
+block N+1, Go retroactively marks block N's last flashblock as `is_final=true`, emitting
+`FIRE BLOCK N <idx + 1000> ...` for that block.
+
+Rust: Always hardcodes `is_final = false`. The `idx + 1000` sentinel in the FIRE BLOCK
+line is never emitted. The reason: `FlashblocksPayloadV1` / `Metadata` does not carry a
+per-payload "final" marker. The peek-ahead pattern from Go would require buffering the
+current flashblock until the next message arrives, which complicates the sequential
+processing model significantly.
+
+Impact: Downstream consumers cannot detect the last partial for a block from the FIRE
+BLOCK line alone. The consumer must infer finality from the canonical FIRE BLOCK (idx=0)
+that the live-block tracer emits when the canonical block arrives.
+
+**2. PayloadID validation**
+
+Go: Validates that all flashblocks within the same block number carry the same PayloadID.
+A mismatch triggers a reset/skip for the block.
+
+Rust: No PayloadID validation. The sequence validator only checks block number + index
+monotonicity. In practice, the WS feed should not send mismatched PayloadIDs for the same
+block, so this is a defense-in-depth gap rather than a functional correctness gap.
+
+**3. Timestamp/staleness check**
+
+Go: Skips execution if the flashblock timestamp is more than some threshold in the past
+("too far behind"). Avoids executing stale flashblocks that arrived very late.
+
+Rust: No timestamp check. Every flashblock is executed regardless of how old it is. This
+can be addressed later if excessive staleness becomes an operational concern.
+
+**4. Notification messages / PayloadID-keyed feed**
+
+Go: Receives special `0xdeadbeef` notification messages from NewPayload calls on the
+engine API path. These are used to initialize the state for a new block before the first
+flashblock arrives.
+
+Rust: No equivalent notification. The processor is purely reactive to WS messages from
+the flashblocks feed. Bootstrap happens on-demand when the first base flashblock for a
+block arrives.
+
+### Non-Issue Differences (out of scope per dev feedback)
+
+- Architecture (Go: controller+processor split; Rust: single processor struct)
+- Parallel transaction message preparation (Go uses up to 10 workers; Rust is sequential)
+- `SnapshotFlashBlockForNextIteration` call (Go explicitly snapshots; Rust's State<DB>
+  accumulates naturally without explicit snapshots)
+- Reconnection strategy (both implement reconnect/retry; different implementations)
+
+---
+
 ## State Tracker
 
 **Last Updated:** 2026-05-20 UTC
-**Current Step:** Done — implementation complete, set `state: review`.
-**Status:** New crate `base-firehose-flashblocks` (5 modules) is wired into `bin/node` behind `--firehose-flashblocks-url`; full default-members workspace builds; `cargo clippy -- -D warnings` is clean; `cargo test -p base-firehose-flashblocks` runs 4 tests (all pass) and emits one `FIRE INIT 3.1 reth-flashblock 0.8.0` line as expected.
+**Current Step:** Done — integration test framework added, state set to `review`.
+**Status:** New crate `base-firehose-flashblocks` (5 modules) is wired into `bin/node` behind `--firehose-flashblocks-url`; full default-members workspace builds; `cargo clippy -- -D warnings` is clean; `cargo test -p base-firehose-flashblocks` runs 5 tests (all pass).
 
 ### Known gaps / follow-ups for the reviewer
 
@@ -757,6 +847,11 @@ existing `FirehoseExtension` wiring. The implementor should align with that patt
 - End-to-end behavior (a real flashblock WS feed driving a running node and the
   downstream firehose consumer reading the emitted partials) is not exercised by
   the unit tests in this branch.
+- The base flashblock (raw index=0) emits `FIRE BLOCK N 0` (flash_idx=0), which is
+  the same as a canonical block in the FIRE protocol. Both Go and Rust pass `idx=0`
+  to the tracer for the base flashblock. In practice, the two tracer streams are
+  distinguishable by their distinct `FIRE INIT` headers (`reth` vs `reth-flashblock`)
+  rather than by per-line `flash_idx` values.
 
 | Step | Status | Notes |
 |---|---|---|
@@ -775,3 +870,5 @@ existing `FirehoseExtension` wiring. The implementor should align with that patt
 | Step 6 — CLI flag | Done | `bin/node/src/cli.rs`: `--firehose-flashblocks-url <Url>` as `Option<Url>`. Independent of `--flashblocks-url`. |
 | Step 7 — Node wiring | Done | `bin/node/src/main.rs`: declares `pub mod firehose;` and installs `FirehoseFlashblocksExtension` when the flag is `Some`. `bin/node/src/firehose.rs::FirehoseFlashblocksExtension` uses `add_node_started_hook` — gates on `reth_firehose::is_tracer_initialized()`, builds the dedicated tracer from the node's chain id, and starts the streamer. `bin/node/Cargo.toml` gets `base-firehose-flashblocks`, `reth-chainspec`, and `tracing`. |
 | Step 8 — Tests + clippy + drive-by fixes | Done | 4 unit tests in the new crate: 3× `Error` Display invariants + 1× `FlashblocksTracerHandle::new` smoke test that emits `FIRE INIT 3.1 reth-flashblock 0.8.0` (verified by inspecting stdout). Drive-by clippy fixes outside the new crate (all pre-existing `-D warnings` failures, none caused by this work): `crates/builder/core/src/flashblocks/context.rs` (gate `B256` import behind `cfg(any(test, feature = "test-utils"))`), `crates/execution/engine-tree/src/validator.rs` (backtick `BaseFeeVault`/`L1FeeVault`/`OperatorFeeVault` in doc comment), `crates/execution/firehose/{src/extras.rs, README.md}` (same doc_markdown treatment). `cargo clippy -- -D warnings` is now clean across default-members. `cargo build` of default-members succeeds. |
+| Step 9 — Dev Feedback: Integration test framework (2026-05-20) | Done | Added `crates/firehose-flashblocks/tests/flashblock_sequence.rs` integration test. Framework: `GenesisClient` mock (implements all 40+ reth provider traits, returns genesis header for all header lookups, routes state to `GenesisStateProvider` wrapping `StateProviderTest`); `flash_base(block_number, parent_hash, timestamp)` builder; `ws_server_once(sequence)` one-shot WS server using `tokio-tungstenite`; `fire_block_lines(raw)` parser; `run_flashblock_sequence(client, sequence)` harness (buffer-backed tracer via `FlashblocksTracerHandle::with_writer`). Added `with_writer` constructor to `FlashblocksTracerHandle` for test isolation. Test `flash_base_emits_fire_block` sends one base flashblock for block 1 and asserts `FIRE BLOCK 1 0` is emitted (raw index=0 maps to printed flash_idx=0). Added workspace deps: `reth-db-models` (needed by `BlockBodyIndicesProvider`). Added dev-deps: `reth-revm` with `test-utils` feature, `revm`, `alloy-rpc-types-engine`. `cargo test -p base-firehose-flashblocks` → 5 tests, all pass. `cargo clippy -p base-firehose-flashblocks --tests -- -D warnings` → clean. |
+| Step 10 — Dev Feedback: Semantic equivalence analysis (2026-05-20) | Done | See "Semantic Equivalence Analysis" section above. Summary: 4 behavioral divergences (is_final peek-ahead missing, no PayloadID validation, no timestamp staleness check, no notification messages). Core tracing path (tx execution + FIRE BLOCK emission) is equivalent to the Go implementation. |
