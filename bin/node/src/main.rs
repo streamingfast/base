@@ -17,7 +17,7 @@ use base_tx_forwarding::TxForwardingExtension;
 use base_txpool_rpc::{TxPoolRpcConfig, TxPoolRpcExtension};
 use base_txpool_tracing::{TxPoolExtension, TxpoolConfig};
 
-use crate::firehose::FirehoseExtension;
+use crate::firehose::{FirehoseExtension, FirehoseFlashblocksExtension};
 
 type NodeCli = Cli<cli::Args>;
 
@@ -35,6 +35,10 @@ fn main() {
     cli.run(|builder, args| async move {
         let mut runner = BaseNodeRunner::new(args.rollup_args.clone());
         runner.install_ext::<FirehoseExtension>(());
+
+        if let Some(url) = args.firehose_flashblocks_url.clone() {
+            runner.install_ext::<FirehoseFlashblocksExtension>(Some(url));
+        }
 
         // Create flashblocks config first so we can share its state with metering
         let flashblocks_config: Option<FlashblocksConfig> = (&args).into();

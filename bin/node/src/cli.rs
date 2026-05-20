@@ -22,6 +22,16 @@ pub struct Args {
     #[arg(long, alias = "websocket-url")]
     pub flashblocks_url: Option<Url>,
 
+    /// WebSocket URL of a flashblocks feed to re-execute through a dedicated Firehose tracer.
+    ///
+    /// When set (and the Firehose tracer is initialized), each incoming flashblock is
+    /// re-executed and emitted as a partial-block FIRE event so the downstream Firehose
+    /// consumer can observe state ahead of canonical engine-API confirmation. Independent of
+    /// `--flashblocks-url` (which drives RPC pending state, not Firehose). Disabled (no-op)
+    /// when unset.
+    #[arg(long = "firehose-flashblocks-url")]
+    pub firehose_flashblocks_url: Option<Url>,
+
     /// The max pending blocks depth.
     #[arg(
         long = "max-pending-blocks-depth",
