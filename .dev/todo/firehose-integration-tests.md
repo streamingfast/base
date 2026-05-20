@@ -19,15 +19,10 @@ We want to have Firehose integration tests that run real Base transaction, trace
 
 ## Dev Feedback
 
-2. Our reth fork at `https://github.com/streamingfast/reth/tree/firehose/1.x` has all the requested changes defined by you in `Part 1` below. Clone and inspect that the changes are correct according to our plan and adjust the plan with the new details. and removal of part 1 which is not needed.
+**Round #2**
 
-**Verified (2026-05-13):** Cloned both `v1.11.4-fh-1` tag and `firehose/1.x` branch HEAD.
-- Tag `v1.11.4-fh-1` (currently used by base): `Prestate`, `TraceContext`, `seed_cache_db`, `build_account_info`, `parse_fire_block_for`, `decode_hex` are all **private** in prestate.rs — Part 1 changes are NOT in this tag.
-- Branch `firehose/1.x` HEAD (commit `06e46c3`, "Reformatted code"): All those items are **already public**, and `lib.rs` already re-exports them all — exactly what Part 1 required.
-- There is no `v1.11.4-fh-2` tag yet; only `v1.11.4-fh-1` exists.
-- `reth-firehose-tests` is not in base's `[workspace.dependencies]` yet.
-
-**Conclusion:** Part 1 is done on the branch but not yet tagged. Step 0 in the plan is updated to: "cut a new tag on the `firehose/1.x` branch and update base's Cargo.toml to that tag + add `reth-firehose-tests` to workspace deps." Part 1 section removed from the spec.
+1. Change `GOLDEN_UPDATE` to `GOLDEN_UPDATE` everywhere needed
+1. Delete generate_golden.rs, this is not the right approach anyway, will revisit this after merger in a subsequent task
 
 ## Spec & Implementation
 
@@ -109,7 +104,7 @@ pub use reth_firehose_tests::{assert_block_equals_golden, RunOutcome};
 #### Step 5 — Create test data for `nop_transfer`
 
 - Craft a minimal `prestate.json` with a simple ETH-transfer signed transaction, a genesis seeding the sender with enough ETH, and a block context matching a post-Regolith OP block
-- Run with `UPDATE_GOLDENS=true` to produce the golden `.binpb`
+- Run with `GOLDEN_UPDATE=true` to produce the golden `.binpb`
 - Commit both files under `tests/cases/nop_transfer/`
 
 #### Step 6 — Write `tests/prestate.rs`
@@ -223,15 +218,15 @@ Verify the exact fields available in `firehose-tracer` at the version pinned in 
 | Start with one test case (`nop_transfer`) | Minimal viable harness; more cases easy to add |
 | Use `OpPreTxAdjust` / `OpPostTxExtras` from `base-execution-firehose` | Already implemented and tested for OP Stack |
 | Goldens are committed binary files (`.binpb`) | Same pattern as reference; no runtime generation |
-| `UPDATE_GOLDENS` env-var convenience in `assert_block_equals_golden` | Standard pattern for regenerating goldens (already exists in reference, lives in `reth-firehose-tests`) |
+| `GOLDEN_UPDATE` env-var convenience in `assert_block_equals_golden` | Standard pattern for regenerating goldens (already exists in reference, lives in `reth-firehose-tests`) |
 
 ---
 
 ## State Tracker
 
-**Last Updated:** 2026-05-16
-**Current Step:** Done — ready for review
-**Status:** Implementation complete; `cargo test -p base-firehose-tests --test prestate` passes (`nop_transfer ... ok`)
+**Last Updated:** 2026-05-20
+**Current Step:** Done — ready for review (Round 2)
+**Status:** Round 2 feedback applied; `cargo test -p base-firehose-tests --test prestate` and `cargo clippy -p base-firehose-tests -- -D warnings` both pass
 
 | Step | Status | Notes |
 |---|---|---|
@@ -246,3 +241,6 @@ Verify the exact fields available in `firehose-tracer` at the version pinned in 
 | Step 1–7 — Crate implementation | Done | crates/execution/firehose-tests/ created with src/lib.rs, src/prestate.rs, tests/prestate.rs, tests/cases/nop_transfer/ (prestate.json + block.2099.binpb), examples/generate_golden.rs |
 | SignatureFields for BaseTxEnvelope | Done | Added to crates/common/consensus/src/reth_compat.rs; deposit txs return (B256::ZERO, B256::ZERO, Bytes::new()) |
 | Tests | Done | `cargo test -p base-firehose-tests --test prestate` → `test nop_transfer ... ok` |
+| Dev Feedback Round 2 — Rename UPDATE_GOLDENS → GOLDEN_UPDATE | Done | Renamed in tests/prestate.rs and task file spec |
+| Dev Feedback Round 2 — Delete examples/generate_golden.rs | Done | File deleted; [[example]] entry removed from Cargo.toml |
+| Dev Feedback Round 2 — Clippy clean | Done | Fixed option_if_let_else (reth_compat.rs), redundant_clone (prestate.rs), doc_markdown backticks (firehose README + extras.rs) |
