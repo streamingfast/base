@@ -68,6 +68,9 @@ futures.workspace = true
 # serialization
 serde_json.workspace = true
 
+# assertions
+pretty_assertions.workspace = true
+
 [[test]]
 name = "flashblock_sequence"
 path = "tests/flashblock_sequence.rs"
