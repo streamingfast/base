@@ -4331,7 +4331,6 @@ dependencies = [
  "reth-primitives-traits",
  "reth-provider",
  "reth-revm",
- "rstest",
  "thiserror 2.0.18",
  "tracing",
  "url",

@@ -13,7 +13,9 @@ pub enum Error {
     /// Could not fetch a [`reth_provider::StateProvider`] for the parent block within the
     /// retry window. Happens when canonical state hasn't caught up to flashblock pace and the
     /// processor has no carried-forward `accumulated_db` to fall back on.
-    #[error("state provider for parent of block {block_number} (parent {parent_hash:?}) not available after retries")]
+    #[error(
+        "state provider for parent of block {block_number} (parent {parent_hash:?}) not available after retries"
+    )]
     StateProviderTimeout {
         /// Block number whose parent state we attempted to fetch.
         block_number: u64,
@@ -52,4 +54,42 @@ pub enum Error {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_provider_timeout_display_includes_block_and_parent() {
+        let err = Error::StateProviderTimeout {
+            block_number: 123,
+            parent_hash: B256::repeat_byte(0xab),
+        };
+        let s = err.to_string();
+        assert!(s.contains("123"), "missing block number in: {s}");
+        assert!(s.contains("0xab"), "missing parent hash in: {s}");
+    }
+
+    #[test]
+    fn transaction_decoding_display_includes_index_and_message() {
+        let err = Error::TransactionDecoding {
+            tx_index: 4,
+            message: "boom".to_string(),
+        };
+        let s = err.to_string();
+        assert!(s.contains('4'), "missing tx_index in: {s}");
+        assert!(s.contains("boom"), "missing message in: {s}");
+    }
+
+    #[test]
+    fn evm_env_display_includes_block() {
+        let err = Error::EvmEnv {
+            block_number: 999,
+            source: Box::new(std::io::Error::other("noise")),
+        };
+        let s = err.to_string();
+        assert!(s.contains("999"), "missing block_number in: {s}");
+        assert!(s.contains("noise"), "missing source in: {s}");
+    }
 }

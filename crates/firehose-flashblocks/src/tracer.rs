@@ -65,3 +65,25 @@ impl FlashblocksTracerHandle {
         &mut self.tracer
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use firehose_tracer::config::{ChainClient, ChainConfig, Config};
+    use reth_firehose::init_stdout_lock;
+
+    use super::*;
+
+    #[test]
+    fn new_succeeds_when_stdout_lock_is_initialized() {
+        // `init_stdout_lock` is idempotent; calling it before construction avoids the
+        // `stdout_lock not initialized` panic without depending on the global tracer's
+        // single-shot `init_tracer`.
+        let _ = init_stdout_lock();
+
+        let config = Config { chain_client: ChainClient::Reth, ..Default::default() };
+        let chain_config = ChainConfig::new(8453);
+        let mut handle = FlashblocksTracerHandle::new(config, chain_config);
+        let _ = handle.tracer_mut();
+    }
+}
+
