@@ -51,21 +51,19 @@ The `evm-firehose-tracer-rs` dependency (`firehose-tracer`) might requires some 
 
 ## Dev Feedback
 
-**Implementation feedback**
-- Run an analysis in a subagent using Opus high effort to analyze if this flashblocks worktree branch is equivalent in semantic behavior (both should emit the same sequence of FIRE ... events when presented against the same state and sequence of flashblocks) from our Geth implementation https://github.com/streamingfast/go-ethereum/tree/release/optimism-1.x-fh3.0/node/flashblock (out of scope: differences in architecture, code layout).
-- Launch a subagent sonnet to add a test framework at a highish level so we can prove most of the implementation work. This new framework will be put crates/firehose-flashblocks/tests since those will be more like integration tests.
+1. `The reason: `FlashblocksPayloadV1` / `Metadata` does not carry a per-payload "final" marker.`
 
-  What I want to see in the tests
-  - Top-level test cases have nice abstraction to "stream" events out, define helpers to help construct easily the various flashblocks possible sequence something like vec![flashBase(<good defaults, easy extensibility>), flashDelta(), ...]
-  (or as iterable).
-  - The test framework spins up a WebSocket server that stream test case events out on connected peers
-  - The test case runner configures the Flashblock infrastructure against a local state database, if you can look at task feature/firehose-integration-tests (its a git branch), it contains important pieces we could re-use here.
-  - The test case runner validates the sequence of `FIRE` elements, we will need to decode them
-  - The test case defines the expected sequence using a vec![...] with helpers to showcase.
-  - We will probably need to disable some verification of the block also since we might not be constructing a fully valid block.
-  - We can start all test from a common genesis which act as both genesis block and genesis state
+   Investigate this further, where `is_final` comes from exactly in op-geth? We normally follow the same semantic structure for the WebSocket received message, AFAIK, there is no indeed such field is_final. So where is_final would get populated in op-geth counterpart? I know we added a quick change in engine newPayload to be notified rapidly of a new block in geth, even before it gets executed in geth.
 
-  *DO NOT* add tests coverage here, perform the simplest possible test first which is to emit a flashBase and checking that a corresponding FIRE is emitted
+   **Investigation complete — see "is_final Investigation" section in Spec & Implementation below.**
+
+2. Split .worktrees/feature/firehose-flashblocks-support/crates/firehose-flashblocks/tests/flashblock_sequence.rs so the framework is in its own file `framework.rs` and then each group file will contain on test cases.
+
+   **Done. Framework is now at `tests/framework/mod.rs` (a Cargo subdirectory, so it is not compiled as a standalone binary). `tests/flashblock_sequence.rs` imports it with `mod framework;` and contains only test cases.**
+
+3. Add actual parsing of FIRE ... lines so we can verify the content too. The firehose-tracer should have some code to do that but you might need to re-implement some elements (that we would then port back to firehose-tracer) as I don't think it supports FIRE 3.1 protocol parsing (flashblock support, but maybe ...).
+
+   **Done. `firehose-tracer 5.1.0` has `printer::compute_printed_flash_block_index` but no line parser. Implemented `ParsedFireBlock` struct and `parse_fire_blocks()` in `tests/framework/mod.rs`. Two integration tests now assert block_number, printed_flash_idx, is_final, flash_idx, block_hash, prev_block_number, lib_num, and timestamp_ns.**
 
 ## Spec & Implementation
 
@@ -819,11 +817,112 @@ block arrives.
 
 ---
 
+## is_final Investigation (Dev Feedback Item 1)
+
+**Source files read:** `node/flashblock/controller.go` from `streamingfast/go-ethereum` branch
+`release/optimism-1.x-fh3.0`.
+
+### Where `is_final` comes from in op-geth
+
+`is_final` is **not** a field anywhere in `FlashblocksPayloadV1` or `Metadata`. The WS protocol
+has no per-message "final" marker. Go derives `is_final` at the call site through two distinct
+mechanisms, both implemented in `controller.go::processMessage`.
+
+#### Mechanism 1 — Peek-ahead on the WS message channel
+
+After the controller accumulates a delta (index > 0), it peeks at the next message in the
+in-memory buffered channel:
+
+```go
+if nextMsg, ok := c.msgChannel.Peek(); ok {
+    // ... skip any 0xdeadbeef notification messages in the peek position ...
+    if nextMsg != nil && nextMsg.Static != nil {
+        if uint64(nextMsg.Static.BlockNumber) == c.state.ExecutableData.Number+1 {
+            // Next message is a base for block N+1 → current delta is the last for block N
+            expectedBlockHash = &nextMsg.Static.ParentHash
+        }
+    }
+}
+isFinalBlock := expectedBlockHash != nil
+```
+
+When the next queued message is the base for `block N+1`, the controller knows the current
+flashblock is the last one for `block N` and passes `isLastFlashBlock=true` to the processor,
+which then calls `tracer.SetFinalFlashBlock(...)`. The `OnBlockStart` hook receives
+`FlashBlock.Idx = currentIndex` and Go's Firehose tracer maps that through its own
+`compute_printed_flash_block_index` equivalent to emit `idx + 1000` in the FIRE BLOCK line.
+
+**Key property**: The peek can only see the NEXT message; if the message queue is empty (the WS
+feed hasn't sent the next base yet), the peek fails and `isFinalBlock = false`. So even in Go,
+if messages arrive slowly (one at a time with gaps), `is_final` is set on the same iteration
+that the next base happens to be buffered, not necessarily on the actual last delta.
+
+#### Mechanism 2 — Engine API `NewPayload` notification (the `0xdeadbeef` path)
+
+In `engine/payload_handler.go` (or equivalent), the op-geth team added a hook in the engine
+API `newPayload` call that sends a special synthetic message into the flashblock controller's
+channel:
+
+```go
+// From Controller.SendNotification (called by engine newPayload handler):
+notification := &FlashblocksPayloadV1{
+    Version:         hexutil.Bytes{0xde, 0xad, 0xbe, 0xef},
+    Index:           blockNumber,           // the canonical block number arriving
+    ParentFlashHash: &blockHash,            // the canonical block hash
+}
+c.msgChannel.C <- notification
+```
+
+When the controller sees this notification (via `isNotificationMessage(msg)`), it knows:
+> "The canonical block N just arrived via engine API — execute the current accumulated state
+> with `isLastFlashBlock=true` right now, before we even receive the next WS message."
+
+This means the `is_final` signal can come either from (a) the WS peek or (b) the engine API
+notification, whichever arrives first. In practice the engine `newPayload` arrives a few ms
+before the next flashblock's WS base message, so the notification path fires first.
+
+### What the Rust equivalent would look like
+
+The Rust equivalent requires two changes:
+
+**A. WS peek-ahead**: The `FlashblocksSubscriber` would need to expose a `Peek` operation on
+its internal channel, or the processor's `on_flashblock_received` callback would need to accept
+a "next message" hint. Currently `FlashblocksReceiver::on_flashblock_received` only receives
+the current message. A redesign would be needed: either the subscriber calls back with
+`(current, Option<next>)`, or we use a tokio `watch` channel where the processor can always
+read the latest state.
+
+**B. Engine API notification**: The reth engine tree (`crates/execution/engine-tree/`) would
+need to call a method on `FirehoseFlashblocksProcessor` when `engine_newPayload` is called.
+This is analogous to the Go `SendNotification` call. The processor would then immediately
+execute the current accumulated state with `is_final=true`, even if no more WS messages arrive.
+
+### Recommendation
+
+**Do not implement `is_final` in this PR.** The current `is_final=false` hardcode is acceptable
+because:
+
+1. Downstream consumers already distinguish flashblock streams from canonical streams via the
+   distinct `FIRE INIT` header (`reth-flashblock` vs `reth`). Within the flashblock stream,
+   `is_final` is a "quality of life" signal, not a correctness requirement.
+2. The peek-ahead mechanism requires a non-trivial redesign of `FlashblocksReceiver` trait.
+3. The engine API notification hook requires cross-crate wiring into `engine-tree`, which is
+   a significant change outside the scope of this feature.
+
+A follow-up PR can add `is_final` support once the architecture is stable. The two levers:
+- **Short-term heuristic**: buffer the current flashblock and delay execution by one tick;
+  when the next WS message arrives for block N+1, re-execute the buffered flashblock with
+  `is_final=true`. Adds one flashblock of latency but requires no engine-tree changes.
+- **Proper signal**: wire `engine_newPayload` → `FirehoseFlashblocksProcessor::notify_canonical`
+  callback to trigger immediate final execution with `is_final=true`.
+
+---
+
 ## State Tracker
 
 **Last Updated:** 2026-05-20 UTC
-**Current Step:** Done — integration test framework added, state set to `review`.
-**Status:** New crate `base-firehose-flashblocks` (5 modules) is wired into `bin/node` behind `--firehose-flashblocks-url`; full default-members workspace builds; `cargo clippy -- -D warnings` is clean; `cargo test -p base-firehose-flashblocks` runs 5 tests (all pass).
+**Current Step:** Step 11 — Dev Feedback round 2 (is_final investigation, test split, FIRE parsing).
+**Status:** New crate `base-firehose-flashblocks` (5 modules) is wired into `bin/node` behind `--firehose-flashblocks-url`; full default-members workspace builds; `cargo clippy -- -D warnings` is clean; `cargo test -p base-firehose-flashblocks` runs 6 tests (all pass).
 
 ### Known gaps / follow-ups for the reviewer
 
@@ -872,3 +971,4 @@ block arrives.
 | Step 8 — Tests + clippy + drive-by fixes | Done | 4 unit tests in the new crate: 3× `Error` Display invariants + 1× `FlashblocksTracerHandle::new` smoke test that emits `FIRE INIT 3.1 reth-flashblock 0.8.0` (verified by inspecting stdout). Drive-by clippy fixes outside the new crate (all pre-existing `-D warnings` failures, none caused by this work): `crates/builder/core/src/flashblocks/context.rs` (gate `B256` import behind `cfg(any(test, feature = "test-utils"))`), `crates/execution/engine-tree/src/validator.rs` (backtick `BaseFeeVault`/`L1FeeVault`/`OperatorFeeVault` in doc comment), `crates/execution/firehose/{src/extras.rs, README.md}` (same doc_markdown treatment). `cargo clippy -- -D warnings` is now clean across default-members. `cargo build` of default-members succeeds. |
 | Step 9 — Dev Feedback: Integration test framework (2026-05-20) | Done | Added `crates/firehose-flashblocks/tests/flashblock_sequence.rs` integration test. Framework: `GenesisClient` mock (implements all 40+ reth provider traits, returns genesis header for all header lookups, routes state to `GenesisStateProvider` wrapping `StateProviderTest`); `flash_base(block_number, parent_hash, timestamp)` builder; `ws_server_once(sequence)` one-shot WS server using `tokio-tungstenite`; `fire_block_lines(raw)` parser; `run_flashblock_sequence(client, sequence)` harness (buffer-backed tracer via `FlashblocksTracerHandle::with_writer`). Added `with_writer` constructor to `FlashblocksTracerHandle` for test isolation. Test `flash_base_emits_fire_block` sends one base flashblock for block 1 and asserts `FIRE BLOCK 1 0` is emitted (raw index=0 maps to printed flash_idx=0). Added workspace deps: `reth-db-models` (needed by `BlockBodyIndicesProvider`). Added dev-deps: `reth-revm` with `test-utils` feature, `revm`, `alloy-rpc-types-engine`. `cargo test -p base-firehose-flashblocks` → 5 tests, all pass. `cargo clippy -p base-firehose-flashblocks --tests -- -D warnings` → clean. |
 | Step 10 — Dev Feedback: Semantic equivalence analysis (2026-05-20) | Done | See "Semantic Equivalence Analysis" section above. Summary: 4 behavioral divergences (is_final peek-ahead missing, no PayloadID validation, no timestamp staleness check, no notification messages). Core tracing path (tx execution + FIRE BLOCK emission) is equivalent to the Go implementation. |
+| Step 11 — Dev Feedback round 2: is_final investigation + test split + FIRE parsing (2026-05-20) | Done | (1) Investigated is_final in op-geth controller.go — see "is_final Investigation" section. Two mechanisms: WS peek-ahead and engine newPayload 0xdeadbeef notification. Documented recommendation to defer to a follow-up PR. (2) Split test file: framework moved to `tests/framework/mod.rs` (Cargo subdirectory, not compiled as standalone binary); `tests/flashblock_sequence.rs` imports via `mod framework;` and holds only test cases. (3) Replaced `fire_block_lines` with `ParsedFireBlock` struct + `parse_fire_blocks()` implementing the full FIRE 3.1 BLOCK line format. Added second integration test `flash_base_plus_delta_emits_two_fire_blocks` that exercises `flash_delta`, `flash_idx`, `is_final`, `block_hash`, `prev_block_number`, `lib_num`, `timestamp_ns`. `cargo test -p base-firehose-flashblocks` → 6 tests, all pass. `cargo clippy -p base-firehose-flashblocks --tests -- -D warnings` → clean. |
