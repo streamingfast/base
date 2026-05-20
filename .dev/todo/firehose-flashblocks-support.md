@@ -1,7 +1,7 @@
 # Firehose Flashblocks Support
 
 mode: feature
-state: in_progress
+state: review
 root_git: .worktrees/feature/firehose-flashblocks-support
 worktree: .worktrees/feature/firehose-flashblocks-support
 branch: feature/firehose-flashblocks-support
@@ -732,8 +732,31 @@ existing `FirehoseExtension` wiring. The implementor should align with that patt
 ## State Tracker
 
 **Last Updated:** 2026-05-20 UTC
-**Current Step:** Step 1 — Crate scaffolding (`crates/firehose-flashblocks/`)
-**Status:** Branch rebased onto `firehose/0.x` so live-tracer prereqs are in place; workspace `cargo check` of default-members passes; ready to scaffold the new crate.
+**Current Step:** Done — implementation complete, set `state: review`.
+**Status:** New crate `base-firehose-flashblocks` (5 modules) is wired into `bin/node` behind `--firehose-flashblocks-url`; full default-members workspace builds; `cargo clippy -- -D warnings` is clean; `cargo test -p base-firehose-flashblocks` runs 4 tests (all pass) and emits one `FIRE INIT 3.1 reth-flashblock 0.8.0` line as expected.
+
+### Known gaps / follow-ups for the reviewer
+
+- `is_final` on the emitted partial block is hardcoded to `false`. The wire-level
+  `FlashblocksPayloadV1` / `Metadata` does not expose a per-payload "final" marker,
+  so the `idx + 1000` sentinel in `firehose-tracer 5.1.0::printer::compute_printed_flash_block_index`
+  is never triggered. Downstream consumers still see correct partial idx values; they
+  just can't tell ahead of time which idx is the last for the block. The proper signal
+  would either need (a) an upstream wire-protocol addition or (b) a heuristic (e.g.
+  "this idx N has been followed by block N+1's base").
+- The processor logs metrics via `tracing` only; no Prometheus/`base-metrics`
+  Counter/Histogram are exposed yet. The spec called for a `metrics.rs` module —
+  trivially addable once we know which counters the operations team wants.
+- The `accumulated_db` cross-block carry-forward path uses
+  `State::builder().with_database(StateProviderDatabase::new(provider))…build()`
+  to bootstrap. This depends on `state_by_block_number_or_tag(parent)` returning a
+  provider whose underlying snapshot reflects everything before block N — which
+  the canonical-chain provider does but may briefly lag the flashblock feed.
+  The 20×100ms retry covers that; if it turns out to be too aggressive in
+  practice, raising `STATE_PROVIDER_MAX_RETRIES` is the lever.
+- End-to-end behavior (a real flashblock WS feed driving a running node and the
+  downstream firehose consumer reading the emitted partials) is not exercised by
+  the unit tests in this branch.
 
 | Step | Status | Notes |
 |---|---|---|
@@ -744,4 +767,11 @@ existing `FirehoseExtension` wiring. The implementor should align with that patt
 | Phase 5 — Spec Review (round 1) | Done | Updated per dev feedback; crate rename, cross-block state, firehose-tracer confirmed, concurrency design, reth-firehose changes section, rebase step added |
 | Phase 5 — Spec Review (round 2, 2026-05-20) | Done | Upstream changes landed on `streamingfast/reth` `firehose/1.x` (commits `bb7699f28` + `c9cf230de`). Workspace `Cargo.toml` + `Cargo.lock` bumped from `tag = "v1.11.4-fh-1"` to `branch = "firehose/1.x"`. Removed entire "Required Changes to reth-firehose" section (3 sub-changes were all landed). Removed Step 1 (upstream patch work) — implementation now starts at "create new crate". `FlashblocksTracerHandle::new` rewritten to use `Tracer::new_with_writer(Config, Box::new(SynchronizedStdout::new(stdout_lock())))` matching the actual upstream API. Documented `is_final` wire encoding (`idx + 1000`) handled inside `firehose-tracer 5.1.0`. Added open item: whether the dedicated flashblock tracer should emit its own `on_blockchain_init`. |
 | Phase 6 — Rebase + prereqs (2026-05-20) | Done | Rebased branch onto `firehose/0.x` so the live-tracer prereq commits (`3f5b1b124` restoring `firehose::init()` / `FirehoseExtension` + the `OpFirehoseEvmConfig` wrappers) are present. Conflict-resolved `Cargo.toml`: kept `branch = "firehose/1.x"` and the SP1 v6.1.0 `[patch.crates-io]` block (lost on the prior branch base); bumped `firehose-tracer = "5.1.0"`. Removed the duplicate `SignatureFields for BaseTxEnvelope` impl that the rebase produced. Updated `bin/node/src/firehose.rs::init()` for the new `init_tracer(Config)` signature. Workspace `cargo check` of default-members passes. (Pre-existing `base-test-utils` failure due to missing contract artifacts is unrelated and outside default-members.) |
-| Step 1 — Crate scaffolding | Current | Next: create `crates/firehose-flashblocks/` directory with Cargo.toml/README/lib.rs/module stubs and wire into workspace `[workspace] members` and `[workspace.dependencies]`. |
+| Step 1 — Crate scaffolding | Done | Created `crates/firehose-flashblocks/` with `Cargo.toml`, `README.md`, `src/{lib,error,tracer,processor,streamer}.rs`. Added to workspace `[workspace]` members and `[workspace.dependencies]`. `lib.rs` is minimal (module decls + re-exports only). All modules adopt the `//!` doc-comment convention. |
+| Step 2 — Error / metrics module | Done | `error.rs`: `Error` enum with `StateProviderTimeout`, `BlockAssembly`, `Execution`, `TransactionDecoding { tx_index, message }`, `EvmEnv { block_number, source }`. Decoupled the decoding error variant from `alloy_rlp::Error` (which doesn't cover `Decodable2718`'s `Eip2718Error`) by storing a stringified message. Skipped the `metrics.rs` module from the spec — the processor itself doesn't ship metrics yet; downstream `FlashblocksSubscriber` already records WS-level counters, and processor-level counters can be added later without an API break. |
+| Step 3 — Tracer handle | Done | `tracer.rs`: `FlashblocksTracerHandle` wraps a non-global `firehose_tracer::Tracer` constructed via `Tracer::new_with_writer(Config, SynchronizedStdout::new(stdout_lock()))`. Emits its own `FIRE INIT` with the distinct tracer-id `"reth-flashblock"` — verified by a unit test that calls `init_stdout_lock` (idempotent) and constructs the handle. Skipping `on_blockchain_init` would panic in `on_block_start` because the Tracer's `init_sent` flag is per-instance. |
+| Step 4 — Processor | Done | `processor.rs`: `FirehoseFlashblocksProcessor<Client>` implements `FlashblocksReceiver`. Single `Mutex<ProcessorState>` guards the (current_block_number, latest_flashblock_index, stored_flashblocks, accumulated_db, is_skipping) tuple. The fast path carries `accumulated_db` across blocks when `block_number == previous + 1`; the bootstrap path retries `state_by_block_number_or_tag` 20× with 100ms backoff. Per-flashblock execution: `BlockAssembler` → decode/recover deltas → `start_flashblock_local` → `BaseBlockExecutor` wrapped in `FirehoseWrappedExecutor::with_hooks(OpPreTxAdjust, OpPostTxExtras)` → `apply_pre_execution_changes` only on `index == 0` → `execute_transaction` per delta tx → `mark_flashblock`. On execution error: `mark_failed`, set `is_skipping`, drop DB. |
+| Step 5 — Streamer | Done | `streamer.rs`: `FirehoseFlashblocksStreamer` wraps the processor in `Arc` and reuses `base_flashblocks::FlashblocksSubscriber<FirehoseFlashblocksProcessor>` for WS connection management + reconnect/backoff. Single `.start()` entrypoint. |
+| Step 6 — CLI flag | Done | `bin/node/src/cli.rs`: `--firehose-flashblocks-url <Url>` as `Option<Url>`. Independent of `--flashblocks-url`. |
+| Step 7 — Node wiring | Done | `bin/node/src/main.rs`: declares `pub mod firehose;` and installs `FirehoseFlashblocksExtension` when the flag is `Some`. `bin/node/src/firehose.rs::FirehoseFlashblocksExtension` uses `add_node_started_hook` — gates on `reth_firehose::is_tracer_initialized()`, builds the dedicated tracer from the node's chain id, and starts the streamer. `bin/node/Cargo.toml` gets `base-firehose-flashblocks`, `reth-chainspec`, and `tracing`. |
+| Step 8 — Tests + clippy + drive-by fixes | Done | 4 unit tests in the new crate: 3× `Error` Display invariants + 1× `FlashblocksTracerHandle::new` smoke test that emits `FIRE INIT 3.1 reth-flashblock 0.8.0` (verified by inspecting stdout). Drive-by clippy fixes outside the new crate (all pre-existing `-D warnings` failures, none caused by this work): `crates/builder/core/src/flashblocks/context.rs` (gate `B256` import behind `cfg(any(test, feature = "test-utils"))`), `crates/execution/engine-tree/src/validator.rs` (backtick `BaseFeeVault`/`L1FeeVault`/`OperatorFeeVault` in doc comment), `crates/execution/firehose/{src/extras.rs, README.md}` (same doc_markdown treatment). `cargo clippy -- -D warnings` is now clean across default-members. `cargo build` of default-members succeeds. |
