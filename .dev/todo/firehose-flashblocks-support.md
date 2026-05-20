@@ -1,7 +1,7 @@
 # Firehose Flashblocks Support
 
 mode: feature
-state: planned
+state: in_progress
 root_git: .worktrees/feature/firehose-flashblocks-support
 worktree: .worktrees/feature/firehose-flashblocks-support
 branch: feature/firehose-flashblocks-support
@@ -14,8 +14,6 @@ target_branch: firehose/0.x
 ---
 
 ## Initial Description
-
-**PLAN ONLY** We plan together, DO NOT START IMPLEMENTATION
 
 ### Context
 
@@ -53,40 +51,7 @@ The `evm-firehose-tracer-rs` dependency (`firehose-tracer`) might requires some 
 
 ## Dev Feedback
 
-> `--firehose-flashblocks-url
-
-To make the 100% clear, if this is empty string (the default), Flashblocks events consumption and state building is all disabled.
-
-> `base-execution-firehose-flashblocks` crate name
-
-Let's use `base-firehose-flashblocks` as crate name (instead of `base-execution-firehose-flashblocks`) for all Firehose and flashblocks custom code.
-
-> - State accumulation: carry forward `reth_revm::State<StateProviderDatabase>` across flashblocks of the same block so each delta only re-executes its new transactions on top of the accumulated state (matching the Geth `StateProcessor` incremental approach).
-
-And also from one block to the other, so that if we receive Block 1 base & delta0, Block 1 delta1, Block 1 delta2, Block 1 delta3 Block 2 base & delta 0, then have the correct state kept so we can immediately apply Block 2 base & delta 0 on top of reconstructed block Block 1 (from base & delta0 + delta1 + delta2 + delta3).
-
-This state accumulation and reconciliation with canonical chain once available is a place where you will need to switch to ULTRA THINK as there is a lot of possible edge cases and we know usually that partial events are received faster than the canonical block is update so in our experiment, it wasn't unsuable to receive partial Block 2 base & delta0 to delta 3 (out of 9) before the chain's canonical instances in memory where ready to allow retrieveing a StateProvider at Block 1.
-
-> **`reth-firehose` API**: Does `FirehoseBlockTracer::start` at tag `v1.11.4-fh-1` already support a flashblock index parameter? If not, coordinate with `maoueh` to add `start_flashblock(sealed, finalized, index)` + `mark_flashblock()`.
-> **`firehose-tracer` protobuf**: Does `OnBlockStart` in `firehose-tracer 5.0.0` accept a
-
-Those are together.
-
-So yes https://github.com/streamingfast/evm-firehose-tracer-rs/blob/main/firehose-tracer/src/types.rs#L15 the evm-firehose-tracer-rs has now support for Flashblock, it needs to be be passed in the `BlockEvent`.
-
-In a section of this plan, describe what you need to be implemented in reth-firehose to properly handle flashblocks in base.
-
-You will need to rebase your worktree on top of latest firehose/0.x to gain access to latest evm-firehose-tracer-rs version.
-
-3. **`NodeHooks` API for late startup**: `FirehoseFlashblocksStreamer` needs access to the provider (to fetch parent state).
-
-I don't understand this open question. Do what is needed to make it work,  I cannot steer you here as I don't understand what you are asking for.
-
-> Concurrency over stdout for writing and tracer instances
-
-We need to ensure that the global tracer, which is essentially a live tracer is not re-used directly for flashblocks. Indeed, two tracer instance cannot tracer at the same time the same block execution. Seperate tracer instance must be preserved to ensure flashblocks execution don't contaminate normal live block execution.
-
-And if there is two tracer, there is a need to coordinate how writing to stdout to ensure that each tracer writes a full line before the other can write it's own to ensure they do not intervleave in the stdout bytes otherwise the reader might crash.
+Ok we have implemented the necesary changes requested in plan on `streamingfast/reth`, update to `branch firehose/1.x` to benefit from it. Adjust plan now with this new information
 
 ## Spec & Implementation
 
@@ -137,7 +102,7 @@ subsystem is disabled and has zero runtime cost.
 | New crate `base-firehose-flashblocks` | Keeps all Firehose+flashblocks logic isolated; avoids bloating `base-execution-firehose`. The boundary is substantial enough to warrant a crate. |
 | Separate CLI flag `--firehose-flashblocks-url` | The existing `--flashblocks-url` drives RPC pending state. The two features are independent and may be used independently. |
 | **Dedicated (non-global) tracer instance** | The global tracer is locked by the live-block execution path. Two concurrent executions using the same tracer would corrupt output. The flashblock processor owns its own `firehose_tracer::Tracer`. |
-| **Stdout write coordination via a shared Mutex** | Both the global tracer and the flashblock tracer write to stdout. Lines must not interleave. A process-wide `Mutex<()>` guards each `write_all` call; both tracer instances must acquire it before flushing a line. This mutex is installed once in `reth-firehose` via a new `init_stdout_lock()` function. |
+| **Stdout write coordination via a shared Mutex** | Both the global tracer and the flashblock tracer write to stdout. Lines must not interleave. A process-wide `Mutex<()>` guards each `write_all` call; both tracer instances must acquire it before flushing a line. This mutex is already installed on `firehose/1.x` via `reth_firehose::init_stdout_lock()` and is wired into the global tracer automatically by `reth_firehose::init_tracer(Config)`. The flashblock tracer obtains the same `Arc<Mutex<()>>` via `reth_firehose::stdout_lock()`. |
 | **Cross-block state accumulation** | The processor keeps `accumulated_db: State<StateProviderDatabase>` alive across flashblocks of the same block AND across blocks. On a new base (index 0), if the current block number equals `previous_block_number + 1`, the state is carried forward directly (no provider lookup needed). If there is a gap (skipped blocks, restart), a fresh `StateProvider` is fetched for the parent. |
 | Reuse `FlashblocksSubscriber` | WS connection management + reconnect is already battle-tested. The subscriber calls `FlashblocksReceiver::on_flashblock_received` — we implement that on `FirehoseFlashblocksProcessor`. |
 | Reuse `BlockAssembler` | Converts accumulated `Vec<Flashblock>` → `AssembledBlock` (header + body) needed for EVM env construction and `FirehoseBlockTracer` initialization. |
@@ -316,54 +281,53 @@ workspace = true
 
 ---
 
-### Required Changes to `reth-firehose` (streamingfast/reth)
+### Upstream Prerequisites (already landed on `streamingfast/reth` `firehose/1.x`)
 
-The `reth-firehose` crate at tag `v1.11.4-fh-1` passes `flash_block: None` in all
-`BlockEvent` constructions and has no `start_flashblock` / `mark_flashblock` API.
-`firehose-tracer` at version 5.1.1 (on `firehose/0.x`) already has:
+All the upstream changes that the original plan called for are now merged on the
+`firehose/1.x` branch of `streamingfast/reth`. The workspace dependency has been bumped
+accordingly:
+
+- `Cargo.toml`: every `git = "https://github.com/streamingfast/reth.git"` line now uses
+  `branch = "firehose/1.x"` instead of `tag = "v1.11.4-fh-1"` (72 dependency lines
+  + 1 `[workspace.dependencies] reth-firehose` line).
+- `Cargo.lock`: regenerated; all `reth-*` crates now resolve to commit `c052fdfe…`
+  (head of `firehose/1.x`). The transitive `firehose-tracer` resolution remains
+  `5.1.0` (registry), which is the version that already exposes `FlashBlockData`,
+  `BlockEvent.flash_block: Option<FlashBlockData>`, and
+  `Tracer::new_with_writer(Config, Box<dyn Write + Send>)`.
+
+What the upstream now provides (read directly from
+`/tmp/reth-firehose-1x/crates/firehose/src/{lib.rs,block_tracer.rs}`):
+
+#### 1. Stdout write coordination — `crates/firehose/src/lib.rs`
 
 ```rust
-pub struct FlashBlockData {
-    pub idx: u64,
-    pub is_final: bool,
+pub struct SynchronizedStdout { lock: Arc<Mutex<()>> }
+impl SynchronizedStdout {
+    pub fn new(lock: Arc<Mutex<()>>) -> Self;
 }
-// and BlockEvent { flash_block: Option<FlashBlockData> }
+impl Write for SynchronizedStdout { /* acquires lock, then delegates to stdout */ }
+
+pub fn init_stdout_lock() -> Arc<Mutex<()>>;   // idempotent; returns the shared lock
+pub fn stdout_lock() -> Arc<Mutex<()>>;        // panics if init_tracer hasn't run
+pub fn is_tracer_initialized() -> bool;
+pub fn init_tracer(config: firehose_tracer::config::Config);
+pub fn tracer() -> MutexGuard<'static, firehose_tracer::Tracer>;
 ```
 
-**Two changes are needed in `streamingfast/reth`:**
+Key semantics:
 
-#### 1. `FirehoseBlockTracer::start_flashblock` constructor
+- `init_tracer` now takes a `firehose_tracer::config::Config` (it used to take a pre-built
+  `Tracer`). Internally it calls `init_stdout_lock()`, wraps the lock in
+  `SynchronizedStdout`, and builds the global tracer with
+  `Tracer::new_with_writer(config, Box::new(SynchronizedStdout::new(lock)))`. The global
+  tracer is therefore already serialised against the shared lock.
+- Any additional tracer (e.g. our flashblock tracer) must be built **after** `init_tracer`
+  has run, using `stdout_lock()` + `SynchronizedStdout::new(...)` + the tracer's
+  `new_with_writer` so it shares the same `Arc<Mutex<()>>`.
+- When only one tracer is active the lock is uncontested → effectively zero overhead.
 
-Add a new constructor to `FirehoseBlockTracer` in `crates/firehose/src/block_tracer.rs`:
-
-```rust
-impl FirehoseBlockTracer<GlobalTracerGuard> {
-    /// Acquires the global tracer and emits on_block_start with a FlashBlock annotation.
-    /// Used by the flashblock processor for pre-canonical partial block emission.
-    pub fn start_flashblock<N>(
-        block: &SealedBlock<N::Block>,
-        finalized: Option<firehose_tracer::types::FinalizedBlockRef>,
-        flash_block_idx: u64,
-        is_final: bool,
-    ) -> Self
-    where ...
-    {
-        let mut guard = crate::tracer();
-        guard.on_block_start(firehose_tracer::types::BlockEvent {
-            block: mapper::to_block_data(block),
-            finalized,
-            flash_block: Some(firehose_tracer::types::FlashBlockData {
-                idx: flash_block_idx,
-                is_final,
-            }),
-        });
-        Self { guard, status: Status::Started, is_genesis: false }
-    }
-}
-```
-
-However, the flashblock processor uses a **dedicated tracer** (not the global). So a
-`start_flashblock_local` variant (like the existing `start_local`) is also needed:
+#### 2. `FirehoseBlockTracer::start_flashblock_local` — `crates/firehose/src/block_tracer.rs`
 
 ```rust
 impl<'a> FirehoseBlockTracer<&'a mut firehose_tracer::Tracer> {
@@ -374,32 +338,24 @@ impl<'a> FirehoseBlockTracer<&'a mut firehose_tracer::Tracer> {
         flash_block_idx: u64,
         is_final: bool,
     ) -> Self
-    where ...
-    {
-        tracer.on_block_start(firehose_tracer::types::BlockEvent {
-            block: mapper::to_block_data(block),
-            finalized,
-            flash_block: Some(firehose_tracer::types::FlashBlockData {
-                idx: flash_block_idx,
-                is_final,
-            }),
-        });
-        Self { guard: tracer, status: Status::Started, is_genesis: false }
-    }
+    where
+        N: NodePrimitives,
+        N::Block: BlockTrait,
+        <N::Block as BlockTrait>::Header: BlockHeader + Sealable,
+        <N::Block as BlockTrait>::Body: BlockBody,
+        <<N::Block as BlockTrait>::Body as BlockBody>::OmmerHeader: BlockHeader + Sealable,
+    { /* emits on_block_start with flash_block: Some(FlashBlockData { idx, is_final }) */ }
 }
 ```
 
-#### 2. `mark_flashblock` method (immediate flush without validation gate)
+Only the `_local` variant exists upstream — there is intentionally **no**
+`start_flashblock` (global) constructor. Flashblock emission *always* uses a dedicated
+tracer, so the design no longer needs the global-tracer flavor.
 
-The existing `mark_verified` is intended for use **after** state-root validation. For flashblocks we
-want to flush immediately (partial blocks have no state root yet). Add:
+#### 3. `FirehoseBlockTracer::mark_flashblock` — same file
 
 ```rust
-impl<G> FirehoseBlockTracer<G>
-where G: DerefMut<Target = firehose_tracer::Tracer>
-{
-    /// Emits on_block_end(None) immediately, without the "verified" semantics.
-    /// Use this for flashblock partial emissions where state-root validation is not available.
+impl<G> FirehoseBlockTracer<G> where G: DerefMut<Target = firehose_tracer::Tracer> {
     pub fn mark_flashblock(mut self) {
         self.guard.on_block_end(None);
         self.status = Status::Consumed;
@@ -407,35 +363,26 @@ where G: DerefMut<Target = firehose_tracer::Tracer>
 }
 ```
 
-#### 3. Stdout write coordination
+Identical to `mark_verified` but without the genesis-skip path (a flashblock never represents
+block 1). The doc-comment explicitly tells callers to only invoke this on guards created via
+`start_flashblock_local`.
 
-Currently `firehose_tracer::Tracer` writes to stdout without coordination. When two `Tracer`
-instances exist simultaneously (global live-block tracer + flashblock tracer), their writes may
-interleave.
+#### 4. `firehose-tracer 5.1.0` is_final wire-protocol behavior
 
-The fix: install a process-wide `Arc<Mutex<()>>` that both tracers acquire before each `write_all`
-to stdout. This requires:
+The `is_final` bit on `FlashBlockData` is not a passive label — when `true`, the tracer
+encodes the flashblock index as `idx + 1000` in the FIRE BLOCK line
+(`printer::compute_printed_flash_block_index`). The downstream Firehose consumer uses this
+sentinel to identify the last partial of a block. Our processor must set this bool correctly
+based on the WebSocket payload's "final" marker; no extra wire-protocol work is needed.
 
-- A new `init_stdout_lock()` function in `reth-firehose` `lib.rs` (or `runner.rs`) that
-  initializes a `static STDOUT_LOCK: OnceLock<Arc<Mutex<()>>>`.
-- Both `init_tracer` (global) and the flashblock `Tracer::new(...)` construction must use a writer
-  that acquires `STDOUT_LOCK` before writing.
-- In `firehose-tracer`, `Tracer::new` accepts any `impl Write`. The solution: create a newtype
-  `SynchronizedStdout(Arc<Mutex<()>>)` that implements `Write` by acquiring the lock then calling
-  `std::io::stdout().write_all(...)`. Both tracer instances receive the same `Arc<Mutex<()>>`.
+#### Summary of upstream landed changes (no additional reth-firehose work required)
 
-This approach is zero-cost when only one tracer is active (the lock is uncontested) and correct
-when both are active simultaneously.
-
-**Summary of `streamingfast/reth` changes** (tag `v1.11.4-fh-2` or a new patch tag):
-
-| Change | File | Scope |
+| File | Symbol | Status |
 |---|---|---|
-| Add `start_flashblock_local` | `crates/firehose/src/block_tracer.rs` | New method |
-| Add `mark_flashblock` | `crates/firehose/src/block_tracer.rs` | New method |
-| Add `SynchronizedStdout` writer + `STDOUT_LOCK` | `crates/firehose/src/lib.rs` | New type + static |
-| Expose `stdout_lock()` / `init_stdout_lock()` | `crates/firehose/src/lib.rs` | New pub fns |
-| Update `init_tracer` to use `SynchronizedStdout` | `crates/firehose/src/lib.rs` | Modify existing |
+| `crates/firehose/src/lib.rs` | `SynchronizedStdout`, `init_stdout_lock`, `stdout_lock` | Landed |
+| `crates/firehose/src/lib.rs` | `init_tracer(Config)` (signature change) | Landed |
+| `crates/firehose/src/block_tracer.rs` | `start_flashblock_local` | Landed |
+| `crates/firehose/src/block_tracer.rs` | `mark_flashblock` | Landed |
 
 ---
 
@@ -471,35 +418,35 @@ crates/firehose-flashblocks/src/
 
 ### Implementation Plan
 
-**Step 0 — Rebase feature branch onto `firehose/0.x`**
+**Step 0 — Dependency bump (already done in this replan)**
+
+The workspace `Cargo.toml` and `Cargo.lock` have been updated to track `streamingfast/reth`
+on `branch = "firehose/1.x"` (commit `c052fdfe` at the time of writing). This brings in:
+
+- `FirehoseBlockTracer::start_flashblock_local`
+- `FirehoseBlockTracer::mark_flashblock`
+- `reth_firehose::{SynchronizedStdout, init_stdout_lock, stdout_lock, is_tracer_initialized}`
+- `init_tracer` now takes `firehose_tracer::config::Config`
+
+`firehose-tracer 5.1.0` (with `FlashBlockData` and `Tracer::new_with_writer`) is pulled
+transitively. No additional upstream changes are required for the rest of this plan.
+
+Verify before implementing:
 
 ```bash
 cd /Users/maoueh/work/sf/base/.worktrees/feature/firehose-flashblocks-support
-git rebase firehose/0.x
+cargo check -p reth-firehose 2>&1 | tail -10        # should compile clean
+cargo doc -p reth-firehose --no-deps --open          # confirm new symbols visible
 ```
 
-This brings in `firehose-tracer = "5.1.1"` which has `FlashBlockData` support. Verify the
-`SignatureFields` fix from the feature branch applies cleanly (it's a 1-commit change to
-`crates/common/consensus/src/transaction/envelope.rs` that needs to survive the rebase).
-
-**Step 1 — Changes to `streamingfast/reth` (`reth-firehose` crate)**
-
-In the `streamingfast/reth` repository:
-
-1. **`crates/firehose/src/lib.rs`**: Add `SynchronizedStdout` newtype + `STDOUT_LOCK: OnceLock<Arc<Mutex<()>>>` static. Add `init_stdout_lock()` and `stdout_lock()` accessors. Modify `init_tracer` to use `SynchronizedStdout` as the writer. Expose `stdout_lock()` publicly.
-
-2. **`crates/firehose/src/block_tracer.rs`**: Add `start_flashblock_local<N>` on `FirehoseBlockTracer<&'a mut Tracer>`. Add `mark_flashblock` on `FirehoseBlockTracer<G>`.
-
-3. Create a new tag (e.g., `v1.11.4-fh-2`) and update the workspace `Cargo.toml` in `base-reth` to use the new tag.
-
-**Step 2 — New crate `crates/firehose-flashblocks/`**
+**Step 1 — New crate `crates/firehose-flashblocks/`**
 
 - Create directory structure as described above.
 - `Cargo.toml`: name = `"base-firehose-flashblocks"`, add all dependencies listed in §New Crate.
 - Add to workspace `Cargo.toml` members list and `[workspace.dependencies]`.
 - Write `README.md` (brief description).
 
-**Step 3 — `error.rs`**
+**Step 2 — `error.rs`**
 
 Define `Error` enum:
 
@@ -513,7 +460,7 @@ pub enum Error {
 }
 ```
 
-**Step 4 — `metrics.rs`**
+**Step 3 — `metrics.rs`**
 
 Following the existing `Metrics` pattern in `base-flashblocks/src/metrics.rs`:
 
@@ -527,30 +474,56 @@ pub struct Metrics {
 }
 ```
 
-**Step 5 — `tracer.rs` — `FlashblocksTracerHandle`**
+**Step 4 — `tracer.rs` — `FlashblocksTracerHandle`**
+
+Owns a dedicated (non-global) `firehose_tracer::Tracer` for flashblock execution. The
+tracer writes through `SynchronizedStdout` so its output is serialised against the global
+live-block tracer at the stdout-write level. Must be constructed **after**
+`reth_firehose::init_tracer(...)` has been called by the main binary (otherwise
+`stdout_lock()` panics).
 
 ```rust
-/// Owns a dedicated (non-global) firehose_tracer::Tracer for flashblock execution.
-/// The tracer writes to a SynchronizedStdout, coordinating with the global tracer.
+use std::io::Write;
+
 pub struct FlashblocksTracerHandle {
     tracer: firehose_tracer::Tracer,
 }
 
 impl FlashblocksTracerHandle {
-    /// Constructs a new dedicated Tracer using the stdout lock installed by reth-firehose.
-    pub fn new() -> Self {
-        let writer = reth_firehose::SynchronizedStdout::new(reth_firehose::stdout_lock());
-        Self { tracer: firehose_tracer::Tracer::new(writer) }
+    /// Constructs a dedicated Tracer that shares the process-wide stdout lock with the
+    /// global tracer. The supplied `config` should typically mirror the one used for the
+    /// global tracer (e.g. same `chain_client`, same emission mode), with the caveat that
+    /// the cursor file path must NOT be shared — the flashblock tracer is pre-canonical
+    /// and emits separate FIRE BLOCK lines.
+    pub fn new(config: firehose_tracer::config::Config) -> Self {
+        let lock = reth_firehose::stdout_lock();
+        let writer: Box<dyn Write + Send> =
+            Box::new(reth_firehose::SynchronizedStdout::new(lock));
+        let mut tracer = firehose_tracer::Tracer::new_with_writer(config, writer);
+        // on_blockchain_init must be emitted once before any block events — but the global
+        // tracer has already emitted it. The downstream consumer is keyed by tracer-id, so
+        // we either (a) emit a separate init using a distinct tracer-id, or (b) skip the
+        // init and rely on the global one. The decision is captured in the spec below.
+        Self { tracer }
     }
 
-    /// Acquires a mutable reference to the inner tracer for a flashblock emission cycle.
     pub fn tracer_mut(&mut self) -> &mut firehose_tracer::Tracer {
         &mut self.tracer
     }
 }
 ```
 
-**Step 6 — `processor.rs` — `FirehoseFlashblocksProcessor`**
+**On `on_blockchain_init` for the dedicated tracer:** The implementor must inspect
+`firehose_tracer::Tracer::on_blockchain_init` semantics. If the downstream Firehose
+consumer expects exactly one init per FIRE stream, the flashblock tracer should NOT emit
+its own init (the global tracer already did). If init is per-tracer-instance and the
+consumer can handle multiple inits with distinct ids, emit one with a separate
+tracer-id (e.g. `"reth-flashblock"`). Inspect
+`/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/firehose-tracer-5.1.0/src/tracer.rs`
+and the firehose-core consumer side to decide; the safe default is to skip init for the
+flashblock tracer.
+
+**Step 5 — `processor.rs` — `FirehoseFlashblocksProcessor`**
 
 Core logic. The struct and its `on_flashblock_received` implementation.
 
@@ -642,7 +615,7 @@ fn process(&mut self, flashblock: Flashblock, client: &Client, tracer: &mut Flas
   13. Update metrics.
 ```
 
-**Step 7 — `streamer.rs` — `FirehoseFlashblocksStreamer`**
+**Step 6 — `streamer.rs` — `FirehoseFlashblocksStreamer`**
 
 ```rust
 pub struct FirehoseFlashblocksStreamer<Client> {
@@ -668,7 +641,7 @@ impl<Client: ...> FirehoseFlashblocksStreamer<Client> {
 }
 ```
 
-**Step 8 — CLI flag in `bin/node/src/cli.rs`**
+**Step 7 — CLI flag in `bin/node/src/cli.rs`**
 
 ```rust
 /// WebSocket URL for the Firehose flashblocks feed.
@@ -678,7 +651,7 @@ impl<Client: ...> FirehoseFlashblocksStreamer<Client> {
 pub firehose_flashblocks_url: String,
 ```
 
-**Step 9 — Wiring in `bin/node/src/main.rs`**
+**Step 8 — Wiring in `bin/node/src/main.rs`**
 
 ```rust
 // After FirehoseExtension is installed:
@@ -694,7 +667,7 @@ if !fb_url.is_empty() {
 }
 ```
 
-**Step 10 — `FirehoseFlashblocksExtension` in `bin/node/src/`**
+**Step 9 — `FirehoseFlashblocksExtension` in `bin/node/src/`**
 
 Following the existing extension pattern (e.g., `runner.rs` / `extension.rs`):
 
@@ -725,13 +698,13 @@ where Node: FullNodeComponents, ...
 (The exact trait and hook API must be determined by reading `bin/node/src/runner.rs` and the
 existing `FirehoseExtension` wiring. The implementor should align with that pattern.)
 
-**Step 11 — Cargo.toml workspace integration**
+**Step 10 — Cargo.toml workspace integration**
 
 - Add `crates/firehose-flashblocks` to `[workspace]` members.
 - Add `base-firehose-flashblocks = { path = "crates/firehose-flashblocks" }` to
   `[workspace.dependencies]`.
 - Update `bin/node/Cargo.toml` to add `base-firehose-flashblocks.workspace = true`.
-- Update workspace `Cargo.toml` reth-firehose tag to the new one with flashblock support.
+- (No reth-firehose bump needed — already done in Step 0.)
 
 ---
 
@@ -748,16 +721,19 @@ existing `FirehoseExtension` wiring. The implementor should align with that patt
 | Carry `accumulated_db` across blocks (not just within a block) | Key insight from the dev feedback: Block N+1's base arrives before canonical reflects Block N. The carried `State<DB>` is the only reliable source of Block N's post-state. |
 | `is_final` derived from WS payload | The flashblock WS protocol encodes finality in the payload. The implementor must inspect `Flashblock` struct in `base-flashblocks` to find the right field. |
 | Pre-execution changes (EIP-4788, etc.) only on index == 0 | Matches Geth `StateProcessor.Process` `isFirstExecution` gate. These are block-level, not per-delta. |
-| `reth-firehose` needs a new tag | The current `v1.11.4-fh-1` does not have `start_flashblock_local` / `mark_flashblock` / `SynchronizedStdout`. The implementor must make these changes in `streamingfast/reth` and cut a new tag before implementing the processor. |
-| `firehose-tracer` 5.1.1 already has `FlashBlockData` | Confirmed by reading `types.rs`. No changes needed in `evm-firehose-tracer-rs`. |
+| Track `streamingfast/reth` `branch = "firehose/1.x"` (not a fixed tag) | The upstream changes landed on `firehose/1.x` after the original plan was written. Branch tracking is acceptable for the duration of this feature work; once stabilised the maintainer will cut a tag (e.g. `v1.11.4-fh-2`) and we will pin to it. |
+| `init_tracer` signature now takes `Config` (not a pre-built `Tracer`) | API change on `firehose/1.x`: `init_tracer` builds the global tracer internally using `SynchronizedStdout`. Bin/node already on `firehose/0.x` was calling `init_tracer(Tracer::new(...))`; that call site must be updated to pass `Config` directly. |
+| `firehose-tracer` 5.1.0 already has `FlashBlockData` and `new_with_writer` | Confirmed by reading `types.rs` and `tracer.rs` in the registry-vendored source. The flashblock tracer is built via `Tracer::new_with_writer(Config, Box::new(SynchronizedStdout::new(stdout_lock())))`. |
+| `is_final` wire encoding (`idx + 1000`) handled inside `firehose-tracer` | The processor only sets the `bool`; the printer adjusts the printed index automatically (`printer::compute_printed_flash_block_index`). No protocol work on our side. |
+| Flashblock tracer's `on_blockchain_init` is deferred to the implementor to verify | The global tracer already emits `on_blockchain_init`. Whether the dedicated flashblock tracer should emit a separate init (with a distinct tracer-id) or skip it depends on what the downstream Firehose consumer accepts. Default to skip; revise if integration testing shows the consumer requires per-tracer init. |
 
 ---
 
 ## State Tracker
 
-**Last Updated:** 2026-05-16 UTC
-**Current Step:** Phase 5 — Spec Updated per Dev Feedback
-**Status:** Plan updated; state set to `planned` for re-review
+**Last Updated:** 2026-05-20 UTC
+**Current Step:** Step 1 — Crate scaffolding (`crates/firehose-flashblocks/`)
+**Status:** Branch rebased onto `firehose/0.x` so live-tracer prereqs are in place; workspace `cargo check` of default-members passes; ready to scaffold the new crate.
 
 | Step | Status | Notes |
 |---|---|---|
@@ -765,4 +741,7 @@ existing `FirehoseExtension` wiring. The implementor should align with that patt
 | Phase 2 — Gap Analysis | Done | Identified: reth-firehose API gaps, state accumulation strategy, CLI wiring |
 | Phase 3 — Challenging Dialogue | Done | Dev feedback addressed all open questions |
 | Phase 4 — Specification Writing | Done | Full updated spec written above |
-| Phase 5 — Spec Review | Done (re-plan) | Updated per dev feedback; crate rename, cross-block state, firehose-tracer confirmed, concurrency design, reth-firehose changes section, rebase step added |
+| Phase 5 — Spec Review (round 1) | Done | Updated per dev feedback; crate rename, cross-block state, firehose-tracer confirmed, concurrency design, reth-firehose changes section, rebase step added |
+| Phase 5 — Spec Review (round 2, 2026-05-20) | Done | Upstream changes landed on `streamingfast/reth` `firehose/1.x` (commits `bb7699f28` + `c9cf230de`). Workspace `Cargo.toml` + `Cargo.lock` bumped from `tag = "v1.11.4-fh-1"` to `branch = "firehose/1.x"`. Removed entire "Required Changes to reth-firehose" section (3 sub-changes were all landed). Removed Step 1 (upstream patch work) — implementation now starts at "create new crate". `FlashblocksTracerHandle::new` rewritten to use `Tracer::new_with_writer(Config, Box::new(SynchronizedStdout::new(stdout_lock())))` matching the actual upstream API. Documented `is_final` wire encoding (`idx + 1000`) handled inside `firehose-tracer 5.1.0`. Added open item: whether the dedicated flashblock tracer should emit its own `on_blockchain_init`. |
+| Phase 6 — Rebase + prereqs (2026-05-20) | Done | Rebased branch onto `firehose/0.x` so the live-tracer prereq commits (`3f5b1b124` restoring `firehose::init()` / `FirehoseExtension` + the `OpFirehoseEvmConfig` wrappers) are present. Conflict-resolved `Cargo.toml`: kept `branch = "firehose/1.x"` and the SP1 v6.1.0 `[patch.crates-io]` block (lost on the prior branch base); bumped `firehose-tracer = "5.1.0"`. Removed the duplicate `SignatureFields for BaseTxEnvelope` impl that the rebase produced. Updated `bin/node/src/firehose.rs::init()` for the new `init_tracer(Config)` signature. Workspace `cargo check` of default-members passes. (Pre-existing `base-test-utils` failure due to missing contract artifacts is unrelated and outside default-members.) |
+| Step 1 — Crate scaffolding | Current | Next: create `crates/firehose-flashblocks/` directory with Cargo.toml/README/lib.rs/module stubs and wire into workspace `[workspace] members` and `[workspace.dependencies]`. |

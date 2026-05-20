@@ -27,8 +27,8 @@ impl FromExtensionConfig for FirehoseExtension {
 
 /// Initializes the process-wide Firehose tracer with the default `reth` chain-client config.
 pub fn init() {
-    reth_firehose::init_tracer(firehose_tracer::Tracer::new(firehose_tracer::config::Config {
+    reth_firehose::init_tracer(firehose_tracer::config::Config {
         chain_client: firehose_tracer::config::ChainClient::Reth,
         ..Default::default()
-    }));
+    });
 }

@@ -716,31 +716,6 @@ impl InMemorySize for BaseTxEnvelope {
     }
 }
 
-impl SignatureFields for BaseTxEnvelope {
-    fn signature_fields(&self) -> (B256, B256, Bytes) {
-        let Some(sig) = self.signature() else {
-            // Deposit transactions have no signature.
-            return (B256::ZERO, B256::ZERO, Bytes::new());
-        };
-        let y_parity = sig.v() as u64;
-        let v = match self {
-            Self::Legacy(signed) => {
-                if let Some(chain_id) = signed.tx().chain_id {
-                    chain_id * 2 + 35 + y_parity
-                } else {
-                    27 + y_parity
-                }
-            }
-            _ => y_parity,
-        };
-        (
-            B256::new(sig.r().to_be_bytes::<32>()),
-            B256::new(sig.s().to_be_bytes::<32>()),
-            u64_to_trimmed_bytes(v),
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use alloc::vec;
