@@ -6,8 +6,8 @@
 //!
 //! * [`OpPostTxExtras`] — re-emits the three fee-vault balance changes that
 //!   [`base_common_evm::OpHandler::reward_beneficiary`] applies via `Journal::balance_incr`
-//!   during revm's post_execution phase. Revm fires no inspector hooks in that phase, so without
-//!   this the L1FeeVault / BaseFeeVault / OperatorFeeVault credits would be invisible to the
+//!   during revm's `post_execution` phase. Revm fires no inspector hooks in that phase, so without
+//!   this the `L1FeeVault` / `BaseFeeVault` / `OperatorFeeVault` credits would be invisible to the
 //!   tracer.
 //!
 //! * [`OpPreTxAdjust`] — patches the per-tx [`firehose_tracer::types::TxEvent`] before it
@@ -35,7 +35,7 @@ use reth_revm::revm::{
 use base_common_evm::OpContext;
 
 /// Emits the three OP Stack fee vault balance changes that `OpHandler::reward_beneficiary`
-/// applies via `Journal::balance_incr` during revm's post_execution phase.
+/// applies via `Journal::balance_incr` during revm's `post_execution` phase.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpPostTxExtras;
 

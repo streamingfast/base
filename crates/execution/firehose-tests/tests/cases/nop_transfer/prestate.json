@@ -1,0 +1,55 @@
+{
+  "context": {
+    "baseFeePerGas": "7",
+    "difficulty": "0",
+    "gasLimit": "30000000",
+    "miner": "0xf97e180c050e5ab072211ad2c213eb5aee4df134",
+    "number": "2099",
+    "timestamp": "1742240844"
+  },
+  "genesis": {
+    "alloc": {
+      "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266": {
+        "balance": "0x3635c9adc5dea00000"
+      },
+      "0xf97e180c050e5ab072211ad2c213eb5aee4df134": {
+        "balance": "0x3a7bcde14030be1956"
+      }
+    },
+    "baseFeePerGas": "7",
+    "config": {
+      "chainId": 8453,
+      "homesteadBlock": 0,
+      "eip150Block": 0,
+      "eip155Block": 0,
+      "eip158Block": 0,
+      "byzantiumBlock": 0,
+      "constantinopleBlock": 0,
+      "petersburgBlock": 0,
+      "istanbulBlock": 0,
+      "berlinBlock": 0,
+      "londonBlock": 0,
+      "mergeNetsplitBlock": 0,
+      "terminalTotalDifficulty": 0,
+      "bedrockBlock": 0,
+      "regolithTime": 0,
+      "canyonTime": 0,
+      "ecotoneTime": 0,
+      "fjordTime": 0,
+      "graniteTime": 0,
+      "holoceneTime": 0,
+      "isthmusTime": 9999999999,
+      "eip1559Elasticity": 6,
+      "eip1559Denominator": 50,
+      "eip1559DenominatorCanyon": 250
+    },
+    "difficulty": "0",
+    "gasLimit": "30000000",
+    "miner": "0xf97e180c050e5ab072211ad2c213eb5aee4df134",
+    "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "nonce": "0x0000000000000000",
+    "number": "2098",
+    "timestamp": "1742240832"
+  },
+  "input": "0x02f875822105808459682f008503b9aca00782520894a714ac97f3418798620b4486f93f849693f99264880de0b6b3a764000080c080a08e6655159657c43f515a92389e191ecf4a6b9d1f988939d796fe0bcee880d280a026e09ccf7a29466b1a67cbf139df1e01e07b9229e21440e01fa243621f6d69ba"
+}
