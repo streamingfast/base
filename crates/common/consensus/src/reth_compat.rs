@@ -566,11 +566,7 @@ impl reth_firehose::mapper::SignatureFields for BaseTxEnvelope {
             Self::Legacy(signed) => {
                 let sig = signed.signature();
                 let y_parity = sig.v() as u64;
-                let v = if let Some(chain_id) = signed.tx().chain_id {
-                    chain_id * 2 + 35 + y_parity
-                } else {
-                    27 + y_parity
-                };
+                let v = signed.tx().chain_id.map_or_else(|| 27 + y_parity, |chain_id| chain_id * 2 + 35 + y_parity);
                 (
                     B256::new(sig.r().to_be_bytes::<32>()),
                     B256::new(sig.s().to_be_bytes::<32>()),

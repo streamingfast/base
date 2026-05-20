@@ -18,7 +18,7 @@ This crate is that wrapper for Base / OP Stack.
 ## What's in it
 
 - [`OpPostTxExtras`] — post-tx emitter for the three OP fee-vault balance changes
-  (L1FeeVault / BaseFeeVault / OperatorFeeVault) with reason `RewardTransactionFee`.
+  (`L1FeeVault` / `BaseFeeVault` / `OperatorFeeVault`) with reason `RewardTransactionFee`.
 - [`OpPreTxAdjust`] — pre-tx patcher that overrides the `TxEvent` nonce for OP deposit
   envelopes (they carry no nonce field; the effective nonce is the sender's pre-exec
   account nonce).

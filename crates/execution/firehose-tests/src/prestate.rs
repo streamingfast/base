@@ -71,7 +71,7 @@ pub fn run_prestate(case_folder: &Path) -> eyre::Result<RunOutcome> {
     seed_cache_db(&mut db, &prestate.genesis)?;
     let mut state = State::builder().with_database(db).with_bundle_update().build();
 
-    let evm_config = BaseEvmConfig::optimism(chain_spec.clone());
+    let evm_config = BaseEvmConfig::optimism(chain_spec);
 
     let (mut tracer, buffer) = firehose_tracer::Tracer::with_buffer(
         firehose_tracer::config::Config::default(),

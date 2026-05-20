@@ -44,9 +44,5 @@ serde_json.workspace = true
 name = "prestate"
 path = "tests/prestate.rs"
 
-[[example]]
-name = "generate_golden"
-path = "examples/generate_golden.rs"
-
 [dev-dependencies]
 k256.workspace = true

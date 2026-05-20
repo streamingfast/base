@@ -8,7 +8,7 @@ fn nop_transfer() {
     let outcome = run_prestate(&folder).expect("nop_transfer prestate must succeed");
     let golden = folder.join("block.2099.binpb");
 
-    if std::env::var("UPDATE_GOLDENS").is_ok() {
+    if std::env::var("GOLDEN_UPDATE").is_ok() {
         use prost::Message as _;
         std::fs::write(&golden, outcome.block.encode_to_vec())
             .expect("writing golden file must succeed");
