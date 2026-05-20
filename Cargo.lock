@@ -5325,6 +5325,7 @@ dependencies = [
  "base-bundle-extension",
  "base-cli-utils",
  "base-execution-cli",
+ "base-firehose-flashblocks",
  "base-flashblocks",
  "base-flashblocks-node",
  "base-metering",
@@ -5337,8 +5338,10 @@ dependencies = [
  "base-txpool-tracing",
  "clap",
  "firehose-tracer",
+ "reth-chainspec",
  "reth-cli-util",
  "reth-firehose",
+ "tracing",
  "url",
 ]
 

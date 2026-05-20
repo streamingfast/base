@@ -892,7 +892,7 @@ where
     ///     borrowed from `tracer` is attached;
     ///   - the [`OpBlockExecutor`] is wrapped in a
     ///     [`reth_firehose::FirehoseWrappedExecutor`] carrying an [`OpPostTxExtras`] hook
-    ///     so the BaseFeeVault / L1FeeVault / OperatorFeeVault credits from
+    ///     so the `BaseFeeVault` / `L1FeeVault` / `OperatorFeeVault` credits from
     ///     `OpHandler::reward_beneficiary` are emitted as `RewardTransactionFee` balance
     ///     changes;
     ///   - the [`CachedExecutor`] wrapper is bypassed — traced runs always re-execute every
