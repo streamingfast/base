@@ -4310,6 +4310,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "base-firehose-flashblocks"
+version = "0.8.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-evm",
+ "alloy-primitives",
+ "base-common-chains",
+ "base-common-consensus",
+ "base-common-evm",
+ "base-common-flashblocks",
+ "base-execution-evm",
+ "base-execution-firehose",
+ "base-flashblocks",
+ "firehose-tracer",
+ "reth-chainspec",
+ "reth-evm",
+ "reth-firehose",
+ "reth-primitives-traits",
+ "reth-provider",
+ "reth-revm",
+ "rstest",
+ "thiserror 2.0.18",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "base-flashblocks"
 version = "0.8.0"
 dependencies = [

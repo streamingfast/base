@@ -58,6 +58,7 @@ members = [
   "crates/infra/*",
   "crates/common/*",
   "crates/execution/*",
+  "crates/firehose-flashblocks",
   "etc/tools/*",
   "devnet",
   "actions/*",
@@ -221,6 +222,7 @@ base-txpool-rpc = { path = "crates/execution/txpool-rpc" }
 base-engine-tree = { path = "crates/execution/engine-tree" }
 base-execution-firehose = { path = "crates/execution/firehose" }
 base-flashblocks = { path = "crates/execution/flashblocks" }
+base-firehose-flashblocks = { path = "crates/firehose-flashblocks" }
 base-execution-upgrades = { path = "crates/execution/upgrades" }
 base-execution-storage = { path = "crates/execution/storage" }
 base-execution-txpool = { path = "crates/execution/txpool" }
