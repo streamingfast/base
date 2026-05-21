@@ -34,10 +34,13 @@ use base_execution_chainspec::BaseChainSpec;
 use base_firehose_flashblocks::{
     FirehoseFlashblocksProcessor, FlashblocksTracerHandle,
 };
+use base64::Engine as _;
 use firehose_tracer::{
     InMemoryBuffer,
     config::{ChainClient, ChainConfig, Config},
+    pb::Block as EthBlock,
 };
+use prost::Message as _;
 use futures::SinkExt as _;
 use reth_chainspec::{ChainInfo, ChainSpecProvider, EthChainSpec};
 use reth_db_models::StoredBlockBodyIndices;
@@ -693,16 +696,16 @@ pub(crate) async fn ws_server_once(sequence: Vec<Flashblock>) -> SocketAddr {
 /// - `FIRE BLOCK <block_num> <flash_idx> <block_hash> <prev_num> <prev_hash> <lib_num>
 ///   <timestamp_unix_nano> <payload_base64>` — one per executed block or flashblock partial.
 ///
-/// For `Block` and `FlashBlock` variants the `payload_base64` field is intentionally excluded
-/// from the struct and from `PartialEq` comparison, keeping test assertions focused on protocol
-/// metadata rather than payload bytes.
+/// `Block` and `FlashBlock` variants include the decoded `sf.ethereum.type.v2.Block` protobuf
+/// payload. Use [`assert_fire_events_metadata_eq`] when you only care about protocol metadata
+/// fields, or [`assert_fire_events_eq`] for full comparison including the decoded block payload.
 ///
 /// The `flash_idx` encoding on the wire:
 /// - `0` → canonical (non-flash) block; maps to `FireEvent::Block`.
 /// - `1..=999` → flash partial, `is_final = false`; maps to `FireEvent::FlashBlock`.
 /// - `>=1000` → flash partial, `is_final = true` (`idx = printed - 1000`); maps to
 ///   `FireEvent::FlashBlock` with `is_final: true`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum FireEvent {
     /// A `FIRE INIT` line emitted at tracer startup.
     Init {
@@ -723,6 +726,8 @@ pub(crate) enum FireEvent {
         lib_num: u64,
         /// Block timestamp in Unix nanoseconds.
         timestamp_ns: u64,
+        /// Decoded `sf.ethereum.type.v2.Block` protobuf payload.
+        block: EthBlock,
     },
     /// A `FIRE BLOCK` line where `printed_flash_idx > 0` (flashblock partial).
     FlashBlock {
@@ -738,26 +743,33 @@ pub(crate) enum FireEvent {
         lib_num: u64,
         /// Block timestamp in Unix nanoseconds.
         timestamp_ns: u64,
+        /// Decoded `sf.ethereum.type.v2.Block` protobuf payload.
+        block: EthBlock,
     },
 }
 
 impl FireEvent {
-    /// Constructs an expected [`FireEvent::Block`] for equality-based assertions.
+    /// Constructs an expected [`FireEvent::Block`] for metadata-only assertions.
     ///
-    /// `prev_block_number`, `lib_num`, and `timestamp_ns` default to `block_number - 1`,
-    /// `0`, and `>0` respectively — pass them explicitly only when your test cares about
-    /// the exact values.
-    pub(crate) const fn canonical_block(block_number: u64) -> Self {
+    /// Sets `block` to `EthBlock::default()`. Use with [`assert_fire_events_metadata_eq`]
+    /// to compare only protocol metadata fields without inspecting the payload.
+    ///
+    /// `lib_num` and `timestamp_ns` default to `0` — treated as wildcards by the
+    /// metadata comparison helper.
+    pub(crate) fn canonical_block(block_number: u64) -> Self {
         Self::Block {
             block_number,
             prev_block_number: if block_number > 0 { block_number - 1 } else { 0 },
             lib_num: 0,
             timestamp_ns: 0,
+            block: EthBlock::default(),
         }
     }
 
-    /// Constructs an expected [`FireEvent::FlashBlock`] for equality-based assertions.
-    pub(crate) const fn flash_block(block_number: u64, flash_idx: u64, is_final: bool) -> Self {
+    /// Constructs an expected [`FireEvent::FlashBlock`] for metadata-only assertions.
+    ///
+    /// Sets `block` to `EthBlock::default()`. Use with [`assert_fire_events_metadata_eq`].
+    pub(crate) fn flash_block(block_number: u64, flash_idx: u64, is_final: bool) -> Self {
         Self::FlashBlock {
             block_number,
             flash_idx,
@@ -765,55 +777,113 @@ impl FireEvent {
             prev_block_number: if block_number > 0 { block_number - 1 } else { 0 },
             lib_num: 0,
             timestamp_ns: 0,
+            block: EthBlock::default(),
         }
     }
-
 }
 
-/// Asserts that `actual` events match `expected` events, using relaxed matching for
-/// `lib_num` and `timestamp_ns` (a `0` in expected matches any actual value).
+/// Asserts that `actual` events match `expected` ignoring the decoded block payload.
+///
+/// Uses relaxed matching for `lib_num` and `timestamp_ns` as well: a `0` in `expected`
+/// matches any actual value. This is the preferred helper when a test only cares about
+/// protocol metadata (block numbers, flash indices, finality flags).
 ///
 /// Produces a clear diff via [`pretty_assertions`] on mismatch.
-pub(crate) fn assert_fire_events_eq(actual: &[FireEvent], expected: &[FireEvent]) {
-    // Build a normalised copy of `actual` where fields zeroed-out in `expected` are also zeroed,
-    // then use pretty_assertions::assert_eq! for a clean diff.
+pub(crate) fn assert_fire_events_metadata_eq(actual: &[FireEvent], expected: &[FireEvent]) {
+    let sentinel = FireEvent::Block {
+        block_number: 0,
+        prev_block_number: 0,
+        lib_num: 0,
+        timestamp_ns: 0,
+        block: EthBlock::default(),
+    };
     let normalised: Vec<FireEvent> = actual
         .iter()
-        .zip(expected.iter().chain(std::iter::repeat(expected.last().unwrap_or(&FireEvent::Block {
-            block_number: 0,
-            prev_block_number: 0,
-            lib_num: 0,
-            timestamp_ns: 0,
-        }))))
-        .map(|(a, e)| normalize_actual(a, e))
+        .zip(expected.iter().chain(std::iter::repeat(&sentinel)))
+        .map(|(a, e)| normalize_metadata(a, e))
         .collect();
 
     pretty_assertions::assert_eq!(normalised, expected);
 }
 
-/// Normalises `actual` to match the granularity of `expected`.
+/// Asserts that `actual` events exactly match `expected`, including the decoded block payload.
 ///
-/// Fields set to `0` in `expected` are zeroed in the returned copy of `actual`, so that
-/// [`pretty_assertions::assert_eq!`] only highlights differences the test author cares about.
-fn normalize_actual(actual: &FireEvent, expected: &FireEvent) -> FireEvent {
+/// Uses relaxed matching for `lib_num` and `timestamp_ns` (a `0` in expected matches any
+/// actual value) but compares `block` fields directly. Use this when the test needs to
+/// verify that payload tracing is correct.
+///
+/// Produces a clear diff via [`pretty_assertions`] on mismatch.
+pub(crate) fn assert_fire_events_eq(actual: &[FireEvent], expected: &[FireEvent]) {
+    let sentinel = FireEvent::Block {
+        block_number: 0,
+        prev_block_number: 0,
+        lib_num: 0,
+        timestamp_ns: 0,
+        block: EthBlock::default(),
+    };
+    let normalised: Vec<FireEvent> = actual
+        .iter()
+        .zip(expected.iter().chain(std::iter::repeat(&sentinel)))
+        .map(|(a, e)| normalize_full(a, e))
+        .collect();
+
+    pretty_assertions::assert_eq!(normalised, expected);
+}
+
+/// Normalises `actual` for metadata-only comparison against `expected`.
+///
+/// - Zeros `lib_num` and `timestamp_ns` when the corresponding field in `expected` is `0`.
+/// - Replaces the `block` payload in the normalised copy with `expected`'s block, so the
+///   payload is never compared.
+fn normalize_metadata(actual: &FireEvent, expected: &FireEvent) -> FireEvent {
     match (actual, expected) {
         (
-            FireEvent::Block { block_number, prev_block_number, lib_num, timestamp_ns },
+            FireEvent::Block { block_number, prev_block_number, lib_num, timestamp_ns, .. },
+            FireEvent::Block { lib_num: el, timestamp_ns: et, block: eb, .. },
+        ) => FireEvent::Block {
+            block_number: *block_number,
+            prev_block_number: *prev_block_number,
+            lib_num: if *el == 0 { 0 } else { *lib_num },
+            timestamp_ns: if *et == 0 { 0 } else { *timestamp_ns },
+            block: eb.clone(),
+        },
+        (
+            FireEvent::FlashBlock {
+                block_number, flash_idx, is_final, prev_block_number, lib_num, timestamp_ns, ..
+            },
+            FireEvent::FlashBlock { lib_num: el, timestamp_ns: et, block: eb, .. },
+        ) => FireEvent::FlashBlock {
+            block_number: *block_number,
+            flash_idx: *flash_idx,
+            is_final: *is_final,
+            prev_block_number: *prev_block_number,
+            lib_num: if *el == 0 { 0 } else { *lib_num },
+            timestamp_ns: if *et == 0 { 0 } else { *timestamp_ns },
+            block: eb.clone(),
+        },
+        _ => actual.clone(),
+    }
+}
+
+/// Normalises `actual` for full comparison against `expected`.
+///
+/// Zeros `lib_num` and `timestamp_ns` when the corresponding field in `expected` is `0`,
+/// but keeps the actual `block` payload for comparison.
+fn normalize_full(actual: &FireEvent, expected: &FireEvent) -> FireEvent {
+    match (actual, expected) {
+        (
+            FireEvent::Block { block_number, prev_block_number, lib_num, timestamp_ns, block },
             FireEvent::Block { lib_num: el, timestamp_ns: et, .. },
         ) => FireEvent::Block {
             block_number: *block_number,
             prev_block_number: *prev_block_number,
             lib_num: if *el == 0 { 0 } else { *lib_num },
             timestamp_ns: if *et == 0 { 0 } else { *timestamp_ns },
+            block: block.clone(),
         },
         (
             FireEvent::FlashBlock {
-                block_number,
-                flash_idx,
-                is_final,
-                prev_block_number,
-                lib_num,
-                timestamp_ns,
+                block_number, flash_idx, is_final, prev_block_number, lib_num, timestamp_ns, block,
             },
             FireEvent::FlashBlock { lib_num: el, timestamp_ns: et, .. },
         ) => FireEvent::FlashBlock {
@@ -823,6 +893,7 @@ fn normalize_actual(actual: &FireEvent, expected: &FireEvent) -> FireEvent {
             prev_block_number: *prev_block_number,
             lib_num: if *el == 0 { 0 } else { *lib_num },
             timestamp_ns: if *et == 0 { 0 } else { *timestamp_ns },
+            block: block.clone(),
         },
         _ => actual.clone(),
     }
@@ -830,12 +901,28 @@ fn normalize_actual(actual: &FireEvent, expected: &FireEvent) -> FireEvent {
 
 // ── FIRE line parsing ─────────────────────────────────────────────────────────
 
+/// Decodes a base64-encoded, prost-serialised `sf.ethereum.type.v2.Block` from the
+/// `payload_base64` field of a `FIRE BLOCK` line.
+///
+/// Returns `EthBlock::default()` on any decode error (malformed base64 or invalid proto bytes)
+/// rather than panicking, so that parsing never silently drops events.
+fn decode_eth_block(payload_base64: &str) -> EthBlock {
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(payload_base64) {
+        Ok(b) => b,
+        Err(_) => return EthBlock::default(),
+    };
+    EthBlock::decode(bytes.as_slice()).unwrap_or_default()
+}
+
 /// Parses all FIRE lines from raw tracer output and returns structured [`FireEvent`] values.
 ///
 /// Recognised line prefixes:
 /// - `FIRE INIT <version> <node_name> <node_version>`
 /// - `FIRE BLOCK <block_num> <flash_idx> <block_hash> <prev_num> <prev_hash> <lib_num>
 ///   <timestamp_ns> <payload_base64>`
+///
+/// The `payload_base64` field is decoded from base64 and deserialised via prost into an
+/// [`EthBlock`] and stored on the returned [`FireEvent`] variants.
 ///
 /// Lines that do not start with `FIRE` or that have malformed fields are silently skipped.
 pub(crate) fn parse_fire_events(raw: &[u8]) -> Vec<FireEvent> {
@@ -872,6 +959,7 @@ pub(crate) fn parse_fire_events(raw: &[u8]) -> Vec<FireEvent> {
                 let Some(_prev_hash_s) = parts.next() else { continue };
                 let Some(lib_num_s) = parts.next() else { continue };
                 let Some(timestamp_s) = parts.next() else { continue };
+                let Some(payload_b64) = parts.next() else { continue };
 
                 let Ok(block_number) = block_num_s.parse::<u64>() else { continue };
                 let Ok(printed_flash_idx) = flash_idx_s.parse::<u64>() else { continue };
@@ -879,12 +967,15 @@ pub(crate) fn parse_fire_events(raw: &[u8]) -> Vec<FireEvent> {
                 let Ok(lib_num) = lib_num_s.parse::<u64>() else { continue };
                 let Ok(timestamp_ns) = timestamp_s.parse::<u64>() else { continue };
 
+                let block = decode_eth_block(payload_b64);
+
                 if printed_flash_idx == 0 {
                     results.push(FireEvent::Block {
                         block_number,
                         prev_block_number,
                         lib_num,
                         timestamp_ns,
+                        block,
                     });
                 } else {
                     let (flash_idx, is_final) = if printed_flash_idx >= 1000 {
@@ -899,6 +990,7 @@ pub(crate) fn parse_fire_events(raw: &[u8]) -> Vec<FireEvent> {
                         prev_block_number,
                         lib_num,
                         timestamp_ns,
+                        block,
                     });
                 }
             }
