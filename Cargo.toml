@@ -539,6 +539,7 @@ serial_test = "3"
 httpmock = "0.8.2"
 proptest = "1.10.0"
 similar-asserts = "1"
+pretty_assertions = "1.4"
 proptest-arbitrary-interop = "0.1.0"
 arbitrary = { version = "1", default-features = false }
 wiremock = { version = "0.6.2", default-features = false }

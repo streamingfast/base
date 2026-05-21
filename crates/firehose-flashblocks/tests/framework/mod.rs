@@ -5,8 +5,8 @@
 //! - [`GenesisStateProvider`]: a thin [`StateProvider`] wrapper around [`StateProviderTest`].
 //! - [`flash_base`] / [`flash_delta`]: helpers to build [`Flashblock`] fixtures.
 //! - [`ws_server_once`]: a transient WebSocket server that sends a sequence of messages once.
-//! - [`ParsedFireBlock`]: structured parsed representation of a `FIRE BLOCK` line.
-//! - [`parse_fire_blocks`]: parses all `FIRE BLOCK` lines from raw tracer output.
+//! - [`FireEvent`]: structured representation of a single FIRE output line (INIT or BLOCK).
+//! - [`parse_fire_events`]: parses all FIRE lines from raw tracer output.
 //! - [`run_flashblock_sequence`]: end-to-end harness — starts server, runs processor, returns output.
 
 use std::{
@@ -34,10 +34,13 @@ use base_execution_chainspec::BaseChainSpec;
 use base_firehose_flashblocks::{
     FirehoseFlashblocksProcessor, FlashblocksTracerHandle,
 };
+use base64::Engine as _;
 use firehose_tracer::{
     InMemoryBuffer,
     config::{ChainClient, ChainConfig, Config},
+    pb::Block as EthBlock,
 };
+use prost::Message as _;
 use futures::SinkExt as _;
 use reth_chainspec::{ChainInfo, ChainSpecProvider, EthChainSpec};
 use reth_db_models::StoredBlockBodyIndices;
@@ -682,102 +685,317 @@ pub(crate) async fn ws_server_once(sequence: Vec<Flashblock>) -> SocketAddr {
     addr
 }
 
-// ── FIRE BLOCK parsing ───────────────────────────────────────────────────────
+// ── FireEvent ────────────────────────────────────────────────────────────────
 
-/// A parsed representation of a single `FIRE BLOCK` line.
+/// A structured representation of a single FIRE output line.
 ///
-/// The FIRE 3.1 protocol format is:
-/// ```text
-/// FIRE BLOCK <block_num> <flash_block_idx> <block_hash> <prev_num> <prev_hash> <lib_num> <timestamp_unix_nano> <payload_base64>
-/// ```
+/// Parsed from the raw tracer output written to the in-memory buffer during tests.
+/// The two FIRE line types relevant to tests are:
 ///
-/// `flash_block_idx` is 0 for non-flash blocks; for flash blocks it equals the current flash
-/// block index, and equals `idx + 1000` when `is_final = true` (the final partial for this block).
-/// This convention is defined in `firehose_tracer::printer::compute_printed_flash_block_index`.
-#[derive(Debug)]
-pub(crate) struct ParsedFireBlock {
-    /// Block number as printed on the FIRE BLOCK line.
-    pub(crate) block_number: u64,
-    /// Raw printed flash block index from the FIRE BLOCK line.
-    ///
-    /// - `0` for a non-flash (canonical) block.
-    /// - `idx` for a partial flashblock where `is_final = false`.
-    /// - `idx + 1000` for the final partial flashblock where `is_final = true`.
-    pub(crate) printed_flash_idx: u64,
-    /// Block hash (hex, no `0x` prefix).
-    pub(crate) block_hash: String,
-    /// Previous block number.
-    pub(crate) prev_block_number: u64,
-    /// Previous block hash (hex, no `0x` prefix).
-    pub(crate) prev_block_hash: String,
-    /// Last irreversible block number.
-    pub(crate) lib_num: u64,
-    /// Block timestamp in Unix nanoseconds.
-    pub(crate) timestamp_ns: u64,
+/// - `FIRE INIT <version> <node_name> <node_version>` — emitted once per tracer instance.
+/// - `FIRE BLOCK <block_num> <flash_idx> <block_hash> <prev_num> <prev_hash> <lib_num>
+///   <timestamp_unix_nano> <payload_base64>` — one per executed block or flashblock partial.
+///
+/// `Block` and `FlashBlock` variants include the decoded `sf.ethereum.type.v2.Block` protobuf
+/// payload. Use [`assert_fire_events_metadata_eq`] when you only care about protocol metadata
+/// fields, or [`assert_fire_events_eq`] for full comparison including the decoded block payload.
+///
+/// The `flash_idx` encoding on the wire:
+/// - `0` → canonical (non-flash) block; maps to `FireEvent::Block`.
+/// - `1..=999` → flash partial, `is_final = false`; maps to `FireEvent::FlashBlock`.
+/// - `>=1000` → flash partial, `is_final = true` (`idx = printed - 1000`); maps to
+///   `FireEvent::FlashBlock` with `is_final: true`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FireEvent {
+    /// A `FIRE INIT` line emitted at tracer startup.
+    Init {
+        /// Protocol version string (e.g. `"3.1"`).
+        version: String,
+        /// Node/client name (e.g. `"reth-flashblock"`).
+        node_name: String,
+        /// Node/client version string.
+        node_version: String,
+    },
+    /// A `FIRE BLOCK` line where `printed_flash_idx == 0` (canonical block).
+    Block {
+        /// Block number.
+        block_number: u64,
+        /// Previous block number.
+        prev_block_number: u64,
+        /// Last irreversible block number.
+        lib_num: u64,
+        /// Block timestamp in Unix nanoseconds.
+        timestamp_ns: u64,
+        /// Decoded `sf.ethereum.type.v2.Block` protobuf payload.
+        block: EthBlock,
+    },
+    /// A `FIRE BLOCK` line where `printed_flash_idx > 0` (flashblock partial).
+    FlashBlock {
+        /// Block number.
+        block_number: u64,
+        /// Logical flash block index (with the `+1000` sentinel stripped for `is_final`).
+        flash_idx: u64,
+        /// Whether this is the final partial for the block (`printed_flash_idx >= 1000`).
+        is_final: bool,
+        /// Previous block number.
+        prev_block_number: u64,
+        /// Last irreversible block number.
+        lib_num: u64,
+        /// Block timestamp in Unix nanoseconds.
+        timestamp_ns: u64,
+        /// Decoded `sf.ethereum.type.v2.Block` protobuf payload.
+        block: EthBlock,
+    },
 }
 
-impl ParsedFireBlock {
-    /// Returns the logical flash block index (stripping the `+1000` final-block sentinel).
+impl FireEvent {
+    /// Constructs an expected [`FireEvent::Block`] for metadata-only assertions.
     ///
-    /// Returns `None` if this is a non-flash (canonical) block (`printed_flash_idx == 0`).
-    pub(crate) const fn flash_idx(&self) -> Option<u64> {
-        if self.printed_flash_idx == 0 {
-            None
-        } else if self.printed_flash_idx >= 1000 {
-            Some(self.printed_flash_idx - 1000)
-        } else {
-            Some(self.printed_flash_idx)
+    /// Sets `block` to `EthBlock::default()`. Use with [`assert_fire_events_metadata_eq`]
+    /// to compare only protocol metadata fields without inspecting the payload.
+    ///
+    /// `lib_num` and `timestamp_ns` default to `0` — treated as wildcards by the
+    /// metadata comparison helper.
+    pub(crate) fn canonical_block(block_number: u64) -> Self {
+        Self::Block {
+            block_number,
+            prev_block_number: if block_number > 0 { block_number - 1 } else { 0 },
+            lib_num: 0,
+            timestamp_ns: 0,
+            block: EthBlock::default(),
         }
     }
 
-    /// Returns `true` when this is the final partial for a canonical block (`is_final = true`).
+    /// Constructs an expected [`FireEvent::FlashBlock`] for metadata-only assertions.
     ///
-    /// Determined by the `+1000` sentinel: `printed_flash_idx >= 1000`.
-    pub(crate) const fn is_final(&self) -> bool {
-        self.printed_flash_idx >= 1000
+    /// Sets `block` to `EthBlock::default()`. Use with [`assert_fire_events_metadata_eq`].
+    pub(crate) fn flash_block(block_number: u64, flash_idx: u64, is_final: bool) -> Self {
+        Self::FlashBlock {
+            block_number,
+            flash_idx,
+            is_final,
+            prev_block_number: if block_number > 0 { block_number - 1 } else { 0 },
+            lib_num: 0,
+            timestamp_ns: 0,
+            block: EthBlock::default(),
+        }
     }
 }
 
-/// Parses all `FIRE BLOCK` lines from raw tracer output and returns structured representations.
+/// Asserts that `actual` events match `expected` ignoring the decoded block payload.
 ///
-/// Lines that do not start with `FIRE BLOCK` or that have malformed fields are silently skipped.
-pub(crate) fn parse_fire_blocks(raw: &[u8]) -> Vec<ParsedFireBlock> {
+/// Uses relaxed matching for `lib_num` and `timestamp_ns` as well: a `0` in `expected`
+/// matches any actual value. This is the preferred helper when a test only cares about
+/// protocol metadata (block numbers, flash indices, finality flags).
+///
+/// Produces a clear diff via [`pretty_assertions`] on mismatch.
+pub(crate) fn assert_fire_events_metadata_eq(actual: &[FireEvent], expected: &[FireEvent]) {
+    let sentinel = FireEvent::Block {
+        block_number: 0,
+        prev_block_number: 0,
+        lib_num: 0,
+        timestamp_ns: 0,
+        block: EthBlock::default(),
+    };
+    let normalised: Vec<FireEvent> = actual
+        .iter()
+        .zip(expected.iter().chain(std::iter::repeat(&sentinel)))
+        .map(|(a, e)| normalize_metadata(a, e))
+        .collect();
+
+    pretty_assertions::assert_eq!(normalised, expected);
+}
+
+/// Asserts that `actual` events exactly match `expected`, including the decoded block payload.
+///
+/// Uses relaxed matching for `lib_num` and `timestamp_ns` (a `0` in expected matches any
+/// actual value) but compares `block` fields directly. Use this when the test needs to
+/// verify that payload tracing is correct.
+///
+/// Produces a clear diff via [`pretty_assertions`] on mismatch.
+pub(crate) fn assert_fire_events_eq(actual: &[FireEvent], expected: &[FireEvent]) {
+    let sentinel = FireEvent::Block {
+        block_number: 0,
+        prev_block_number: 0,
+        lib_num: 0,
+        timestamp_ns: 0,
+        block: EthBlock::default(),
+    };
+    let normalised: Vec<FireEvent> = actual
+        .iter()
+        .zip(expected.iter().chain(std::iter::repeat(&sentinel)))
+        .map(|(a, e)| normalize_full(a, e))
+        .collect();
+
+    pretty_assertions::assert_eq!(normalised, expected);
+}
+
+/// Normalises `actual` for metadata-only comparison against `expected`.
+///
+/// - Zeros `lib_num` and `timestamp_ns` when the corresponding field in `expected` is `0`.
+/// - Replaces the `block` payload in the normalised copy with `expected`'s block, so the
+///   payload is never compared.
+fn normalize_metadata(actual: &FireEvent, expected: &FireEvent) -> FireEvent {
+    match (actual, expected) {
+        (
+            FireEvent::Block { block_number, prev_block_number, lib_num, timestamp_ns, .. },
+            FireEvent::Block { lib_num: el, timestamp_ns: et, block: eb, .. },
+        ) => FireEvent::Block {
+            block_number: *block_number,
+            prev_block_number: *prev_block_number,
+            lib_num: if *el == 0 { 0 } else { *lib_num },
+            timestamp_ns: if *et == 0 { 0 } else { *timestamp_ns },
+            block: eb.clone(),
+        },
+        (
+            FireEvent::FlashBlock {
+                block_number, flash_idx, is_final, prev_block_number, lib_num, timestamp_ns, ..
+            },
+            FireEvent::FlashBlock { lib_num: el, timestamp_ns: et, block: eb, .. },
+        ) => FireEvent::FlashBlock {
+            block_number: *block_number,
+            flash_idx: *flash_idx,
+            is_final: *is_final,
+            prev_block_number: *prev_block_number,
+            lib_num: if *el == 0 { 0 } else { *lib_num },
+            timestamp_ns: if *et == 0 { 0 } else { *timestamp_ns },
+            block: eb.clone(),
+        },
+        _ => actual.clone(),
+    }
+}
+
+/// Normalises `actual` for full comparison against `expected`.
+///
+/// Zeros `lib_num` and `timestamp_ns` when the corresponding field in `expected` is `0`,
+/// but keeps the actual `block` payload for comparison.
+fn normalize_full(actual: &FireEvent, expected: &FireEvent) -> FireEvent {
+    match (actual, expected) {
+        (
+            FireEvent::Block { block_number, prev_block_number, lib_num, timestamp_ns, block },
+            FireEvent::Block { lib_num: el, timestamp_ns: et, .. },
+        ) => FireEvent::Block {
+            block_number: *block_number,
+            prev_block_number: *prev_block_number,
+            lib_num: if *el == 0 { 0 } else { *lib_num },
+            timestamp_ns: if *et == 0 { 0 } else { *timestamp_ns },
+            block: block.clone(),
+        },
+        (
+            FireEvent::FlashBlock {
+                block_number, flash_idx, is_final, prev_block_number, lib_num, timestamp_ns, block,
+            },
+            FireEvent::FlashBlock { lib_num: el, timestamp_ns: et, .. },
+        ) => FireEvent::FlashBlock {
+            block_number: *block_number,
+            flash_idx: *flash_idx,
+            is_final: *is_final,
+            prev_block_number: *prev_block_number,
+            lib_num: if *el == 0 { 0 } else { *lib_num },
+            timestamp_ns: if *et == 0 { 0 } else { *timestamp_ns },
+            block: block.clone(),
+        },
+        _ => actual.clone(),
+    }
+}
+
+// ── FIRE line parsing ─────────────────────────────────────────────────────────
+
+/// Decodes a base64-encoded, prost-serialised `sf.ethereum.type.v2.Block` from the
+/// `payload_base64` field of a `FIRE BLOCK` line.
+///
+/// Returns `EthBlock::default()` on any decode error (malformed base64 or invalid proto bytes)
+/// rather than panicking, so that parsing never silently drops events.
+fn decode_eth_block(payload_base64: &str) -> EthBlock {
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(payload_base64) {
+        Ok(b) => b,
+        Err(_) => return EthBlock::default(),
+    };
+    EthBlock::decode(bytes.as_slice()).unwrap_or_default()
+}
+
+/// Parses all FIRE lines from raw tracer output and returns structured [`FireEvent`] values.
+///
+/// Recognised line prefixes:
+/// - `FIRE INIT <version> <node_name> <node_version>`
+/// - `FIRE BLOCK <block_num> <flash_idx> <block_hash> <prev_num> <prev_hash> <lib_num>
+///   <timestamp_ns> <payload_base64>`
+///
+/// The `payload_base64` field is decoded from base64 and deserialised via prost into an
+/// [`EthBlock`] and stored on the returned [`FireEvent`] variants.
+///
+/// Lines that do not start with `FIRE` or that have malformed fields are silently skipped.
+pub(crate) fn parse_fire_events(raw: &[u8]) -> Vec<FireEvent> {
     let text = std::str::from_utf8(raw).unwrap_or("");
     let mut results = Vec::new();
 
     for line in text.lines() {
         let mut parts = line.split(' ');
 
-        // Match "FIRE BLOCK"
         let (Some(p0), Some(p1)) = (parts.next(), parts.next()) else { continue };
-        if p0 != "FIRE" || p1 != "BLOCK" {
+        if p0 != "FIRE" {
             continue;
         }
 
-        // Parse: block_num flash_idx block_hash prev_num prev_hash lib_num timestamp_ns payload
-        let Some(block_num_s) = parts.next() else { continue };
-        let Some(flash_idx_s) = parts.next() else { continue };
-        let Some(block_hash_s) = parts.next() else { continue };
-        let Some(prev_num_s) = parts.next() else { continue };
-        let Some(prev_hash_s) = parts.next() else { continue };
-        let Some(lib_num_s) = parts.next() else { continue };
-        let Some(timestamp_s) = parts.next() else { continue };
+        match p1 {
+            "INIT" => {
+                // FIRE INIT <version> <node_name> <node_version>
+                let Some(version) = parts.next() else { continue };
+                let Some(node_name) = parts.next() else { continue };
+                let Some(node_version) = parts.next() else { continue };
+                results.push(FireEvent::Init {
+                    version: version.to_owned(),
+                    node_name: node_name.to_owned(),
+                    node_version: node_version.to_owned(),
+                });
+            }
+            "BLOCK" => {
+                // FIRE BLOCK <block_num> <flash_idx> <block_hash> <prev_num> <prev_hash>
+                //            <lib_num> <timestamp_ns> <payload_base64>
+                let Some(block_num_s) = parts.next() else { continue };
+                let Some(flash_idx_s) = parts.next() else { continue };
+                let Some(_block_hash_s) = parts.next() else { continue };
+                let Some(prev_num_s) = parts.next() else { continue };
+                let Some(_prev_hash_s) = parts.next() else { continue };
+                let Some(lib_num_s) = parts.next() else { continue };
+                let Some(timestamp_s) = parts.next() else { continue };
+                let Some(payload_b64) = parts.next() else { continue };
 
-        let Ok(block_number) = block_num_s.parse::<u64>() else { continue };
-        let Ok(printed_flash_idx) = flash_idx_s.parse::<u64>() else { continue };
-        let Ok(prev_block_number) = prev_num_s.parse::<u64>() else { continue };
-        let Ok(lib_num) = lib_num_s.parse::<u64>() else { continue };
-        let Ok(timestamp_ns) = timestamp_s.parse::<u64>() else { continue };
+                let Ok(block_number) = block_num_s.parse::<u64>() else { continue };
+                let Ok(printed_flash_idx) = flash_idx_s.parse::<u64>() else { continue };
+                let Ok(prev_block_number) = prev_num_s.parse::<u64>() else { continue };
+                let Ok(lib_num) = lib_num_s.parse::<u64>() else { continue };
+                let Ok(timestamp_ns) = timestamp_s.parse::<u64>() else { continue };
 
-        results.push(ParsedFireBlock {
-            block_number,
-            printed_flash_idx,
-            block_hash: block_hash_s.to_owned(),
-            prev_block_number,
-            prev_block_hash: prev_hash_s.to_owned(),
-            lib_num,
-            timestamp_ns,
-        });
+                let block = decode_eth_block(payload_b64);
+
+                if printed_flash_idx == 0 {
+                    results.push(FireEvent::Block {
+                        block_number,
+                        prev_block_number,
+                        lib_num,
+                        timestamp_ns,
+                        block,
+                    });
+                } else {
+                    let (flash_idx, is_final) = if printed_flash_idx >= 1000 {
+                        (printed_flash_idx - 1000, true)
+                    } else {
+                        (printed_flash_idx, false)
+                    };
+                    results.push(FireEvent::FlashBlock {
+                        block_number,
+                        flash_idx,
+                        is_final,
+                        prev_block_number,
+                        lib_num,
+                        timestamp_ns,
+                        block,
+                    });
+                }
+            }
+            _ => {} // skip unknown FIRE sub-commands
+        }
     }
 
     results

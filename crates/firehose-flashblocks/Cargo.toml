@@ -68,6 +68,13 @@ futures.workspace = true
 # serialization
 serde_json.workspace = true
 
+# protobuf decoding (for parsing FIRE BLOCK payload in tests)
+prost.workspace = true
+base64.workspace = true
+
+# assertions
+pretty_assertions.workspace = true
+
 [[test]]
 name = "flashblock_sequence"
 path = "tests/flashblock_sequence.rs"
