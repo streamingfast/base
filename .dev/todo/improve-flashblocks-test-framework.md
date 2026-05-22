@@ -45,7 +45,10 @@ This change enables better coverage where we can simulate when a canonical block
 
 ## Dev Feedback
 
-<empty>
+1. flash_base and flash_delta, they both should return right away a `TestEvent` object so we avoid having to wrap all emitted events inside `TestEvent::flashblock`, same for `TestEvent::canonical_block(1),` we should have locally a `canonical_block` helper or it can be assigned to a variable like other test cases.
+1. Modify all delta variables to be on the form `delta<blockNum>_<flashIndex>` so it reads like `vec![base1, delta1_1, delta1_2, base2, etc...]`
+
+**Applied in commit `94053caa4`.**
 
 ## Spec & Implementation
 
@@ -85,10 +88,11 @@ Total: 12 integration tests, all passing.
 ## State Tracker
 
 **Last Updated:** 2026-05-22
-**Current Step:** Step 2 — Implementation complete, ready for review
+**Current Step:** Step 3 — Dev feedback applied, ready for review
 **Status:** Ready for review
 
 | Step | Status | Notes |
 |---|---|---|
 | Initial setup | Done | Worktree created at .worktrees/feature/improve-flashblocks-test-framework |
 | Implementation | Done | TestEvent enum, GenesisClient inner state, updated tests, 2 new tests, all 12 pass, clippy clean |
+| Dev feedback | Done | flash_base/flash_delta/canonical_block return TestEvent directly; delta vars renamed to delta<N>_<I> pattern; all 12 tests pass, clippy clean |
