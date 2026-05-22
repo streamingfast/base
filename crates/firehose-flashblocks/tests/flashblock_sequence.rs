@@ -17,8 +17,8 @@ mod framework;
 use base_execution_chainspec::BaseChainSpec;
 
 use framework::{
-    FireEvent, assert_fire_events_eq, assert_fire_events_metadata_eq, flash_base, flash_delta,
-    parse_fire_events, run_flashblock_sequence, test_genesis, GenesisClient,
+    FireEvent, GenesisClient, assert_fire_events_eq, assert_fire_events_metadata_eq, flash_base,
+    flash_delta, parse_fire_events, run_flashblock_sequence, test_genesis,
 };
 
 /// Simplest possible test: send a single flash-base event (block 1, no transactions) and verify
@@ -46,10 +46,7 @@ async fn flash_base_emits_fire_block() {
         .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
         .collect();
 
-    assert_fire_events_metadata_eq(
-        &events,
-        &[FireEvent::canonical_block(1)],
-    );
+    assert_fire_events_metadata_eq(&events, &[FireEvent::canonical_block(1)]);
 }
 
 /// Sends a base flashblock then one delta for the same block number and verifies that two
@@ -150,16 +147,13 @@ async fn duplicate_base_is_ignored() {
         .collect();
 
     // Only one FIRE BLOCK must be emitted; the duplicate is silently dropped.
-    assert_fire_events_metadata_eq(
-        &events,
-        &[FireEvent::canonical_block(1)],
-    );
+    assert_fire_events_metadata_eq(&events, &[FireEvent::canonical_block(1)]);
 }
 
 /// Sends a base for block N, then a delta with index 2 (skipping index 1).
 ///
 /// Asserts that only one `FIRE BLOCK` is emitted (for the base). The gap causes the
-/// sequence validator to return `NonSequentialGap`, which sets `is_skipping = true`. No
+/// sequence validator to return `NonSequentialGap`, which resets the processor state. No
 /// further FIRE lines are emitted for the out-of-sequence delta.
 #[tokio::test]
 async fn non_sequential_delta_is_skipped() {
@@ -181,10 +175,7 @@ async fn non_sequential_delta_is_skipped() {
         .collect();
 
     // Only the base FIRE BLOCK is emitted; the gap delta is dropped.
-    assert_fire_events_metadata_eq(
-        &events,
-        &[FireEvent::canonical_block(1)],
-    );
+    assert_fire_events_metadata_eq(&events, &[FireEvent::canonical_block(1)]);
 }
 
 /// Sends a base + two successive deltas (idx=1, idx=2) for the same block.
@@ -223,9 +214,9 @@ async fn two_successive_deltas() {
 /// Sends a base then a delta with index=2, skipping index=1.
 ///
 /// This is equivalent to [`non_sequential_delta_is_skipped`] but verifies the behaviour is
-/// consistent: the gap at idx=2 triggers `NonSequentialGap`, sets `is_skipping=true`, and
-/// only the base `FIRE BLOCK` is emitted. Any further deltas on the same block while
-/// `is_skipping` is set are also dropped (exercised in [`three_successive_deltas_then_gap`]).
+/// consistent: the gap at idx=2 triggers `NonSequentialGap`, the processor resets its state,
+/// and only the base `FIRE BLOCK` is emitted. Any further deltas on the same block after the
+/// reset are also dropped (no in-flight sequence + non-zero index → dropped).
 #[tokio::test]
 async fn jumping_delta_is_skipped() {
     let genesis = test_genesis();
@@ -245,10 +236,7 @@ async fn jumping_delta_is_skipped() {
         .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
         .collect();
 
-    assert_fire_events_metadata_eq(
-        &events,
-        &[FireEvent::canonical_block(1)],
-    );
+    assert_fire_events_metadata_eq(&events, &[FireEvent::canonical_block(1)]);
 }
 
 /// Sends a base + three successive deltas (idx=1, idx=2, idx=3) for the same block.

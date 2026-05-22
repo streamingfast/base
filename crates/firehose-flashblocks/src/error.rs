@@ -5,9 +5,10 @@ use thiserror::Error;
 
 /// Errors raised while re-executing a flashblock through the Firehose tracer.
 ///
-/// `process_flashblock` only ever observes these errors internally: it logs them, sets the
-/// processor into the `is_skipping` state for the rest of the block, and drops the accumulated
-/// DB. The variant carries enough context for the log line; nothing downstream consumes it.
+/// `process_flashblock` only ever observes these errors internally: it logs them and resets
+/// the processor state (clears `current_block_number`, drops the accumulated DB) so that the
+/// next base flashblock restarts tracking from scratch. The variant carries enough context
+/// for the log line; nothing downstream consumes it.
 #[derive(Debug, Error)]
 pub enum Error {
     /// Could not fetch a [`reth_provider::StateProvider`] for the parent block within the

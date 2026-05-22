@@ -33,8 +33,8 @@ use crate::{Error, FlashblocksTracerHandle};
 /// Number of retries when waiting for a parent [`StateProvider`] to materialize.
 ///
 /// The processor retries `state_by_block_number_or_tag(parent)` this many times with
-/// [`STATE_PROVIDER_RETRY_DELAY`] between attempts before giving up and entering the
-/// `is_skipping` state for the current block.
+/// [`STATE_PROVIDER_RETRY_DELAY`] between attempts before giving up and clearing the
+/// processor state so the next base flashblock restarts tracking from scratch.
 const STATE_PROVIDER_MAX_RETRIES: u32 = 20;
 
 /// Sleep duration between [`StateProviderFactory`] retries on the bootstrap path.
@@ -51,18 +51,21 @@ type AccumulatedDb = State<StateProviderDatabase<BoxedStateProvider>>;
 
 /// Mutable state held by the processor, guarded by a single mutex so flashblock callbacks
 /// from the WS subscriber are processed in arrival order.
+///
+/// `current_block_number == None` doubles as the "no valid sequence in progress" signal:
+/// errors clear it, and the next incoming flashblock must be a base (index 0) to restart.
 #[derive(Debug)]
 struct ProcessorState {
-    /// Current block number we are tracing. `None` until the first base flashblock.
+    /// Current block number we are tracing. `None` until the first base flashblock and after
+    /// any error or out-of-sequence event that forces us to wait for the next base.
     current_block_number: Option<u64>,
-    /// Latest flashblock index applied for `current_block_number`. `None` while no base is seen.
+    /// Latest flashblock index applied for `current_block_number`. `None` whenever
+    /// `current_block_number` is `None`.
     latest_flashblock_index: Option<u64>,
-    /// All flashblocks accumulated for the current block. Cleared on a new base.
+    /// All flashblocks accumulated for the current block. Cleared whenever state is reset.
     stored_flashblocks: Vec<Flashblock>,
     /// EVM state shared across flashblocks (and across blocks on the sequential fast path).
     accumulated_db: Option<AccumulatedDb>,
-    /// `true` between an error and the next base flashblock — drops further deltas for the block.
-    is_skipping: bool,
 }
 
 impl ProcessorState {
@@ -72,8 +75,26 @@ impl ProcessorState {
             latest_flashblock_index: None,
             stored_flashblocks: Vec::new(),
             accumulated_db: None,
-            is_skipping: false,
         }
+    }
+
+    /// Clear all per-sequence state, forcing the next flashblock to start a fresh sequence
+    /// (only a base flashblock at index 0 will be accepted; non-zero indices are dropped).
+    fn reset(&mut self) {
+        self.current_block_number = None;
+        self.latest_flashblock_index = None;
+        self.stored_flashblocks.clear();
+        self.accumulated_db = None;
+    }
+
+    /// Begin (or restart) a sequence on a fresh base flashblock at index 0. The accumulated
+    /// DB is left untouched — the caller decides whether to keep the carried-forward state
+    /// (sequential fast path) or to drop it (block gap / startup) before calling this.
+    fn start_block(&mut self, flashblock: Flashblock) {
+        debug_assert_eq!(flashblock.index, 0, "start_block requires a base flashblock");
+        self.current_block_number = Some(flashblock.metadata.block_number);
+        self.latest_flashblock_index = Some(0);
+        self.stored_flashblocks = vec![flashblock];
     }
 }
 
@@ -106,15 +127,13 @@ where
         Self { client, state: Mutex::new(ProcessorState::new()), tracer: Mutex::new(tracer) }
     }
 
-    /// Process a single flashblock event. Errors are logged and swallowed: the processor sets
-    /// the `is_skipping` flag for the rest of the current block and drops the accumulated DB,
-    /// then waits for the next base flashblock.
+    /// Process a single flashblock event. Errors are logged and swallowed: the processor clears
+    /// its in-flight state and accumulated DB so the next base flashblock restarts tracking.
     fn process(&self, flashblock: Flashblock) {
         if let Err(err) = self.process_inner(flashblock) {
-            error!(error = %err, "flashblock processing failed; skipping rest of current block");
+            error!(error = %err, "flashblock processing failed; resetting state and waiting for next base");
             let mut state = self.state.lock().expect("flashblock state mutex poisoned");
-            state.is_skipping = true;
-            state.accumulated_db = None;
+            state.reset();
         }
     }
 
@@ -124,88 +143,84 @@ where
 
         let mut state = self.state.lock().expect("flashblock state mutex poisoned");
 
-        // Validate sequence vs current state.
-        if let Some(latest_block) = state.current_block_number {
-            let latest_idx = state
-                .latest_flashblock_index
-                .expect("latest_flashblock_index must be Some when current_block_number is Some");
-            match FlashblockSequenceValidator::validate(
-                latest_block,
-                latest_idx,
-                block_number,
-                index,
-            ) {
-                SequenceValidationResult::NextInSequence
-                | SequenceValidationResult::FirstOfNextBlock => {}
-                SequenceValidationResult::Duplicate => {
-                    debug!(block = block_number, index, "duplicate flashblock; ignoring");
-                    return Ok(());
-                }
-                SequenceValidationResult::InvalidNewBlockIndex { .. } => {
+        match state.current_block_number {
+            // No prior state: only a base flashblock can start (or restart) a sequence.
+            None => {
+                if index != 0 {
                     warn!(
                         block = block_number,
                         index,
-                        latest_block,
-                        latest_idx,
-                        "new block with non-zero index; dropping accumulated DB and skipping"
+                        "no in-flight sequence and incoming flashblock is not a base (index != 0); dropping and waiting for next base"
                     );
-                    state.is_skipping = true;
-                    state.accumulated_db = None;
                     return Ok(());
                 }
-                SequenceValidationResult::NonSequentialGap { expected, actual } => {
-                    warn!(
-                        block = block_number,
-                        expected,
-                        actual,
-                        "non-sequential flashblock gap; dropping accumulated DB and skipping"
-                    );
-                    state.is_skipping = true;
-                    state.accumulated_db = None;
-                    return Ok(());
-                }
+                state.start_block(flashblock);
             }
-        } else if index != 0 {
-            warn!(
-                block = block_number,
-                index,
-                "first observed flashblock is not a base (index != 0); waiting for next base"
-            );
-            state.is_skipping = true;
-            return Ok(());
-        }
-
-        if state.is_skipping {
-            if index == 0 {
-                state.is_skipping = false;
-            } else {
-                debug!(
-                    block = block_number,
-                    index, "skipping flashblock while in error-recovery state"
+            Some(latest_block) => {
+                let latest_idx = state.latest_flashblock_index.expect(
+                    "latest_flashblock_index must be Some when current_block_number is Some",
                 );
-                return Ok(());
+                match FlashblockSequenceValidator::validate(
+                    latest_block,
+                    latest_idx,
+                    block_number,
+                    index,
+                ) {
+                    SequenceValidationResult::NextInSequence => {
+                        state.stored_flashblocks.push(flashblock);
+                        state.latest_flashblock_index = Some(index);
+                    }
+                    SequenceValidationResult::FirstOfNextBlock => {
+                        // Strict successor block — keep accumulated_db so the sequential fast
+                        // path can carry committed state forward without re-bootstrapping.
+                        state.start_block(flashblock);
+                    }
+                    SequenceValidationResult::Duplicate => {
+                        debug!(block = block_number, index, "duplicate flashblock; ignoring");
+                        return Ok(());
+                    }
+                    SequenceValidationResult::InvalidNewBlockIndex { index: 0, .. } => {
+                        // Block gap but on a base flashblock — opportunistically restart on it.
+                        // The accumulated DB is no longer valid (we missed one or more blocks),
+                        // so drop it and let the bootstrap path re-fetch canonical state below.
+                        warn!(
+                            block = block_number,
+                            latest_block,
+                            latest_idx,
+                            "block gap with base flashblock; restarting from new base and dropping accumulated DB"
+                        );
+                        state.accumulated_db = None;
+                        state.start_block(flashblock);
+                    }
+                    SequenceValidationResult::InvalidNewBlockIndex { .. } => {
+                        warn!(
+                            block = block_number,
+                            index,
+                            latest_block,
+                            latest_idx,
+                            "new block with non-zero index; resetting state and waiting for next base"
+                        );
+                        state.reset();
+                        return Ok(());
+                    }
+                    SequenceValidationResult::NonSequentialGap { expected, actual } => {
+                        warn!(
+                            block = block_number,
+                            expected,
+                            actual,
+                            "non-sequential flashblock gap; resetting state and waiting for next base"
+                        );
+                        state.reset();
+                        return Ok(());
+                    }
+                }
             }
-        }
-
-        // On a new base, drop accumulated_db iff the new block is not the strict successor of
-        // the previous one (so a fresh bootstrap from the canonical provider runs below).
-        if index == 0 {
-            let is_sequential =
-                state.current_block_number.is_some_and(|prev| prev + 1 == block_number);
-            if !is_sequential {
-                state.accumulated_db = None;
-            }
-            state.stored_flashblocks = vec![flashblock];
-            state.latest_flashblock_index = Some(0);
-            state.current_block_number = Some(block_number);
-        } else {
-            state.stored_flashblocks.push(flashblock);
-            state.latest_flashblock_index = Some(index);
         }
 
         let stored_flashblocks = state.stored_flashblocks.clone();
         let mut accumulated_db = state.accumulated_db.take();
-        drop(state);
+
+        drop(state); // release the lock on the state
 
         let assembled = BlockAssembler::assemble(&stored_flashblocks)
             .map_err(|e| Error::BlockAssembly(Box::new(e)))?;
@@ -225,14 +240,9 @@ where
 
         if accumulated_db.is_none() {
             let parent_block = block_number.saturating_sub(1);
-            let provider = match self.bootstrap_provider(parent_block) {
-                Some(p) => p,
-                None => {
-                    let mut state = self.state.lock().expect("flashblock state mutex poisoned");
-                    state.is_skipping = true;
-                    return Err(Error::StateProviderTimeout { block_number, parent_hash });
-                }
-            };
+            let provider = self
+                .bootstrap_provider(parent_block)
+                .ok_or(Error::StateProviderTimeout { block_number, parent_hash })?;
             accumulated_db = Some(
                 State::builder()
                     .with_database(StateProviderDatabase::new(provider))
@@ -243,19 +253,11 @@ where
         }
 
         let mut db = accumulated_db.expect("accumulated_db was populated just above");
-        let exec_result = self.execute_flashblock(&assembled, index, &new_transactions, &mut db);
+        self.execute_flashblock(&assembled, index, &new_transactions, &mut db)?;
 
         let mut state_guard = self.state.lock().expect("flashblock state mutex poisoned");
-        match &exec_result {
-            Ok(()) => {
-                state_guard.accumulated_db = Some(db);
-            }
-            Err(_) => {
-                state_guard.is_skipping = true;
-                state_guard.accumulated_db = None;
-            }
-        }
-        exec_result
+        state_guard.accumulated_db = Some(db);
+        Ok(())
     }
 
     fn bootstrap_provider(&self, parent_block: u64) -> Option<BoxedStateProvider> {
