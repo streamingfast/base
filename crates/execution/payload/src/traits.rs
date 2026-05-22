@@ -3,9 +3,9 @@ use base_common_consensus::{BaseTransaction, DepositReceiptExt};
 use reth_payload_primitives::PayloadBuilderAttributes;
 use reth_primitives_traits::{FullBlockHeader, NodePrimitives, SignedTransaction, WithEncoded};
 
-use crate::OpPayloadBuilderAttributes;
+use crate::BasePayloadBuilderAttributes;
 
-/// Helper trait to encapsulate common bounds on [`NodePrimitives`] for OP payload builder.
+/// Helper trait to encapsulate common bounds on [`NodePrimitives`] for the payload builder.
 pub trait PayloadPrimitives:
     NodePrimitives<
         Receipt: DepositReceiptExt,
@@ -35,7 +35,7 @@ where
     type _Header = Header;
 }
 
-/// Attributes for the OP payload builder.
+/// Attributes for the payload builder.
 pub trait Attributes: PayloadBuilderAttributes {
     /// Primitive transaction type.
     type Transaction: SignedTransaction;
@@ -47,7 +47,7 @@ pub trait Attributes: PayloadBuilderAttributes {
     fn sequencer_transactions(&self) -> &[WithEncoded<Self::Transaction>];
 }
 
-impl<T: SignedTransaction> Attributes for OpPayloadBuilderAttributes<T> {
+impl<T: SignedTransaction> Attributes for BasePayloadBuilderAttributes<T> {
     type Transaction = T;
 
     fn no_tx_pool(&self) -> bool {

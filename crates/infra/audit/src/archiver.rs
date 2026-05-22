@@ -10,7 +10,7 @@ use tokio::{
     sync::{Mutex, mpsc},
     time::sleep,
 };
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     metrics::Metrics,
@@ -18,8 +18,9 @@ use crate::{
     storage::EventWriter,
 };
 
-/// Archives audit events from Kafka to S3 storage.
-pub struct KafkaAuditArchiver<R, W>
+/// Archives audit events from a generic [`EventReader`] (Kafka, RPC, etc.) to
+/// an [`EventWriter`] (typically S3) via a worker pool.
+pub struct AuditArchiver<R, W>
 where
     R: EventReader,
     W: EventWriter + Clone + Send + 'static,
@@ -29,17 +30,17 @@ where
     _phantom: PhantomData<W>,
 }
 
-impl<R, W> fmt::Debug for KafkaAuditArchiver<R, W>
+impl<R, W> fmt::Debug for AuditArchiver<R, W>
 where
     R: EventReader,
     W: EventWriter + Clone + Send + 'static,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("KafkaAuditArchiver").finish_non_exhaustive()
+        f.debug_struct("AuditArchiver").finish_non_exhaustive()
     }
 }
 
-impl<R, W> KafkaAuditArchiver<R, W>
+impl<R, W> AuditArchiver<R, W>
 where
     R: EventReader,
     W: EventWriter + Clone + Send + 'static,
@@ -81,10 +82,8 @@ where
                     match event {
                         Some(event) => {
                             let archive_start = Instant::now();
-                            // tmp: only use this to clear kafka consumer offset
-                            // TODO: use debug! later
                             if noop_archive {
-                                info!(
+                                debug!(
                                     worker_id,
                                     bundle_id = %event.event.bundle_id(),
                                     tx_ids = ?event.event.transaction_ids(),
@@ -96,7 +95,7 @@ where
                                 continue;
                             }
                             if let Err(e) = writer.archive_event(event).await {
-                                error!(worker_id, error = %e, "Failed to write event");
+                                warn!(worker_id, error = %e, "Failed to write event");
                             } else {
                                 Metrics::archive_event_duration()
                                     .record(archive_start.elapsed().as_secs_f64());

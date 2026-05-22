@@ -6,9 +6,14 @@
 mod action;
 pub use action::{Action, L2BlockProvider};
 
-mod miner;
-pub use miner::{
-    L1Block, L1Miner, L1MinerConfig, PendingTx, ReorgError, UserDeposit, block_info_from,
+mod conductor;
+pub use conductor::{ConductorState, TestConductor, TestConductorHandle};
+
+mod l1;
+pub use l1::{
+    ActionBlobProvider, ActionL1BlockFetcher, ActionL1ChainProvider, ActionL1FetcherError, L1Block,
+    L1Miner, L1MinerConfig, L1PendingTransaction, L1ProviderError, L1TxBuilder, ReorgError,
+    SharedL1Chain, UserDeposit, block_info_from, l1_block_to_rpc,
 };
 
 mod l2;
@@ -21,7 +26,9 @@ mod harness;
 pub use harness::ActionTestHarness;
 
 mod batcher;
-pub use batcher::{Batcher, BatcherConfig, BatcherError, Inner, L1MinerTxManager, Pending};
+pub use batcher::{
+    Batcher, BatcherConfig, BatcherError, Inner, L1MinerTxManager, L1SignedSubmission, Pending,
+};
 
 mod matrix;
 pub use matrix::{ForkMatrix, ForkSetter};
@@ -30,11 +37,7 @@ mod test_rollup_config;
 pub use test_rollup_config::TestRollupConfigBuilder;
 
 mod providers;
-pub use providers::{
-    ActionBlobDataSource, ActionBlobProvider, ActionDataSource, ActionL1BlockFetcher,
-    ActionL1ChainProvider, ActionL1FetcherError, ActionL2ChainProvider, L1ProviderError,
-    L2ProviderError, SharedL1Chain, l1_block_to_rpc,
-};
+pub use providers::{ActionL2ChainProvider, L2ProviderError};
 
 mod p2p;
 pub use p2p::{SupervisedP2P, TestGossipTransport, TestGossipTransportError};
@@ -47,6 +50,6 @@ pub use engine::{
 
 mod node;
 pub use node::{
-    ActionPipeline, BlobVerifierPipeline, DerivedBlock, NodeStepResult, TestRollupNode,
+    ActionPipeline, DerivedBlock, NodeStepResult, ProductionDaProvider, TestRollupNode,
     VerifierError, VerifierPipeline,
 };

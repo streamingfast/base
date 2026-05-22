@@ -7,7 +7,7 @@ use alloy_primitives::FixedBytes;
 use alloy_rpc_types_engine::{
     ForkchoiceUpdated, INVALID_FORK_CHOICE_STATE_ERROR, PayloadId, PayloadStatus, PayloadStatusEnum,
 };
-use base_consensus_genesis::RollupConfig;
+use base_common_genesis::RollupConfig;
 use rstest::rstest;
 use thiserror::Error;
 use tokio::sync::mpsc;

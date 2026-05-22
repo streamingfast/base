@@ -42,14 +42,13 @@ use base_proof_contracts::{
 use base_proof_primitives::{ProofJournal, ProofRequest, ProofResult, ProverClient};
 use base_proof_rpc::{L1Provider, L2Provider, RollupProvider, RpcError};
 use eyre::Result;
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{StreamExt, stream};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
     Metrics,
-    constants::PROPOSAL_TIMEOUT,
     driver::{DriverConfig, RecoveredState},
     error::ProposerError,
     output_proposer::OutputProposer,
@@ -85,7 +84,7 @@ pub struct PipelineConfig {
 /// - No cache exists (cold start / pipeline reset).
 /// - The anchor advanced past the cached tip (governance intervention).
 /// - `game_count` decreased (L1 reorg removed games).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CachedRecovery {
     /// Factory `game_count` at the time of the last walk.
     game_count: u64,
@@ -109,6 +108,12 @@ struct PipelineState {
     retry_counts: BTreeMap<u64, u32>,
     /// Cached result from the last successful recovery scan.
     cached_recovery: Option<CachedRecovery>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProofPlan {
+    start_block: u64,
+    target_block: u64,
 }
 
 impl PipelineState {
@@ -346,13 +351,12 @@ where
         })?;
 
         let mut start_block = recovered.l2_block_number;
-        let mut start_output = recovered.output_root;
+        let mut plans = Vec::new();
+        let mut output_blocks = BTreeSet::new();
 
-        while cursor <= safe_head && state.inflight.len() < self.config.max_parallel_proofs {
-            // Skip blocks already being handled (in-flight, proved, or
-            // submitting).  Track the last skipped block so we can fetch
-            // its output root once — only when we actually find a block
-            // to dispatch.
+        while cursor <= safe_head
+            && state.inflight.len() + plans.len() < self.config.max_parallel_proofs
+        {
             let mut last_skipped = None;
             while cursor <= safe_head
                 && (state.inflight.contains(&cursor)
@@ -362,82 +366,76 @@ where
                 last_skipped = Some(cursor);
                 cursor = match cursor.checked_add(self.config.driver.block_interval) {
                     Some(c) => c,
-                    // Overflow means there are no further blocks to dispatch.
                     None => return Ok(()),
                 };
             }
 
-            // Nothing left to dispatch after skipping.
             if cursor > safe_head {
                 break;
             }
 
-            // Still at max capacity after skipping.
-            if state.inflight.len() >= self.config.max_parallel_proofs {
+            if state.inflight.len() + plans.len() >= self.config.max_parallel_proofs {
                 break;
             }
 
-            // Fetch the output root for the last skipped block so the
-            // proof request chains correctly.
             if let Some(skipped) = last_skipped {
-                match self.rollup_client.output_at_block(skipped).await {
-                    Ok(output) => {
-                        start_block = skipped;
-                        start_output = output.output_root;
-                    }
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            block = skipped,
-                            "Failed to fetch output root while skipping, stopping dispatch"
-                        );
-                        break;
-                    }
-                }
+                start_block = skipped;
+                output_blocks.insert(skipped);
             }
 
-            match self.build_proof_request_for(start_block, start_output, cursor).await {
-                Ok(request) => {
-                    let claimed_output = request.claimed_l2_output_root;
-                    let prover = Arc::clone(&self.prover);
-                    let target = cursor;
-                    let cancel = self.cancel.child_token();
+            plans.push(ProofPlan { start_block, target_block: cursor });
+            output_blocks.insert(cursor);
+            start_block = cursor;
 
-                    info!(
-                        from_block = start_block,
-                        to_block = target,
-                        blocks = target.saturating_sub(start_block),
-                        "Dispatching proof task"
-                    );
-                    state.inflight.insert(target);
-                    state.prove_tasks.spawn(async move {
-                        let mut proof_timer =
-                            base_metrics::timed!(Metrics::proof_duration_seconds());
-                        tokio::select! {
-                            () = cancel.cancelled() => {
-                                proof_timer.disarm();
-                                (target, Err(ProposerError::Internal("cancelled".into())))
-                            }
-                            result = prover.prove(request) => {
-                                drop(proof_timer);
-                                (target, result.map_err(|e| ProposerError::Prover(e.to_string())))
-                            }
-                        }
-                    });
-
-                    start_block = cursor;
-                    start_output = claimed_output;
-                }
-                Err(e) => {
-                    warn!(error = %e, target_block = cursor, "Failed to build proof request");
-                    break;
-                }
-            }
             cursor = match cursor.checked_add(self.config.driver.block_interval) {
                 Some(c) => c,
                 None => break,
             };
         }
+
+        if plans.is_empty() {
+            state.record_gauges();
+            return Ok(());
+        }
+
+        let requests = match self
+            .build_proof_requests_for(recovered, &plans, output_blocks.into_iter().collect())
+            .await
+        {
+            Ok(requests) => requests,
+            Err(e) => {
+                warn!(error = %e, "Failed to build proof request batch");
+                state.record_gauges();
+                return Ok(());
+            }
+        };
+
+        for (plan, request) in requests {
+            let prover = Arc::clone(&self.prover);
+            let cancel = self.cancel.child_token();
+
+            info!(
+                from_block = plan.start_block,
+                to_block = plan.target_block,
+                blocks = plan.target_block.saturating_sub(plan.start_block),
+                "Dispatching proof task"
+            );
+            state.inflight.insert(plan.target_block);
+            state.prove_tasks.spawn(async move {
+                let mut proof_timer = base_metrics::timed!(Metrics::proof_duration_seconds());
+                tokio::select! {
+                    () = cancel.cancelled() => {
+                        proof_timer.disarm();
+                        (plan.target_block, Err(ProposerError::Internal("cancelled".into())))
+                    }
+                    result = prover.prove(request) => {
+                        drop(proof_timer);
+                        (plan.target_block, result.map_err(|e| ProposerError::Prover(e.to_string())))
+                    }
+                }
+            });
+        }
+
         state.record_gauges();
         Ok(())
     }
@@ -578,11 +576,20 @@ where
             }
             SubmitOutcome::Failed { target_block, proof, error } => {
                 Metrics::errors_total(error.metric_label()).increment(1);
-                warn!(
-                    error = %error,
-                    target_block,
-                    "Submission failed, will retry"
-                );
+                // Drop the cache only when the contract explicitly reports
+                // the parent is no longer valid; transient failures (RPC,
+                // gas/nonce, signing) leave it intact to avoid an
+                // unnecessary forward walk on the next tick.
+                if error.is_invalid_parent_game() {
+                    warn!(
+                        error = %error,
+                        target_block,
+                        "Submission rejected: parent game invalid, dropping recovery cache"
+                    );
+                    state.cached_recovery = None;
+                } else {
+                    warn!(error = %error, target_block, "Submission failed, will retry");
+                }
                 state.proved.insert(target_block, proof);
                 state.submitting = None;
                 state.record_gauges();
@@ -656,6 +663,49 @@ where
         &self,
         cache: &mut Option<CachedRecovery>,
     ) -> Option<(RecoveredState, u64)> {
+        if let Some(cached) = cache.as_ref() {
+            let safe_head = match self.latest_safe_block_number().await {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!(error = %e, "Failed to fetch safe head, retrying next tick");
+                    return None;
+                }
+            };
+
+            let next_proposal_block =
+                match cached.state.l2_block_number.checked_add(self.config.driver.block_interval) {
+                    Some(block) => block,
+                    None => {
+                        warn!(
+                            cached_block = cached.state.l2_block_number,
+                            block_interval = self.config.driver.block_interval,
+                            "Cannot compute next proposal block, retrying next tick"
+                        );
+                        return None;
+                    }
+                };
+
+            if safe_head < next_proposal_block {
+                debug!(
+                    safe_head,
+                    cached_block = cached.state.l2_block_number,
+                    next_proposal_block,
+                    "Safe head below next proposal target, skipping recovery"
+                );
+                return Some((cached.state, safe_head));
+            }
+
+            let state = match self.recover_latest_state(cache).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "Failed to recover on-chain state, retrying next tick");
+                    return None;
+                }
+            };
+
+            return Some((state, safe_head));
+        }
+
         let (state_result, safe_head_result) =
             tokio::join!(self.recover_latest_state(cache), self.latest_safe_block_number(),);
 
@@ -684,7 +734,7 @@ where
     /// # Strategy
     ///
     /// 1. Read `game_count` from the factory and anchor root from the registry
-    ///    (2 RPC calls per tick — always needed for cache validation).
+    ///    once the safe head is high enough to need recovery.
     /// 2. **Cache check — fast path.** If both `game_count` and `anchor_root`
     ///    match the cache, return the cached state immediately (zero RPCs).
     /// 3. **Forward walk.** Walk from the anchor block, stepping by
@@ -720,12 +770,14 @@ where
             .await
             .map_err(|e| ProposerError::Contract(format!("recovery game_count failed: {e}")))?;
 
-        // Read the anchor root early so it can be included in the cache key.
-        let anchor = self
+        // Read the anchor root and anchor game from one L1 snapshot so
+        // recovery cannot combine an old root with a newer anchor game.
+        let anchor_snapshot = self
             .anchor_registry
-            .get_anchor_root()
+            .anchor_snapshot()
             .await
-            .map_err(|e| ProposerError::Contract(format!("get_anchor_root failed: {e}")))?;
+            .map_err(|e| ProposerError::Contract(format!("anchor_snapshot failed: {e}")))?;
+        let anchor = anchor_snapshot.anchor_root;
 
         // The cached tip is valid as long as the anchor hasn't advanced past
         // it. The anchor advances when games resolve (~every 20 min after the
@@ -764,11 +816,19 @@ where
                 );
                 cached.state
             }
-            _ => RecoveredState {
-                parent_address: self.config.driver.anchor_state_registry_address,
-                output_root: anchor.root,
-                l2_block_number: anchor.l2_block_number,
-            },
+            _ => {
+                let parent_address = if anchor_snapshot.anchor_game.is_zero() {
+                    self.config.driver.anchor_state_registry_address
+                } else {
+                    anchor_snapshot.anchor_game
+                };
+
+                RecoveredState {
+                    parent_address,
+                    output_root: anchor.root,
+                    l2_block_number: anchor.l2_block_number,
+                }
+            }
         };
 
         let state = self.forward_walk(&start).await?;
@@ -935,59 +995,182 @@ where
         &self,
         blocks: Vec<u64>,
     ) -> Result<HashMap<u64, B256>, ProposerError> {
+        self.fetch_canonical_roots_with(blocks, false).await
+    }
+
+    /// Concurrently fetches canonical output roots, bypassing the output cache.
+    async fn fetch_fresh_canonical_roots(
+        &self,
+        blocks: Vec<u64>,
+    ) -> Result<HashMap<u64, B256>, ProposerError> {
+        self.fetch_canonical_roots_with(blocks, true).await
+    }
+
+    /// Concurrently fetches canonical output roots with configurable cache usage.
+    ///
+    /// When `bypass_cache` is true, each root is fetched directly from the rollup node.
+    async fn fetch_canonical_roots_with(
+        &self,
+        blocks: Vec<u64>,
+        bypass_cache: bool,
+    ) -> Result<HashMap<u64, B256>, ProposerError> {
+        self.fetch_canonical_root_results_with(blocks, bypass_cache)
+            .await
+            .into_iter()
+            .map(|(block_number, result)| result.map(|root| (block_number, root)))
+            .collect()
+    }
+
+    async fn fetch_canonical_root_results_with(
+        &self,
+        blocks: Vec<u64>,
+        bypass_cache: bool,
+    ) -> HashMap<u64, Result<B256, ProposerError>> {
         if blocks.is_empty() {
-            return Ok(HashMap::new());
+            return HashMap::new();
         }
         stream::iter(blocks)
             .map(|block_number| {
                 let rollup = &self.rollup_client;
                 async move {
-                    rollup
-                        .output_at_block(block_number)
-                        .await
-                        .map(|out| (block_number, out.output_root))
-                        .map_err(ProposerError::Rpc)
+                    let output = if bypass_cache {
+                        rollup.fresh_output_at_block(block_number).await
+                    } else {
+                        rollup.output_at_block(block_number).await
+                    };
+                    (block_number, output.map(|out| out.output_root).map_err(ProposerError::Rpc))
                 }
             })
             .buffered(self.config.recovery_scan_concurrency)
-            .try_collect()
+            .collect()
             .await
     }
 
-    async fn build_proof_request_for(
+    async fn build_proof_requests_for(
         &self,
-        starting_block_number: u64,
-        agreed_output_root: B256,
-        target_block: u64,
-    ) -> Result<ProofRequest, ProposerError> {
-        let (agreed_l2_head, claimed_output, l1_head) = tokio::try_join!(
-            async {
-                self.l2_client
-                    .header_by_number(Some(starting_block_number))
-                    .await
-                    .map_err(ProposerError::Rpc)
-            },
-            async {
-                self.rollup_client.output_at_block(target_block).await.map_err(ProposerError::Rpc)
-            },
+        recovered: &RecoveredState,
+        plans: &[ProofPlan],
+        output_blocks: Vec<u64>,
+    ) -> Result<Vec<(ProofPlan, ProofRequest)>, ProposerError> {
+        let start_blocks: Vec<u64> = plans
+            .iter()
+            .map(|plan| plan.start_block)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        let (l1_head_result, output_roots, l2_heads) = tokio::join!(
             async { self.l1_client.header_by_number(None).await.map_err(ProposerError::Rpc) },
-        )?;
+            self.fetch_canonical_root_results_with(output_blocks, false),
+            async {
+                stream::iter(start_blocks)
+                    .map(|block_number| {
+                        let l2 = &self.l2_client;
+                        async move {
+                            let result = l2
+                                .header_by_number(Some(block_number))
+                                .await
+                                .map_err(ProposerError::Rpc);
+                            (block_number, result)
+                        }
+                    })
+                    .buffered(self.config.recovery_scan_concurrency)
+                    .collect::<HashMap<_, _>>()
+                    .await
+            },
+        );
+        let l1_head = l1_head_result?;
 
-        let request = ProofRequest {
-            l1_head: l1_head.hash,
-            agreed_l2_head_hash: agreed_l2_head.hash,
-            agreed_l2_output_root: agreed_output_root,
-            claimed_l2_output_root: claimed_output.output_root,
-            claimed_l2_block_number: target_block,
-            proposer: self.config.driver.proposer_address,
-            intermediate_block_interval: self.config.driver.intermediate_block_interval,
-            l1_head_number: l1_head.number,
-            image_hash: self.config.driver.tee_image_hash,
-        };
+        let mut requests = Vec::with_capacity(plans.len());
+        for plan in plans {
+            let agreed_l2_head = match l2_heads.get(&plan.start_block) {
+                Some(Ok(header)) => header,
+                Some(Err(e)) => {
+                    warn!(
+                        error = %e,
+                        start_block = plan.start_block,
+                        target_block = plan.target_block,
+                        "Stopping proof request batch after L2 header fetch failed"
+                    );
+                    break;
+                }
+                None => {
+                    warn!(
+                        start_block = plan.start_block,
+                        target_block = plan.target_block,
+                        "Stopping proof request batch because L2 header is missing"
+                    );
+                    break;
+                }
+            };
 
-        info!(request = ?request, "Built proof request for parallel proving");
+            let agreed_output_root = if plan.start_block == recovered.l2_block_number {
+                recovered.output_root
+            } else {
+                match output_roots.get(&plan.start_block) {
+                    Some(Ok(root)) => *root,
+                    Some(Err(e)) => {
+                        warn!(
+                            error = %e,
+                            start_block = plan.start_block,
+                            target_block = plan.target_block,
+                            "Stopping proof request batch after start output fetch failed"
+                        );
+                        break;
+                    }
+                    None => {
+                        warn!(
+                            start_block = plan.start_block,
+                            target_block = plan.target_block,
+                            "Stopping proof request batch because start output is missing"
+                        );
+                        break;
+                    }
+                }
+            };
 
-        Ok(request)
+            let claimed_l2_output_root = match output_roots.get(&plan.target_block) {
+                Some(Ok(root)) => *root,
+                Some(Err(e)) => {
+                    warn!(
+                        error = %e,
+                        target_block = plan.target_block,
+                        "Stopping proof request batch after target output fetch failed"
+                    );
+                    break;
+                }
+                None => {
+                    warn!(
+                        target_block = plan.target_block,
+                        "Stopping proof request batch because target output is missing"
+                    );
+                    break;
+                }
+            };
+
+            let request = ProofRequest {
+                l1_head: l1_head.hash,
+                agreed_l2_head_hash: agreed_l2_head.hash,
+                agreed_l2_output_root: agreed_output_root,
+                claimed_l2_output_root,
+                claimed_l2_block_number: plan.target_block,
+                proposer: self.config.driver.proposer_address,
+                intermediate_block_interval: self.config.driver.intermediate_block_interval,
+                l1_head_number: l1_head.number,
+                image_hash: self.config.driver.tee_image_hash,
+            };
+
+            info!(
+                from_block = plan.start_block,
+                to_block = plan.target_block,
+                l1_head_number = l1_head.number,
+                "Built proof request for parallel proving"
+            );
+
+            requests.push((*plan, request));
+        }
+
+        Ok(requests)
     }
 
     /// Recovers the TEE signer from the aggregate proposal and checks
@@ -1063,7 +1246,7 @@ where
         // JIT validation: check that the proved output root still matches canonical.
         let canonical_output = self
             .rollup_client
-            .output_at_block(target_block)
+            .fresh_output_at_block(target_block)
             .await
             .map_err(|e| SubmitAction::Failed(ProposerError::Rpc(e)))?;
 
@@ -1091,13 +1274,15 @@ where
             .extract_intermediate_roots(starting_block_number, proposals, &intermediate_blocks)
             .map_err(SubmitAction::Failed)?;
 
-        // Fetch canonical roots for non-target intermediate blocks only;
-        // the target block was already fetched for the JIT check above.
+        // Fetch fresh canonical roots for non-target intermediate blocks only;
+        // the target block was already fetched fresh for the JIT check above.
         let non_target_blocks: Vec<u64> =
             intermediate_blocks.iter().copied().filter(|&b| b != target_block).collect();
 
-        let mut canonical_map: HashMap<u64, B256> =
-            self.fetch_canonical_roots(non_target_blocks).await.map_err(SubmitAction::Failed)?;
+        let mut canonical_map: HashMap<u64, B256> = self
+            .fetch_fresh_canonical_roots(non_target_blocks)
+            .await
+            .map_err(SubmitAction::Failed)?;
         canonical_map.insert(target_block, canonical_output.output_root);
 
         for (root, block) in intermediate_roots.iter().zip(intermediate_blocks.iter()) {
@@ -1164,26 +1349,20 @@ where
             "Proposing output (creating dispute game)"
         );
 
-        // Submit with timeout.
         let mut propose_timer = base_metrics::timed!(Metrics::proposal_l1_tx_duration_seconds());
-        let propose_result = tokio::time::timeout(
-            PROPOSAL_TIMEOUT,
-            self.output_proposer.propose_output(
-                aggregate_proposal,
-                parent_address,
-                &intermediate_roots,
-            ),
-        )
-        .await;
+        let propose_result = self
+            .output_proposer
+            .propose_output(aggregate_proposal, parent_address, &intermediate_roots)
+            .await;
 
         match propose_result {
-            Ok(Ok(())) => {
+            Ok(()) => {
                 drop(propose_timer);
                 info!(target_block, "Dispute game created successfully");
                 Metrics::l2_output_proposals_total().increment(1);
                 Ok(())
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 if e.is_game_already_exists() {
                     drop(propose_timer);
                     info!(
@@ -1191,17 +1370,27 @@ where
                         "Game already exists, next tick will load fresh state from chain"
                     );
                     Err(SubmitAction::GameAlreadyExists)
+                } else if e.is_l1_origin_too_old() {
+                    propose_timer.disarm();
+                    warn!(
+                        error = %e,
+                        target_block,
+                        "Proof L1 origin is too old, discarding proof to re-prove"
+                    );
+                    Err(SubmitAction::Discard(e))
+                } else if e.is_invalid_signer() {
+                    propose_timer.disarm();
+                    warn!(
+                        error = %e,
+                        target_block,
+                        "Proof signer is invalid on-chain, discarding proof to re-prove"
+                    );
+                    Metrics::tee_signer_invalid_total().increment(1);
+                    Err(SubmitAction::Discard(e))
                 } else {
                     propose_timer.disarm();
                     Err(SubmitAction::Failed(e))
                 }
-            }
-            Err(_) => {
-                propose_timer.disarm();
-                Err(SubmitAction::Failed(ProposerError::Internal(format!(
-                    "dispute game creation timed out after {}s",
-                    PROPOSAL_TIMEOUT.as_secs()
-                ))))
             }
         }
     }
@@ -1302,9 +1491,17 @@ enum SubmitOutcome {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc, time::Duration};
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use alloy_primitives::{Address, B256};
+    use async_trait::async_trait;
     use base_proof_primitives::{ProofResult, Proposal, ProverClient};
     use rstest::rstest;
     use tokio_util::sync::CancellationToken;
@@ -1396,6 +1593,7 @@ mod tests {
             game_count_override: Some(n as u64),
             uuid_games,
             games_should_fail: false,
+            game_count_calls: None,
         };
 
         (factory, output_roots)
@@ -1411,6 +1609,23 @@ mod tests {
         MockAnchorStateRegistry,
         MockDisputeGameFactory,
     >;
+
+    #[derive(Debug)]
+    struct SnapshotOnlyAnchorStateRegistry {
+        snapshot: base_proof_contracts::AnchorSnapshot,
+    }
+
+    #[async_trait::async_trait]
+    impl AnchorStateRegistryClient for SnapshotOnlyAnchorStateRegistry {
+        async fn anchor_snapshot(
+            &self,
+        ) -> std::result::Result<
+            base_proof_contracts::AnchorSnapshot,
+            base_proof_contracts::ContractError,
+        > {
+            Ok(self.snapshot)
+        }
+    }
 
     fn test_pipeline(
         pipeline_config: PipelineConfig,
@@ -1428,8 +1643,10 @@ mod tests {
             output_roots: HashMap::new(),
             max_safe_block: None,
         });
-        let anchor_registry =
-            Arc::new(MockAnchorStateRegistry { anchor_root: test_anchor_root(TEST_ANCHOR_BLOCK) });
+        let anchor_registry = Arc::new(MockAnchorStateRegistry {
+            anchor_root: test_anchor_root(TEST_ANCHOR_BLOCK),
+            anchor_game: Address::ZERO,
+        });
         let factory = Arc::new(MockDisputeGameFactory::with_games(vec![]));
 
         ProvingPipeline::new(
@@ -1468,6 +1685,63 @@ mod tests {
         block_interval: u64,
         intermediate_block_interval: u64,
     ) -> TestPipeline {
+        recovery_pipeline_full_with_output_proposer(
+            factory,
+            output_roots,
+            anchor_block,
+            block_interval,
+            intermediate_block_interval,
+            Arc::new(MockOutputProposer),
+        )
+    }
+
+    fn recovery_pipeline_full_with_output_proposer(
+        factory: MockDisputeGameFactory,
+        output_roots: HashMap<u64, B256>,
+        anchor_block: u64,
+        block_interval: u64,
+        intermediate_block_interval: u64,
+        output_proposer: Arc<dyn OutputProposer>,
+    ) -> TestPipeline {
+        recovery_pipeline_full_with_anchor_game_and_output_proposer(
+            factory,
+            output_roots,
+            anchor_block,
+            Address::ZERO,
+            block_interval,
+            intermediate_block_interval,
+            output_proposer,
+        )
+    }
+
+    fn recovery_pipeline_full_with_anchor_game(
+        factory: MockDisputeGameFactory,
+        output_roots: HashMap<u64, B256>,
+        anchor_block: u64,
+        anchor_game: Address,
+        block_interval: u64,
+        intermediate_block_interval: u64,
+    ) -> TestPipeline {
+        recovery_pipeline_full_with_anchor_game_and_output_proposer(
+            factory,
+            output_roots,
+            anchor_block,
+            anchor_game,
+            block_interval,
+            intermediate_block_interval,
+            Arc::new(MockOutputProposer),
+        )
+    }
+
+    fn recovery_pipeline_full_with_anchor_game_and_output_proposer(
+        factory: MockDisputeGameFactory,
+        output_roots: HashMap<u64, B256>,
+        anchor_block: u64,
+        anchor_game: Address,
+        block_interval: u64,
+        intermediate_block_interval: u64,
+        output_proposer: Arc<dyn OutputProposer>,
+    ) -> TestPipeline {
         let cancel = CancellationToken::new();
         let l1 = Arc::new(MockL1 { latest_block_number: TEST_L1_BLOCK_NUMBER });
         let l2 = Arc::new(MockL2 { block_not_found: true, canonical_hash: None });
@@ -1478,8 +1752,10 @@ mod tests {
             output_roots,
             max_safe_block: None,
         });
-        let anchor_registry =
-            Arc::new(MockAnchorStateRegistry { anchor_root: test_anchor_root(anchor_block) });
+        let anchor_registry = Arc::new(MockAnchorStateRegistry {
+            anchor_root: test_anchor_root(anchor_block),
+            anchor_game,
+        });
 
         ProvingPipeline::new(
             PipelineConfig {
@@ -1501,7 +1777,7 @@ mod tests {
             anchor_registry,
             Arc::new(factory),
             Arc::new(MockAggregateVerifier::default()),
-            Arc::new(MockOutputProposer),
+            output_proposer,
             cancel,
         )
     }
@@ -1581,6 +1857,87 @@ mod tests {
         );
         assert_eq!(state.l2_block_number, TEST_ANCHOR_BLOCK, "should return anchor block");
         assert!(cache.is_some(), "cache should still be populated");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_recovery_cold_start_uses_anchor_game_after_anchor_advance() {
+        let anchor_game = proxy_addr(0);
+        let anchor_block = TEST_BLOCK_INTERVAL;
+
+        let mut factory = MockDisputeGameFactory::with_games(vec![]);
+        factory.game_count_override = Some(1);
+        let pipeline = recovery_pipeline_full_with_anchor_game(
+            factory,
+            HashMap::new(),
+            anchor_block,
+            anchor_game,
+            TEST_BLOCK_INTERVAL,
+            TEST_BLOCK_INTERVAL,
+        );
+
+        let mut cache: Option<CachedRecovery> = None;
+        let state = pipeline.recover_latest_state(&mut cache).await.unwrap();
+
+        assert_eq!(state.parent_address, anchor_game, "advanced anchor game should be the parent");
+        assert_eq!(state.l2_block_number, anchor_block, "should propose after the live anchor");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_recovery_reads_anchor_root_and_game_from_one_snapshot() {
+        let anchor_game = proxy_addr(0);
+        let anchor_root = B256::repeat_byte(0xAA);
+        let anchor_block = TEST_BLOCK_INTERVAL;
+        let cancel = CancellationToken::new();
+        let l1 = Arc::new(MockL1 { latest_block_number: TEST_L1_BLOCK_NUMBER });
+        let l2 = Arc::new(MockL2 { block_not_found: true, canonical_hash: None });
+        let prover: Arc<dyn ProverClient> =
+            Arc::new(MockProver { delay: MOCK_PROVER_DELAY, block_interval: TEST_BLOCK_INTERVAL });
+        let rollup = Arc::new(MockRollupClient {
+            sync_status: test_sync_status(TEST_BLOCK_INTERVAL * 2, B256::ZERO),
+            output_roots: HashMap::new(),
+            max_safe_block: None,
+        });
+        let anchor_registry = Arc::new(SnapshotOnlyAnchorStateRegistry {
+            snapshot: base_proof_contracts::AnchorSnapshot {
+                anchor_root: base_proof_contracts::AnchorRoot {
+                    root: anchor_root,
+                    l2_block_number: anchor_block,
+                },
+                anchor_game,
+            },
+        });
+        let mut factory = MockDisputeGameFactory::with_games(vec![]);
+        factory.game_count_override = Some(1);
+
+        let pipeline = ProvingPipeline::new(
+            PipelineConfig {
+                max_parallel_proofs: 4,
+                max_retries: 3,
+                recovery_scan_concurrency: 8,
+                tee_prover_registry_address: None,
+                driver: DriverConfig {
+                    block_interval: TEST_BLOCK_INTERVAL,
+                    intermediate_block_interval: TEST_BLOCK_INTERVAL,
+                    ..Default::default()
+                },
+            },
+            prover,
+            l1,
+            l2,
+            rollup,
+            anchor_registry,
+            Arc::new(factory),
+            Arc::new(MockAggregateVerifier::default()),
+            Arc::new(MockOutputProposer),
+            cancel,
+        );
+
+        let mut cache: Option<CachedRecovery> = None;
+        let state = pipeline.recover_latest_state(&mut cache).await.unwrap();
+
+        assert_eq!(state.parent_address, anchor_game);
+        assert_eq!(state.output_root, anchor_root);
+        assert_eq!(state.l2_block_number, anchor_block);
     }
 
     // ---- Recovery: forward walk ----
@@ -1670,8 +2027,10 @@ mod tests {
             output_roots,
             max_safe_block: Some(TEST_BLOCK_INTERVAL * 2),
         });
-        let anchor_registry =
-            Arc::new(MockAnchorStateRegistry { anchor_root: test_anchor_root(TEST_ANCHOR_BLOCK) });
+        let anchor_registry = Arc::new(MockAnchorStateRegistry {
+            anchor_root: test_anchor_root(TEST_ANCHOR_BLOCK),
+            anchor_game: Address::ZERO,
+        });
 
         let pipeline = ProvingPipeline::new(
             PipelineConfig {
@@ -1727,6 +2086,31 @@ mod tests {
         assert_eq!(state2.parent_address, state1.parent_address);
         assert_eq!(state2.l2_block_number, state1.l2_block_number);
         assert_eq!(state2.output_root, state1.output_root);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_tick_skips_recovery_when_safe_head_below_cached_next_target() {
+        let game_count_calls = Arc::new(AtomicUsize::new(0));
+        let mut factory = MockDisputeGameFactory::with_games(vec![]);
+        factory.game_count_calls = Some(Arc::clone(&game_count_calls));
+        let pipeline = recovery_pipeline(factory, HashMap::new());
+
+        let cached = CachedRecovery {
+            game_count: 0,
+            state: RecoveredState {
+                parent_address: Address::ZERO,
+                output_root: B256::ZERO,
+                l2_block_number: TEST_ANCHOR_BLOCK,
+            },
+        };
+        let mut state = PipelineState::new();
+        state.cached_recovery = Some(cached);
+
+        pipeline.tick(&mut state).await.unwrap();
+
+        assert_eq!(game_count_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.cached_recovery, Some(cached));
+        assert!(state.inflight.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1928,8 +2312,10 @@ mod tests {
             output_roots: HashMap::new(),
             max_safe_block: None,
         });
-        let anchor_registry =
-            Arc::new(MockAnchorStateRegistry { anchor_root: test_anchor_root(TEST_ANCHOR_BLOCK) });
+        let anchor_registry = Arc::new(MockAnchorStateRegistry {
+            anchor_root: test_anchor_root(TEST_ANCHOR_BLOCK),
+            anchor_game: Address::ZERO,
+        });
         let factory = Arc::new(MockDisputeGameFactory::with_games(vec![]));
 
         let pipeline = ProvingPipeline::new(
@@ -1985,6 +2371,65 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_dispatch_keeps_successful_plans_when_later_output_fetch_fails() {
+        let cancel = CancellationToken::new();
+        let safe_head = TEST_BLOCK_INTERVAL * 2;
+
+        let l1 = Arc::new(MockL1 { latest_block_number: TEST_L1_BLOCK_NUMBER });
+        let l2 = Arc::new(MockL2 { block_not_found: true, canonical_hash: None });
+        let prover: Arc<dyn ProverClient> = Arc::new(MockProver {
+            delay: Duration::from_secs(3600),
+            block_interval: TEST_BLOCK_INTERVAL,
+        });
+        let rollup = Arc::new(MockRollupClient {
+            sync_status: test_sync_status(safe_head, B256::ZERO),
+            output_roots: HashMap::new(),
+            max_safe_block: Some(TEST_BLOCK_INTERVAL),
+        });
+        let anchor_registry = Arc::new(MockAnchorStateRegistry {
+            anchor_root: test_anchor_root(TEST_ANCHOR_BLOCK),
+            anchor_game: Address::ZERO,
+        });
+        let factory = Arc::new(MockDisputeGameFactory::with_games(vec![]));
+
+        let pipeline = ProvingPipeline::new(
+            PipelineConfig {
+                max_parallel_proofs: 2,
+                max_retries: 3,
+                recovery_scan_concurrency: 8,
+                tee_prover_registry_address: None,
+                driver: DriverConfig {
+                    block_interval: TEST_BLOCK_INTERVAL,
+                    intermediate_block_interval: TEST_BLOCK_INTERVAL,
+                    ..Default::default()
+                },
+            },
+            prover,
+            l1,
+            l2,
+            rollup,
+            anchor_registry,
+            factory,
+            Arc::new(MockAggregateVerifier::default()),
+            Arc::new(MockOutputProposer),
+            cancel,
+        );
+
+        let recovered = RecoveredState {
+            parent_address: Address::ZERO,
+            output_root: B256::ZERO,
+            l2_block_number: TEST_ANCHOR_BLOCK,
+        };
+        let mut state = PipelineState::new();
+
+        pipeline.dispatch_proofs(&recovered, safe_head, &mut state).await.unwrap();
+
+        assert!(state.inflight.contains(&TEST_BLOCK_INTERVAL));
+        assert!(!state.inflight.contains(&(TEST_BLOCK_INTERVAL * 2)));
+        assert_eq!(state.inflight.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_dispatch_skips_submitting_block() {
         let cancel = CancellationToken::new();
         let safe_head = TEST_BLOCK_INTERVAL * 4;
@@ -2000,8 +2445,10 @@ mod tests {
             output_roots: HashMap::new(),
             max_safe_block: None,
         });
-        let anchor_registry =
-            Arc::new(MockAnchorStateRegistry { anchor_root: test_anchor_root(TEST_ANCHOR_BLOCK) });
+        let anchor_registry = Arc::new(MockAnchorStateRegistry {
+            anchor_root: test_anchor_root(TEST_ANCHOR_BLOCK),
+            anchor_game: Address::ZERO,
+        });
         let factory = Arc::new(MockDisputeGameFactory::with_games(vec![]));
 
         let pipeline = ProvingPipeline::new(
@@ -2094,6 +2541,87 @@ mod tests {
         assert!(state.cached_recovery.is_none(), "reset() should clear cached_recovery");
     }
 
+    /// Pipeline, primed state with a cached recovery tip, and a proof ready
+    /// for `handle_submit_result(SubmitOutcome::Failed { .. })` tests.
+    fn submission_failure_fixture() -> (TestPipeline, PipelineState, ProofResult) {
+        let pipeline =
+            recovery_pipeline(MockDisputeGameFactory::with_games(vec![]), HashMap::new());
+        let target_block = TEST_BLOCK_INTERVAL;
+        let proposal = test_proposal(target_block);
+        let proof =
+            ProofResult::Tee { aggregate_proposal: proposal.clone(), proposals: vec![proposal] };
+
+        let mut state = PipelineState::new();
+        state.submitting = Some(target_block);
+        state.cached_recovery = Some(CachedRecovery {
+            game_count: 1,
+            state: RecoveredState {
+                parent_address: proxy_addr(0),
+                output_root: B256::repeat_byte(0x01),
+                l2_block_number: target_block,
+            },
+        });
+
+        (pipeline, state, proof)
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_invalid_parent_game_submission_clears_cached_recovery() {
+        let (pipeline, mut state, proof) = submission_failure_fixture();
+        let target_block = TEST_BLOCK_INTERVAL;
+        let cached_before = state.cached_recovery;
+
+        let chain_next = pipeline
+            .handle_submit_result(
+                Ok(SubmitOutcome::Failed {
+                    target_block,
+                    proof,
+                    error: ProposerError::InvalidParentGame,
+                }),
+                &mut state,
+            )
+            .await;
+
+        assert!(cached_before.is_some());
+        assert!(!chain_next, "failed submission should not chain another submit");
+        assert!(state.cached_recovery.is_none(), "InvalidParentGame must drop the cache");
+        assert!(state.proved.contains_key(&target_block), "proof should be re-queued for retry");
+        assert!(state.submitting.is_none(), "submitting slot should be released");
+    }
+
+    #[rstest]
+    #[case::contract_revert(ProposerError::Contract("mock submission failure".into()))]
+    #[case::rpc_transport(ProposerError::Rpc(base_proof_rpc::RpcError::Transport("rpc down".into())))]
+    #[case::rpc_timeout(ProposerError::Rpc(base_proof_rpc::RpcError::Timeout("slow rpc".into())))]
+    #[case::tx_manager_nonce(ProposerError::TxManager(
+        base_tx_manager::TxManagerError::NonceTooLow
+    ))]
+    #[case::tx_reverted(ProposerError::TxReverted("0xdeadbeef".into()))]
+    #[case::internal(ProposerError::Internal("bug".into()))]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_transient_failed_submission_preserves_cached_recovery(
+        #[case] error: ProposerError,
+    ) {
+        let (pipeline, mut state, proof) = submission_failure_fixture();
+        let target_block = TEST_BLOCK_INTERVAL;
+        let cached_before = state.cached_recovery;
+
+        let chain_next = pipeline
+            .handle_submit_result(
+                Ok(SubmitOutcome::Failed { target_block, proof, error }),
+                &mut state,
+            )
+            .await;
+
+        assert!(!chain_next, "transient failure should not chain another submit");
+        assert_eq!(
+            state.cached_recovery, cached_before,
+            "transient failure must preserve the cached recovery tip"
+        );
+        assert!(state.proved.contains_key(&target_block), "proof should be re-queued for retry");
+        assert!(state.submitting.is_none(), "submitting slot should be released");
+    }
+
     // ---- Intermediate output root validation (submission) tests ----
 
     /// Shared block intervals for submission validation tests.
@@ -2116,6 +2644,54 @@ mod tests {
         ProofResult::Tee { aggregate_proposal: aggregate, proposals }
     }
 
+    #[derive(Debug)]
+    struct DelayedOutputProposer {
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl OutputProposer for DelayedOutputProposer {
+        async fn propose_output(
+            &self,
+            _proposal: &Proposal,
+            _parent_address: Address,
+            _intermediate_roots: &[B256],
+        ) -> Result<(), ProposerError> {
+            tokio::time::sleep(self.delay).await;
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct L1OriginTooOldOutputProposer;
+
+    #[async_trait]
+    impl OutputProposer for L1OriginTooOldOutputProposer {
+        async fn propose_output(
+            &self,
+            _proposal: &Proposal,
+            _parent_address: Address,
+            _intermediate_roots: &[B256],
+        ) -> Result<(), ProposerError> {
+            Err(ProposerError::L1OriginTooOld)
+        }
+    }
+
+    #[derive(Debug)]
+    struct InvalidSignerOutputProposer;
+
+    #[async_trait]
+    impl OutputProposer for InvalidSignerOutputProposer {
+        async fn propose_output(
+            &self,
+            _proposal: &Proposal,
+            _parent_address: Address,
+            _intermediate_roots: &[B256],
+        ) -> Result<(), ProposerError> {
+            Err(ProposerError::InvalidSigner)
+        }
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_validate_and_submit_intermediate_roots_match() {
         // MockRollupClient returns B256::repeat_byte(n) for blocks without
@@ -2126,6 +2702,71 @@ mod tests {
         let result =
             pipeline.validate_and_submit(&proof_result, SUBMIT_BLOCK_INTERVAL, Address::ZERO).await;
         assert!(result.is_ok(), "all roots match, submission should succeed");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_validate_and_submit_does_not_apply_outer_timeout() {
+        let pipeline = recovery_pipeline_full_with_output_proposer(
+            MockDisputeGameFactory::with_games(vec![]),
+            HashMap::new(),
+            TEST_ANCHOR_BLOCK,
+            SUBMIT_BLOCK_INTERVAL,
+            SUBMIT_INTERMEDIATE_INTERVAL,
+            Arc::new(DelayedOutputProposer {
+                delay: crate::constants::PROPOSAL_TIMEOUT + Duration::from_secs(1),
+            }),
+        );
+        let proof_result = submit_proof_result(SUBMIT_BLOCK_INTERVAL);
+
+        let result =
+            pipeline.validate_and_submit(&proof_result, SUBMIT_BLOCK_INTERVAL, Address::ZERO).await;
+
+        assert!(
+            result.is_ok(),
+            "submission should rely on tx-manager timeout, not an outer timeout"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_validate_and_submit_discards_l1_origin_too_old() {
+        let pipeline = recovery_pipeline_full_with_output_proposer(
+            MockDisputeGameFactory::with_games(vec![]),
+            HashMap::new(),
+            TEST_ANCHOR_BLOCK,
+            SUBMIT_BLOCK_INTERVAL,
+            SUBMIT_INTERMEDIATE_INTERVAL,
+            Arc::new(L1OriginTooOldOutputProposer),
+        );
+        let proof_result = submit_proof_result(SUBMIT_BLOCK_INTERVAL);
+
+        let result =
+            pipeline.validate_and_submit(&proof_result, SUBMIT_BLOCK_INTERVAL, Address::ZERO).await;
+
+        assert!(
+            matches!(result, Err(SubmitAction::Discard(ProposerError::L1OriginTooOld))),
+            "stale L1 origin should discard the proof, got {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_validate_and_submit_discards_invalid_signer() {
+        let pipeline = recovery_pipeline_full_with_output_proposer(
+            MockDisputeGameFactory::with_games(vec![]),
+            HashMap::new(),
+            TEST_ANCHOR_BLOCK,
+            SUBMIT_BLOCK_INTERVAL,
+            SUBMIT_INTERMEDIATE_INTERVAL,
+            Arc::new(InvalidSignerOutputProposer),
+        );
+        let proof_result = submit_proof_result(SUBMIT_BLOCK_INTERVAL);
+
+        let result =
+            pipeline.validate_and_submit(&proof_result, SUBMIT_BLOCK_INTERVAL, Address::ZERO).await;
+
+        assert!(
+            matches!(result, Err(SubmitAction::Discard(ProposerError::InvalidSigner))),
+            "invalid signer should discard the proof, got {result:?}"
+        );
     }
 
     #[rstest]

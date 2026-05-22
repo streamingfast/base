@@ -12,16 +12,17 @@ use alloy_consensus::{
 use alloy_eips::{Encodable2718, eip7685::EMPTY_REQUESTS_HASH, merge::BEACON_NONCE};
 use alloy_evm::Database;
 use alloy_primitives::{Address, B256, Bloom, U256, logs_bloom, map::foldhash::HashMap};
-use base_access_lists::{FlashblockAccessList, FlashblockAccessListBuilder};
+use base_access_lists::FlashblockAccessList;
 use base_builder_publish::WebSocketPublisher;
+use base_bundles::RejectedTransaction;
 use base_common_chains::Upgrades;
 use base_common_consensus::{BaseReceipt, BaseTransactionSigned};
 use base_common_flashblocks::{
     ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, FlashblocksPayloadV1,
 };
-use base_execution_consensus::{calculate_receipt_root_no_memo_optimism, isthmus};
-use base_execution_evm::{BaseEvmConfig, OpNextBlockEnvAttributes};
-use base_execution_payload_builder::{OpBuiltPayload, OpPayloadBuilderAttributes};
+use base_execution_consensus::{calculate_receipt_root_no_memo, isthmus};
+use base_execution_evm::{BaseEvmConfig, BaseNextBlockEnvAttributes};
+use base_execution_payload_builder::{BaseBuiltPayload, BasePayloadBuilderAttributes};
 use either::Either;
 use eyre::WrapErr as _;
 use reth_basic_payload_builder::BuildOutcome;
@@ -52,7 +53,7 @@ use crate::{
     flashblocks::{
         FlashblocksExtraCtx,
         best_txs::BestFlashblocksTxs,
-        context::OpPayloadBuilderCtx,
+        context::BasePayloadBuilderCtx,
         generator::{BlockCell, BuildArguments},
     },
     traits::{ClientBounds, PoolBounds},
@@ -71,22 +72,9 @@ type NextBestFlashblocksTxs<Pool> = BestFlashblocksTxs<
     >,
 >;
 
-/// Execution information specific to flashblocks.
-///
-/// Tracks the last consumed flashblock index and manages the
-/// flashblock-level access list builder for progressive block construction.
-#[derive(Debug, Default, Clone)]
-pub struct FlashblocksExecutionInfo {
-    /// Index of the last consumed flashblock
-    pub(crate) last_flashblock_index: usize,
-
-    /// Flashblock-level access list builder
-    pub(crate) access_list_builder: FlashblockAccessListBuilder,
-}
-
 /// Base payload builder
 #[derive(Debug, Clone)]
-pub(super) struct OpPayloadBuilder<Pool, Client> {
+pub(super) struct BasePayloadBuilder<Pool, Client> {
     /// The type responsible for creating the evm.
     pub evm_config: BaseEvmConfig,
     /// The transaction pool
@@ -95,35 +83,38 @@ pub(super) struct OpPayloadBuilder<Pool, Client> {
     pub client: Client,
     /// Sender for sending built payloads to [`PayloadHandler`],
     /// which broadcasts outgoing payloads via p2p.
-    pub payload_tx: mpsc::Sender<OpBuiltPayload>,
+    pub payload_tx: mpsc::Sender<BaseBuiltPayload>,
     /// WebSocket publisher for broadcasting flashblocks
     /// to all connected subscribers.
     pub ws_pub: Arc<WebSocketPublisher>,
     /// System configuration for the builder
     pub config: BuilderConfig,
+    /// Sender for forwarding per-block batches of rejected transactions to the audit-archiver.
+    pub rejected_tx_sender: Option<mpsc::Sender<Vec<RejectedTransaction>>>,
 }
 
-impl<Pool, Client> OpPayloadBuilder<Pool, Client> {
-    /// `OpPayloadBuilder` constructor.
+impl<Pool, Client> BasePayloadBuilder<Pool, Client> {
+    /// `BasePayloadBuilder` constructor.
     pub(super) const fn new(
         evm_config: BaseEvmConfig,
         pool: Pool,
         client: Client,
         config: BuilderConfig,
-        payload_tx: mpsc::Sender<OpBuiltPayload>,
+        payload_tx: mpsc::Sender<BaseBuiltPayload>,
         ws_pub: Arc<WebSocketPublisher>,
+        rejected_tx_sender: Option<mpsc::Sender<Vec<RejectedTransaction>>>,
     ) -> Self {
-        Self { evm_config, pool, client, payload_tx, ws_pub, config }
+        Self { evm_config, pool, client, payload_tx, ws_pub, config, rejected_tx_sender }
     }
 }
 
-impl<Pool, Client> reth_basic_payload_builder::PayloadBuilder for OpPayloadBuilder<Pool, Client>
+impl<Pool, Client> reth_basic_payload_builder::PayloadBuilder for BasePayloadBuilder<Pool, Client>
 where
     Pool: Clone + Send + Sync,
     Client: Clone + Send + Sync,
 {
-    type Attributes = OpPayloadBuilderAttributes<BaseTransactionSigned>;
-    type BuiltPayload = OpBuiltPayload;
+    type Attributes = BasePayloadBuilderAttributes<BaseTransactionSigned>;
+    type BuiltPayload = BaseBuiltPayload;
 
     fn try_build(
         &self,
@@ -147,19 +138,19 @@ where
     }
 }
 
-impl<Pool, Client> OpPayloadBuilder<Pool, Client>
+impl<Pool, Client> BasePayloadBuilder<Pool, Client>
 where
     Pool: PoolBounds,
     Client: ClientBounds,
 {
-    fn get_op_payload_builder_ctx(
+    fn get_base_payload_builder_ctx(
         &self,
         config: reth_basic_payload_builder::PayloadConfig<
-            OpPayloadBuilderAttributes<base_common_consensus::BaseTxEnvelope>,
+            BasePayloadBuilderAttributes<base_common_consensus::BaseTxEnvelope>,
         >,
         cancel: CancellationToken,
         extra: FlashblocksExtraCtx,
-    ) -> eyre::Result<OpPayloadBuilderCtx> {
+    ) -> eyre::Result<BasePayloadBuilderCtx> {
         let chain_spec = self.client.chain_spec();
         let timestamp = config.attributes.timestamp();
 
@@ -177,7 +168,7 @@ where
             Default::default()
         };
 
-        let block_env_attributes = OpNextBlockEnvAttributes {
+        let block_env_attributes = BaseNextBlockEnvAttributes {
             timestamp,
             suggested_fee_recipient: config.attributes.suggested_fee_recipient(),
             prev_randao: config.attributes.prev_randao(),
@@ -192,7 +183,7 @@ where
             .next_evm_env(&config.parent_header, &block_env_attributes)
             .wrap_err("failed to create next evm env")?;
 
-        Ok(OpPayloadBuilderCtx {
+        Ok(BasePayloadBuilderCtx {
             evm_config,
             chain_spec,
             config,
@@ -201,6 +192,7 @@ where
             cancel,
             extra,
             builder_config: self.config.clone(),
+            rejected_tx_sender: self.rejected_tx_sender.clone(),
         })
     }
 
@@ -214,8 +206,8 @@ where
     /// a result indicating success with the payload or an error in case of failure.
     async fn build_payload(
         &self,
-        args: BuildArguments<OpPayloadBuilderAttributes<BaseTransactionSigned>, OpBuiltPayload>,
-        best_payload: BlockCell<OpBuiltPayload>,
+        args: BuildArguments<BasePayloadBuilderAttributes<BaseTransactionSigned>, BaseBuiltPayload>,
+        best_payload: BlockCell<BaseBuiltPayload>,
     ) -> Result<(), PayloadBuilderError> {
         let block_build_start_time = Instant::now();
         let BuildArguments {
@@ -237,7 +229,7 @@ where
 
         let timestamp = config.attributes.timestamp();
         let mut ctx = self
-            .get_op_payload_builder_ctx(
+            .get_base_payload_builder_ctx(
                 config,
                 block_cancel.clone(),
                 FlashblocksExtraCtx {
@@ -512,12 +504,12 @@ where
         P: StateRootProvider + HashedPostStateProvider + StorageRootProvider,
     >(
         &self,
-        ctx: &OpPayloadBuilderCtx,
+        ctx: &BasePayloadBuilderCtx,
         info: &mut ExecutionInfo,
         state: &mut State<DB>,
         best_txs: &mut NextBestFlashblocksTxs<Pool>,
         block_cancel: &CancellationToken,
-        best_payload: &BlockCell<OpBuiltPayload>,
+        best_payload: &BlockCell<BaseBuiltPayload>,
         publish_guard: &parking_lot::Mutex<()>,
         span: &tracing::Span,
         executed_sender_nonces: &mut HashMap<Address, u64>,
@@ -785,7 +777,7 @@ where
     /// Do some logging and metric recording when we stop build flashblocks
     fn record_flashblocks_metrics(
         &self,
-        ctx: &OpPayloadBuilderCtx,
+        ctx: &BasePayloadBuilderCtx,
         info: &ExecutionInfo,
         flashblocks_per_block: u64,
         span: &tracing::Span,
@@ -820,9 +812,9 @@ where
     fn finalize_payload<DB, P>(
         &self,
         state: &mut State<DB>,
-        ctx: &OpPayloadBuilderCtx,
+        ctx: &BasePayloadBuilderCtx,
         info: &mut ExecutionInfo,
-        finalized_cell: &BlockCell<OpBuiltPayload>,
+        finalized_cell: &BlockCell<BaseBuiltPayload>,
     ) -> Result<(), PayloadBuilderError>
     where
         DB: Database<Error = ProviderError> + AsRef<P>,
@@ -832,6 +824,8 @@ where
 
         // Build the final block WITH state root computed
         let (final_payload, _) = build_block(state, ctx, info, true)?;
+
+        ctx.flush_rejected_txs(info);
 
         let elapsed = start_time.elapsed();
         info!(
@@ -891,13 +885,13 @@ where
 }
 
 #[async_trait::async_trait]
-impl<Pool, Client> PayloadBuilder for OpPayloadBuilder<Pool, Client>
+impl<Pool, Client> PayloadBuilder for BasePayloadBuilder<Pool, Client>
 where
     Pool: PoolBounds,
     Client: ClientBounds,
 {
-    type Attributes = OpPayloadBuilderAttributes<BaseTransactionSigned>;
-    type BuiltPayload = OpBuiltPayload;
+    type Attributes = BasePayloadBuilderAttributes<BaseTransactionSigned>;
+    type BuiltPayload = BaseBuiltPayload;
 
     async fn try_build(
         &self,
@@ -923,7 +917,7 @@ struct FlashblocksMetadata {
 
 pub(crate) fn execute_pre_steps<DB>(
     state: &mut State<DB>,
-    ctx: &OpPayloadBuilderCtx,
+    ctx: &BasePayloadBuilderCtx,
 ) -> Result<ExecutionInfo, PayloadBuilderError>
 where
     DB: Database<Error = ProviderError> + std::fmt::Debug + revm::Database,
@@ -942,10 +936,10 @@ where
 
 pub(crate) fn build_block<DB, P>(
     state: &mut State<DB>,
-    ctx: &OpPayloadBuilderCtx,
+    ctx: &BasePayloadBuilderCtx,
     info: &mut ExecutionInfo,
     calculate_state_root: bool,
-) -> Result<(OpBuiltPayload, FlashblocksPayloadV1), PayloadBuilderError>
+) -> Result<(BaseBuiltPayload, FlashblocksPayloadV1), PayloadBuilderError>
 where
     DB: Database<Error = ProviderError> + AsRef<P> + revm::Database,
     P: StateRootProvider + HashedPostStateProvider + StorageRootProvider,
@@ -971,7 +965,7 @@ where
         ));
     }
 
-    let receipts_root = calculate_receipt_root_no_memo_optimism(
+    let receipts_root = calculate_receipt_root_no_memo(
         &info.receipts,
         &ctx.chain_spec,
         ctx.attributes().timestamp(),
@@ -1115,7 +1109,7 @@ where
     let _access_list = fal_builder.build(min_tx_index, max_tx_index);
 
     let metadata: FlashblocksMetadata =
-        if ctx.chain_spec.is_base_v1_active_at_timestamp(ctx.attributes().timestamp()) {
+        if ctx.chain_spec.is_azul_active_at_timestamp(ctx.attributes().timestamp()) {
             FlashblocksMetadata {
                 block_number: ctx.parent().number + 1,
                 access_list: None,
@@ -1173,7 +1167,7 @@ where
     state.transition_state = untouched_transition_state;
 
     Ok((
-        OpBuiltPayload::new(ctx.payload_id(), sealed_block, info.total_fees, Some(executed)),
+        BaseBuiltPayload::new(ctx.payload_id(), sealed_block, info.total_fees, Some(executed)),
         fb_payload,
     ))
 }
@@ -1193,10 +1187,10 @@ mod tests {
     use reth_revm::{State, database::StateProviderDatabase};
 
     use super::{FlashblocksMetadata, build_block};
-    use crate::{ExecutionInfo, flashblocks::context::OpPayloadBuilderCtx};
+    use crate::{ExecutionInfo, flashblocks::context::BasePayloadBuilderCtx};
 
     /// Creates a minimal [`BaseChainSpec`] with all L1 hardforks through Cancun
-    /// active at genesis but **no** OP-specific hardforks (Bedrock, Canyon,
+    /// active at genesis but **no** inherited rollup hardforks (Bedrock, Canyon,
     /// Ecotone, Holocene, Isthmus, Jovian are all absent).
     ///
     /// This keeps `build_block` on the simplest code paths: no blob fields,
@@ -1231,7 +1225,7 @@ mod tests {
     fn build_block_empty_no_state_root() {
         let chain_spec = minimal_chain_spec();
         let parent = genesis_header();
-        let ctx = OpPayloadBuilderCtx::for_test(chain_spec, Arc::clone(&parent));
+        let ctx = BasePayloadBuilderCtx::for_test(chain_spec, Arc::clone(&parent));
 
         let db = StateProviderDatabase::new(NoopProvider::default());
         let mut state = State::builder().with_database(db).with_bundle_update().build();
@@ -1263,7 +1257,7 @@ mod tests {
     fn build_block_empty_with_state_root() {
         let chain_spec = minimal_chain_spec();
         let parent = genesis_header();
-        let ctx = OpPayloadBuilderCtx::for_test(chain_spec, Arc::clone(&parent));
+        let ctx = BasePayloadBuilderCtx::for_test(chain_spec, Arc::clone(&parent));
 
         let db = StateProviderDatabase::new(NoopProvider::default());
         let mut state = State::builder().with_database(db).with_bundle_update().build();
@@ -1294,7 +1288,7 @@ mod tests {
     fn build_block_rejects_block_number_mismatch() {
         let chain_spec = minimal_chain_spec();
         let parent = genesis_header();
-        let mut ctx = OpPayloadBuilderCtx::for_test(chain_spec, Arc::clone(&parent));
+        let mut ctx = BasePayloadBuilderCtx::for_test(chain_spec, Arc::clone(&parent));
 
         // Tamper with the EVM block number so it disagrees with parent + 1.
         // parent.number is 0, so the expected block number is 1.
@@ -1325,7 +1319,7 @@ mod tests {
     fn build_block_rejects_missing_beacon_block_root() {
         let chain_spec = minimal_chain_spec();
         let parent = genesis_header();
-        let mut ctx = OpPayloadBuilderCtx::for_test(chain_spec, Arc::clone(&parent));
+        let mut ctx = BasePayloadBuilderCtx::for_test(chain_spec, Arc::clone(&parent));
 
         // Clear the parent beacon block root that for_test() sets.
         ctx.config.attributes.payload_attributes.parent_beacon_block_root = None;

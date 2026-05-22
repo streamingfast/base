@@ -21,14 +21,14 @@ use base_common_consensus::{
     BaseBlock, BasePrimitives, BaseReceipt, BaseTransactionSigned, OpTxType,
 };
 use base_common_evm::{
-    BaseBlockExecutor, BaseBlockExecutorFactory, BaseEvm, BaseEvmFactory, BaseTxResult,
-    OpHaltReason,
+    BaseBlockExecutor, BaseBlockExecutorFactory, BaseEvm, BaseEvmFactory, BaseHaltReason,
+    BaseTxResult,
 };
 use base_common_rpc_types_engine::ExecutionData;
 use base_execution_chainspec::BaseChainSpec;
-use base_execution_evm::OpRethReceiptBuilder;
+use base_execution_evm::BaseRethReceiptBuilder;
 use base_flashblocks::FlashblocksState;
-use base_node_core::OpEngineTypes;
+use base_node_core::{BaseEngineTypes, engine::BasePostExecutionValidator};
 use reth_chain_state::{DeferredTrieData, ExecutedBlock, LazyOverlay};
 use reth_consensus::{ConsensusError, FullConsensus, ReceiptRootBloom};
 use reth_engine_primitives::{
@@ -49,7 +49,7 @@ use reth_evm::{
     ConfigureEvm, EvmEnvFor, ExecutionCtxFor, SpecFor, block::BlockExecutor,
     execute::ExecutableTxFor,
 };
-use reth_node_api::{AddOnsContext, BlockTy, FullNodeComponents, FullNodeTypes, NodeTypes};
+use reth_node_api::{AddOnsContext, FullNodeComponents, FullNodeTypes, NodeTypes};
 use reth_node_builder::{
     invalid_block_hook::InvalidBlockHookExt,
     rpc::{ChangesetCache, EngineValidatorBuilder, PayloadValidatorBuilder},
@@ -143,12 +143,12 @@ where
     Evm: ConfigureEvm<
             Primitives = BasePrimitives,
             BlockExecutorFactory = BaseBlockExecutorFactory<
-                OpRethReceiptBuilder,
+                BaseRethReceiptBuilder,
                 Arc<BaseChainSpec>,
                 BaseEvmFactory,
             >,
         > + 'static,
-    C: CachedExecutionProvider<BaseTxResult<OpHaltReason, OpTxType>> + Clone,
+    C: CachedExecutionProvider<BaseTxResult<BaseHaltReason, OpTxType>> + Clone,
 {
     /// Creates a new `TreePayloadValidator`.
     #[allow(clippy::too_many_arguments)]
@@ -342,7 +342,7 @@ where
             type_name = ?input.type_name(),
         )
     )]
-    pub fn validate_block_with_state<
+    fn validate_block_with_state<
         T: PayloadTypes<
                 BuiltPayload: BuiltPayload<Primitives = BasePrimitives>,
                 ExecutionData = ExecutionData,
@@ -353,7 +353,7 @@ where
         mut ctx: TreeCtx<'_, BasePrimitives>,
     ) -> ValidationOutcome<BasePrimitives, InsertPayloadError<BaseBlock>>
     where
-        V: PayloadValidator<T, Block = BaseBlock>,
+        V: BasePostExecutionValidator<T>,
         Evm: ConfigureEngineEvm<ExecutionData, Primitives = BasePrimitives>,
     {
         /// A helper macro that returns the block in case there was an error
@@ -463,7 +463,7 @@ where
         let mut handle = ensure_ok!(self.spawn_payload_processor(
             env.clone(),
             txs,
-            provider_builder,
+            provider_builder.clone(),
             overlay_factory.clone(),
             strategy,
             block_access_list,
@@ -574,6 +574,7 @@ where
                 &block,
                 &parent_block,
                 &output,
+                &provider_builder,
                 &mut ctx,
                 receipt_root_bloom
             ),
@@ -1259,11 +1260,12 @@ where
         block: &RecoveredBlock<BaseBlock>,
         parent_block: &SealedHeader<Header>,
         output: &BlockExecutionOutput<BaseReceipt>,
+        parent_state_provider_builder: &StateProviderBuilder<BasePrimitives, P>,
         ctx: &mut TreeCtx<'_, BasePrimitives>,
         receipt_root_bloom: Option<ReceiptRootBloom>,
     ) -> Result<HashedPostState, InsertBlockErrorKind>
     where
-        V: PayloadValidator<T, Block = BaseBlock>,
+        V: BasePostExecutionValidator<T>,
     {
         let start = Instant::now();
 
@@ -1301,10 +1303,15 @@ where
         let hashed_state = self.provider.hashed_post_state(&output.state);
         drop(_enter);
 
-        let _enter = debug_span!(target: "engine::tree::payload_validator", "validate_block_post_execution_with_hashed_state").entered();
-        if let Err(err) =
-            self.validator.validate_block_post_execution_with_hashed_state(&hashed_state, block)
-        {
+        let _enter = debug_span!(target: "engine::tree::payload_validator", "validate_block_post_execution_with_parent_state").entered();
+        // Build a fresh parent-state provider for validation instead of reusing the execution
+        // provider, which may be wrapped with execution caches.
+        let parent_state_provider = parent_state_provider_builder.build()?;
+        if let Err(err) = self.validator.validate_block_post_execution_with_parent_state(
+            &hashed_state,
+            parent_state_provider,
+            block,
+        ) {
             // call post-block hook
             self.on_invalid_block(parent_block, block, output, None, ctx.state_mut());
             return Err(err.into());
@@ -1676,12 +1683,12 @@ where
         + ChainSpecProvider<ChainSpec = BaseChainSpec>
         + Clone
         + 'static,
-    V: PayloadValidator<Types, Block = BaseBlock>,
+    V: BasePostExecutionValidator<Types>,
     Evm: ConfigureEngineEvm<
             ExecutionData,
             Primitives = BasePrimitives,
             BlockExecutorFactory = BaseBlockExecutorFactory<
-                OpRethReceiptBuilder,
+                BaseRethReceiptBuilder,
                 Arc<BaseChainSpec>,
             >,
         > + 'static,
@@ -1689,7 +1696,7 @@ where
             BuiltPayload: BuiltPayload<Primitives = BasePrimitives>,
             ExecutionData = ExecutionData,
         >,
-    C: CachedExecutionProvider<BaseTxResult<OpHaltReason, OpTxType>>
+    C: CachedExecutionProvider<BaseTxResult<BaseHaltReason, OpTxType>>
         + Clone
         + Send
         + Sync
@@ -1773,14 +1780,14 @@ impl<Node, EV> EngineValidatorBuilder<Node> for BaseEngineValidatorBuilder<EV>
 where
     Node: FullNodeComponents<
             Types: NodeTypes<
-                Payload = OpEngineTypes,
+                Payload = BaseEngineTypes,
                 ChainSpec = BaseChainSpec,
                 Primitives = BasePrimitives,
             >,
             Evm: ConfigureEngineEvm<ExecutionData>
                      + ConfigureEvm<
                 BlockExecutorFactory = BaseBlockExecutorFactory<
-                    OpRethReceiptBuilder,
+                    BaseRethReceiptBuilder,
                     Arc<BaseChainSpec>,
                 >,
             >,
@@ -1788,16 +1795,13 @@ where
     <<Node as FullNodeTypes>::Types as NodeTypes>::Payload:
         PayloadTypes<ExecutionData = ExecutionData>,
     EV: PayloadValidatorBuilder<Node>,
-    EV::Validator: reth_engine_primitives::PayloadValidator<
-            <Node::Types as NodeTypes>::Payload,
-            Block = BlockTy<Node::Types>,
-        >,
+    EV::Validator: BasePostExecutionValidator<<Node::Types as NodeTypes>::Payload>,
 {
     type EngineValidator = BaseEngineValidator<
         Node::Provider,
         Node::Evm,
         EV::Validator,
-        FlashblocksCachedExecutionProvider<Node::Provider>,
+        FlashblocksCachedExecutionProvider,
     >;
 
     async fn build_tree_validator(
@@ -1816,10 +1820,7 @@ where
             validator,
             tree_config,
             invalid_block_hook,
-            FlashblocksCachedExecutionProvider::new(
-                ctx.node.provider().clone(),
-                self.flashblocks_state.clone(),
-            ),
+            FlashblocksCachedExecutionProvider::new(self.flashblocks_state.clone()),
             changeset_cache,
             ctx.node.task_executor().clone(),
         ))

@@ -152,7 +152,7 @@ impl SnarkE2e {
             .context("BASE_CONSENSUS_ADDRESS must be set")?;
 
         let l1_provider = ProviderBuilder::new().connect_http(l1_url.parse()?);
-        let op_provider = ProviderBuilder::<Identity, Identity, Base>::default()
+        let base_provider = ProviderBuilder::<Identity, Identity, Base>::default()
             .connect_http(l2_consensus_url.parse()?);
 
         let finalized_l1 = l1_provider
@@ -164,7 +164,8 @@ impl SnarkE2e {
 
         let mut attempts = 0u64;
         loop {
-            let l1_origin = L1HeadCalculator::get_l1_origin_num(&op_provider, target_block).await?;
+            let l1_origin =
+                L1HeadCalculator::get_l1_origin_num(&base_provider, target_block).await?;
 
             if l1_origin + SEQUENCE_WINDOW <= finalized_l1 {
                 info!(
@@ -215,6 +216,7 @@ impl SnarkE2e {
                 session_id: None,
                 prover_address: Some("0x0000000000000000000000000000000000000000".to_string()),
                 l1_head: None,
+                intermediate_root_interval: None,
             })
             .await?;
 
@@ -281,7 +283,7 @@ impl SnarkE2e {
         // -- 5. Compute aggregation verifying key ---------------------------------
         info!("computing aggregation verifying key (LightProver — VK only)");
         let t = std::time::Instant::now();
-        let (_range_vk, agg_vk) = base_succinct_proof_utils::cluster_setup_vkeys()
+        let (_range_vk, agg_vk) = base_proof_succinct_proof_utils::cluster_setup_vkeys()
             .await
             .context("failed to compute aggregation verifying key")?;
         info!(elapsed_secs = t.elapsed().as_secs_f64(), "aggregation verifying key computed");

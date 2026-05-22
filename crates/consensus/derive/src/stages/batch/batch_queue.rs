@@ -5,7 +5,7 @@ use core::fmt::Debug;
 
 use alloy_eips::BlockNumHash;
 use async_trait::async_trait;
-use base_consensus_genesis::{RollupConfig, SystemConfig};
+use base_common_genesis::{RollupConfig, SystemConfig};
 use base_protocol::{
     Batch, BatchValidity, BatchWithInclusionBlock, BlockInfo, L2BlockInfo, SingleBatch,
 };
@@ -111,10 +111,13 @@ where
         // Note: epoch origin can now be one block ahead of the L2 Safe Head
         // This is in the case where we auto generate all batches in an epoch & advance the epoch
         // but don't advance the L2 Safe Head's epoch
-        if parent.l1_origin != epoch.id() && parent.l1_origin.number != epoch.number - 1 {
+        let previous_epoch = epoch.number.checked_sub(1);
+        if parent.l1_origin != epoch.id()
+            && previous_epoch.is_none_or(|number| parent.l1_origin.number != number)
+        {
             return Err(PipelineErrorKind::Reset(ResetError::L1OriginMismatch(
                 parent.l1_origin.number,
-                epoch.number - 1,
+                previous_epoch.unwrap_or(epoch.number),
             )));
         }
 
@@ -138,7 +141,7 @@ where
                 BatchValidity::Future => {
                     // Drop Future batches post-holocene.
                     //
-                    // See: <https://specs.optimism.io/protocol/holocene/derivation.html#batch_queue>
+                    // See: <https://specs.base.org/upgrades/holocene/derivation#batch_queue>
                     if !self.cfg.is_holocene_active(origin.timestamp) {
                         remaining.push(batch.clone());
                     } else {
@@ -480,7 +483,7 @@ mod tests {
     use alloy_primitives::{Address, B256, Bytes, TxKind, U256, address, b256};
     use alloy_rlp::{BytesMut, Encodable};
     use base_common_consensus::{BaseBlock, BaseTxEnvelope, OpTxType, TxDeposit};
-    use base_consensus_genesis::{ChainGenesis, HardForkConfig, RollupConfig, SystemConfig};
+    use base_common_genesis::{ChainGenesis, HardForkConfig, RollupConfig, SystemConfig};
     use base_protocol::{BatchReader, L1BlockInfoBedrock, L1BlockInfoTx};
     use tracing::Level;
     use tracing_subscriber::layer::SubscriberExt;
@@ -497,7 +500,7 @@ mod tests {
         let file_contents = &(&*file_contents)[..file_contents.len() - 1];
         let data = alloy_primitives::hex::decode(file_contents).unwrap();
         let bytes: alloy_primitives::Bytes = data.into();
-        BatchReader::new(bytes, RollupConfig::MAX_RLP_BYTES_PER_CHANNEL_FJORD as usize)
+        BatchReader::new(bytes, RollupConfig::MAX_RLP_BYTES_PER_CHANNEL_FJORD as usize, true)
     }
 
     #[test]
@@ -728,6 +731,24 @@ mod tests {
         };
         let result = bq.derive_next_batch(false, parent).await.unwrap_err();
         assert_eq!(result, PipelineError::MissingOrigin.crit());
+    }
+
+    #[tokio::test]
+    async fn test_derive_next_batch_epoch_zero_parent_ahead_does_not_underflow() {
+        let cfg = Arc::new(RollupConfig::default());
+        let mock = TestNextBatchProvider::new(vec![]);
+        let fetcher = TestL2ChainProvider::default();
+        let mut bq = BatchQueue::new(cfg, mock, fetcher);
+        bq.origin = Some(BlockInfo::default());
+        bq.l1_blocks.push(BlockInfo::default());
+
+        let parent = L2BlockInfo {
+            l1_origin: BlockNumHash { number: 1, ..Default::default() },
+            ..Default::default()
+        };
+        let result = bq.derive_next_batch(false, parent).await.unwrap_err();
+
+        assert_eq!(result, PipelineErrorKind::Reset(ResetError::L1OriginMismatch(1, 0)));
     }
 
     #[tokio::test]
@@ -1086,7 +1107,7 @@ mod tests {
         };
         let fetcher = TestL2ChainProvider {
             blocks: vec![block_nine, block_seven],
-            op_blocks: vec![block, second],
+            base_blocks: vec![block, second],
             ..Default::default()
         };
         let mut bq = BatchQueue::new(cfg, mock, fetcher);

@@ -22,7 +22,7 @@ base-consensus-engine.workspace = true
 base-consensus-derive.workspace = true
 base-consensus-safedb.workspace = true
 base-consensus-sources.workspace = true
-base-consensus-genesis.workspace = true
+base-common-genesis.workspace = true
 base-consensus-providers.workspace = true
 base-consensus-rpc = { workspace = true, features = ["client"] }
 
@@ -44,7 +44,6 @@ alloy-transport-http = { workspace = true, features = ["reqwest", "reqwest-rustl
 # base-common
 base-common-chains.workspace = true
 base-common-network.workspace = true
-base-common-provider.workspace = true
 base-common-consensus.workspace = true
 base-common-rpc-types-engine = { workspace = true, features = ["std"] }
 
@@ -102,4 +101,5 @@ metrics = [
 	"base-metrics/metrics",
 	"dep:metrics",
 	"libp2p/metrics",
+	"tower-http/metrics",
 ]

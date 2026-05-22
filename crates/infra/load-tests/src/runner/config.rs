@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 use revm::precompile::PrecompileId;
 use url::Url;
 
@@ -48,10 +48,40 @@ pub enum TxType {
         /// Looper contract address (required when iterations > 1).
         looper_contract: Option<Address>,
     },
-    /// Osaka (Base V1) opcode or precompile transaction.
+    /// Osaka (Base Azul) opcode or precompile transaction.
     Osaka {
         /// Target Osaka feature.
         target: OsakaTarget,
+    },
+    /// Uniswap V3 style swap.
+    UniswapV3 {
+        /// Router contract address.
+        router: Address,
+        /// Input token address.
+        token_in: Address,
+        /// Output token address.
+        token_out: Address,
+        /// Fee tier.
+        fee: u32,
+        /// Minimum swap amount.
+        min_amount: U256,
+        /// Maximum swap amount.
+        max_amount: U256,
+    },
+    /// Aerodrome Slipstream (concentrated liquidity) swap.
+    AerodromeCl {
+        /// CL Router contract address.
+        router: Address,
+        /// Input token address.
+        token_in: Address,
+        /// Output token address.
+        token_out: Address,
+        /// Tick spacing.
+        tick_spacing: i32,
+        /// Minimum swap amount.
+        min_amount: U256,
+        /// Maximum swap amount.
+        max_amount: U256,
     },
 }
 
@@ -61,8 +91,12 @@ pub const DEFAULT_MAX_GAS_PRICE: u128 = 1_000_000_000_000;
 /// Configuration for a load test run.
 #[derive(Debug, Clone)]
 pub struct LoadConfig {
-    /// HTTP JSON-RPC endpoint URL.
-    pub rpc_http_url: Url,
+    /// HTTP JSON-RPC endpoints used for sharded transaction submission.
+    pub transaction_submission_rpcs: Vec<Url>,
+    /// HTTP JSON-RPC endpoint used for read/query operations.
+    pub query_rpc: Url,
+    /// Optional HTTP JSON-RPC endpoints whose txpools should be cleared before a test.
+    pub txpool_nodes: Vec<Url>,
     /// Chain ID.
     pub chain_id: u64,
     /// Number of test accounts to create.
@@ -87,17 +121,19 @@ pub struct LoadConfig {
     pub batch_timeout: Duration,
     /// Maximum gas price cap to prevent overspending during congestion.
     pub max_gas_price: u128,
-    /// WebSocket JSON-RPC endpoint URL for block subscription (enables block latency tracking).
-    pub rpc_ws_url: Option<Url>,
-    /// WebSocket URL for flashblocks subscription (enables flashblock latency tracking).
-    pub flashblocks_ws_url: Option<Url>,
+    /// Builder flashblocks broadcast WebSocket endpoint.
+    pub flashblocks_ws: Url,
 }
 
 impl LoadConfig {
     /// Creates a new load config for devnet.
     pub fn devnet() -> Self {
         Self {
-            rpc_http_url: "http://localhost:8545".parse().expect("valid default rpc_http_url"),
+            transaction_submission_rpcs: vec![
+                "http://localhost:8545".parse().expect("valid default transaction_submission_rpc"),
+            ],
+            query_rpc: "http://localhost:8545".parse().expect("valid default query_rpc"),
+            txpool_nodes: Vec::new(),
             chain_id: 1337,
             account_count: 10,
             seed: 42,
@@ -106,15 +142,19 @@ impl LoadConfig {
             transactions: vec![TxConfig { weight: 100, tx_type: TxType::Transfer }],
             target_gps: 2_100_000,
             duration: Some(Duration::from_secs(30)),
-            max_in_flight_per_sender: 50,
+            max_in_flight_per_sender: 128,
             batch_size: 5,
             batch_timeout: Duration::from_millis(50),
             max_gas_price: DEFAULT_MAX_GAS_PRICE,
-            rpc_ws_url: Some("ws://localhost:8546".parse().expect("valid default rpc_ws_url")),
-            flashblocks_ws_url: Some(
-                "ws://localhost:7111".parse().expect("valid default flashblocks_ws_url"),
-            ),
+            flashblocks_ws: "ws://localhost:7111".parse().expect("valid default flashblocks_ws"),
         }
+    }
+
+    /// Returns the first transaction submission endpoint.
+    pub fn primary_submission_rpc(&self) -> &Url {
+        self.transaction_submission_rpcs
+            .first()
+            .expect("LoadConfig::validate guarantees at least one submission RPC")
     }
 
     /// Validates the configuration, returning an error if invalid.
@@ -136,12 +176,38 @@ impl LoadConfig {
         if self.transactions.is_empty() {
             return Err(BaselineError::Config("transactions must not be empty".into()));
         }
+        if self.transaction_submission_rpcs.is_empty() {
+            return Err(BaselineError::Config(
+                "transaction_submission_rpcs must not be empty".into(),
+            ));
+        }
+        for url in &self.transaction_submission_rpcs {
+            if !matches!(url.scheme(), "http" | "https") {
+                return Err(BaselineError::Config(
+                    "transaction_submission_rpcs must use http:// or https://".into(),
+                ));
+            }
+        }
+        if !matches!(self.query_rpc.scheme(), "http" | "https") {
+            return Err(BaselineError::Config("query_rpc must use http:// or https://".into()));
+        }
+        for url in &self.txpool_nodes {
+            if !matches!(url.scheme(), "http" | "https") {
+                return Err(BaselineError::Config(
+                    "txpool_nodes must use http:// or https://".into(),
+                ));
+            }
+        }
+        if !matches!(self.flashblocks_ws.scheme(), "ws" | "wss") {
+            return Err(BaselineError::Config("flashblocks_ws must use ws:// or wss://".into()));
+        }
         Ok(())
     }
 
-    /// Sets the HTTP JSON-RPC URL.
+    /// Sets the transaction submission HTTP JSON-RPC URL.
     pub fn with_rpc_http_url(mut self, url: Url) -> Self {
-        self.rpc_http_url = url;
+        self.transaction_submission_rpcs = vec![url.clone()];
+        self.query_rpc = url;
         self
     }
 

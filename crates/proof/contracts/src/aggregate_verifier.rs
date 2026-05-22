@@ -9,10 +9,13 @@
 
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::RootProvider;
-use alloy_sol_types::{SolCall, sol};
+use alloy_sol_types::{SolCall, SolError, sol};
 use async_trait::async_trait;
 
-use crate::ContractError;
+use crate::{
+    ContractError,
+    anchor_state_registry::{AnchorPreflight, AnchorRoot, IAnchorStateRegistry},
+};
 
 sol! {
     /// `AggregateVerifier` (dispute game) contract interface.
@@ -20,13 +23,23 @@ sol! {
     /// Each game instance is a clone created by `DisputeGameFactory.create()`.
     #[sol(rpc)]
     interface IAggregateVerifier {
+        /// Error returned when the proof's L1 origin is older than the EIP-2935 history window.
+        error L1OriginTooOld(uint256 l1OriginNumber, uint256 currentBlock);
+
+        /// Error returned by `initialize` when the parent game is unregistered,
+        /// unrespected, blacklisted, retired, or resolved as `CHALLENGER_WINS`.
+        error InvalidParentGame();
+
+        /// Error bubbled from `TEEVerifier` when a proof signer is not registered.
+        error InvalidSigner(address signer);
+
         /// Returns the root claim (output root) of this game.
         function rootClaim() external pure returns (bytes32);
 
         /// Returns the L2 block number this game proposes.
         function l2SequenceNumber() external pure returns (uint256);
 
-        /// Returns the current game status (`0=IN_PROGRESS`, `1=CHALLENGER_WINS`, `2=DEFENDER_WINS`).
+        /// Returns the current game status. See [`GameStatus`] for values.
         function status() external view returns (uint8);
 
         /// Returns the address that provided a TEE proof.
@@ -135,6 +148,9 @@ sol! {
 
         /// Returns the address of the `DelayedWETH` contract used by this game.
         function DELAYED_WETH() external view returns (address);
+
+        /// Returns the address of the `AnchorStateRegistry` contract.
+        function anchorStateRegistry() external view returns (address);
     }
 }
 
@@ -149,14 +165,49 @@ pub struct GameInfo {
     pub parent_address: Address,
 }
 
+/// Status values returned by `AggregateVerifier.status()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum GameStatus {
+    /// The game is still in progress.
+    InProgress = 0,
+    /// The challenger won the dispute.
+    ChallengerWins = 1,
+    /// The defender won the dispute.
+    DefenderWins = 2,
+}
+
+impl std::fmt::Display for GameStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InProgress => write!(f, "InProgress (0)"),
+            Self::ChallengerWins => write!(f, "ChallengerWins (1)"),
+            Self::DefenderWins => write!(f, "DefenderWins (2)"),
+        }
+    }
+}
+
+impl TryFrom<u8> for GameStatus {
+    type Error = u8;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::InProgress),
+            1 => Ok(Self::ChallengerWins),
+            2 => Ok(Self::DefenderWins),
+            other => Err(other),
+        }
+    }
+}
+
 /// Async trait for querying `AggregateVerifier` game instances.
 #[async_trait]
 pub trait AggregateVerifierClient: Send + Sync {
     /// Queries game details from a game proxy address.
     async fn game_info(&self, game_address: Address) -> Result<GameInfo, ContractError>;
 
-    /// Returns the current game status (`0=IN_PROGRESS`, `1=CHALLENGER_WINS`, `2=DEFENDER_WINS`).
-    async fn status(&self, game_address: Address) -> Result<u8, ContractError>;
+    /// Returns the current game status.
+    async fn status(&self, game_address: Address) -> Result<GameStatus, ContractError>;
 
     /// Returns the address that provided a ZK proof for the given game.
     async fn zk_prover(&self, game_address: Address) -> Result<Address, ContractError>;
@@ -226,6 +277,41 @@ pub trait AggregateVerifierClient: Send + Sync {
 
     /// Returns the address of the `DelayedWETH` contract used by this game.
     async fn delayed_weth(&self, game_address: Address) -> Result<Address, ContractError>;
+
+    /// Returns the address of the `AnchorStateRegistry` contract for this game.
+    async fn anchor_state_registry(&self, game_address: Address) -> Result<Address, ContractError>;
+
+    /// Returns whether the game is finalized in its `AnchorStateRegistry`.
+    /// Cheap single call that gates the heavier [`anchor_preflight`] read.
+    async fn is_game_finalized(
+        &self,
+        asr_address: Address,
+        game_address: Address,
+    ) -> Result<bool, ContractError>;
+
+    /// Reads the eligibility flags and current anchor root for a game from
+    /// the `AnchorStateRegistry` in a single batched call. Should only be
+    /// called after [`is_game_finalized`] returns true.
+    async fn anchor_preflight(
+        &self,
+        asr_address: Address,
+        game_address: Address,
+    ) -> Result<AnchorPreflight, ContractError>;
+}
+
+/// The 4-byte selector for `L1OriginTooOld()`.
+pub const fn l1_origin_too_old_selector() -> [u8; 4] {
+    IAggregateVerifier::L1OriginTooOld::SELECTOR
+}
+
+/// The 4-byte selector for `InvalidParentGame()`.
+pub const fn invalid_parent_game_selector() -> [u8; 4] {
+    IAggregateVerifier::InvalidParentGame::SELECTOR
+}
+
+/// The 4-byte selector for `TEEVerifier.InvalidSigner(address)`.
+pub const fn invalid_signer_selector() -> [u8; 4] {
+    IAggregateVerifier::InvalidSigner::SELECTOR
 }
 
 /// Concrete implementation backed by Alloy's sol-generated contract bindings.
@@ -276,15 +362,21 @@ impl AggregateVerifierClient for AggregateVerifierContractClient {
         Ok(GameInfo { root_claim, l2_block_number, parent_address })
     }
 
-    async fn status(&self, game_address: Address) -> Result<u8, ContractError> {
+    async fn status(&self, game_address: Address) -> Result<GameStatus, ContractError> {
         let contract =
             IAggregateVerifier::IAggregateVerifierInstance::new(game_address, &self.provider);
 
-        contract
+        let raw: u8 = contract
             .status()
             .call()
             .await
-            .map_err(|e| ContractError::Call { context: "status failed".into(), source: e })
+            .map_err(|e| ContractError::Call { context: "status failed".into(), source: e })?;
+
+        GameStatus::try_from(raw).map_err(|unknown| {
+            ContractError::Validation(format!(
+                "game {game_address} returned unrecognized status {unknown}"
+            ))
+        })
     }
 
     async fn zk_prover(&self, game_address: Address) -> Result<Address, ContractError> {
@@ -537,6 +629,83 @@ impl AggregateVerifierClient for AggregateVerifierContractClient {
             .await
             .map_err(|e| ContractError::Call { context: "DELAYED_WETH failed".into(), source: e })
     }
+
+    async fn anchor_state_registry(&self, game_address: Address) -> Result<Address, ContractError> {
+        let contract =
+            IAggregateVerifier::IAggregateVerifierInstance::new(game_address, &self.provider);
+
+        contract.anchorStateRegistry().call().await.map_err(|e| ContractError::Call {
+            context: "anchorStateRegistry failed".into(),
+            source: e,
+        })
+    }
+
+    async fn is_game_finalized(
+        &self,
+        asr_address: Address,
+        game_address: Address,
+    ) -> Result<bool, ContractError> {
+        let contract =
+            IAnchorStateRegistry::IAnchorStateRegistryInstance::new(asr_address, &self.provider);
+
+        contract.isGameFinalized(game_address).call().await.map_err(|e| ContractError::Call {
+            context: "isGameFinalized failed".into(),
+            source: e,
+        })
+    }
+
+    async fn anchor_preflight(
+        &self,
+        asr_address: Address,
+        game_address: Address,
+    ) -> Result<AnchorPreflight, ContractError> {
+        let contract =
+            IAnchorStateRegistry::IAnchorStateRegistryInstance::new(asr_address, &self.provider);
+
+        let (blacklisted, retired, respected, paused, anchor) = futures::try_join!(
+            async {
+                contract.isGameBlacklisted(game_address).call().await.map_err(|e| {
+                    ContractError::Call { context: "isGameBlacklisted failed".into(), source: e }
+                })
+            },
+            async {
+                contract.isGameRetired(game_address).call().await.map_err(|e| ContractError::Call {
+                    context: "isGameRetired failed".into(),
+                    source: e,
+                })
+            },
+            async {
+                contract.isGameRespected(game_address).call().await.map_err(|e| {
+                    ContractError::Call { context: "isGameRespected failed".into(), source: e }
+                })
+            },
+            async {
+                contract
+                    .paused()
+                    .call()
+                    .await
+                    .map_err(|e| ContractError::Call { context: "paused failed".into(), source: e })
+            },
+            async {
+                contract.getAnchorRoot().call().await.map_err(|e| ContractError::Call {
+                    context: "getAnchorRoot failed".into(),
+                    source: e,
+                })
+            },
+        )?;
+
+        let l2_block_number: u64 = anchor.l2SequenceNumber.try_into().map_err(|_| {
+            ContractError::Validation("anchor l2SequenceNumber overflows u64".into())
+        })?;
+
+        Ok(AnchorPreflight {
+            blacklisted,
+            retired,
+            respected,
+            paused,
+            anchor_root: AnchorRoot { root: anchor.root, l2_block_number },
+        })
+    }
 }
 
 /// Encodes the calldata for `IAggregateVerifier.nullify()`.
@@ -685,6 +854,30 @@ mod tests {
     fn test_encode_claim_credit_calldata_has_selector() {
         let calldata = encode_claim_credit_calldata();
         assert_eq!(&calldata[..4], &IAggregateVerifier::claimCreditCall::SELECTOR);
+    }
+
+    #[test]
+    fn test_l1_origin_too_old_selector() {
+        let selector = l1_origin_too_old_selector();
+        assert_eq!(selector.len(), 4);
+        assert_ne!(selector, [0u8; 4]);
+    }
+
+    #[test]
+    fn test_invalid_parent_game_selector() {
+        let selector = invalid_parent_game_selector();
+        assert_eq!(selector.len(), 4);
+        assert_ne!(selector, [0u8; 4]);
+        assert_ne!(selector, l1_origin_too_old_selector());
+    }
+
+    #[test]
+    fn test_invalid_signer_selector() {
+        let selector = invalid_signer_selector();
+        assert_eq!(selector.len(), 4);
+        assert_ne!(selector, [0u8; 4]);
+        assert_ne!(selector, l1_origin_too_old_selector());
+        assert_ne!(selector, invalid_parent_game_selector());
     }
 
     #[test]

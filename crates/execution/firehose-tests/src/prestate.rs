@@ -23,7 +23,9 @@ use base_execution_evm::BaseEvmConfig;
 use base_execution_firehose::{OpPostTxExtras, OpPreTxAdjust};
 use eyre::Context;
 use reth_firehose::{FirehoseBlockTracer, run_wrapped_block};
-use reth_firehose_tests::{RunOutcome, TraceContext, decode_hex, parse_fire_block_for, seed_cache_db};
+use reth_firehose_tests::{
+    RunOutcome, TraceContext, decode_hex, parse_fire_block_for, seed_cache_db,
+};
 use reth_primitives_traits::{Block as _, RecoveredBlock};
 use reth_revm::State;
 use revm::database::{CacheDB, EmptyDB};
@@ -71,7 +73,7 @@ pub fn run_prestate(case_folder: &Path) -> eyre::Result<RunOutcome> {
     seed_cache_db(&mut db, &prestate.genesis)?;
     let mut state = State::builder().with_database(db).with_bundle_update().build();
 
-    let evm_config = BaseEvmConfig::optimism(chain_spec);
+    let evm_config = BaseEvmConfig::base(chain_spec);
 
     let (mut tracer, buffer) = firehose_tracer::Tracer::with_buffer(
         firehose_tracer::config::Config::default(),

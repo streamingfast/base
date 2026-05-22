@@ -5,35 +5,31 @@
 
 extern crate alloc;
 
-mod spec;
-pub use spec::OpSpecId;
+pub use base_common_chains::BaseUpgrade;
 
-mod constants;
-pub use constants::*;
+mod spec;
+pub use spec::BaseSpecId;
 
 mod result;
-pub use result::OpHaltReason;
+pub use result::BaseHaltReason;
 
 mod l1block;
 pub use l1block::L1BlockInfo;
 
 mod transaction;
 pub use transaction::{
-    BaseTransactionBuilder, BuildError, DEPOSIT_TRANSACTION_TYPE, DepositTransactionParts,
-    OpTransaction, OpTransactionError, OpTxTr,
+    BaseTransaction, BaseTransactionBuilder, BaseTransactionError, BaseTxTr, BuildError,
+    DEPOSIT_TRANSACTION_TYPE, DepositTransactionParts,
 };
 
 mod handler;
-pub use handler::{IsTxError, OpHandler};
+pub use handler::{BaseHandler, IsTxError};
 
 mod precompiles;
 pub use precompiles::BasePrecompiles;
 
-mod op_evm;
-pub use op_evm::OpEvm;
-
 mod api;
-pub use api::{BaseError, Builder, DefaultOp, DefaultOpEvm, OpContext, OpContextTr};
+pub use api::{BaseContext, BaseContextTr, BaseError, Builder, DefaultBase};
 
 mod evm;
 pub use evm::BaseEvm;
@@ -43,9 +39,6 @@ pub use factory::BaseEvmFactory;
 
 mod tx_env;
 pub use tx_env::BaseTxEnv;
-
-mod ctx;
-pub use ctx::BaseBlockExecutionCtx;
 
 mod error;
 pub use error::BaseBlockExecutionError;
@@ -57,7 +50,6 @@ mod canyon;
 pub use canyon::ensure_create2_deployer;
 
 mod executor;
-pub use executor::{BaseBlockExecutor, BaseTxResult};
-
-mod executor_factory;
-pub use executor_factory::BaseBlockExecutorFactory;
+pub use executor::{
+    BaseBlockExecutionCtx, BaseBlockExecutor, BaseBlockExecutorFactory, BaseTxResult,
+};

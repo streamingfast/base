@@ -5,8 +5,8 @@ use std::{fmt::Debug, sync::Arc};
 use alloy_primitives::B256;
 use alloy_rpc_types_debug::ExecutionWitness;
 use base_common_chains::Upgrades;
-use base_execution_payload_builder::{Attributes, OpPayloadBuilder, PayloadPrimitives};
-use base_execution_txpool::OpPooledTx;
+use base_execution_payload_builder::{Attributes, BasePayloadBuilder, PayloadPrimitives};
+use base_execution_txpool::BasePooledTx;
 use jsonrpsee_core::{RpcResult, async_trait};
 use reth_chainspec::ChainSpecProvider;
 use reth_evm::ConfigureEvm;
@@ -20,7 +20,7 @@ use reth_storage_api::{
 };
 use reth_tasks::TaskSpawner;
 use reth_transaction_pool::TransactionPool;
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::oneshot;
 
 /// An extension to the `debug_` namespace of the RPC API.
 pub struct BaseDebugWitnessApi<Pool, Provider, EvmConfig, Attrs> {
@@ -32,10 +32,9 @@ impl<Pool, Provider, EvmConfig, Attrs> BaseDebugWitnessApi<Pool, Provider, EvmCo
     pub fn new(
         provider: Provider,
         task_spawner: Box<dyn TaskSpawner>,
-        builder: OpPayloadBuilder<Pool, Provider, EvmConfig, (), Attrs>,
+        builder: BasePayloadBuilder<Pool, Provider, EvmConfig, (), Attrs>,
     ) -> Self {
-        let semaphore = Arc::new(Semaphore::new(3));
-        let inner = BaseDebugWitnessApiInner { provider, builder, task_spawner, semaphore };
+        let inner = BaseDebugWitnessApiInner { provider, builder, task_spawner };
         Self { inner: Arc::new(inner) }
     }
 }
@@ -63,7 +62,9 @@ impl<Pool, Provider, EvmConfig, Attrs> DebugExecutionWitnessApiServer<Attrs::Rpc
     for BaseDebugWitnessApi<Pool, Provider, EvmConfig, Attrs>
 where
     Pool: TransactionPool<
-            Transaction: OpPooledTx<Consensus = <Provider::Primitives as NodePrimitives>::SignedTx>,
+            Transaction: BasePooledTx<
+                Consensus = <Provider::Primitives as NodePrimitives>::SignedTx,
+            >,
         > + 'static,
     Provider: BlockReaderIdExt<Header = <Provider::Primitives as NodePrimitives>::BlockHeader>
         + NodePrimitivesProvider<Primitives: PayloadPrimitives>
@@ -82,8 +83,6 @@ where
         parent_block_hash: B256,
         attributes: Attrs::RpcPayloadAttributes,
     ) -> RpcResult<ExecutionWitness> {
-        let _permit = self.inner.semaphore.acquire().await;
-
         let parent_header = self.parent_header(parent_block_hash).to_rpc_result()?;
 
         let (tx, rx) = oneshot::channel();
@@ -116,7 +115,6 @@ impl<Pool, Provider, EvmConfig, Attrs> Debug
 
 struct BaseDebugWitnessApiInner<Pool, Provider, EvmConfig, Attrs> {
     provider: Provider,
-    builder: OpPayloadBuilder<Pool, Provider, EvmConfig, (), Attrs>,
+    builder: BasePayloadBuilder<Pool, Provider, EvmConfig, (), Attrs>,
     task_spawner: Box<dyn TaskSpawner>,
-    semaphore: Arc<Semaphore>,
 }

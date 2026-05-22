@@ -5,7 +5,7 @@ use core::fmt::Debug;
 
 use alloy_eips::BlockNumHash;
 use async_trait::async_trait;
-use base_consensus_genesis::{RollupConfig, SystemConfig};
+use base_common_genesis::{RollupConfig, SystemConfig};
 use base_protocol::{
     Batch, BatchValidity, BatchWithInclusionBlock, BlockInfo, L2BlockInfo, SingleBatch, SpanBatch,
     SpanBatchError,
@@ -32,7 +32,7 @@ pub trait BatchStreamProvider {
 /// It slots in between the [`ChannelReader`] and [`BatchQueue`]
 /// stages, buffering span batches until they are validated.
 ///
-/// [`Holocene`]: https://specs.optimism.io/protocol/holocene/overview.html
+/// [`Holocene`]: https://specs.base.org/upgrades/holocene/overview
 /// [`ChannelReader`]: crate::stages::ChannelReader
 /// [`BatchQueue`]: crate::stages::BatchQueue
 #[derive(Debug)]
@@ -258,7 +258,7 @@ mod tests {
     use alloy_eips::{BlockNumHash, NumHash};
     use alloy_primitives::{FixedBytes, b256};
     use base_common_consensus::BaseBlock;
-    use base_consensus_genesis::{ChainGenesis, HardForkConfig, SystemConfig};
+    use base_common_genesis::{ChainGenesis, HardForkConfig, SystemConfig};
     use base_protocol::{SingleBatch, SpanBatchElement};
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -466,7 +466,7 @@ mod tests {
             l1_origin: BlockNumHash { number: 9, ..Default::default() },
             ..Default::default()
         };
-        let op_block = BaseBlock {
+        let base_block = BaseBlock {
             header: Header { number: 41, ..Default::default() },
             body: BlockBody { transactions: vec![], ommers: vec![], withdrawals: None },
         };
@@ -487,7 +487,7 @@ mod tests {
 
         let mut provider = TestL2ChainProvider::default();
         provider.blocks.push(l2_parent);
-        provider.op_blocks.push(op_block);
+        provider.base_blocks.push(base_block);
 
         let mut stream = BatchStream::new(prev, config, provider);
         let err = stream.next_batch(l2_safe_head, &l1_blocks).await.unwrap_err();

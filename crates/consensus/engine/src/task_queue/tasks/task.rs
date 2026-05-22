@@ -186,14 +186,14 @@ impl<EngineClient_: EngineClient> PartialOrd for EngineTask<EngineClient_> {
 
 impl<EngineClient_: EngineClient> Ord for EngineTask<EngineClient_> {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Order (descending): BuildBlock -> InsertUnsafe -> Consolidate -> Finalize
+        // Order (descending): BuildBlock -> Insert -> Consolidate -> Finalize
         //
-        // https://specs.optimism.io/protocol/derivation.html#forkchoice-synchronization
+        // https://specs.base.org/protocol/consensus/derivation#forkchoice-synchronization
         //
         // - Block building jobs are prioritized above all other tasks, to give priority to the
         //   sequencer. BuildTask handles forkchoice updates automatically.
-        // - InsertUnsafe tasks are prioritized over Consolidate tasks, to ensure that unsafe block
-        //   gossip is imported promptly.
+        // - Insert tasks are prioritized over Consolidate tasks, to ensure direct payload imports
+        //   are handled promptly.
         // - Consolidate tasks are prioritized over Finalize tasks, as they advance the safe chain
         //   via derivation.
         // - Finalize tasks have the lowest priority, as they only update finalized status.
@@ -217,11 +217,11 @@ impl<EngineClient_: EngineClient> Ord for EngineTask<EngineClient_> {
             (Self::Seal(_) | Self::GetPayload(_), _) => Ordering::Greater,
             (_, Self::Seal(_) | Self::GetPayload(_)) => Ordering::Less,
 
-            // BuildBlock tasks are prioritized over InsertUnsafe and Consolidate tasks
+            // BuildBlock tasks are prioritized over Insert and Consolidate tasks
             (Self::Build(_), _) => Ordering::Greater,
             (_, Self::Build(_)) => Ordering::Less,
 
-            // InsertUnsafe tasks are prioritized over Consolidate and Finalize tasks
+            // Insert tasks are prioritized over Consolidate and Finalize tasks
             (Self::Insert(_), _) => Ordering::Greater,
             (_, Self::Insert(_)) => Ordering::Less,
 
@@ -246,6 +246,13 @@ impl<EngineClient_: EngineClient> EngineTaskExt for EngineTask<EngineClient_> {
     type Error = EngineTaskErrors;
 
     async fn execute(&self, state: &mut EngineState) -> Result<(), Self::Error> {
+        // Wall-clock duration of the entire retry loop (not per attempt), so the
+        // difference against `engine_method_request_duration{method}` isolates pure
+        // CL retry/yield overhead. Records on drop regardless of outcome
+        // (success / critical / reset / flush).
+        let label = self.task_metrics_label();
+        let _task_timer = base_metrics::timed!(Metrics::engine_task_duration(label));
+
         // Retry the task until it succeeds or a critical error occurs.
         while let Err(e) = self.execute_inner(state).await {
             let severity = e.severity();

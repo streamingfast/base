@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use alloy_primitives::Address;
 use alloy_provider::{Provider, ProviderBuilder};
 use anyhow::{Context, Result};
-use base_consensus_genesis::RollupConfig;
-use base_consensus_registry::Registry;
+use base_common_chains::Registry;
+use base_common_genesis::RollupConfig;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -80,7 +80,7 @@ pub struct ConductorNodeConfig {
 
 /// Monitoring configuration for a chain watched by basectl.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChainConfig {
+pub struct MonitoringConfig {
     /// Human-readable chain name (e.g. "mainnet", "sepolia").
     pub name: String,
     /// L2 JSON-RPC endpoint URL.
@@ -89,15 +89,15 @@ pub struct ChainConfig {
     pub flashblocks_ws: Url,
     /// L1 Ethereum JSON-RPC endpoint URL.
     pub l1_rpc: Url,
-    /// Optional OP-Node JSON-RPC endpoint URL.
+    /// Optional Base consensus node JSON-RPC endpoint URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub op_node_rpc: Option<Url>,
+    pub consensus_node_rpc: Option<Url>,
     /// L1 `SystemConfig` contract address.
     pub system_config: Address,
     /// L1 batcher address for blob attribution.
     ///
     /// This is the current live batcher address, not necessarily the genesis
-    /// batcher. It may differ from the value in `base-consensus-registry` if
+    /// batcher. It may differ from the value in `base-common-chains` if
     /// the batcher was updated via a `SystemConfig` transaction after genesis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batcher_address: Option<Address>,
@@ -115,7 +115,7 @@ pub struct ChainConfig {
     pub proofs: Option<ProofsConfig>,
 }
 
-impl ChainConfig {
+impl MonitoringConfig {
     /// Returns the block explorer base URL for this chain, if known.
     pub fn explorer_base_url(&self) -> Option<&'static str> {
         match self.name.as_str() {
@@ -140,12 +140,12 @@ const fn default_blob_target() -> u64 {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
-struct ChainConfigOverride {
+struct MonitoringConfigOverride {
     name: Option<String>,
     rpc: Option<Url>,
     flashblocks_ws: Option<Url>,
     l1_rpc: Option<Url>,
-    op_node_rpc: Option<Url>,
+    consensus_node_rpc: Option<Url>,
     #[serde(default)]
     system_config: Option<Address>,
     #[serde(default)]
@@ -156,7 +156,7 @@ struct ChainConfigOverride {
     proofs: Option<ProofsConfig>,
 }
 
-impl ChainConfig {
+impl MonitoringConfig {
     /// Returns a sorted list of all available network names: the three built-ins
     /// followed by any `*.yaml`/`*.yml` files found in `~/.config/base/networks/`
     /// that are not already covered by the built-ins.
@@ -190,7 +190,7 @@ impl ChainConfig {
             rpc: Url::parse("https://mainnet.base.org").unwrap(),
             flashblocks_ws: Url::parse("wss://mainnet.flashblocks.base.org/ws").unwrap(),
             l1_rpc: Url::parse("https://ethereum-rpc.publicnode.com").unwrap(),
-            op_node_rpc: None,
+            consensus_node_rpc: None,
             system_config: rollup.l1_system_config_address,
             batcher_address: Some("0x5050F69a9786F081509234F1a7F4684b5E5b76C9".parse().unwrap()),
             l1_blob_target: 14,
@@ -209,7 +209,7 @@ impl ChainConfig {
             rpc: Url::parse("https://sepolia.base.org").unwrap(),
             flashblocks_ws: Url::parse("wss://sepolia.flashblocks.base.org/ws").unwrap(),
             l1_rpc: Url::parse("https://ethereum-sepolia-rpc.publicnode.com").unwrap(),
-            op_node_rpc: None,
+            consensus_node_rpc: None,
             system_config: rollup.l1_system_config_address,
             batcher_address: Some("0xfc56E7272EEBBBA5bC6c544e159483C4a38f8bA3".parse().unwrap()),
             l1_blob_target: 14,
@@ -221,19 +221,19 @@ impl ChainConfig {
 
     /// Returns a devnet configuration for local development.
     ///
-    /// The devnet addresses are fetched dynamically from the op-node via the
+    /// The devnet addresses are fetched dynamically from the consensus node via the
     /// `optimism_rollupConfig` RPC method since they are regenerated each time
     /// the devnet is started.
     ///
     /// Use `load("devnet")` to get a fully configured devnet with addresses
-    /// fetched from the running op-node.
+    /// fetched from the running consensus node.
     fn devnet_base() -> Self {
         Self {
             name: "devnet".to_string(),
             rpc: Url::parse("http://localhost:7545").unwrap(),
             flashblocks_ws: Url::parse("ws://localhost:7111").unwrap(),
             l1_rpc: Url::parse("http://localhost:4545").unwrap(),
-            op_node_rpc: Some(Url::parse("http://localhost:7549").unwrap()),
+            consensus_node_rpc: Some(Url::parse("http://localhost:7549").unwrap()),
             // These will be populated by fetch_rollup_config
             system_config: Address::ZERO,
             batcher_address: None,
@@ -287,17 +287,18 @@ impl ChainConfig {
         }
     }
 
-    /// Fetches the rollup config from the op-node via the `optimism_rollupConfig` RPC method.
-    async fn fetch_rollup_config(op_node_url: &Url) -> Result<RollupConfig> {
-        let provider = ProviderBuilder::new()
-            .connect(op_node_url.as_str())
-            .await
-            .with_context(|| format!("Failed to connect to op-node at {op_node_url}"))?;
+    /// Fetches the rollup config from the consensus node via the `optimism_rollupConfig` RPC method.
+    async fn fetch_rollup_config(consensus_node_url: &Url) -> Result<RollupConfig> {
+        let provider =
+            ProviderBuilder::new().connect(consensus_node_url.as_str()).await.with_context(
+                || format!("Failed to connect to consensus node at {consensus_node_url}"),
+            )?;
 
-        let config: RollupConfig = provider
-            .raw_request("optimism_rollupConfig".into(), ())
-            .await
-            .with_context(|| "Failed to fetch rollup config from op-node")?;
+        let config: RollupConfig =
+            provider
+                .raw_request("optimism_rollupConfig".into(), ())
+                .await
+                .with_context(|| "Failed to fetch rollup config from consensus node")?;
 
         Ok(config)
     }
@@ -310,7 +311,7 @@ impl ChainConfig {
     /// 3. Or treat as standalone file path
     ///
     /// For devnet, the `system_config` and `batcher_address` are fetched dynamically
-    /// from the op-node via the `optimism_rollupConfig` RPC method.
+    /// from the consensus node via the `optimism_rollupConfig` RPC method.
     pub async fn load(name_or_path: &str) -> Result<Self> {
         let base_config = match name_or_path {
             "mainnet" => Some(Self::mainnet()),
@@ -352,14 +353,15 @@ impl ChainConfig {
         )
     }
 
-    /// Load devnet config by fetching addresses from the op-node.
+    /// Load devnet config by fetching addresses from the consensus node.
     async fn load_devnet() -> Result<Self> {
         let mut config = Self::devnet_base();
 
-        let op_node_url = config.op_node_rpc.as_ref().expect("devnet should have op_node_rpc");
+        let consensus_node_url =
+            config.consensus_node_rpc.as_ref().expect("devnet should have consensus_node_rpc");
 
-        let rollup_config = Self::fetch_rollup_config(op_node_url).await.with_context(
-            || "Failed to fetch rollup config from op-node. Is the devnet running?",
+        let rollup_config = Self::fetch_rollup_config(consensus_node_url).await.with_context(
+            || "Failed to fetch rollup config from consensus node. Is the devnet running?",
         )?;
 
         config.system_config = rollup_config.l1_system_config_address;
@@ -382,7 +384,7 @@ impl ChainConfig {
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-        let overrides: ChainConfigOverride = serde_yaml::from_str(&contents)
+        let overrides: MonitoringConfigOverride = serde_yaml::from_str(&contents)
             .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
 
         Ok(Self {
@@ -390,7 +392,7 @@ impl ChainConfig {
             rpc: overrides.rpc.unwrap_or(base.rpc),
             flashblocks_ws: overrides.flashblocks_ws.unwrap_or(base.flashblocks_ws),
             l1_rpc: overrides.l1_rpc.unwrap_or(base.l1_rpc),
-            op_node_rpc: overrides.op_node_rpc.or(base.op_node_rpc),
+            consensus_node_rpc: overrides.consensus_node_rpc.or(base.consensus_node_rpc),
             system_config: overrides.system_config.unwrap_or(base.system_config),
             batcher_address: overrides.batcher_address.or(base.batcher_address),
             l1_blob_target: overrides.l1_blob_target.unwrap_or(base.l1_blob_target),
@@ -411,11 +413,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_builtin_configs() {
-        let mainnet = ChainConfig::load("mainnet").await.unwrap();
+        let mainnet = MonitoringConfig::load("mainnet").await.unwrap();
         assert_eq!(mainnet.name, "mainnet");
         assert!(mainnet.rpc.as_str().contains("mainnet"));
 
-        let sepolia = ChainConfig::load("sepolia").await.unwrap();
+        let sepolia = MonitoringConfig::load("sepolia").await.unwrap();
         assert_eq!(sepolia.name, "sepolia");
         assert!(sepolia.rpc.as_str().contains("sepolia"));
     }
@@ -423,19 +425,19 @@ mod tests {
     #[test]
     fn test_devnet_base_config() {
         // Test the base devnet config structure (without RPC call)
-        let devnet = ChainConfig::devnet_base();
+        let devnet = MonitoringConfig::devnet_base();
         assert_eq!(devnet.name, "devnet");
         assert!(devnet.rpc.as_str().contains("localhost"));
         assert_eq!(devnet.rpc.as_str(), "http://localhost:7545/");
         assert_eq!(devnet.flashblocks_ws.as_str(), "ws://localhost:7111/");
         assert_eq!(devnet.l1_rpc.as_str(), "http://localhost:4545/");
-        assert!(devnet.op_node_rpc.is_some());
-        assert_eq!(devnet.op_node_rpc.unwrap().as_str(), "http://localhost:7549/");
+        assert!(devnet.consensus_node_rpc.is_some());
+        assert_eq!(devnet.consensus_node_rpc.unwrap().as_str(), "http://localhost:7549/");
     }
 
     #[tokio::test]
     async fn test_unknown_config() {
-        let result = ChainConfig::load("nonexistent").await;
+        let result = MonitoringConfig::load("nonexistent").await;
         assert!(result.is_err());
     }
 }

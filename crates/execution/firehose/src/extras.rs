@@ -5,7 +5,7 @@
 //! path):
 //!
 //! * [`OpPostTxExtras`] — re-emits the three fee-vault balance changes that
-//!   [`base_common_evm::OpHandler::reward_beneficiary`] applies via `Journal::balance_incr`
+//!   [`base_common_evm::BaseHandler::reward_beneficiary`] applies via `Journal::balance_incr`
 //!   during revm's `post_execution` phase. Revm fires no inspector hooks in that phase, so without
 //!   this the `L1FeeVault` / `BaseFeeVault` / `OperatorFeeVault` credits would be invisible to the
 //!   tracer.
@@ -19,7 +19,9 @@
 use alloy_evm::Evm as _;
 use alloy_primitives::{Address, Bytes, U256};
 use base_common_consensus::Predeploys;
-use base_common_evm::{BaseEvm, DEPOSIT_TRANSACTION_TYPE, OpSpecId, OpTxTr};
+use base_common_evm::{
+    BaseContext, BaseEvm, BaseSpecId, BaseTxTr, BaseUpgrade, DEPOSIT_TRANSACTION_TYPE,
+};
 use firehose_tracer::firehose_debug;
 use firehose_tracer::pb::sf::ethereum::r#type::v2::balance_change::Reason;
 use firehose_tracer::types::{TxEvent, TxType};
@@ -32,9 +34,7 @@ use reth_revm::revm::{
     interpreter::{InterpreterResult, interpreter::EthInterpreter},
 };
 
-use base_common_evm::OpContext;
-
-/// Emits the three OP Stack fee vault balance changes that `OpHandler::reward_beneficiary`
+/// Emits the three OP Stack fee vault balance changes that `BaseHandler::reward_beneficiary`
 /// applies via `Journal::balance_incr` during revm's `post_execution` phase.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpPostTxExtras;
@@ -42,8 +42,8 @@ pub struct OpPostTxExtras;
 impl<DB, I, P> PostTxExtras<BaseEvm<DB, I, P>> for OpPostTxExtras
 where
     DB: alloy_evm::Database,
-    I: Inspector<OpContext<DB>, EthInterpreter> + FirehoseInspectorApi,
-    P: PrecompileProvider<OpContext<DB>, Output = InterpreterResult>,
+    I: Inspector<BaseContext<DB>, EthInterpreter> + FirehoseInspectorApi,
+    P: PrecompileProvider<BaseContext<DB>, Output = InterpreterResult>,
 {
     fn emit_post_tx_extras(
         &self,
@@ -56,9 +56,9 @@ where
             gas_used,
             base_fee
         );
-        // Deposit txs return early in `OpHandler::reward_beneficiary` without crediting any
+        // Deposit txs return early in `BaseHandler::reward_beneficiary` without crediting any
         // vault — skip them here so we do not emit phantom entries.
-        let (enveloped, spec): (Bytes, OpSpecId) = {
+        let (enveloped, spec): (Bytes, BaseSpecId) = {
             let ctx = evm.ctx();
             let tx = ctx.tx();
             if tx.is_deposit() {
@@ -66,7 +66,7 @@ where
                 return;
             }
             // Non-deposit txs are guaranteed to carry envelope bytes (validated upstream in
-            // `OpHandler::validate_env`). If we hit the None branch it's an internal bug —
+            // `BaseHandler::validate_env`). If we hit the None branch it's an internal bug —
             // emit nothing rather than panic: the tracer stays consistent with the handler,
             // which would have errored out before reaching `reward_beneficiary`.
             let Some(bytes) = tx.enveloped_tx().cloned() else {
@@ -95,7 +95,7 @@ where
         let (l1_cost, operator_fee_cost) = {
             let l1 = evm.ctx_mut().chain_mut();
             let l1_cost = l1.calculate_tx_l1_cost(&enveloped, spec);
-            let operator_fee_cost = if spec.is_enabled_in(OpSpecId::ISTHMUS) {
+            let operator_fee_cost = if spec.is_enabled_in(BaseUpgrade::Isthmus) {
                 l1.operator_fee_charge(&enveloped, U256::from(gas_used), spec)
             } else {
                 U256::ZERO
@@ -115,7 +115,7 @@ where
 
         // Emission order matches the geth-instrumented op-node: BaseFeeVault (0x...19) →
         // L1FeeVault (0x...1A) → OperatorFeeVault (0x...1B). Note this differs from
-        // `OpHandler::reward_beneficiary`'s journal-balance_incr order (L1 → base → operator)
+        // `BaseHandler::reward_beneficiary`'s journal-balance_incr order (L1 → base → operator)
         // — the handler order doesn't matter for state since increments commute, but the
         // firehose trace contract pins ordinals to the geth instrumentation, so we emit in
         // address-ascending order here. Generic coinbase-tip emission already fired (inspector)
@@ -163,8 +163,8 @@ pub struct OpPreTxAdjust;
 impl<DB, I, P> PreTxAdjust<BaseEvm<DB, I, P>> for OpPreTxAdjust
 where
     DB: alloy_evm::Database,
-    I: Inspector<OpContext<DB>, EthInterpreter> + FirehoseInspectorApi,
-    P: PrecompileProvider<OpContext<DB>, Output = InterpreterResult>,
+    I: Inspector<BaseContext<DB>, EthInterpreter> + FirehoseInspectorApi,
+    P: PrecompileProvider<BaseContext<DB>, Output = InterpreterResult>,
 {
     fn adjust_tx_event(
         &self,
@@ -189,7 +189,7 @@ where
         tx_event.nonce = nonce;
 
         // Reclassify the depth-0 sender balance change. For deposit txs,
-        // `OpHandler::validate_against_state_and_deduct_caller` writes
+        // `BaseHandler::validate_against_state_and_deduct_caller` writes
         // `balance + mint − effective_balance_spending` (op-revm/handler.rs:104-142). For
         // typical deposits (zero gas cost, zero spending) the change is purely the `mint`
         // credit — the geth-instrumented op-node tags this as `IncreaseMint` (reason 18),

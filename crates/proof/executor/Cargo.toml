@@ -17,7 +17,7 @@ normal = ["getrandom"]
 # Workspace
 base-protocol.workspace = true
 base-proof-mpt.workspace = true
-base-consensus-genesis.workspace = true
+base-common-genesis.workspace = true
 
 # Alloy
 alloy-rlp.workspace = true
@@ -53,7 +53,7 @@ alloy-transport = { workspace = true, optional = true }
 alloy-rpc-client = { workspace = true, optional = true }
 alloy-transport-http = { workspace = true, optional = true }
 alloy-rpc-types-engine = { workspace = true, optional = true }
-base-consensus-registry = { workspace = true, optional = true }
+base-common-chains = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["full"], optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 rocksdb = { workspace = true, features = ["snappy"], optional = true }
@@ -68,11 +68,11 @@ std = [
 	"alloy-rlp/std",
 	"alloy-rpc-types-engine?/std",
 	"alloy-trie/std",
+	"base-common-chains?/std",
 	"base-common-consensus/std",
 	"base-common-evm/std",
+	"base-common-genesis/std",
 	"base-common-rpc-types-engine/std",
-	"base-consensus-genesis/std",
-	"base-consensus-registry?/std",
 	"base-proof-mpt/std",
 	"base-protocol/std",
 	"getrandom/std",
@@ -83,14 +83,14 @@ std = [
 	"tracing/std",
 ]
 test-utils = [
-	"base-consensus-registry?/test-utils",
+	"base-common-chains?/test-utils",
 	"base-protocol/test-utils",
 	"dep:alloy-provider",
 	"dep:alloy-rpc-client",
 	"dep:alloy-rpc-types-engine",
 	"dep:alloy-transport",
 	"dep:alloy-transport-http",
-	"dep:base-consensus-registry",
+	"dep:base-common-chains",
 	"dep:rand",
 	"dep:rocksdb",
 	"dep:serde",

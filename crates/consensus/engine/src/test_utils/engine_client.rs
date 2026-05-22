@@ -9,25 +9,22 @@ use alloy_primitives::{Address, B256, BlockHash, StorageKey};
 use alloy_provider::{EthGetBlock, ProviderCall, RpcWithBlock};
 use alloy_rpc_types_engine::{
     ClientVersionV1, ExecutionPayloadBodiesV1, ExecutionPayloadEnvelopeV2, ExecutionPayloadInputV2,
-    ExecutionPayloadV1, ExecutionPayloadV3, ForkchoiceState, ForkchoiceUpdated, PayloadId,
-    PayloadStatus,
+    ExecutionPayloadV3, ForkchoiceState, ForkchoiceUpdated, PayloadId, PayloadStatus,
 };
 use alloy_rpc_types_eth::{Block, EIP1186AccountProofResponse, Transaction as EthTransaction};
 use alloy_transport::{TransportError, TransportErrorKind, TransportResult};
-use alloy_transport_http::Http;
 use async_trait::async_trait;
-use base_common_network::Base;
-use base_common_provider::BaseEngineApi;
-use base_common_rpc_types::Transaction as OpTransaction;
+use base_common_genesis::RollupConfig;
+use base_common_network::{Base, BaseEngineApi};
+use base_common_rpc_types::Transaction as BaseTransaction;
 use base_common_rpc_types_engine::{
     BaseExecutionPayloadEnvelopeV3, BaseExecutionPayloadEnvelopeV4, BaseExecutionPayloadEnvelopeV5,
     BaseExecutionPayloadV4, BasePayloadAttributes,
 };
-use base_consensus_genesis::RollupConfig;
 use base_protocol::L2BlockInfo;
 use tokio::sync::RwLock;
 
-use crate::{EngineClient, EngineClientError, HyperAuthClient};
+use crate::{EngineClient, EngineClientError};
 
 /// Builder for creating test `MockEngineClient` instances with sensible defaults
 pub fn test_engine_client_builder() -> MockEngineClientBuilder {
@@ -41,15 +38,15 @@ pub fn test_engine_client_builder() -> MockEngineClientBuilder {
 #[derive(Debug, Clone, Default)]
 pub struct MockEngineStorage {
     /// Storage for block responses by tag.
-    pub l2_blocks_by_label: HashMap<BlockNumberOrTag, Block<OpTransaction>>,
+    pub l2_blocks_by_label: HashMap<BlockNumberOrTag, Block<BaseTransaction>>,
     /// Storage for block info responses by tag.
     pub block_info_by_tag: HashMap<BlockNumberOrTag, L2BlockInfo>,
 
     // Version-specific new_payload responses
-    /// Storage for `new_payload_v1` responses.
-    pub new_payload_v1_response: Option<PayloadStatus>,
     /// Storage for `new_payload_v2` responses.
     pub new_payload_v2_response: Option<PayloadStatus>,
+    /// Storage for the most recent `new_payload_v2` request.
+    pub last_new_payload_v2_request: Option<ExecutionPayloadInputV2>,
     /// Storage for `new_payload_v3` responses.
     pub new_payload_v3_response: Option<PayloadStatus>,
     /// Storage for `new_payload_v4` responses.
@@ -70,11 +67,11 @@ pub struct MockEngineStorage {
     // Version-specific get_payload responses
     /// Storage for execution payload envelope v2 responses.
     pub execution_payload_v2: Option<ExecutionPayloadEnvelopeV2>,
-    /// Storage for OP execution payload envelope v3 responses.
+    /// Storage for Base execution payload envelope v3 responses.
     pub execution_payload_v3: Option<BaseExecutionPayloadEnvelopeV3>,
-    /// Storage for OP execution payload envelope v4 responses.
+    /// Storage for Base execution payload envelope v4 responses.
     pub execution_payload_v4: Option<BaseExecutionPayloadEnvelopeV4>,
-    /// Storage for OP execution payload envelope v5 responses.
+    /// Storage for Base execution payload envelope v5 responses.
     pub execution_payload_v5: Option<BaseExecutionPayloadEnvelopeV5>,
 
     // Version-specific get_payload_bodies responses
@@ -95,7 +92,7 @@ pub struct MockEngineStorage {
     pub l1_blocks_by_id: HashMap<String, Block<EthTransaction>>,
     /// Storage for L2 blocks by stringified `BlockId`.
     /// L2 blocks use Base transactions.
-    pub l2_blocks_by_id: HashMap<String, Block<OpTransaction>>,
+    pub l2_blocks_by_id: HashMap<String, Block<BaseTransaction>>,
     /// Storage for proofs by (address, stringified `BlockId`) key.
     pub proofs_by_address: HashMap<(Address, String), EIP1186AccountProofResponse>,
 }
@@ -109,14 +106,14 @@ pub struct MockEngineStorage {
 ///
 /// ```rust
 /// use base_consensus_engine::test_utils::{MockEngineClient};
-/// use base_consensus_genesis::RollupConfig;
+/// use base_common_genesis::RollupConfig;
 /// use alloy_rpc_types_engine::{PayloadStatus, PayloadStatusEnum};
 /// use alloy_primitives::B256;
 /// use std::sync::Arc;
 ///
 /// let mock = MockEngineClient::builder()
 ///     .with_config(Arc::new(RollupConfig::default()))
-///     .with_new_payload_v1_response(PayloadStatus {
+///     .with_new_payload_v2_response(PayloadStatus {
 ///         status: PayloadStatusEnum::Valid,
 ///         latest_valid_hash: Some(B256::ZERO),
 ///     })
@@ -144,7 +141,7 @@ impl MockEngineClientBuilder {
     pub fn with_l2_block_by_label(
         mut self,
         tag: BlockNumberOrTag,
-        block: Block<OpTransaction>,
+        block: Block<BaseTransaction>,
     ) -> Self {
         self.storage.l2_blocks_by_label.insert(tag, block);
         self
@@ -153,12 +150,6 @@ impl MockEngineClientBuilder {
     /// Sets a block info response for a specific tag.
     pub fn with_block_info_by_tag(mut self, tag: BlockNumberOrTag, info: L2BlockInfo) -> Self {
         self.storage.block_info_by_tag.insert(tag, info);
-        self
-    }
-
-    /// Sets the `new_payload_v1` response.
-    pub fn with_new_payload_v1_response(mut self, status: PayloadStatus) -> Self {
-        self.storage.new_payload_v1_response = Some(status);
         self
     }
 
@@ -266,7 +257,7 @@ impl MockEngineClientBuilder {
     }
 
     /// Sets an L2 block response for a specific `BlockId`.
-    pub fn with_l2_block(mut self, block_id: BlockId, block: Block<OpTransaction>) -> Self {
+    pub fn with_l2_block(mut self, block_id: BlockId, block: Block<BaseTransaction>) -> Self {
         let key = block_id_to_key(&block_id);
         self.storage.l2_blocks_by_id.insert(key, block);
         self
@@ -332,7 +323,11 @@ impl MockEngineClient {
     }
 
     /// Sets a block response for a specific tag.
-    pub async fn set_l2_block_by_label(&self, tag: BlockNumberOrTag, block: Block<OpTransaction>) {
+    pub async fn set_l2_block_by_label(
+        &self,
+        tag: BlockNumberOrTag,
+        block: Block<BaseTransaction>,
+    ) {
         self.storage.write().await.l2_blocks_by_label.insert(tag, block);
     }
 
@@ -341,14 +336,14 @@ impl MockEngineClient {
         self.storage.write().await.block_info_by_tag.insert(tag, info);
     }
 
-    /// Sets the `new_payload_v1` response.
-    pub async fn set_new_payload_v1_response(&self, status: PayloadStatus) {
-        self.storage.write().await.new_payload_v1_response = Some(status);
-    }
-
     /// Sets the `new_payload_v2` response.
     pub async fn set_new_payload_v2_response(&self, status: PayloadStatus) {
         self.storage.write().await.new_payload_v2_response = Some(status);
+    }
+
+    /// Returns the most recent `new_payload_v2` request, if any.
+    pub async fn last_new_payload_v2(&self) -> Option<ExecutionPayloadInputV2> {
+        self.storage.read().await.last_new_payload_v2_request.clone()
     }
 
     /// Sets the `new_payload_v3` response.
@@ -418,7 +413,7 @@ impl MockEngineClient {
     }
 
     /// Sets an L2 block response for a specific `BlockId`.
-    pub async fn set_l2_block(&self, block_id: BlockId, block: Block<OpTransaction>) {
+    pub async fn set_l2_block(&self, block_id: BlockId, block: Block<BaseTransaction>) {
         let key = block_id_to_key(&block_id);
         self.storage.write().await.l2_blocks_by_id.insert(key, block);
     }
@@ -503,20 +498,10 @@ impl EngineClient for MockEngineClient {
         })
     }
 
-    async fn new_payload_v1(&self, _payload: ExecutionPayloadV1) -> TransportResult<PayloadStatus> {
-        let storage = self.storage.read().await;
-        storage.new_payload_v1_response.clone().ok_or_else(|| {
-            TransportError::from(TransportErrorKind::custom_str(
-                "new_payload_v1 was called but no v1 response configured. \
-                 Use with_new_payload_v1_response() or set_new_payload_v1_response() to set a response."
-            ))
-        })
-    }
-
     async fn l2_block_by_label(
         &self,
         numtag: BlockNumberOrTag,
-    ) -> Result<Option<Block<OpTransaction>>, EngineClientError> {
+    ) -> Result<Option<Block<BaseTransaction>>, EngineClientError> {
         let storage = self.storage.read().await;
         Ok(storage.l2_blocks_by_label.get(&numtag).cloned())
     }
@@ -531,12 +516,13 @@ impl EngineClient for MockEngineClient {
 }
 
 #[async_trait]
-impl BaseEngineApi<Base, Http<HyperAuthClient>> for MockEngineClient {
+impl BaseEngineApi for MockEngineClient {
     async fn new_payload_v2(
         &self,
-        _payload: ExecutionPayloadInputV2,
+        payload: ExecutionPayloadInputV2,
     ) -> TransportResult<PayloadStatus> {
-        let storage = self.storage.read().await;
+        let mut storage = self.storage.write().await;
+        storage.last_new_payload_v2_request = Some(payload);
         storage.new_payload_v2_response.clone().ok_or_else(|| {
             TransportError::from(TransportErrorKind::custom_str(
                 "new_payload_v2 was called but no v2 response configured. \

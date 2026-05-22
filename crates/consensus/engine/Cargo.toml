@@ -13,7 +13,7 @@ workspace = true
 [dependencies]
 # workspace
 base-metrics.workspace = true
-base-consensus-genesis.workspace = true
+base-common-genesis.workspace = true
 base-protocol = {workspace = true, features = ["serde", "std"]}
 
 # alloy
@@ -33,7 +33,6 @@ alloy-provider = { workspace = true, features = ["ipc", "ws", "reqwest", "reqwes
 
 # base-alloy
 base-common-network.workspace = true
-base-common-provider.workspace = true
 base-common-rpc-types.workspace = true
 base-common-consensus = { workspace = true, features = ["std"] }
 base-common-rpc-types-engine = { workspace = true, features = ["serde", "std"] }
@@ -57,7 +56,7 @@ metrics = { workspace = true, optional = true }
 rstest.workspace = true
 arbitrary.workspace = true
 tokio-tungstenite.workspace = true
-base-consensus-registry.workspace = true
+base-common-chains.workspace = true
 metrics-exporter-prometheus.workspace = true
 rand = {workspace = true, features = ["thread_rng"]}
 base-common-rpc-types = {workspace = true, features = ["arbitrary", "k256"]}

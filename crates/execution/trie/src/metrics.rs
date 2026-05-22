@@ -3,7 +3,10 @@
 use std::{
     fmt::Debug,
     future::Future,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -20,7 +23,10 @@ use reth_trie_common::{BranchNodeCompact, Nibbles};
 
 use crate::{
     BaseProofsStorageResult, BaseProofsStore, BlockStateDiff,
-    api::{BaseProofsInitialStateStore, InitialStateAnchor, OperationDurations, WriteCounts},
+    api::{
+        BaseProofsBatchStore, BaseProofsInitialStateStore, InitialStateAnchor, OperationDurations,
+        WriteCounts,
+    },
     cursor,
 };
 
@@ -84,7 +90,7 @@ impl StorageOperation {
 }
 
 base_metrics::define_metrics! {
-    optimism_trie.storage.operation,
+    base_trie.storage.operation,
     struct = OperationMetrics,
     #[describe("Duration of storage operations in seconds")]
     #[label(operation)]
@@ -92,7 +98,7 @@ base_metrics::define_metrics! {
 }
 
 base_metrics::define_metrics! {
-    optimism_trie.block,
+    base_trie.block,
     struct = BlockMetrics,
     #[describe("Total time to process a block (end-to-end) in seconds")]
     total_duration_seconds: histogram,
@@ -267,12 +273,17 @@ impl<C: HashedStorageCursor> HashedStorageCursor for BaseProofsHashedCursorWithM
 pub struct BaseProofsStorageWithMetrics<S> {
     storage: S,
     metrics: Arc<StorageMetrics>,
+    tx_acquisitions: Arc<AtomicU64>,
 }
 
 impl<S> BaseProofsStorageWithMetrics<S> {
     /// Initializes new [`StorageMetrics`] and wraps given storage instance.
     pub fn new(storage: S) -> Self {
-        Self { storage, metrics: Arc::new(StorageMetrics) }
+        Self {
+            storage,
+            metrics: Arc::new(StorageMetrics),
+            tx_acquisitions: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     /// Get the underlying storage.
@@ -283,6 +294,12 @@ impl<S> BaseProofsStorageWithMetrics<S> {
     /// Get the metrics.
     pub const fn metrics(&self) -> &Arc<StorageMetrics> {
         &self.metrics
+    }
+
+    /// Read-only transactions acquired since this wrapper was created. Used by
+    /// integration tests to verify request-scoped transaction sharing.
+    pub fn tx_acquisitions(&self) -> u64 {
+        self.tx_acquisitions.load(Ordering::Relaxed)
     }
 }
 
@@ -306,6 +323,7 @@ where
         = BaseProofsHashedCursorWithMetrics<S::AccountHashedCursor<'tx>>
     where
         Self: 'tx;
+    type Tx = S::Tx;
 
     #[inline]
     fn get_earliest_block_number(&self) -> BaseProofsStorageResult<Option<(u64, B256)>> {
@@ -356,6 +374,69 @@ where
     }
 
     #[inline]
+    fn ro_tx(&self) -> BaseProofsStorageResult<Self::Tx> {
+        let tx = self.storage.ro_tx()?;
+        self.tx_acquisitions.fetch_add(1, Ordering::Relaxed);
+        Ok(tx)
+    }
+
+    #[inline]
+    fn storage_trie_cursor_with_tx<'tx>(
+        &self,
+        tx: &'tx Self::Tx,
+        hashed_address: B256,
+        max_block_number: u64,
+    ) -> BaseProofsStorageResult<Self::StorageTrieCursor<'tx>>
+    where
+        Self: 'tx,
+    {
+        let cursor =
+            self.storage.storage_trie_cursor_with_tx(tx, hashed_address, max_block_number)?;
+        Ok(BaseProofsTrieCursorWithMetrics::new(cursor, Arc::clone(&self.metrics)))
+    }
+
+    #[inline]
+    fn account_trie_cursor_with_tx<'tx>(
+        &self,
+        tx: &'tx Self::Tx,
+        max_block_number: u64,
+    ) -> BaseProofsStorageResult<Self::AccountTrieCursor<'tx>>
+    where
+        Self: 'tx,
+    {
+        let cursor = self.storage.account_trie_cursor_with_tx(tx, max_block_number)?;
+        Ok(BaseProofsTrieCursorWithMetrics::new(cursor, Arc::clone(&self.metrics)))
+    }
+
+    #[inline]
+    fn storage_hashed_cursor_with_tx<'tx>(
+        &self,
+        tx: &'tx Self::Tx,
+        hashed_address: B256,
+        max_block_number: u64,
+    ) -> BaseProofsStorageResult<Self::StorageCursor<'tx>>
+    where
+        Self: 'tx,
+    {
+        let cursor =
+            self.storage.storage_hashed_cursor_with_tx(tx, hashed_address, max_block_number)?;
+        Ok(BaseProofsHashedCursorWithMetrics::new(cursor, Arc::clone(&self.metrics)))
+    }
+
+    #[inline]
+    fn account_hashed_cursor_with_tx<'tx>(
+        &self,
+        tx: &'tx Self::Tx,
+        max_block_number: u64,
+    ) -> BaseProofsStorageResult<Self::AccountHashedCursor<'tx>>
+    where
+        Self: 'tx,
+    {
+        let cursor = self.storage.account_hashed_cursor_with_tx(tx, max_block_number)?;
+        Ok(BaseProofsHashedCursorWithMetrics::new(cursor, Arc::clone(&self.metrics)))
+    }
+
+    #[inline]
     fn store_trie_updates(
         &self,
         block_ref: BlockWithParent,
@@ -401,6 +482,24 @@ where
     ) -> BaseProofsStorageResult<()> {
         BlockMetrics::earliest_number().set(block_number as f64);
         self.storage.set_earliest_block_number(block_number, hash)
+    }
+}
+
+impl<S> BaseProofsBatchStore for BaseProofsStorageWithMetrics<S>
+where
+    S: BaseProofsBatchStore + 'static,
+{
+    type BatchSession<'a>
+        = S::BatchSession<'a>
+    where
+        Self: 'a;
+
+    #[inline]
+    fn with_batch_session<R, F>(&self, f: F) -> BaseProofsStorageResult<R>
+    where
+        F: FnOnce(&mut Self::BatchSession<'_>) -> BaseProofsStorageResult<R>,
+    {
+        self.storage.with_batch_session(f)
     }
 }
 

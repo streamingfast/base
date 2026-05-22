@@ -18,7 +18,7 @@ pub struct BuilderConfig {
     /// sequencer.
     pub block_time: Duration,
 
-    /// Data Availability configuration for the OP builder
+    /// Data Availability configuration for the payload builder.
     /// Defines constraints for the maximum size of data availability transactions.
     pub da_config: BaseDAConfig,
 
@@ -83,6 +83,18 @@ pub struct BuilderConfig {
     /// Cache of permanently rejected transaction hashes, shared across blocks.
     /// Transactions in this cache are skipped by the iterator without re-evaluation.
     pub rejection_cache: RejectionCache,
+
+    /// URL of the audit-archiver RPC endpoint for rejected transaction forwarding.
+    /// When set, rejected transactions will be forwarded to this endpoint.
+    pub audit_archiver_url: Option<String>,
+
+    /// Bounded channel capacity for rejected transaction forwarding.
+    /// When the channel is full, new rejected transactions are dropped.
+    pub rejected_tx_channel_size: usize,
+
+    /// Maximum number of rejected transactions accumulated per block before
+    /// further rejections are dropped. Prevents unbounded `ExecutionInfo` growth.
+    pub max_rejected_txs_per_block: usize,
 }
 
 impl BuilderConfig {
@@ -117,6 +129,9 @@ impl core::fmt::Debug for BuilderConfig {
             .field("metering_wait_duration", &self.metering_wait_duration)
             .field("metering_provider", &self.metering_provider)
             .field("rejection_cache_size", &self.rejection_cache.entry_count())
+            .field("audit_archiver_url", &self.audit_archiver_url)
+            .field("rejected_tx_channel_size", &self.rejected_tx_channel_size)
+            .field("max_rejected_txs_per_block", &self.max_rejected_txs_per_block)
             .finish()
     }
 }
@@ -143,6 +158,9 @@ impl Default for BuilderConfig {
             metering_wait_duration: None,
             metering_provider: Arc::new(NoopMeteringProvider),
             rejection_cache: RejectionCache::new(100_000, Duration::from_secs(1800)),
+            audit_archiver_url: None,
+            rejected_tx_channel_size: 500,
+            max_rejected_txs_per_block: 500,
         }
     }
 }

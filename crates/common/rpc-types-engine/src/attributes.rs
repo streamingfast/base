@@ -26,7 +26,7 @@ pub struct BasePayloadAttributes {
     /// Transactions is a field for rollups: the transactions list is forced into the block
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
     pub transactions: Option<Vec<Bytes>>,
-    /// If true, the no transactions are taken out of the tx-pool, only transactions from the above
+    /// If true, no transactions are taken from the tx-pool; only transactions from the above
     /// Transactions list will be included.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
     pub no_tx_pool: Option<bool>,
@@ -121,7 +121,7 @@ impl BasePayloadAttributes {
             .ok_or(EIP1559ParamError::NoEIP1559Params)?
     }
 
-    /// Extracts the Holocene 1599 parameters from the encoded form:
+    /// Extracts the Holocene EIP-1559 parameters from the encoded form:
     /// <https://github.com/ethereum-optimism/specs/blob/main/specs/protocol/holocene/exec-engine.md#eip1559params-encoding>
     ///
     /// Returns (`elasticity`, `denominator`)
@@ -148,14 +148,10 @@ impl BasePayloadAttributes {
     ///
     /// This iterator will be empty if there are no transactions in the attributes.
     pub fn decoded_transactions(&self) -> impl Iterator<Item = Eip2718Result<BaseTxEnvelope>> + '_ {
-        self.transactions.iter().flatten().map(|tx_bytes| {
-            let mut buf = tx_bytes.as_ref();
-            let tx = BaseTxEnvelope::decode_2718(&mut buf).map_err(alloy_rlp::Error::from)?;
-            if !buf.is_empty() {
-                return Err(alloy_rlp::Error::UnexpectedLength.into());
-            }
-            Ok(tx)
-        })
+        self.transactions
+            .iter()
+            .flatten()
+            .map(|tx_bytes| BaseTxEnvelope::decode_2718_exact(tx_bytes.as_ref()))
     }
 
     /// Returns iterator over decoded transactions with their original encoded bytes.
@@ -169,7 +165,7 @@ impl BasePayloadAttributes {
             .flatten()
             .cloned()
             .zip(self.decoded_transactions())
-            .map(|(tx_bytes, result)| result.map(|op_tx| WithEncoded::new(tx_bytes, op_tx)))
+            .map(|(tx_bytes, result)| result.map(|base_tx| WithEncoded::new(tx_bytes, base_tx)))
     }
 
     /// Returns an iterator over the recovered [`BaseTxEnvelope`] in this attributes.
@@ -210,7 +206,7 @@ impl BasePayloadAttributes {
             .flatten()
             .cloned()
             .zip(self.recovered_transactions())
-            .map(|(tx_bytes, result)| result.map(|op_tx| WithEncoded::new(tx_bytes, op_tx)))
+            .map(|(tx_bytes, result)| result.map(|base_tx| WithEncoded::new(tx_bytes, base_tx)))
     }
 }
 

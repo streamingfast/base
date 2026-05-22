@@ -12,8 +12,8 @@ use reth_cli_commands::{
 
 use crate::chainspec::BaseChainSpecParser;
 
+pub mod base_proofs;
 pub mod init_state;
-pub mod op_proofs;
 pub mod p2p;
 
 #[cfg(feature = "dev")]
@@ -30,7 +30,7 @@ pub enum Commands<Ext: clap::Args + fmt::Debug = NoArgs> {
     Init(init_cmd::InitCommand<BaseChainSpecParser>),
     /// Initialize the database from a state dump file.
     #[command(name = "init-state")]
-    InitState(init_state::InitStateCommandOp<BaseChainSpecParser>),
+    InitState(init_state::BaseInitStateCommand<BaseChainSpecParser>),
     /// Dumps genesis block JSON configuration to stdout.
     DumpGenesis(dump_genesis::DumpGenesisCommand<BaseChainSpecParser>),
     /// Database debugging utilities
@@ -57,7 +57,7 @@ pub enum Commands<Ext: clap::Args + fmt::Debug = NoArgs> {
     ReExecute(re_execute::Command<BaseChainSpecParser>),
     /// Manage storage of historical proofs in expanded trie db in fault proof window.
     #[command(name = "proofs")]
-    BaseProofs(op_proofs::Command<BaseChainSpecParser>),
+    BaseProofs(base_proofs::Command<BaseChainSpecParser>),
 }
 
 impl<Ext: clap::Args + fmt::Debug> Commands<Ext> {

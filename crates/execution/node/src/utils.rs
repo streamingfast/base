@@ -4,7 +4,7 @@ use alloy_genesis::Genesis;
 use alloy_primitives::{Address, B256};
 use alloy_rpc_types_engine::PayloadAttributes;
 use base_execution_chainspec::BaseChainSpecBuilder;
-use base_execution_payload_builder::{OpBuiltPayload, OpPayloadBuilderAttributes};
+use base_execution_payload_builder::{BaseBuiltPayload, BasePayloadBuilderAttributes};
 use reth_e2e_test_utils::{
     NodeHelperType, TmpDB, transaction::TransactionTestContext, wallet::Wallet,
 };
@@ -28,7 +28,7 @@ pub async fn setup(num_nodes: usize) -> eyre::Result<(Vec<BaseNode>, Wallet)> {
         Arc::new(BaseChainSpecBuilder::base_mainnet().genesis(genesis).ecotone_activated().build()),
         false,
         Default::default(),
-        optimism_payload_attributes,
+        payload_attributes,
     )
     .await
 }
@@ -38,7 +38,7 @@ pub async fn advance_chain(
     length: usize,
     node: &mut BaseNode,
     wallet: Arc<Mutex<Wallet>>,
-) -> eyre::Result<Vec<OpBuiltPayload>> {
+) -> eyre::Result<Vec<BaseBuiltPayload>> {
     node.advance(length as u64, |_| {
         let wallet = Arc::clone(&wallet);
         Box::pin(async move {
@@ -56,7 +56,7 @@ pub async fn advance_chain(
 }
 
 /// Helper function to create a new eth payload attributes
-pub fn optimism_payload_attributes<T>(timestamp: u64) -> OpPayloadBuilderAttributes<T> {
+pub fn payload_attributes<T>(timestamp: u64) -> BasePayloadBuilderAttributes<T> {
     let attributes = PayloadAttributes {
         timestamp,
         prev_randao: B256::ZERO,
@@ -65,7 +65,7 @@ pub fn optimism_payload_attributes<T>(timestamp: u64) -> OpPayloadBuilderAttribu
         parent_beacon_block_root: Some(B256::ZERO),
     };
 
-    OpPayloadBuilderAttributes {
+    BasePayloadBuilderAttributes {
         payload_attributes: EthPayloadBuilderAttributes::new(B256::ZERO, attributes),
         transactions: vec![],
         no_tx_pool: false,

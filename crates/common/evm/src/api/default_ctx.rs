@@ -1,49 +1,46 @@
-//! Contains trait [`DefaultOp`] used to create a default context.
+//! Contains trait [`DefaultBase`] used to create a default context.
+use base_common_chains::BaseUpgrade;
 use revm::{
     Context, Journal, MainContext,
     context::{BlockEnv, CfgEnv, TxEnv},
     database_interface::EmptyDB,
 };
 
-use crate::{L1BlockInfo, OpSpecId, OpTransaction};
+use crate::{BaseSpecId, BaseTransaction, L1BlockInfo};
 
-/// Type alias for the default context type of the `OpEvm`.
-pub type OpContext<DB> =
-    Context<BlockEnv, OpTransaction<TxEnv>, CfgEnv<OpSpecId>, DB, Journal<DB>, L1BlockInfo>;
+/// Type alias for the default context type of the `BaseEvm`.
+pub type BaseContext<DB> =
+    Context<BlockEnv, BaseTransaction<TxEnv>, CfgEnv<BaseSpecId>, DB, Journal<DB>, L1BlockInfo>;
 
 /// Trait that allows for a default context to be created.
-pub trait DefaultOp {
+pub trait DefaultBase {
     /// Create a default context.
-    fn op() -> OpContext<EmptyDB>;
+    fn base() -> BaseContext<EmptyDB>;
 }
 
-impl DefaultOp for OpContext<EmptyDB> {
-    fn op() -> Self {
+impl DefaultBase for BaseContext<EmptyDB> {
+    fn base() -> Self {
         Context::mainnet()
-            .with_tx(OpTransaction::builder().build_fill())
-            .with_cfg(CfgEnv::new_with_spec(OpSpecId::BEDROCK))
+            .with_tx(BaseTransaction::builder().build_fill())
+            .with_cfg(CfgEnv::new_with_spec(BaseSpecId::new(BaseUpgrade::Bedrock)))
             .with_chain(L1BlockInfo::default())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use revm::{
-        ExecuteEvm,
-        inspector::{InspectEvm, NoOpInspector},
-    };
+    use revm::{ExecuteEvm, InspectEvm, inspector::NoOpInspector};
 
     use super::*;
     use crate::Builder;
 
     #[test]
-    fn default_run_op() {
-        let ctx = Context::op();
-        // convert to Base context
-        let mut evm = ctx.build_op_with_inspector(NoOpInspector {});
-        // execute
-        let _ = evm.transact(OpTransaction::builder().build_fill());
-        // inspect
-        let _ = evm.inspect_one_tx(OpTransaction::builder().build_fill());
+    fn default_run_base() {
+        let ctx = Context::base();
+        let mut evm = ctx.build_with_inspector(NoOpInspector {});
+        // execute without inspector
+        let _ = evm.transact(BaseTransaction::builder().build_fill());
+        // execute with inspector callbacks
+        let _ = evm.inspect_one_tx(BaseTransaction::builder().build_fill());
     }
 }

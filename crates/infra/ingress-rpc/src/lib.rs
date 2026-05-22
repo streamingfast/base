@@ -21,6 +21,7 @@ mod validation;
 use std::{
     net::{IpAddr, SocketAddr},
     str::FromStr,
+    sync::Arc,
 };
 
 use alloy_primitives::TxHash;
@@ -28,7 +29,10 @@ use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use base_bundles::MeterBundleResponse;
 use base_common_network::Base;
 use clap::Args;
-use tokio::sync::broadcast;
+use tokio::{
+    sync::{Semaphore, broadcast},
+    task::JoinSet,
+};
 use tracing::{debug, error, info, warn};
 use url::Url;
 pub use validation::{AccountInfo, AccountInfoLookup, L1BlockInfoLookup, validate_bundle};
@@ -89,13 +93,34 @@ pub struct Config {
     #[arg(long, env = "TIPS_INGRESS_KAFKA_INGRESS_TOPIC", default_value = "tips-ingress")]
     pub ingress_topic: String,
 
-    /// Kafka properties file for audit events
+    /// Deprecated: audit events are now published over RPC. Accepted for
+    /// backward compatibility with existing deploy configs and ignored at
+    /// runtime (a deprecation warning is logged when set).
     #[arg(long, env = "TIPS_INGRESS_KAFKA_AUDIT_PROPERTIES_FILE")]
-    pub audit_kafka_properties: String,
+    pub audit_kafka_properties: Option<String>,
 
-    /// Kafka topic for audit events
-    #[arg(long, env = "TIPS_INGRESS_KAFKA_AUDIT_TOPIC", default_value = "tips-audit")]
-    pub audit_topic: String,
+    /// Deprecated: audit events are now published over RPC. Accepted for
+    /// backward compatibility with existing deploy configs and ignored at
+    /// runtime (a deprecation warning is logged when set).
+    #[arg(long, env = "TIPS_INGRESS_KAFKA_AUDIT_TOPIC")]
+    pub audit_topic: Option<String>,
+
+    /// URL of the audit-archiver RPC endpoint that receives bundle events via
+    /// `base_persistBatchedBundleEvent`.
+    #[arg(long, env = "TIPS_INGRESS_AUDIT_RPC_URL")]
+    pub audit_rpc_url: Url,
+
+    /// Per-request timeout for audit RPC calls, in seconds.
+    #[arg(long, env = "TIPS_INGRESS_AUDIT_RPC_TIMEOUT_SECS", default_value = "2")]
+    pub audit_rpc_timeout_secs: u64,
+
+    /// Flush the audit batch when it reaches this many events.
+    #[arg(long, env = "TIPS_INGRESS_AUDIT_BATCH_MAX_SIZE", default_value = "50")]
+    pub audit_batch_max_size: usize,
+
+    /// Maximum time (ms) the first event in a batch waits before forced flush.
+    #[arg(long, env = "TIPS_INGRESS_AUDIT_BATCH_MAX_WAIT_MS", default_value = "25")]
+    pub audit_batch_max_wait_ms: u64,
 
     /// Default lifetime for sent transactions in seconds (default: 3 hours)
     #[arg(
@@ -141,10 +166,20 @@ pub struct Config {
     #[arg(long, env = "TIPS_INGRESS_BUNDLE_CACHE_TTL", default_value = "20")]
     pub bundle_cache_ttl: u64,
 
+    /// Capacity of the bounded audit event channel.
+    ///
+    /// When the channel is full, new audit events are dropped to avoid blocking
+    /// the RPC handler. Size this to handle peak tx throughput × Kafka stall time.
+    #[arg(long, env = "TIPS_INGRESS_AUDIT_CHANNEL_CAPACITY", default_value = "512")]
+    pub audit_channel_capacity: usize,
+
     /// Enable sending to builder
     #[arg(long, env = "TIPS_INGRESS_SEND_TO_BUILDER", default_value = "false")]
     pub send_to_builder: bool,
 }
+
+/// Maximum number of concurrent RPC calls per builder URL.
+const MAX_CONCURRENT_RPCS: usize = 64;
 
 /// Connects ingress metering data to builder RPCs.
 #[derive(Debug)]
@@ -152,8 +187,12 @@ pub struct BuilderConnector;
 
 impl BuilderConnector {
     /// Spawns a background task that forwards metering data to the builder RPC.
+    ///
+    /// RPC calls are dispatched concurrently (up to [`MAX_CONCURRENT_RPCS`]) so
+    /// that slow responses don't block the recv loop and risk broadcast channel
+    /// lag.
     pub fn connect(metering_rx: broadcast::Receiver<MeterBundleResponse>, builder_rpc: Url) {
-        let rpc_url = builder_rpc.clone();
+        let rpc_url: Arc<str> = Arc::from(builder_rpc.as_str());
         let builder: RootProvider<Base> = ProviderBuilder::new()
             .disable_recommended_fillers()
             .network::<Base>()
@@ -161,8 +200,17 @@ impl BuilderConnector {
 
         tokio::spawn(async move {
             let mut event_rx = metering_rx;
+            let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_RPCS));
+            let mut join_set = JoinSet::new();
             info!(url = %rpc_url, "BuilderConnector started, waiting for metering data");
             loop {
+                // Drain completed tasks to observe panics / errors.
+                while let Some(result) = join_set.try_join_next() {
+                    if let Err(e) = result {
+                        error!(url = %rpc_url, error = %e, "RPC forwarding task failed");
+                    }
+                }
+
                 match event_rx.recv().await {
                     Ok(event) => {
                         if event.results.is_empty() {
@@ -175,26 +223,34 @@ impl BuilderConnector {
                         }
 
                         let tx_hash = event.results[0].tx_hash;
-                        match builder
-                            .client()
-                            .request::<(TxHash, MeterBundleResponse), ()>(
-                                "base_setMeteringInformation",
-                                (tx_hash, event),
-                            )
-                            .await
-                        {
-                            Ok(()) => debug!(
-                                url = %rpc_url,
-                                tx_hash = %tx_hash,
-                                "Forwarded metering information"
-                            ),
-                            Err(e) => error!(
-                                url = %rpc_url,
-                                error = %e,
-                                tx_hash = %tx_hash,
-                                "Failed to set metering information"
-                            ),
-                        }
+                        let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
+                            break;
+                        };
+                        let builder = builder.clone();
+                        let url = Arc::clone(&rpc_url);
+                        join_set.spawn(async move {
+                            match builder
+                                .client()
+                                .request::<(TxHash, MeterBundleResponse), ()>(
+                                    "base_setMeteringInformation",
+                                    (tx_hash, event),
+                                )
+                                .await
+                            {
+                                Ok(()) => debug!(
+                                    url = %url,
+                                    tx_hash = %tx_hash,
+                                    "Forwarded metering information"
+                                ),
+                                Err(e) => error!(
+                                    url = %url,
+                                    error = %e,
+                                    tx_hash = %tx_hash,
+                                    "Failed to set metering information"
+                                ),
+                            }
+                            drop(permit);
+                        });
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(
@@ -207,6 +263,13 @@ impl BuilderConnector {
                         info!(url = %rpc_url, "BuilderConnector channel closed, shutting down");
                         break;
                     }
+                }
+            }
+
+            // Drain remaining in-flight tasks on shutdown.
+            while let Some(result) = join_set.join_next().await {
+                if let Err(e) = result {
+                    error!(url = %rpc_url, error = %e, "RPC forwarding task failed during shutdown");
                 }
             }
         });
@@ -237,6 +300,7 @@ mod tests {
                 tx_hash: TxHash::ZERO,
                 value: U256::ZERO,
                 execution_time_us: 500,
+                opcode_gas: vec![],
             }],
             ..Default::default()
         }
@@ -321,6 +385,32 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         // wiremock verifies 0 calls were made.
+    }
+
+    #[tokio::test]
+    async fn test_builder_connector_forwards_concurrently() {
+        let mock_server = MockServer::start().await;
+
+        // Each response takes 200ms. Sequential forwarding would need >=1000ms
+        // for 5 messages. Concurrent forwarding completes in ~200ms; we allow
+        // a generous 2s budget so CI load doesn't cause flaky failures.
+        Mock::given(method("POST"))
+            .respond_with(jsonrpc_ok().set_delay(Duration::from_millis(200)))
+            .expect(5)
+            .mount(&mock_server)
+            .await;
+
+        let (tx, rx) = broadcast::channel::<MeterBundleResponse>(16);
+        BuilderConnector::connect(rx, mock_server.uri().parse().unwrap());
+
+        for _ in 0..5 {
+            tx.send(response_with_results()).unwrap();
+        }
+
+        // 2s is generous for concurrent (~200ms) but well under sequential (>=1s).
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+
+        // wiremock verifies exactly 5 calls were made within the time window.
     }
 
     #[tokio::test]

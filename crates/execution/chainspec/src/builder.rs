@@ -9,7 +9,7 @@ use reth_primitives_traits::SealedHeader;
 
 use crate::BaseChainSpec;
 
-/// Chain spec builder for an OP stack chain.
+/// Chain spec builder for a Base chain.
 #[derive(Debug, Default, From)]
 pub struct BaseChainSpecBuilder {
     /// [`ChainSpecBuilder`]
@@ -19,10 +19,11 @@ pub struct BaseChainSpecBuilder {
 impl BaseChainSpecBuilder {
     /// Construct a new builder from the Base Mainnet chain spec.
     pub fn base_mainnet() -> Self {
+        let base_mainnet = BaseChainSpec::mainnet();
         let mut inner = ChainSpecBuilder::default()
-            .chain(crate::BASE_MAINNET.chain)
-            .genesis(crate::BASE_MAINNET.genesis.clone());
-        let forks = crate::BASE_MAINNET.hardforks.clone();
+            .chain(base_mainnet.chain)
+            .genesis(base_mainnet.genesis.clone());
+        let forks = base_mainnet.hardforks.clone();
         inner = inner.with_forks(forks);
         Self { inner }
     }
@@ -122,11 +123,18 @@ impl BaseChainSpecBuilder {
         self
     }
 
-    /// Enable Base V1 at genesis.
-    pub fn base_v1_activated(mut self) -> Self {
+    /// Enable Base Azul at genesis.
+    pub fn azul_activated(mut self) -> Self {
         self = self.jovian_activated();
         self.inner = self.inner.with_fork(EthereumHardfork::Osaka, ForkCondition::Timestamp(0));
-        self.inner = self.inner.with_fork(BaseUpgrade::V1, ForkCondition::Timestamp(0));
+        self.inner = self.inner.with_fork(BaseUpgrade::Azul, ForkCondition::Timestamp(0));
+        self
+    }
+
+    /// Enable Beryl at genesis.
+    pub fn beryl_activated(mut self) -> Self {
+        self = self.azul_activated();
+        self.inner = self.inner.with_fork(BaseUpgrade::Beryl, ForkCondition::Timestamp(0));
         self
     }
 

@@ -14,7 +14,7 @@ use arc_swap::ArcSwapOption;
 use base_common_chains::Upgrades;
 use base_common_consensus::{BaseBlock, BaseTxEnvelope};
 use base_common_flashblocks::Flashblock;
-use base_execution_evm::{BaseEvmConfig, OpNextBlockEnvAttributes};
+use base_execution_evm::{BaseEvmConfig, BaseNextBlockEnvAttributes};
 use rayon::prelude::*;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_evm::ConfigureEvm;
@@ -158,15 +158,20 @@ where
                         {
                             return;
                         }
-                        info!("waiting for first Flashblock");
                         // we should ignore this error since it doesn't necessarily indicate a problem
                         return;
                     }
                     _ => {}
                 }
 
-                error!(message = "could not process Flashblock", error = %e);
-                Metrics::block_processing_error().increment(1);
+                // skip logging expected caching case
+                if !matches!(
+                    e,
+                    StateProcessorError::Provider(ProviderError::MissingCanonicalHeader { .. })
+                ) {
+                    error!(message = "could not process Flashblock", error = %e);
+                    Metrics::block_processing_error().increment(1);
+                }
             }
         }
     }
@@ -359,7 +364,7 @@ where
             .map_err(|e| ProviderError::StateProvider(e.to_string()))?
             .ok_or(ProviderError::MissingCanonicalHeader { block_number: canonical_block })?;
 
-        let evm_config = BaseEvmConfig::optimism(self.client.chain_spec());
+        let evm_config = BaseEvmConfig::base(self.client.chain_spec());
         let state_provider = self
             .client
             .state_by_block_number_or_tag(BlockNumberOrTag::Number(canonical_block))
@@ -393,7 +398,7 @@ where
             // Extract L1 block info using the AssembledBlock method
             let l1_block_info = assembled.l1_block_info()?;
 
-            let block_env_attributes = OpNextBlockEnvAttributes {
+            let block_env_attributes = BaseNextBlockEnvAttributes {
                 timestamp: assembled.base.timestamp,
                 suggested_fee_recipient: assembled.base.fee_recipient,
                 prev_randao: assembled.base.prev_randao,

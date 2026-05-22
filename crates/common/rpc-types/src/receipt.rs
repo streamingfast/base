@@ -8,10 +8,10 @@ use base_common_consensus::{
 };
 use serde::{Deserialize, Serialize};
 
-/// OP Transaction Receipt type
+/// Base transaction receipt type
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[doc(alias = "OpTxReceipt")]
+#[doc(alias = "BaseTxReceipt")]
 pub struct BaseTransactionReceipt {
     /// Regular eth transaction receipt including deposit receipts
     #[serde(flatten)]
@@ -202,18 +202,17 @@ pub struct L1BlockInfo {
 
 impl Eq for L1BlockInfo {}
 
-impl From<BaseTransactionReceipt> for BaseReceiptEnvelope<alloy_primitives::Log> {
+impl From<BaseTransactionReceipt> for BaseReceiptEnvelope {
     fn from(value: BaseTransactionReceipt) -> Self {
-        let inner_envelope = value.inner.inner.into();
+        let ReceiptWithBloom { logs_bloom, receipt } = value.inner.inner;
 
         /// Helper function to convert the inner logs within a [`ReceiptWithBloom`] from RPC to
         /// consensus types.
         #[inline(always)]
         fn convert_standard_receipt(
-            receipt: ReceiptWithBloom<Receipt<alloy_rpc_types_eth::Log>>,
+            receipt: Receipt<alloy_rpc_types_eth::Log>,
+            logs_bloom: alloy_primitives::Bloom,
         ) -> ReceiptWithBloom<Receipt<alloy_primitives::Log>> {
-            let ReceiptWithBloom { logs_bloom, receipt } = receipt;
-
             let consensus_logs = receipt.logs.into_iter().map(|log| log.inner).collect();
             ReceiptWithBloom {
                 receipt: Receipt {
@@ -225,18 +224,20 @@ impl From<BaseTransactionReceipt> for BaseReceiptEnvelope<alloy_primitives::Log>
             }
         }
 
-        match inner_envelope {
-            BaseReceiptEnvelope::Legacy(receipt) => Self::Legacy(convert_standard_receipt(receipt)),
-            BaseReceiptEnvelope::Eip2930(receipt) => {
-                Self::Eip2930(convert_standard_receipt(receipt))
+        match receipt {
+            BaseReceipt::Legacy(receipt) => {
+                Self::Legacy(convert_standard_receipt(receipt, logs_bloom))
             }
-            BaseReceiptEnvelope::Eip1559(receipt) => {
-                Self::Eip1559(convert_standard_receipt(receipt))
+            BaseReceipt::Eip2930(receipt) => {
+                Self::Eip2930(convert_standard_receipt(receipt, logs_bloom))
             }
-            BaseReceiptEnvelope::Eip7702(receipt) => {
-                Self::Eip7702(convert_standard_receipt(receipt))
+            BaseReceipt::Eip1559(receipt) => {
+                Self::Eip1559(convert_standard_receipt(receipt, logs_bloom))
             }
-            BaseReceiptEnvelope::Deposit(DepositReceiptWithBloom { logs_bloom, receipt }) => {
+            BaseReceipt::Eip7702(receipt) => {
+                Self::Eip7702(convert_standard_receipt(receipt, logs_bloom))
+            }
+            BaseReceipt::Deposit(receipt) => {
                 let consensus_logs = receipt.inner.logs.into_iter().map(|log| log.inner).collect();
                 let consensus_receipt = DepositReceiptWithBloom {
                     receipt: DepositReceipt {
@@ -301,21 +302,21 @@ mod tests {
     }
 
     #[test]
-    fn serialize_empty_op_chain_transaction_receipt_fields_struct() {
-        let op_fields = TransactionReceiptFields::default();
+    fn serialize_empty_base_chain_transaction_receipt_fields_struct() {
+        let base_fields = TransactionReceiptFields::default();
 
-        let json = serde_json::to_value(op_fields).unwrap();
+        let json = serde_json::to_value(base_fields).unwrap();
         assert_eq!(json, json!({}));
     }
 
     #[test]
     fn serialize_l1_fee_scalar() {
-        let op_fields = TransactionReceiptFields {
+        let base_fields = TransactionReceiptFields {
             l1_block_info: L1BlockInfo { l1_fee_scalar: Some(0.678), ..Default::default() },
             ..Default::default()
         };
 
-        let json = serde_json::to_value(op_fields).unwrap();
+        let json = serde_json::to_value(base_fields).unwrap();
 
         assert_eq!(json["l1FeeScalar"], serde_json::Value::String("0.678".to_string()));
     }
@@ -326,19 +327,19 @@ mod tests {
             "l1FeeScalar": "0.678"
         });
 
-        let op_fields: TransactionReceiptFields = serde_json::from_value(json).unwrap();
-        assert_eq!(op_fields.l1_block_info.l1_fee_scalar, Some(0.678f64));
+        let base_fields: TransactionReceiptFields = serde_json::from_value(json).unwrap();
+        assert_eq!(base_fields.l1_block_info.l1_fee_scalar, Some(0.678f64));
 
         let json = json!({
             "l1FeeScalar": Value::Null
         });
 
-        let op_fields: TransactionReceiptFields = serde_json::from_value(json).unwrap();
-        assert_eq!(op_fields.l1_block_info.l1_fee_scalar, None);
+        let base_fields: TransactionReceiptFields = serde_json::from_value(json).unwrap();
+        assert_eq!(base_fields.l1_block_info.l1_fee_scalar, None);
 
         let json = json!({});
 
-        let op_fields: TransactionReceiptFields = serde_json::from_value(json).unwrap();
-        assert_eq!(op_fields.l1_block_info.l1_fee_scalar, None);
+        let base_fields: TransactionReceiptFields = serde_json::from_value(json).unwrap();
+        assert_eq!(base_fields.l1_block_info.l1_fee_scalar, None);
     }
 }

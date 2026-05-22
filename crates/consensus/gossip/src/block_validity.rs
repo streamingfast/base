@@ -5,10 +5,10 @@ use alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
 use alloy_primitives::{Address, B256};
 use alloy_rpc_types_engine::{ExecutionPayloadV3, PayloadError};
 use base_common_consensus::BaseTxEnvelope;
+use base_common_genesis::RollupConfig;
 use base_common_rpc_types_engine::{
     BaseExecutionPayload, BaseExecutionPayloadV4, BasePayloadError, NetworkPayloadEnvelope,
 };
-use base_consensus_genesis::RollupConfig;
 use libp2p::gossipsub::MessageAcceptance;
 
 use super::BlockHandler;
@@ -93,19 +93,19 @@ impl BlockHandler {
     /// Ie, the entries pruned must be old enough blocks to be considered invalid
     /// if new blocks for that height are received.
     ///
-    /// This value is chosen to match `op-node` validator's lru cache size.
+    /// This value is chosen to match the reference node validator's lru cache size.
     /// See: <https://github.com/ethereum-optimism/optimism/blob/836d50be5d5f4ae14ffb2ea6106720a2b080cdae/op-node/p2p/gossip.go#L266>
     pub const SEEN_HASH_CACHE_SIZE: usize = 1_000;
 
     /// The maximum number of blocks to keep per height.
     /// This value is chosen according to the Base specs:
-    /// <https://specs.optimism.io/protocol/rollup-node-p2p.html#block-validation>
+    /// <https://specs.base.org/protocol/consensus/p2p#block-validation>
     const MAX_BLOCKS_TO_KEEP: usize = 5;
 
     /// Determines if a block is valid.
     ///
     /// We validate the block according to the rules defined here:
-    /// <https://specs.optimism.io/protocol/rollup-node-p2p.html#block-validation>
+    /// <https://specs.base.org/protocol/consensus/p2p#block-validation>
     ///
     /// The block encoding/compression are assumed to be valid at this point (they are first checked
     /// in the handle).
@@ -180,6 +180,20 @@ impl BlockHandler {
             });
         }
 
+        // CHECK: The signature is valid before doing expensive block conversion and hashing work.
+        let msg = envelope.payload_hash.signature_message(self.rollup_config.l2_chain_id.id());
+        let block_signer = *self.signer_recv.borrow();
+
+        // The block has a valid signature.
+        let Ok(msg_signer) = envelope.signature.recover_address_from_prehash(&msg) else {
+            return Err(BlockInvalidError::Signature);
+        };
+
+        // The block is signed by the expected signer (the unsafe block signer).
+        if msg_signer != block_signer {
+            return Err(BlockInvalidError::Signer { expected: block_signer, received: msg_signer });
+        }
+
         // CHECK: Ensure the block hash is valid.
         let expected = envelope.payload.block_hash();
         let mut block: Block<BaseTxEnvelope> = envelope.payload.clone().try_into_block()?;
@@ -213,20 +227,6 @@ impl BlockHandler {
                     block_hash: envelope.payload.block_hash(),
                 });
             }
-        }
-
-        // CHECK: The signature is valid.
-        let msg = envelope.payload_hash.signature_message(self.rollup_config.l2_chain_id.id());
-        let block_signer = *self.signer_recv.borrow();
-
-        // The block has a valid signature.
-        let Ok(msg_signer) = envelope.signature.recover_address_from_prehash(&msg) else {
-            return Err(BlockInvalidError::Signature);
-        };
-
-        // The block is signed by the expected signer (the unsafe block signer).
-        if msg_signer != block_signer {
-            return Err(BlockInvalidError::Signer { expected: block_signer, received: msg_signer });
         }
 
         self.seen_hashes
@@ -319,8 +319,8 @@ pub(crate) mod tests {
     use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3};
     use arbitrary::{Arbitrary, Unstructured};
     use base_common_consensus::BaseTxEnvelope;
+    use base_common_genesis::RollupConfig;
     use base_common_rpc_types_engine::{BaseExecutionPayload, BaseExecutionPayloadV4, PayloadHash};
-    use base_consensus_genesis::RollupConfig;
 
     use super::*;
 
@@ -612,6 +612,38 @@ pub(crate) mod tests {
         let block = v1_valid_block();
 
         let v1 = ExecutionPayloadV1::from_block_slow(&block);
+
+        let payload = BaseExecutionPayload::V1(v1);
+        let mut envelope = NetworkPayloadEnvelope {
+            payload,
+            signature: Signature::test_signature(),
+            payload_hash: PayloadHash(B256::ZERO),
+            parent_beacon_block_root: None,
+        };
+
+        let msg = envelope.payload_hash.signature_message(8453);
+        let signer = envelope.signature.recover_address_from_prehash(&msg).unwrap();
+        let (_, unsafe_signer) = tokio::sync::watch::channel(signer);
+        let mut handler = BlockHandler::new(
+            RollupConfig { l2_chain_id: Chain::base_mainnet(), ..Default::default() },
+            unsafe_signer,
+        );
+
+        let mut signature_bytes = envelope.signature.as_bytes();
+        signature_bytes[0] = !signature_bytes[0];
+        envelope.signature = Signature::from_raw_array(&signature_bytes).unwrap();
+
+        assert!(handler.seen_hashes.is_empty());
+        assert!(matches!(handler.block_valid(&envelope), Err(BlockInvalidError::Signature)));
+    }
+
+    /// Invalid signatures should be rejected before block hash validation.
+    #[test]
+    fn test_invalid_signature_precedes_block_hash_validation() {
+        let block = v1_valid_block();
+
+        let mut v1 = ExecutionPayloadV1::from_block_slow(&block);
+        v1.block_hash = B256::ZERO;
 
         let payload = BaseExecutionPayload::V1(v1);
         let mut envelope = NetworkPayloadEnvelope {

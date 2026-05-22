@@ -7,8 +7,8 @@ use alloy_rpc_types_eth::{Block, BlockTransactions, Withdrawals};
 use base_common_consensus::{
     BaseTxEnvelope, EIP1559ParamError, HoloceneExtraData, JovianExtraData,
 };
+use base_common_genesis::RollupConfig;
 use base_common_rpc_types::Transaction;
-use base_consensus_genesis::RollupConfig;
 use base_protocol::AttributesWithParent;
 
 /// Result of validating payload attributes against an execution layer block.
@@ -21,7 +21,7 @@ use base_protocol::AttributesWithParent;
 ///
 /// ```rust,ignore
 /// use base_consensus_engine::AttributesMatch;
-/// use base_consensus_genesis::RollupConfig;
+/// use base_common_genesis::RollupConfig;
 /// use base_protocol::AttributesWithParent;
 ///
 /// let config = RollupConfig::default();
@@ -148,7 +148,7 @@ impl AttributesMatch {
                 "Checking attributes transaction against block transaction",
             );
             // Let's try to deserialize the attributes transaction
-            let Ok(attr_tx) = BaseTxEnvelope::decode_2718(&mut &attr_tx_bytes[..]) else {
+            let Ok(attr_tx) = BaseTxEnvelope::decode_2718_exact(attr_tx_bytes.as_ref()) else {
                 error!(
                     "Impossible to deserialize transaction from attributes. If we have stored these attributes it means the transactions where well formatted. This is a bug"
                 );
@@ -210,17 +210,20 @@ impl AttributesMatch {
             Some((ae, ad)) => (ae.into(), ad.into()),
         };
 
-        let extra_data_decoded = if config.is_jovian_active(block.header.timestamp) {
-            JovianExtraData::decode(&block.header.extra_data).map(|(be, bd, _)| (be, bd))
-        } else if config.is_holocene_active(block.header.timestamp) {
-            HoloceneExtraData::decode(&block.header.extra_data)
-        } else {
-            return AttributesMismatch::MissingBlockEIP1559.into();
-        };
+        // The Jovian extra_data carries an additional `min_base_fee`. The `Option` doubles as
+        // a fork signal: `Some` iff Jovian is active.
+        let extra_data_decoded: Result<(u32, u32, Option<u64>), EIP1559ParamError> =
+            if config.is_jovian_active(block.header.timestamp) {
+                JovianExtraData::decode(&block.header.extra_data)
+                    .map(|(be, bd, mbf)| (be, bd, Some(mbf)))
+            } else if config.is_holocene_active(block.header.timestamp) {
+                HoloceneExtraData::decode(&block.header.extra_data).map(|(be, bd)| (be, bd, None))
+            } else {
+                return AttributesMismatch::MissingBlockEIP1559.into();
+            };
 
-        // We decode the extra data stemming from the block header.
-        let (be, bd): (u128, u128) = match extra_data_decoded {
-            Ok((be, bd)) => (be.into(), bd.into()),
+        let (be, bd, jovian_block_mbf): (u128, u128, Option<u64>) = match extra_data_decoded {
+            Ok((be, bd, mbf)) => (be.into(), bd.into(), mbf),
             Err(EIP1559ParamError::NoEIP1559Params) => {
                 error!(
                     "EIP1559 parameters for the block not set while holocene is active. This is a bug"
@@ -241,13 +244,26 @@ impl AttributesMatch {
             }
         };
 
-        // We now have to check that both parameters match
         if ae != be || ad != bd {
             return AttributesMismatch::EIP1559Parameters(
                 BaseFeeParams { max_change_denominator: ad, elasticity_multiplier: ae },
                 BaseFeeParams { max_change_denominator: bd, elasticity_multiplier: be },
             )
             .into();
+        }
+
+        // Post-Jovian only: the block header's `min_base_fee` must match the L1-derived value.
+        // Without this check, consolidation would accept an arbitrary `min_base_fee` from the
+        // unsafe block header, letting the next block's base fee floor diverge from the value
+        // derived from the L1 SystemConfig.
+        if let Some(block_mbf) = jovian_block_mbf {
+            let Some(attr_mbf) = attributes.attributes().min_base_fee else {
+                error!("min_base_fee for attributes not set while jovian is active. This is a bug");
+                return AttributesMismatch::MissingAttributesMinBaseFee.into();
+            };
+            if attr_mbf != block_mbf {
+                return AttributesMismatch::MinBaseFee(attr_mbf, block_mbf).into();
+            }
         }
 
         Self::Match
@@ -360,6 +376,12 @@ pub enum AttributesMismatch {
     MissingAttributesEIP1559,
     /// The EIP1559 payload for the block is missing when holocene is active.
     MissingBlockEIP1559,
+    /// The `min_base_fee` payload for the [`AttributesWithParent`] is missing when jovian is
+    /// active.
+    MissingAttributesMinBaseFee,
+    /// The `min_base_fee` of the attributes does not match the `min_base_fee` of the block
+    /// extra data when jovian is active. Carries (`attributes`, `block`).
+    MinBaseFee(u64, u64),
     /// The version in the extra data EIP1559 payload is incorrect. Should be 0.
     InvalidExtraDataVersion,
     /// An unknown extra data decoding error occurred.
@@ -401,9 +423,9 @@ mod tests {
     use alloy_primitives::{Bytes, FixedBytes, address, b256};
     use alloy_rpc_types_eth::BlockTransactions;
     use arbitrary::{Arbitrary, Unstructured};
-    use base_common_consensus::HoloceneExtraData;
+    use base_common_chains::Registry;
+    use base_common_consensus::{HoloceneExtraData, JovianExtraData};
     use base_common_rpc_types_engine::BasePayloadAttributes;
-    use base_consensus_registry::Registry;
     use base_protocol::{BlockInfo, L2BlockInfo};
 
     use super::*;
@@ -1002,5 +1024,77 @@ mod tests {
         let check = AttributesMatch::check(cfg, &attributes, &block);
         assert_eq!(check, AttributesMatch::Match);
         assert!(check.is_match());
+    }
+
+    fn jovian_test_setup() -> (RollupConfig, AttributesWithParent, Block<Transaction>) {
+        let (mut cfg, mut attributes, block) = eip1559_test_setup();
+        cfg.hardforks.jovian_time = Some(0);
+
+        let eip1559_params: FixedBytes<8> = HoloceneExtraData::encode(
+            Default::default(),
+            BaseFeeParams { max_change_denominator: 100, elasticity_multiplier: 2 },
+        )
+        .unwrap()
+        .split_off(1)
+        .as_ref()
+        .try_into()
+        .unwrap();
+        attributes.attributes.eip_1559_params = Some(eip1559_params);
+
+        (cfg, attributes, block)
+    }
+
+    #[test]
+    fn test_jovian_min_base_fee_match() {
+        let (cfg, mut attributes, mut block) = jovian_test_setup();
+
+        attributes.attributes.min_base_fee = Some(123);
+        block.header.extra_data = JovianExtraData::encode(
+            Default::default(),
+            BaseFeeParams { max_change_denominator: 100, elasticity_multiplier: 2 },
+            123,
+        )
+        .unwrap();
+
+        let check = AttributesMatch::check(&cfg, &attributes, &block);
+        assert_eq!(check, AttributesMatch::Match);
+        assert!(check.is_match());
+    }
+
+    #[test]
+    fn test_jovian_min_base_fee_mismatch() {
+        let (cfg, mut attributes, mut block) = jovian_test_setup();
+
+        attributes.attributes.min_base_fee = Some(123);
+        block.header.extra_data = JovianExtraData::encode(
+            Default::default(),
+            BaseFeeParams { max_change_denominator: 100, elasticity_multiplier: 2 },
+            456,
+        )
+        .unwrap();
+
+        let check = AttributesMatch::check(&cfg, &attributes, &block);
+        assert_eq!(check, AttributesMatch::Mismatch(AttributesMismatch::MinBaseFee(123, 456)));
+        assert!(check.is_mismatch());
+    }
+
+    #[test]
+    fn test_jovian_min_base_fee_attribute_missing() {
+        let (cfg, mut attributes, mut block) = jovian_test_setup();
+
+        attributes.attributes.min_base_fee = None;
+        block.header.extra_data = JovianExtraData::encode(
+            Default::default(),
+            BaseFeeParams { max_change_denominator: 100, elasticity_multiplier: 2 },
+            456,
+        )
+        .unwrap();
+
+        let check = AttributesMatch::check(&cfg, &attributes, &block);
+        assert_eq!(
+            check,
+            AttributesMatch::Mismatch(AttributesMismatch::MissingAttributesMinBaseFee)
+        );
+        assert!(check.is_mismatch());
     }
 }

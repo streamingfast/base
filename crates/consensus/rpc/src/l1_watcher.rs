@@ -1,4 +1,4 @@
-use base_consensus_genesis::RollupConfig;
+use base_common_genesis::RollupConfig;
 use base_protocol::BlockInfo;
 use tokio::sync::oneshot::Sender;
 
@@ -18,7 +18,7 @@ pub struct L1State {
     /// This is a legacy sync-status attribute. This is deprecated.
     /// A previous version of the L1 finalization-signal was updated only after the block was
     /// retrieved by number. This intentionally duplicates `finalized_l1` to maintain API
-    /// compatibility with op-node.
+    /// compatibility with legacy sync-status consumers.
     pub current_l1_finalized: Option<BlockInfo>,
     /// The L1 head block ref.
     ///

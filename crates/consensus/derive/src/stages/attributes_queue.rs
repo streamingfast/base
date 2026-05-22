@@ -5,8 +5,8 @@ use core::fmt::Debug;
 
 use alloy_eips::BlockNumHash;
 use async_trait::async_trait;
+use base_common_genesis::{RollupConfig, SystemConfig};
 use base_common_rpc_types_engine::BasePayloadAttributes;
-use base_consensus_genesis::{RollupConfig, SystemConfig};
 use base_protocol::{AttributesWithParent, BlockInfo, L2BlockInfo, SingleBatch};
 
 use crate::{
@@ -216,7 +216,7 @@ mod tests {
     use alloy_eips::BlockNumHash;
     use alloy_primitives::{Address, B256, Bytes, b256};
     use alloy_rpc_types_engine::PayloadAttributes;
-    use base_consensus_genesis::SystemConfig;
+    use base_common_genesis::SystemConfig;
 
     use super::*;
     use crate::{
@@ -225,7 +225,7 @@ mod tests {
         test_utils::{TestAttributesBuilder, TestAttributesProvider, new_test_attributes_provider},
     };
 
-    fn default_optimism_payload_attributes() -> BasePayloadAttributes {
+    fn default_payload_attributes() -> BasePayloadAttributes {
         BasePayloadAttributes {
             payload_attributes: PayloadAttributes {
                 timestamp: 0,
@@ -366,7 +366,7 @@ mod tests {
     async fn test_create_next_attributes_success() {
         let cfg = RollupConfig::default();
         let mock = new_test_attributes_provider(None, vec![]);
-        let mut payload_attributes = default_optimism_payload_attributes();
+        let mut payload_attributes = default_payload_attributes();
         let mock_builder =
             TestAttributesBuilder { attributes: vec![Ok(payload_attributes.clone())] };
         let mut aq = AttributesQueue::new(Arc::new(cfg), mock, mock_builder);
@@ -396,7 +396,7 @@ mod tests {
         let cfg = RollupConfig::default();
         let mock =
             new_test_attributes_provider(Some(Default::default()), vec![Ok(Default::default())]);
-        let mut pa = default_optimism_payload_attributes();
+        let mut pa = default_payload_attributes();
         let mock_builder = TestAttributesBuilder { attributes: vec![Ok(pa.clone())] };
         let mut aq = AttributesQueue::new(Arc::new(cfg), mock, mock_builder);
         // If we load the batch, we should get the last in span.

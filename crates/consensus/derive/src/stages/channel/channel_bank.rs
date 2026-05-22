@@ -5,7 +5,7 @@ use core::fmt::Debug;
 
 use alloy_primitives::{Bytes, hex, map::HashMap};
 use async_trait::async_trait;
-use base_consensus_genesis::RollupConfig;
+use base_common_genesis::RollupConfig;
 use base_protocol::{BlockInfo, Channel, ChannelId, Frame};
 
 use crate::{
@@ -236,7 +236,7 @@ where
     async fn reset(
         &mut self,
         l1_origin: alloy_eips::BlockNumHash,
-        system_config: base_consensus_genesis::SystemConfig,
+        system_config: base_common_genesis::SystemConfig,
     ) -> PipelineResult<()> {
         self.prev.reset(l1_origin, system_config).await?;
         self.channels.clear();
@@ -264,7 +264,7 @@ mod tests {
     use alloc::{vec, vec::Vec};
 
     use alloy_eips::BlockNumHash;
-    use base_consensus_genesis::{HardForkConfig, SystemConfig};
+    use base_common_genesis::{HardForkConfig, SystemConfig};
     use tracing::Level;
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -566,8 +566,8 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let configs: [RollupConfig; 2] = [
-            base_consensus_registry::Registry::rollup_config(8453).cloned().unwrap(),
-            base_consensus_registry::Registry::rollup_config(84532).cloned().unwrap(),
+            base_common_chains::Registry::rollup_config(8453).cloned().unwrap(),
+            base_common_chains::Registry::rollup_config(84532).cloned().unwrap(),
         ];
 
         for cfg in configs {

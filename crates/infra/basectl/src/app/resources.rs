@@ -1,18 +1,12 @@
-use std::{
-    collections::{HashSet, VecDeque},
-    sync::{Arc, atomic::AtomicBool},
-};
+use std::collections::{HashSet, VecDeque};
 
 use base_common_flashblocks::Flashblock;
-use base_consensus_genesis::SystemConfig;
-use tokio::{
-    sync::{mpsc, watch},
-    task::JoinHandle,
-};
+use base_common_genesis::SystemConfig;
+use tokio::sync::{mpsc, watch};
 
 use crate::{
     commands::{DaTracker, FlashblockEntry, LoadingState},
-    config::{ChainConfig, ConductorNodeConfig},
+    config::{ConductorNodeConfig, MonitoringConfig},
     rpc::{
         BacklogFetchResult, BlockDaInfo, ConductorNodeStatus, L1BlockInfo, L1ConnectionMode,
         ProofsSnapshot, TimestampedFlashblock, ValidatorNodeStatus,
@@ -141,21 +135,11 @@ impl ProofsState {
     }
 }
 
-/// Handle to a running load test task and its stop signal, used by [`super::App`]
-/// to await drain completion on shutdown so funds are returned to the funder.
-#[derive(Debug)]
-pub struct LoadTestTask {
-    /// Flag to signal the load test to stop.
-    pub stop_flag: Arc<AtomicBool>,
-    /// Handle to the running load test task.
-    pub handle: JoinHandle<()>,
-}
-
 /// Shared resources available to all TUI views.
 #[derive(Debug)]
 pub struct Resources {
     /// Active chain configuration.
-    pub config: ChainConfig,
+    pub config: MonitoringConfig,
     /// Data availability monitoring state.
     pub da: DaState,
     /// Flashblock stream state.
@@ -171,8 +155,6 @@ pub struct Resources {
     /// L1 system config fetched from the contract.
     pub system_config: Option<SystemConfig>,
     sys_config_rx: Option<mpsc::Receiver<SystemConfig>>,
-    /// Active load test task handle, set by [`super::views::LoadTestView`].
-    pub load_test_task: Option<LoadTestTask>,
 }
 
 /// State for DA (data availability) monitoring.
@@ -221,7 +203,7 @@ pub struct FlashState {
 
 impl Resources {
     /// Creates new resources with the given chain configuration.
-    pub fn new(config: ChainConfig) -> Self {
+    pub fn new(config: MonitoringConfig) -> Self {
         Self {
             config,
             da: DaState::new(),
@@ -232,7 +214,6 @@ impl Resources {
             proofs: ProofsState::default(),
             system_config: None,
             sys_config_rx: None,
-            load_test_task: None,
         }
     }
 

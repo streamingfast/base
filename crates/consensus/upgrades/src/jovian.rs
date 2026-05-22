@@ -2,7 +2,7 @@
 //!
 //! Jovian network upgrade transactions are defined in the [Base Specs][specs].
 //!
-//! [specs]: https://specs.optimism.io/protocol/jovian/derivation.html#network-upgrade-automation-transactions
+//! [specs]: https://specs.base.org/upgrades/jovian/derivation#network-upgrade-automation-transactions
 
 use alloc::vec::Vec;
 
@@ -10,7 +10,7 @@ use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, Bytes, TxKind, U256, hex, keccak256};
 use base_common_consensus::{Deployers, Predeploys, SystemAddresses, TxDeposit};
 
-use crate::{Hardfork, UpgradeCalldata};
+use crate::{Upgrade, UpgradeCalldata};
 
 /// The Jovian network upgrade transactions.
 #[derive(Debug, Default, Clone, Copy)]
@@ -136,7 +136,7 @@ impl Jovian {
     }
 }
 
-impl Hardfork for Jovian {
+impl Upgrade for Jovian {
     /// Constructs the network upgrade transactions.
     fn txs(&self) -> impl Iterator<Item = Bytes> + '_ {
         Self::deposits().map(|tx| {

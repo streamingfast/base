@@ -8,8 +8,10 @@
 
 mod aggregate_verifier;
 pub use aggregate_verifier::{
-    AggregateVerifierClient, AggregateVerifierContractClient, GameInfo, encode_challenge_calldata,
-    encode_claim_credit_calldata, encode_nullify_calldata, encode_resolve_calldata,
+    AggregateVerifierClient, AggregateVerifierContractClient, GameInfo, GameStatus,
+    encode_challenge_calldata, encode_claim_credit_calldata, encode_nullify_calldata,
+    encode_resolve_calldata, invalid_parent_game_selector, invalid_signer_selector,
+    l1_origin_too_old_selector,
 };
 
 mod delayed_weth;
@@ -17,7 +19,8 @@ pub use delayed_weth::{DelayedWETHClient, DelayedWETHContractClient};
 
 mod anchor_state_registry;
 pub use anchor_state_registry::{
-    AnchorRoot, AnchorStateRegistryClient, AnchorStateRegistryContractClient,
+    AnchorPreflight, AnchorRoot, AnchorSnapshot, AnchorStateRegistryClient,
+    AnchorStateRegistryContractClient, encode_set_anchor_state_calldata,
 };
 
 mod dispute_game_factory;
@@ -32,7 +35,9 @@ pub use tee_prover_registry::{
 };
 
 mod nitro_enclave_verifier;
-pub use nitro_enclave_verifier::INitroEnclaveVerifier;
+pub use nitro_enclave_verifier::{
+    INitroEnclaveVerifier, NitroEnclaveVerifierClient, NitroEnclaveVerifierContractClient,
+};
 
 mod error;
 pub use error::ContractError;

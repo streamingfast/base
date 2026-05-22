@@ -1,12 +1,22 @@
 use alloy_consensus::{
-    EthereumTxEnvelope, Extended, InMemorySize, Sealable, Sealed, SignableTransaction, Signed,
-    TransactionEnvelope, TxEip1559, TxEip2930, TxEip7702, TxEnvelope, TxLegacy,
+    Extended, InMemorySize, Sealable, Sealed, SignableTransaction, Signed, TransactionEnvelope,
+    TxEip1559, TxEip2930, TxEip7702, TxEnvelope, TxLegacy,
     error::ValueError,
     transaction::{TransactionInfo, TxHashRef},
 };
 use alloy_eips::eip2718::Encodable2718;
+#[cfg(feature = "evm")]
+use alloy_evm::{FromRecoveredTx, FromTxWithEncoded};
+#[cfg(feature = "alloy-compat")]
+use alloy_network::{AnyRpcTransaction, AnyTxEnvelope};
 use alloy_primitives::{B256, Bytes, Signature, TxHash};
+#[cfg(feature = "alloy-compat")]
+use alloy_rpc_types_eth::{ConversionError, Transaction as AlloyRpcTransaction};
+#[cfg(feature = "alloy-compat")]
+use alloy_serde::WithOtherFields;
 use reth_firehose::mapper::{SignatureFields, u64_to_trimmed_bytes};
+#[cfg(feature = "evm")]
+use revm::context::TxEnv;
 
 use crate::{
     BasePooledTransaction, TxDeposit,
@@ -165,10 +175,10 @@ impl<Tx> From<BaseTxEnvelope> for Extended<BaseTxEnvelope, Tx> {
     }
 }
 
-impl<T> TryFrom<EthereumTxEnvelope<T>> for BaseTxEnvelope {
-    type Error = EthereumTxEnvelope<T>;
+impl TryFrom<TxEnvelope> for BaseTxEnvelope {
+    type Error = TxEnvelope;
 
-    fn try_from(value: EthereumTxEnvelope<T>) -> Result<Self, Self::Error> {
+    fn try_from(value: TxEnvelope) -> Result<Self, Self::Error> {
         Self::try_from_eth_envelope(value)
     }
 }
@@ -181,6 +191,30 @@ impl TryFrom<BaseTxEnvelope> for TxEnvelope {
     }
 }
 
+#[cfg(feature = "evm")]
+impl FromRecoveredTx<BaseTxEnvelope> for TxEnv {
+    fn from_recovered_tx(tx: &BaseTxEnvelope, caller: alloy_primitives::Address) -> Self {
+        match tx {
+            BaseTxEnvelope::Legacy(tx) => Self::from_recovered_tx(tx.tx(), caller),
+            BaseTxEnvelope::Eip1559(tx) => Self::from_recovered_tx(tx.tx(), caller),
+            BaseTxEnvelope::Eip2930(tx) => Self::from_recovered_tx(tx.tx(), caller),
+            BaseTxEnvelope::Eip7702(tx) => Self::from_recovered_tx(tx.tx(), caller),
+            BaseTxEnvelope::Deposit(tx) => Self::from_recovered_tx(tx.inner(), caller),
+        }
+    }
+}
+
+#[cfg(feature = "evm")]
+impl FromTxWithEncoded<BaseTxEnvelope> for TxEnv {
+    fn from_encoded_tx(
+        tx: &BaseTxEnvelope,
+        caller: alloy_primitives::Address,
+        _encoded: alloy_primitives::Bytes,
+    ) -> Self {
+        Self::from_recovered_tx(tx, caller)
+    }
+}
+
 #[cfg(feature = "alloy-compat")]
 impl From<BaseTxEnvelope> for alloy_rpc_types_eth::TransactionRequest {
     fn from(value: BaseTxEnvelope) -> Self {
@@ -190,6 +224,40 @@ impl From<BaseTxEnvelope> for alloy_rpc_types_eth::TransactionRequest {
             BaseTxEnvelope::Eip7702(tx) => tx.into_parts().0.into(),
             BaseTxEnvelope::Deposit(tx) => tx.into_inner().into(),
             BaseTxEnvelope::Legacy(tx) => tx.into_parts().0.into(),
+        }
+    }
+}
+
+#[cfg(feature = "alloy-compat")]
+impl TryFrom<AnyTxEnvelope> for BaseTxEnvelope {
+    type Error = AnyTxEnvelope;
+
+    fn try_from(value: AnyTxEnvelope) -> Result<Self, Self::Error> {
+        Self::try_from_any_envelope(value)
+    }
+}
+
+#[cfg(feature = "alloy-compat")]
+impl TryFrom<AnyRpcTransaction> for BaseTxEnvelope {
+    type Error = ConversionError;
+
+    fn try_from(tx: AnyRpcTransaction) -> Result<Self, Self::Error> {
+        let WithOtherFields { inner: AlloyRpcTransaction { inner, .. }, other: _ } = tx.0;
+
+        let from = inner.signer();
+        match inner.into_inner() {
+            AnyTxEnvelope::Ethereum(tx) => Self::try_from_eth_envelope(tx).map_err(|_| {
+                ConversionError::Custom("unable to convert from ethereum type".to_string())
+            }),
+            AnyTxEnvelope::Unknown(mut tx) => {
+                // Re-insert `from` field which was consumed by outer `Transaction`.
+                // Ref hack in op-alloy <https://github.com/alloy-rs/op-alloy/blob/7d50b698631dd73f8d20f9f60ee78cd0597dc278/crates/rpc-types/src/transaction.rs#L236-L237>
+                tx.inner
+                    .fields
+                    .insert_value("from".to_string(), from)
+                    .map_err(|err| ConversionError::Custom(err.to_string()))?;
+                Ok(Self::Deposit(Sealed::new(tx.try_into()?)))
+            }
         }
     }
 }
@@ -304,15 +372,13 @@ impl BaseTxEnvelope {
     /// Returns the given envelope as error if [`BaseTxEnvelope`] doesn't support the variant
     /// (EIP-4844)
     #[allow(clippy::result_large_err)]
-    pub fn try_from_eth_envelope<T>(
-        tx: EthereumTxEnvelope<T>,
-    ) -> Result<Self, EthereumTxEnvelope<T>> {
+    pub fn try_from_eth_envelope(tx: TxEnvelope) -> Result<Self, TxEnvelope> {
         match tx {
-            EthereumTxEnvelope::Legacy(tx) => Ok(tx.into()),
-            EthereumTxEnvelope::Eip2930(tx) => Ok(tx.into()),
-            EthereumTxEnvelope::Eip1559(tx) => Ok(tx.into()),
-            tx @ EthereumTxEnvelope::<T>::Eip4844(_) => Err(tx),
-            EthereumTxEnvelope::Eip7702(tx) => Ok(tx.into()),
+            TxEnvelope::Legacy(tx) => Ok(tx.into()),
+            TxEnvelope::Eip2930(tx) => Ok(tx.into()),
+            TxEnvelope::Eip1559(tx) => Ok(tx.into()),
+            tx @ TxEnvelope::Eip4844(_) => Err(tx),
+            TxEnvelope::Eip7702(tx) => Ok(tx.into()),
         }
     }
 
@@ -652,7 +718,7 @@ pub(super) mod serde_bincode_compat {
 
         /// Tests a bincode round-trip for [`BaseTxEnvelope`] using an arbitrary instance.
         #[test]
-        fn test_op_tx_envelope_bincode_roundtrip_arbitrary() {
+        fn test_base_tx_envelope_bincode_roundtrip_arbitrary() {
             #[serde_as]
             #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
             struct Data {
@@ -805,6 +871,69 @@ mod tests {
         let tx = BaseTxEnvelope::decode_2718(&mut b[..].as_ref()).unwrap();
         let deposit = tx.as_deposit().unwrap();
         assert_eq!(deposit.mint, 0);
+    }
+
+    #[cfg(feature = "alloy-compat")]
+    use alloy_network::{AnyRpcTransaction, AnyTxEnvelope, UnknownTxEnvelope};
+
+    #[cfg(feature = "alloy-compat")]
+    #[test]
+    fn test_alloy_compat_conversion() {
+        let deposit = r#"{
+  "blockHash": "0x2c475c5d2d609929cec7be9caaaebd29be53e4ef21b1f7b897cb954469e20d01",
+  "blockNumber": "0x191350d",
+  "depositReceiptVersion": "0x1",
+  "from": "0xdeaddeaddeaddeaddeaddeaddeaddeaddead0001",
+  "gas": "0xf4240",
+  "gasPrice": "0x0",
+  "hash": "0x096c03d72acb06339c9c7860d1c36b6451932ec0ff16fd34aa9e30a73a245e13",
+  "input": "0x440a5e20000008dd00101c1200000000000000030000000067acc63f00000000014d1f2d000000000000000000000000000000000000000000000000000000005ba4c0eb00000000000000000000000000000000000000000000000000000001ce2291bdcbb8f62c15343b39cfacdbf81c4747822ebb16c2518126e47d984422a82defc10000000000000000000000005050f69a9786f081509234f1a7f4684b5e5b76c9",
+  "mint": "0x0",
+  "nonce": "0x191350e",
+  "r": "0x0",
+  "s": "0x0",
+  "sourceHash": "0x990d7122a1f121f3a6bc45723e28f4921c269037a77e77ffee3c8585136d1a92",
+  "to": "0x4200000000000000000000000000000000000015",
+  "transactionIndex": "0x0",
+  "type": "0x7e",
+  "v": "0x0",
+  "value": "0x0"
+}"#;
+
+        let unknown_tx_envelope: UnknownTxEnvelope = serde_json::from_str(deposit).unwrap();
+        let _deposit: crate::TxDeposit = unknown_tx_envelope.try_into().unwrap();
+
+        let any: AnyTxEnvelope = serde_json::from_str(deposit).unwrap();
+        let envelope = BaseTxEnvelope::try_from(any).unwrap();
+        assert!(envelope.is_deposit());
+    }
+
+    #[cfg(feature = "alloy-compat")]
+    #[test]
+    fn test_alloy_compat_rpc_transaction() {
+        let json = r#"{
+  "blockHash": "0x2c475c5d2d609929cec7be9caaaebd29be53e4ef21b1f7b897cb954469e20d01",
+  "blockNumber": "0x191350d",
+  "depositReceiptVersion": "0x1",
+  "from": "0xdeaddeaddeaddeaddeaddeaddeaddeaddead0001",
+  "gas": "0xf4240",
+  "gasPrice": "0x0",
+  "hash": "0x096c03d72acb06339c9c7860d1c36b6451932ec0ff16fd34aa9e30a73a245e13",
+  "input": "0x440a5e20000008dd00101c1200000000000000030000000067acc63f00000000014d1f2d000000000000000000000000000000000000000000000000000000005ba4c0eb00000000000000000000000000000000000000000000000000000001ce2291bdcbb8f62c15343b39cfacdbf81c4747822ebb16c2518126e47d984422a82defc10000000000000000000000005050f69a9786f081509234f1a7f4684b5e5b76c9",
+  "mint": "0x0",
+  "nonce": "0x191350e",
+  "r": "0x0",
+  "s": "0x0",
+  "sourceHash": "0x990d7122a1f121f3a6bc45723e28f4921c269037a77e77ffee3c8585136d1a92",
+  "to": "0x4200000000000000000000000000000000000015",
+  "transactionIndex": "0x0",
+  "type": "0x7e",
+  "v": "0x0",
+  "value": "0x0"
+}"#;
+        let tx: AnyRpcTransaction = serde_json::from_str(json).unwrap();
+        let tx = BaseTxEnvelope::try_from(tx).unwrap();
+        assert!(tx.is_deposit());
     }
 
     #[test]

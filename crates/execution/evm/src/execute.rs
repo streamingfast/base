@@ -17,9 +17,9 @@ mod tests {
     use reth_primitives_traits::{Account, RecoveredBlock};
     use reth_revm::{database::StateProviderDatabase, test_utils::StateProviderTest};
 
-    use crate::{BaseEvmConfig, OpRethReceiptBuilder};
+    use crate::{BaseEvmConfig, BaseRethReceiptBuilder};
 
-    fn create_op_state_provider() -> StateProviderTest {
+    fn create_base_state_provider() -> StateProviderTest {
         let mut db = StateProviderTest::default();
 
         let l1_block_contract_account =
@@ -52,11 +52,11 @@ mod tests {
     }
 
     fn evm_config(chain_spec: Arc<BaseChainSpec>) -> BaseEvmConfig {
-        BaseEvmConfig::new(chain_spec, OpRethReceiptBuilder::default())
+        BaseEvmConfig::new(chain_spec, BaseRethReceiptBuilder::default())
     }
 
     #[test]
-    fn op_deposit_fields_pre_canyon() {
+    fn base_deposit_fields_pre_canyon() {
         let header = Header {
             timestamp: 1,
             number: 1,
@@ -68,7 +68,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut db = create_op_state_provider();
+        let mut db = create_base_state_provider();
 
         let addr = Address::ZERO;
         let account = Account { balance: U256::MAX, ..Account::default() };
@@ -129,7 +129,7 @@ mod tests {
     }
 
     #[test]
-    fn op_deposit_fields_post_canyon() {
+    fn base_deposit_fields_post_canyon() {
         // ensure_create2_deployer will fail if timestamp is set to less than 2
         let header = Header {
             timestamp: 2,
@@ -142,7 +142,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut db = create_op_state_provider();
+        let mut db = create_base_state_provider();
         let addr = Address::ZERO;
         let account = Account { balance: U256::MAX, ..Account::default() };
 

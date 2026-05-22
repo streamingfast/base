@@ -16,7 +16,7 @@ use alloy_consensus::{BlockHeader, Transaction, transaction::TxHashRef};
 use alloy_evm::block::BlockExecutor;
 use alloy_primitives::Sealable;
 use base_common_consensus::BasePrimitives;
-use base_common_evm::{BaseEvmFactory, OpTransaction};
+use base_common_evm::{BaseEvmFactory, BaseTransaction};
 use reth_errors::BlockExecutionError;
 use reth_evm::{
     ConfigureEngineEvm, ConfigureEvm, EvmEnvFor, ExecutionCtxFor, TransactionEnv,
@@ -53,7 +53,7 @@ where
             >,
         > + Unpin
         + 'static,
-    OpTransaction<TxEnv>: TransactionEnv,
+    BaseTransaction<TxEnv>: TransactionEnv,
     BlockTy<F::Primitives>: BlockTrait,
     <BlockTy<F::Primitives> as BlockTrait>::Header: BlockHeader + Sealable,
     <BlockTy<F::Primitives> as BlockTrait>::Body: BlockBody,
@@ -121,7 +121,7 @@ where
             >,
         > + Unpin
         + 'static,
-    OpTransaction<TxEnv>: TransactionEnv,
+    BaseTransaction<TxEnv>: TransactionEnv,
     BlockTy<F::Primitives>: BlockTrait,
     <BlockTy<F::Primitives> as BlockTrait>::Header: BlockHeader + Sealable,
     <BlockTy<F::Primitives> as BlockTrait>::Body: BlockBody,

@@ -46,13 +46,13 @@ multiple-versions = "deny"
 skip = [
     # Windows platform crates - different versions used by various upstream deps
     "windows",
-    "windows-sys",
-    "windows-targets",
     "windows-core",
     "windows-implement",
     "windows-link",
     "windows-result",
     "windows-strings",
+    "windows-sys",
+    "windows-targets",
     "windows_aarch64_gnullvm",
     "windows_aarch64_msvc",
     "windows_i686_gnu",
@@ -104,7 +104,6 @@ skip = [
     "socket2",
     "bitflags",
     "redox_users",
-    "redox_syscall",
     "windows",
     "windows-core",
     "windows-implement",
@@ -192,29 +191,9 @@ skip = [
     "http-body",
     "hyper",
     "hyper-rustls",
-    "hyper-timeout",
     "rustls",
     "rustls-webpki",
     "tokio-rustls",
-    "sync_wrapper",
-
-    # axum/tonic/tower stack version mismatches from upstream grpc/http deps
-    "axum",
-    "axum-core",
-    "tonic",
-    "tonic-build",
-    "tower",
-    "matchit",
-    "prost-build",
-    "prost-types",
-
-    # OpenTelemetry stack version mismatches (older vs newer otel deps)
-    "opentelemetry",
-    "opentelemetry-appender-tracing",
-    "opentelemetry-otlp",
-    "opentelemetry-proto",
-    "opentelemetry_sdk",
-    "tracing-opentelemetry",
 
     # toml/serde stack version mismatches from upstream deps
     "serde_spanned",
@@ -264,24 +243,6 @@ skip = [
     "tracing-subscriber",
     "wasm-streams",
     "winnow",
-
-    # Misc upstream version mismatches
-    "bindgen",
-    "console",
-    "derive_more",
-    "derive_more-impl",
-    "dirs",
-    "dirs-sys",
-    "indexmap",
-    "indicatif",
-    "jsonwebtoken",
-    "num_enum",
-    "num_enum_derive",
-    "ordered-float",
-    "petgraph",
-    "proc-macro-crate",
-    "rustc-hash",
-    "sysinfo",
 ]
 
 [sources]

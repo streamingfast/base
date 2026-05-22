@@ -197,9 +197,9 @@ base_metrics::define_metrics! {
     rejected_tx_priority_fee: histogram,
     #[describe("Actual execution time for transactions without metering data (microseconds)")]
     unmetered_tx_actual_execution_time_us: histogram,
-    #[describe("Transactions committed to a payload without metering data")]
+    #[describe("Metering responses that arrived after unmetered payload inclusion")]
     metering_late_arrival_total: counter,
-    #[describe("Time between first metering lookup miss and metering data arrival (milliseconds)")]
+    #[describe("Time between unmetered payload inclusion and metering data arrival (milliseconds)")]
     metering_late_arrival_latency_ms: histogram,
     #[describe("Execution time from late-arriving metering data (microseconds)")]
     metering_late_arrival_execution_time_us: histogram,
@@ -209,6 +209,14 @@ base_metrics::define_metrics! {
     tx_accounts_modified: histogram,
     #[describe("Number of storage slots modified by a transaction (from EVM post-state)")]
     tx_storage_slots_modified: histogram,
+    #[describe("Rejected transaction batch drops due to full forwarding channel")]
+    rejected_tx_channel_drops: counter,
+    #[describe("Rejected transaction drops due to per-block accumulation limit")]
+    rejected_tx_per_block_drops: counter,
+    #[describe("Rejected txs forwarded to audit-archiver")]
+    rejected_txs_forwarded: counter,
+    #[describe("Number of failed rejected transaction batch forwards to audit-archiver")]
+    rejected_tx_forward_failures: counter,
 }
 
 impl BuilderMetrics {

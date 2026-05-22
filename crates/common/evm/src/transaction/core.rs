@@ -1,4 +1,4 @@
-//! Base transaction abstraction containing the `[OpTxTr]` trait and corresponding `[OpTransaction]` type.
+//! Base transaction abstraction containing the `[BaseTxTr]` trait and corresponding `[BaseTransaction]` type.
 
 use alloc::vec;
 
@@ -12,12 +12,12 @@ use revm::{
     primitives::{Address, B256, Bytes, TxKind, U256},
 };
 
-use crate::{BaseTransactionBuilder, DEPOSIT_TRANSACTION_TYPE, DepositTransactionParts, OpTxTr};
+use crate::{BaseTransactionBuilder, BaseTxTr, DEPOSIT_TRANSACTION_TYPE, DepositTransactionParts};
 
 /// Base transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct OpTransaction<T: Transaction> {
+pub struct BaseTransaction<T: Transaction> {
     /// Base transaction fields.
     pub base: T,
     /// An enveloped EIP-2718 typed transaction
@@ -30,27 +30,27 @@ pub struct OpTransaction<T: Transaction> {
     pub deposit: DepositTransactionParts,
 }
 
-impl<T: Transaction> AsRef<T> for OpTransaction<T> {
+impl<T: Transaction> AsRef<T> for BaseTransaction<T> {
     fn as_ref(&self) -> &T {
         &self.base
     }
 }
 
-impl<T: Transaction> OpTransaction<T> {
+impl<T: Transaction> BaseTransaction<T> {
     /// Create a new Base transaction.
     pub fn new(base: T) -> Self {
         Self { base, enveloped_tx: None, deposit: DepositTransactionParts::default() }
     }
 }
 
-impl OpTransaction<TxEnv> {
+impl BaseTransaction<TxEnv> {
     /// Create a new Base transaction.
     pub fn builder() -> BaseTransactionBuilder {
         BaseTransactionBuilder::new()
     }
 }
 
-impl Default for OpTransaction<TxEnv> {
+impl Default for BaseTransaction<TxEnv> {
     fn default() -> Self {
         Self {
             base: TxEnv::default(),
@@ -60,7 +60,7 @@ impl Default for OpTransaction<TxEnv> {
     }
 }
 
-impl<TX: Transaction + SystemCallTx> SystemCallTx for OpTransaction<TX> {
+impl<TX: Transaction + SystemCallTx> SystemCallTx for BaseTransaction<TX> {
     fn new_system_tx_with_caller(
         caller: Address,
         system_contract_address: Address,
@@ -75,7 +75,7 @@ impl<TX: Transaction + SystemCallTx> SystemCallTx for OpTransaction<TX> {
     }
 }
 
-impl<T: Transaction> Transaction for OpTransaction<T> {
+impl<T: Transaction> Transaction for BaseTransaction<T> {
     type AccessListItem<'a>
         = T::AccessListItem<'a>
     where
@@ -163,7 +163,7 @@ impl<T: Transaction> Transaction for OpTransaction<T> {
     }
 }
 
-impl<T: Transaction> OpTxTr for OpTransaction<T> {
+impl<T: Transaction> BaseTxTr for BaseTransaction<T> {
     fn enveloped_tx(&self) -> Option<&Bytes> {
         self.enveloped_tx.as_ref()
     }
@@ -184,7 +184,7 @@ impl<T: Transaction> OpTxTr for OpTransaction<T> {
     }
 }
 
-impl<T> IntoTxEnv<Self> for OpTransaction<T>
+impl<T> IntoTxEnv<Self> for BaseTransaction<T>
 where
     T: Transaction,
 {
@@ -194,7 +194,7 @@ where
 }
 
 #[cfg(feature = "reth")]
-impl<T: reth_evm::TransactionEnv> reth_evm::TransactionEnv for OpTransaction<T> {
+impl<T: reth_evm::TransactionEnv> reth_evm::TransactionEnv for BaseTransaction<T> {
     fn set_gas_limit(&mut self, gas_limit: u64) {
         self.base.set_gas_limit(gas_limit);
     }
@@ -212,14 +212,14 @@ impl<T: reth_evm::TransactionEnv> reth_evm::TransactionEnv for OpTransaction<T> 
     }
 }
 
-impl FromRecoveredTx<BaseTxEnvelope> for OpTransaction<TxEnv> {
+impl FromRecoveredTx<BaseTxEnvelope> for BaseTransaction<TxEnv> {
     fn from_recovered_tx(tx: &BaseTxEnvelope, sender: Address) -> Self {
         let encoded = tx.encoded_2718();
         Self::from_encoded_tx(tx, sender, encoded.into())
     }
 }
 
-impl FromTxWithEncoded<BaseTxEnvelope> for OpTransaction<TxEnv> {
+impl FromTxWithEncoded<BaseTxEnvelope> for BaseTransaction<TxEnv> {
     fn from_encoded_tx(tx: &BaseTxEnvelope, caller: Address, encoded: Bytes) -> Self {
         match tx {
             BaseTxEnvelope::Legacy(tx) => Self {
@@ -247,14 +247,14 @@ impl FromTxWithEncoded<BaseTxEnvelope> for OpTransaction<TxEnv> {
     }
 }
 
-impl FromRecoveredTx<TxDeposit> for OpTransaction<TxEnv> {
+impl FromRecoveredTx<TxDeposit> for BaseTransaction<TxEnv> {
     fn from_recovered_tx(tx: &TxDeposit, sender: Address) -> Self {
         let encoded = tx.encoded_2718();
         Self::from_encoded_tx(tx, sender, encoded.into())
     }
 }
 
-impl FromTxWithEncoded<TxDeposit> for OpTransaction<TxEnv> {
+impl FromTxWithEncoded<TxDeposit> for BaseTransaction<TxEnv> {
     fn from_encoded_tx(tx: &TxDeposit, caller: Address, encoded: Bytes) -> Self {
         let base = TxEnv::from_recovered_tx(tx, caller);
         let deposit = DepositTransactionParts {
@@ -279,7 +279,7 @@ mod tests {
     fn test_deposit_transaction_fields() {
         let base_tx = TxEnv::builder().gas_limit(10).gas_price(100).gas_priority_fee(Some(5));
 
-        let op_tx = OpTransaction::builder()
+        let base_tx = BaseTransaction::builder()
             .base(base_tx)
             .enveloped_tx(None)
             .not_system_transaction()
@@ -287,13 +287,13 @@ mod tests {
             .source_hash(B256::from([1u8; 32]))
             .build()
             .unwrap();
-        // Verify transaction type (deposit transactions should have tx_type based on OpSpecId)
+        // Verify transaction type (deposit transactions should have tx_type based on BaseSpecId)
         // The tx_type is derived from the transaction structure, not set manually
         // Verify common fields access
-        assert_eq!(op_tx.gas_limit(), 10);
-        assert_eq!(op_tx.kind(), revm::primitives::TxKind::Call(Address::ZERO));
+        assert_eq!(base_tx.gas_limit(), 10);
+        assert_eq!(base_tx.kind(), revm::primitives::TxKind::Call(Address::ZERO));
         // Verify gas related calculations - deposit transactions use gas_price for effective gas price
-        assert_eq!(op_tx.effective_gas_price(90), 100);
-        assert_eq!(op_tx.max_fee_per_gas(), 100);
+        assert_eq!(base_tx.effective_gas_price(90), 100);
+        assert_eq!(base_tx.max_fee_per_gas(), 100);
     }
 }

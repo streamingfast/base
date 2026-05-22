@@ -16,23 +16,23 @@ use reth_node_builder::{
 
 use crate::types::{BaseComponentsBuilder, BaseNodeTypes, ConcreteBaseAddOns};
 
-/// Alias for the default OP components type.
+/// Alias for the default Base components type.
 type BaseComponents = <BaseComponentsBuilder as NodeComponentsBuilder<BaseNodeTypes>>::Components;
 
-/// Convenience alias for the OP node adapter type used by the reth builder.
+/// Convenience alias for the Base node adapter type used by the reth builder.
 ///
 /// Because `Components` depends only on pool, network, executor, and consensus builders (not the
 /// payload service builder), this type is identical regardless of which payload service is used.
 pub type BaseNodeAdapter = NodeAdapter<BaseNodeTypes, BaseComponents>;
 
-/// Convenience alias for the OP Eth API type exposed by the reth RPC add-ons.
-type OpEthApi = <ConcreteBaseAddOns as RethRpcAddOns<BaseNodeAdapter>>::EthApi;
+/// Convenience alias for the Base Eth API type exposed by the reth RPC add-ons.
+type BaseEthApi = <ConcreteBaseAddOns as RethRpcAddOns<BaseNodeAdapter>>::EthApi;
 
-/// Convenience alias for the full OP node handle produced after launch.
+/// Convenience alias for the full Base node handle produced after launch.
 type BaseFullNode = FullNode<BaseNodeAdapter, ConcreteBaseAddOns>;
 
 /// Alias for the RPC context used by Base extensions.
-pub type BaseRpcContext<'a> = RpcContext<'a, BaseNodeAdapter, OpEthApi>;
+pub type BaseRpcContext<'a> = RpcContext<'a, BaseNodeAdapter, BaseEthApi>;
 
 /// Hook type for extending RPC modules.
 type RpcModuleHook = Box<dyn FnOnce(&mut BaseRpcContext<'_>) -> Result<()> + Send + 'static>;
@@ -88,7 +88,7 @@ impl NodeHooks {
     /// Applies all accumulated hooks to the given configured builder.
     ///
     /// This is generic over `CB` so that it works with any payload service whose component
-    /// builder produces the same concrete `Components` type as the default OP builder.
+    /// builder produces the same concrete `Components` type as the default payload builder.
     pub fn apply_to<CB>(self, mut builder: RethNodeBuilder<CB>) -> RethNodeBuilder<CB>
     where
         CB: NodeComponentsBuilder<BaseNodeTypes, Components = BaseComponents>,

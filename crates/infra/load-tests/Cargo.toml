@@ -8,27 +8,25 @@ homepage.workspace = true
 repository.workspace = true
 description = "Core library for Base network load testing and benchmarking"
 
-[[bin]]
-name = "base-load-test"
-path = "src/bin/load_test.rs"
-
-
 [lints]
 workspace = true
 
 [dependencies]
 # alloy
+alloy-eips.workspace = true
+alloy-signer.workspace = true
 alloy-network.workspace = true
 alloy-rpc-types.workspace = true
 alloy-sol-types.workspace = true
 alloy-primitives.workspace = true
+alloy-consensus = { workspace = true, features = ["std"] }
 alloy-provider = { workspace = true, features = ["pubsub", "ws"] }
 alloy-signer-local = { workspace = true, features = ["mnemonic"] }
 
 # base
 base-tx-manager.workspace = true
 base-common-network.workspace = true
-base-common-rpc-types.workspace = true
+base-common-consensus.workspace = true
 base-common-flashblocks.workspace = true
 
 # display
@@ -50,6 +48,7 @@ tokio-util.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 parking_lot.workspace = true
+reqwest = { workspace = true, features = ["json"] }
 tokio = { workspace = true, features = ["signal"] }
 tokio-tungstenite = { workspace = true, features = ["native-tls"] }
 

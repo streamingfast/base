@@ -9,12 +9,6 @@
 #[macro_use]
 extern crate tracing;
 
-/// Maximum allowed forward gap for sequencer external unsafe payloads.
-///
-/// Larger gaps are treated as deep CL/EL sync and are left to derivation/EL sync rather than
-/// admitting far-future live gossip into reth.
-const MAX_SEQUENCER_EXTERNAL_UNSAFE_GAP: u64 = 300;
-
 mod service;
 pub use service::{
     DerivationDelegateConfig, FollowNode, HEAD_STREAM_POLL_INTERVAL, L1Config, L1ConfigBuilder,
@@ -32,17 +26,17 @@ pub use actors::{
     DerivationStateUpdate, EngineActor, EngineActorRequest, EngineClientError, EngineClientResult,
     EngineConfig, EngineDerivationClient, EngineError, EngineProcessingRequest, EngineProcessor,
     EngineProcessorOptions, EngineRequestReceiver, EngineRpcProcessor, EngineRpcRequest,
-    EngineRpcRequestReceiver, GetPayloadRequest, GossipTransport, L1BlockFetcher, L1OriginSelector,
-    L1OriginSelectorError, L1OriginSelectorProvider, L1WatcherActor, L1WatcherActorError,
-    L1WatcherDerivationClient, L1WatcherQueryExecutor, L1WatcherQueryProcessor, L2Finalizer,
-    L2SourceClient, LogRetrier, NetworkActor, NetworkActorError, NetworkBuilder,
-    NetworkBuilderError, NetworkConfig, NetworkDriver, NetworkDriverError, NetworkEngineClient,
-    NetworkHandler, NetworkInboundData, NodeActor, OriginSelector, PayloadBuilder, PayloadSealer,
-    PendingStopSender, PoolActivation, QueuedDerivationEngineClient, QueuedEngineDerivationClient,
-    QueuedEngineRpcClient, QueuedL1WatcherDerivationClient, QueuedNetworkEngineClient,
-    QueuedSequencerAdminAPIClient, QueuedSequencerEngineClient, QueuedUnsafePayloadGossipClient,
-    RecoveryModeGuard, ResetRequest, RpcActor, RpcActorError, RpcContext, SealRequest, SealState,
-    SealStepError, SequencerActor, SequencerActorError, SequencerAdminQuery, SequencerConfig,
+    GetPayloadRequest, GossipTransport, L1BlockFetcher, L1OriginSelector, L1OriginSelectorError,
+    L1OriginSelectorProvider, L1WatcherActor, L1WatcherActorError, L1WatcherDerivationClient,
+    L1WatcherQueryExecutor, L1WatcherQueryProcessor, L2Finalizer, L2SourceClient, LogRetrier,
+    NetworkActor, NetworkActorError, NetworkBuilder, NetworkBuilderError, NetworkConfig,
+    NetworkDriver, NetworkDriverError, NetworkEngineClient, NetworkHandler, NetworkInboundData,
+    NodeActor, OriginSelector, PayloadBuilder, PayloadSealer, PendingStopSender, PoolActivation,
+    QueuedDerivationEngineClient, QueuedEngineDerivationClient, QueuedEngineRpcClient,
+    QueuedL1WatcherDerivationClient, QueuedNetworkEngineClient, QueuedSequencerAdminAPIClient,
+    QueuedSequencerEngineClient, QueuedUnsafePayloadGossipClient, RecoveryModeGuard, ResetRequest,
+    RpcActor, RpcActorError, RpcContext, ScheduledTicker, SealRequest, SealState, SealStepError,
+    SequencerActor, SequencerActorError, SequencerAdminQuery, SequencerConfig,
     SequencerEngineClient, UnsafePayloadGossipClient, UnsafePayloadGossipClientError,
     UnsealedPayloadHandle,
 };

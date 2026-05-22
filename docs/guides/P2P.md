@@ -139,10 +139,10 @@ records (a method for distributing node records through the domain name system).
 
 Different layers of the Ethereum stack use ENR extension keys for chain-specific metadata. On
 Ethereum L1's execution layer, ENRs carry an `eth` key with fork ID information. On the L1 consensus
-layer, they carry an `eth2` key with the fork digest and attestation subnet bitfield. On Base (and
-OP Stack chains more broadly), every ENR includes an `opstack` key that encodes the L2 chain ID and
-a version number. This is how nodes on different chains (say, Base Mainnet vs Base Sepolia) can tell
-each other apart during discovery. The textual representation of an ENR is a base64-encoded string
+layer, they carry an `eth2` key with the fork digest and attestation subnet bitfield. Base ENRs
+include an `opstack` key that encodes the L2 chain ID and a version number. This is how nodes on
+different chains (say, Base Mainnet vs Base Sepolia) can tell each other apart during discovery.
+The textual representation of an ENR is a base64-encoded string
 prefixed with `enr:`, which you will see in configuration files and bootnode lists.
 
 The [`BaseEnr`](https://github.com/base/base/blob/main/crates/consensus/peers/src/enr.rs) struct
@@ -159,7 +159,7 @@ pub struct BaseEnr {
 
 impl BaseEnr {
     /// The ENR key literal string for the consensus layer.
-    pub const OP_CL_KEY: &str = "opstack";
+    pub const OPSTACK_ENR_KEY: &str = "opstack";
 
     /// Constructs a BaseEnr from a chain id.
     pub const fn from_chain_id(chain_id: u64) -> Self {
@@ -472,9 +472,9 @@ The `ping` behaviour sends periodic keepalive pings to connected peers and measu
 times. The `gossipsub` behaviour handles the actual block gossip. The `identify` behaviour exchanges
 capability information between peers when they first connect (the Base node advertises its agent
 version as `"base"`). The `sync_req_resp` behaviour supports a legacy request-response protocol
-called `payload_by_number` that is part of the OP Stack spec. This is being deprecated, and the Base
-implementation responds with "not found" to all requests, but it is still present so that op-nodes
-don't penalize Base nodes for not supporting it.
+called `payload_by_number` that is part of the legacy rollup P2P spec. This is being deprecated, and the Base
+implementation responds with "not found" to all requests, but it is still present so that legacy
+peers don't penalize Base nodes for not supporting it.
 
 The `GossipDriver`
 ([`gossip/src/driver.rs`](https://github.com/base/base/blob/main/crates/consensus/gossip/src/driver.rs))
@@ -553,7 +553,7 @@ mutable state.
 ### CL startup flow from the command line
 
 When you launch the Base consensus binary, the P2P configuration comes from CLI flags defined in
-[`base-client-cli`](https://github.com/base/base/tree/main/crates/client/cli). The key flags include
+[`base-consensus-cli`](../../crates/consensus/cli). The key flags include
 `--p2p.listen.tcp` (default 9222) and `--p2p.listen.udp` (default 9223) for the local bind
 addresses, `--p2p.advertise.ip` for NAT (Network Address Translation) scenarios where the node is
 behind a router and its public IP address differs from its local IP, `--p2p.priv.path` for the
@@ -665,7 +665,7 @@ The Base transaction pool is defined in
 extends reth's standard transaction pool with rollup-specific validation and ordering.
 
 The
-[`OpTransactionValidator`](https://github.com/base/base/blob/main/crates/execution/txpool/src/validator.rs)
+[`BaseTransactionValidator`](https://github.com/base/base/blob/main/crates/execution/txpool/src/validator.rs)
 wraps reth's `EthTransactionValidator` and adds L1 data gas fee checks. Every transaction on Base
 incurs both an L2 execution gas cost and an L1 data fee (the cost of posting the transaction data to
 Ethereum L1). The validator ensures that the sender's balance covers both fees. It also rejects
@@ -814,7 +814,7 @@ networks are completely separate and serve different purposes.
 
 -
   [`crates/execution/txpool/src/validator.rs`](https://github.com/base/base/blob/main/crates/execution/txpool/src/validator.rs)
-  — OpTransactionValidator with L1 data gas checks
+  — BaseTransactionValidator with L1 data gas checks
 -
   [`crates/execution/txpool/src/ordering.rs`](https://github.com/base/base/blob/main/crates/execution/txpool/src/ordering.rs)
   — BaseOrdering (fee-based vs FIFO)

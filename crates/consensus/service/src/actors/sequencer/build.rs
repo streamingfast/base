@@ -7,8 +7,8 @@
 use std::{sync::Arc, time::Instant};
 
 use alloy_rpc_types_engine::PayloadId;
+use base_common_genesis::RollupConfig;
 use base_consensus_derive::{AttributesBuilder, PipelineErrorKind};
-use base_consensus_genesis::RollupConfig;
 use base_protocol::{AttributesWithParent, BlockInfo, L2BlockInfo};
 
 use crate::{
@@ -93,14 +93,15 @@ impl<A: AttributesBuilder, O: OriginSelector, E: SequencerEngineClient> PayloadB
             return Ok(None);
         };
 
-        Metrics::sequencer_attributes_build_duration().set(attributes_build_start.elapsed());
+        Metrics::sequencer_attributes_build_duration().record(attributes_build_start.elapsed());
 
         let build_request_start = Instant::now();
 
         let payload_id =
             self.engine_client.start_build_block(attributes_with_parent.clone()).await?;
 
-        Metrics::sequencer_block_building_start_task_duration().set(build_request_start.elapsed());
+        Metrics::sequencer_block_building_start_task_duration()
+            .record(build_request_start.elapsed());
 
         Ok(Some(UnsealedPayloadHandle { payload_id, attributes_with_parent }))
     }

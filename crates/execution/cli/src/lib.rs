@@ -7,12 +7,14 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-/// A configurable App on top of the cli parser.
+/// A configurable app on top of the CLI parser.
 pub mod app;
 /// Base chain specification parser.
 pub mod chainspec;
 /// Base CLI commands.
 pub mod commands;
+/// Standard Base execution-node runner wiring.
+pub mod standard_node;
 
 use std::{ffi::OsString, fmt, marker::PhantomData};
 
@@ -35,10 +37,11 @@ use reth_node_core::{
 // reporting
 use reth_node_metrics as _;
 use reth_rpc_server_types::{DefaultRpcModuleValidator, RpcModuleValidator};
+pub use standard_node::{StandardBaseRethNode, StandardNodeArgs};
 
 /// The main base-reth cli interface.
 ///
-/// This is the entrypoint to the executable.
+/// This is the entry point to the executable.
 #[derive(Debug, Parser)]
 #[command(author, name = version_metadata().name_client.as_ref(), version = version_metadata().short_version.as_ref(), long_version = version_metadata().long_version.as_ref(), about = "Reth", long_about = None)]
 pub struct Cli<
@@ -63,12 +66,12 @@ pub struct Cli<
 }
 
 impl Cli {
-    /// Parsers only the default CLI arguments
+    /// Parses only the default CLI arguments.
     pub fn parse_args() -> Self {
         Self::parse()
     }
 
-    /// Parsers only the default CLI arguments from the given iterator
+    /// Parses only the default CLI arguments from the given iterator.
     pub fn try_parse_args_from<I, T>(itr: I) -> Result<Self, clap::error::Error>
     where
         I: IntoIterator<Item = T>,
@@ -119,7 +122,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use base_execution_chainspec::{BASE_DEV, BASE_MAINNET};
+    use base_execution_chainspec::BaseChainSpec;
     use base_node_core::args::RollupArgs;
     use clap::Parser;
     use reth_cli_commands::{NodeCommand, node::NoArgs};
@@ -129,7 +132,7 @@ mod tests {
     #[test]
     fn parse_dev() {
         let cmd = NodeCommand::<BaseChainSpecParser, NoArgs>::parse_from(["base-reth", "--dev"]);
-        let chain = BASE_DEV.clone();
+        let chain = BaseChainSpec::devnet();
         assert_eq!(cmd.chain.chain, chain.chain);
         assert_eq!(cmd.chain.genesis_hash(), chain.genesis_hash());
         assert_eq!(
@@ -189,7 +192,7 @@ mod tests {
 
         match cmd.command {
             Commands::Node(command) => {
-                assert_eq!(command.chain.as_ref(), BASE_MAINNET.as_ref());
+                assert_eq!(command.chain.as_ref(), &BaseChainSpec::mainnet());
             }
             _ => panic!("unexpected command"),
         }

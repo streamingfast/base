@@ -174,9 +174,11 @@ mod tests {
             error_message: None,
             prover_address: None,
             l1_head: None,
+            intermediate_root_interval: None,
             created_at: now,
             updated_at: now,
             completed_at: Some(now),
+            retry_count: 0,
         }
     }
 

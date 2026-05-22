@@ -73,7 +73,7 @@ impl Default for DriverConfig {
 ///
 /// This is either a game found in the `DisputeGameFactory` or the
 /// anchor root from the `AnchorStateRegistry` when no games exist.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveredState {
     /// Proxy address of the parent game, or the `AnchorStateRegistry` address
     /// when creating the first game from anchor state (no parent game exists).
@@ -271,8 +271,10 @@ mod tests {
             output_roots: HashMap::new(),
             max_safe_block: None,
         });
-        let anchor_registry =
-            Arc::new(MockAnchorStateRegistry { anchor_root: test_anchor_root(0) });
+        let anchor_registry = Arc::new(MockAnchorStateRegistry {
+            anchor_root: test_anchor_root(0),
+            anchor_game: Address::ZERO,
+        });
         let factory = Arc::new(MockDisputeGameFactory::with_games(vec![]));
 
         let pipeline = ProvingPipeline::new(

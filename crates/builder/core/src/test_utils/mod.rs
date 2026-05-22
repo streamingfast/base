@@ -26,8 +26,8 @@ pub use utils::*;
 
 use crate::BuilderConfig;
 
-/// Signs an OP transaction and returns the recovered signed transaction.
-pub fn sign_op_tx(
+/// Signs a Base transaction and returns the recovered signed transaction.
+pub fn sign_base_tx(
     signer: &PrivateKeySigner,
     mut tx: BaseTypedTransaction,
 ) -> eyre::Result<Recovered<BaseTransactionSigned>> {

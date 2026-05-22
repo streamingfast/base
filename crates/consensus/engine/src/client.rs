@@ -1,35 +1,30 @@
 //! An Engine API Client.
 
-use std::{future::Future, sync::Arc};
+use std::{future::Future, io, sync::Arc};
 
 use alloy_eips::{BlockId, eip1898::BlockNumberOrTag};
 use alloy_network::{Ethereum, Network};
 use alloy_primitives::{Address, B256, BlockHash, Bytes, StorageKey};
-use alloy_provider::{EthGetBlock, Provider, RootProvider, RpcWithBlock, ext::EngineApi};
+use alloy_provider::{EthGetBlock, IpcConnect, Provider, RootProvider, RpcWithBlock};
 use alloy_rpc_client::{ClientBuilder, RpcClient};
 use alloy_rpc_types_engine::{
     ClientVersionV1, ExecutionPayloadBodiesV1, ExecutionPayloadEnvelopeV2, ExecutionPayloadInputV2,
-    ExecutionPayloadV1, ExecutionPayloadV3, ForkchoiceState, ForkchoiceUpdated, JwtSecret,
-    PayloadId, PayloadStatus,
+    ExecutionPayloadV3, ForkchoiceState, ForkchoiceUpdated, JwtSecret, PayloadId, PayloadStatus,
 };
 use alloy_rpc_types_eth::{Block, EIP1186AccountProofResponse};
 use alloy_transport::{RpcError, TransportErrorKind, TransportResult};
 use alloy_transport_http::{
-    AuthLayer, AuthService, Http, HyperClient,
-    hyper_util::{
-        client::legacy::{Client, connect::HttpConnector},
-        rt::TokioExecutor,
-    },
+    AuthLayer, Http, HyperClient,
+    hyper_util::{client::legacy::Client, rt::TokioExecutor},
 };
 use async_trait::async_trait;
-use base_common_network::Base;
-use base_common_provider::BaseEngineApi;
+use base_common_genesis::RollupConfig;
+use base_common_network::{Base, BaseEngineApi};
 use base_common_rpc_types::Transaction;
 use base_common_rpc_types_engine::{
     BaseExecutionPayloadEnvelopeV3, BaseExecutionPayloadEnvelopeV4, BaseExecutionPayloadEnvelopeV5,
     BaseExecutionPayloadV4, BasePayloadAttributes,
 };
-use base_consensus_genesis::RollupConfig;
 use base_protocol::{FromBlockError, L2BlockInfo};
 use http_body_util::Full;
 use thiserror::Error;
@@ -49,14 +44,11 @@ pub enum EngineClientError {
     #[error("An error occurred while decoding the payload: {0}")]
     BlockInfoDecodeError(#[from] FromBlockError),
 }
-/// A Hyper HTTP client with a JWT authentication layer.
-pub type HyperAuthClient<B = Full<Bytes>> = HyperClient<B, AuthService<Client<HttpConnector, B>>>;
-
 /// Engine API client used to communicate with L1/L2 ELs.
 /// `EngineClient` trait that is very coupled to its only implementation.
 /// The main reason this exists is for mocking/unit testing.
 #[async_trait]
-pub trait EngineClient: BaseEngineApi<Base, Http<HyperAuthClient>> + Send + Sync {
+pub trait EngineClient: BaseEngineApi + Send + Sync {
     /// Returns a reference to the inner [`RollupConfig`].
     fn cfg(&self) -> &RollupConfig;
 
@@ -73,9 +65,6 @@ pub trait EngineClient: BaseEngineApi<Base, Http<HyperAuthClient>> + Send + Sync
         address: Address,
         keys: Vec<StorageKey>,
     ) -> RpcWithBlock<(Address, Vec<StorageKey>), EIP1186AccountProofResponse>;
-
-    /// Sends the given payload to the execution layer client, as specified for the Paris fork.
-    async fn new_payload_v1(&self, payload: ExecutionPayloadV1) -> TransportResult<PayloadStatus>;
 
     /// Fetches the [`Block<Transaction>`] for the given [`BlockNumberOrTag`].
     async fn l2_block_by_label(
@@ -116,23 +105,37 @@ where
 {
     /// Creates a new RPC client for the given address and JWT secret.
     ///
-    /// Supports both `http://`/`https://` and `ws://`/`wss://` schemes. For WebSocket URLs a
-    /// [`JwtWsConnect`] is used, which mints a fresh JWT on every connect and reconnect attempt.
+    /// Supports `http://`/`https://`, `ws://`/`wss://`, and `file://` schemes. For WebSocket URLs
+    /// a [`JwtWsConnect`] is used, which mints a fresh JWT on every connect and reconnect attempt.
     /// This ensures the `iat` claim is always within the ±60-second window enforced by Reth and
     /// Geth, unlike a static token that would become stale after 60 seconds.
     ///
-    /// Returns an error if the WebSocket handshake fails (e.g. the engine is not yet reachable).
-    /// HTTP/HTTPS URLs are constructed lazily and never fail here.
+    /// For `file://` URLs, the client connects over IPC and the JWT secret is intentionally
+    /// unused because access control is provided by filesystem permissions on the socket path.
+    ///
+    /// Returns an error if the WebSocket handshake fails (e.g. the engine is not yet reachable),
+    /// or if the URL scheme is unsupported. HTTP/HTTPS URLs are constructed lazily and never fail
+    /// here.
     pub async fn rpc_client<N: Network>(
         addr: Url,
         jwt: JwtSecret,
     ) -> TransportResult<RootProvider<N>> {
         match addr.scheme() {
+            "file" => {
+                let path = addr.to_file_path().map_err(|_| {
+                    TransportErrorKind::custom(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "file:// engine URLs must contain an absolute filesystem path",
+                    ))
+                })?;
+                let client = ClientBuilder::default().ipc(IpcConnect::new(path)).await?;
+                Ok(RootProvider::<N>::new(client))
+            }
             "ws" | "wss" => {
                 let client = ClientBuilder::default().pubsub(JwtWsConnect::new(addr, jwt)).await?;
                 Ok(RootProvider::<N>::new(client))
             }
-            _ => {
+            "http" | "https" => {
                 let hyper_client =
                     Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
                 let auth_layer = AuthLayer::new(jwt);
@@ -142,6 +145,12 @@ where
                 let rpc_client = RpcClient::new(http_hyper, false);
                 Ok(RootProvider::<N>::new(rpc_client))
             }
+            scheme => Err(TransportErrorKind::custom(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unsupported engine URL scheme '{scheme}'; expected http, https, ws, wss, or file"
+                ),
+            ))),
         }
     }
 }
@@ -206,10 +215,6 @@ where
         self.engine.get_proof(address, keys)
     }
 
-    async fn new_payload_v1(&self, payload: ExecutionPayloadV1) -> TransportResult<PayloadStatus> {
-        self.engine.new_payload_v1(payload).await
-    }
-
     async fn l2_block_by_label(
         &self,
         numtag: BlockNumberOrTag,
@@ -230,8 +235,7 @@ where
 }
 
 #[async_trait::async_trait]
-impl<L1Provider, L2Provider> BaseEngineApi<Base, Http<HyperAuthClient>>
-    for BaseEngineClient<L1Provider, L2Provider>
+impl<L1Provider, L2Provider> BaseEngineApi for BaseEngineClient<L1Provider, L2Provider>
 where
     L1Provider: Provider,
     L2Provider: Provider<Base>,
@@ -240,10 +244,7 @@ where
         &self,
         payload: ExecutionPayloadInputV2,
     ) -> TransportResult<PayloadStatus> {
-        let call = <L2Provider as BaseEngineApi<Base, Http<HyperAuthClient>>>::new_payload_v2(
-            &self.engine,
-            payload,
-        );
+        let call = <L2Provider as BaseEngineApi>::new_payload_v2(&self.engine, payload);
 
         record_call_time(call, Metrics::NEW_PAYLOAD_METHOD).await
     }
@@ -253,7 +254,7 @@ where
         payload: ExecutionPayloadV3,
         parent_beacon_block_root: B256,
     ) -> TransportResult<PayloadStatus> {
-        let call = <L2Provider as BaseEngineApi<Base, Http<HyperAuthClient>>>::new_payload_v3(
+        let call = <L2Provider as BaseEngineApi>::new_payload_v3(
             &self.engine,
             payload,
             parent_beacon_block_root,
@@ -267,7 +268,7 @@ where
         payload: BaseExecutionPayloadV4,
         parent_beacon_block_root: B256,
     ) -> TransportResult<PayloadStatus> {
-        let call = <L2Provider as BaseEngineApi<Base, Http<HyperAuthClient>>>::new_payload_v4(
+        let call = <L2Provider as BaseEngineApi>::new_payload_v4(
             &self.engine,
             payload,
             parent_beacon_block_root,
@@ -281,12 +282,11 @@ where
         fork_choice_state: ForkchoiceState,
         payload_attributes: Option<BasePayloadAttributes>,
     ) -> TransportResult<ForkchoiceUpdated> {
-        let call =
-            <L2Provider as BaseEngineApi<Base, Http<HyperAuthClient>>>::fork_choice_updated_v2(
-                &self.engine,
-                fork_choice_state,
-                payload_attributes,
-            );
+        let call = <L2Provider as BaseEngineApi>::fork_choice_updated_v2(
+            &self.engine,
+            fork_choice_state,
+            payload_attributes,
+        );
 
         record_call_time(call, Metrics::FORKCHOICE_UPDATE_METHOD).await
     }
@@ -296,12 +296,11 @@ where
         fork_choice_state: ForkchoiceState,
         payload_attributes: Option<BasePayloadAttributes>,
     ) -> TransportResult<ForkchoiceUpdated> {
-        let call =
-            <L2Provider as BaseEngineApi<Base, Http<HyperAuthClient>>>::fork_choice_updated_v3(
-                &self.engine,
-                fork_choice_state,
-                payload_attributes,
-            );
+        let call = <L2Provider as BaseEngineApi>::fork_choice_updated_v3(
+            &self.engine,
+            fork_choice_state,
+            payload_attributes,
+        );
 
         record_call_time(call, Metrics::FORKCHOICE_UPDATE_METHOD).await
     }
@@ -310,10 +309,7 @@ where
         &self,
         payload_id: PayloadId,
     ) -> TransportResult<ExecutionPayloadEnvelopeV2> {
-        let call = <L2Provider as BaseEngineApi<Base, Http<HyperAuthClient>>>::get_payload_v2(
-            &self.engine,
-            payload_id,
-        );
+        let call = <L2Provider as BaseEngineApi>::get_payload_v2(&self.engine, payload_id);
 
         record_call_time(call, Metrics::GET_PAYLOAD_METHOD).await
     }
@@ -322,10 +318,7 @@ where
         &self,
         payload_id: PayloadId,
     ) -> TransportResult<BaseExecutionPayloadEnvelopeV3> {
-        let call = <L2Provider as BaseEngineApi<Base, Http<HyperAuthClient>>>::get_payload_v3(
-            &self.engine,
-            payload_id,
-        );
+        let call = <L2Provider as BaseEngineApi>::get_payload_v3(&self.engine, payload_id);
 
         record_call_time(call, Metrics::GET_PAYLOAD_METHOD).await
     }
@@ -334,10 +327,7 @@ where
         &self,
         payload_id: PayloadId,
     ) -> TransportResult<BaseExecutionPayloadEnvelopeV4> {
-        let call = <L2Provider as BaseEngineApi<Base, Http<HyperAuthClient>>>::get_payload_v4(
-            &self.engine,
-            payload_id,
-        );
+        let call = <L2Provider as BaseEngineApi>::get_payload_v4(&self.engine, payload_id);
 
         record_call_time(call, Metrics::GET_PAYLOAD_METHOD).await
     }
@@ -346,10 +336,7 @@ where
         &self,
         payload_id: PayloadId,
     ) -> TransportResult<BaseExecutionPayloadEnvelopeV5> {
-        let call = <L2Provider as BaseEngineApi<Base, Http<HyperAuthClient>>>::get_payload_v5(
-            &self.engine,
-            payload_id,
-        );
+        let call = <L2Provider as BaseEngineApi>::get_payload_v5(&self.engine, payload_id);
 
         record_call_time(call, Metrics::GET_PAYLOAD_METHOD).await
     }
@@ -358,11 +345,8 @@ where
         &self,
         block_hashes: Vec<BlockHash>,
     ) -> TransportResult<ExecutionPayloadBodiesV1> {
-        <L2Provider as BaseEngineApi<Base, Http<HyperAuthClient>>>::get_payload_bodies_by_hash_v1(
-            &self.engine,
-            block_hashes,
-        )
-        .await
+        <L2Provider as BaseEngineApi>::get_payload_bodies_by_hash_v1(&self.engine, block_hashes)
+            .await
     }
 
     async fn get_payload_bodies_by_range_v1(
@@ -370,34 +354,22 @@ where
         start: u64,
         count: u64,
     ) -> TransportResult<ExecutionPayloadBodiesV1> {
-        <L2Provider as BaseEngineApi<Base, Http<HyperAuthClient>>>::get_payload_bodies_by_range_v1(
-            &self.engine,
-            start,
-            count,
-        )
-        .await
+        <L2Provider as BaseEngineApi>::get_payload_bodies_by_range_v1(&self.engine, start, count)
+            .await
     }
 
     async fn get_client_version_v1(
         &self,
         client_version: ClientVersionV1,
     ) -> TransportResult<Vec<ClientVersionV1>> {
-        <L2Provider as BaseEngineApi<Base, Http<HyperAuthClient>>>::get_client_version_v1(
-            &self.engine,
-            client_version,
-        )
-        .await
+        <L2Provider as BaseEngineApi>::get_client_version_v1(&self.engine, client_version).await
     }
 
     async fn exchange_capabilities(
         &self,
         capabilities: Vec<String>,
     ) -> TransportResult<Vec<String>> {
-        <L2Provider as BaseEngineApi<Base, Http<HyperAuthClient>>>::exchange_capabilities(
-            &self.engine,
-            capabilities,
-        )
-        .await
+        <L2Provider as BaseEngineApi>::exchange_capabilities(&self.engine, capabilities).await
     }
 }
 
@@ -458,6 +430,21 @@ mod tests {
                 .unwrap();
     }
 
+    /// `rpc_client` with an unsupported URL scheme must fail with a clear validation error.
+    #[tokio::test]
+    async fn rpc_client_invalid_scheme_rejected() {
+        let addr: Url = "htpp://127.0.0.1:8551".parse().unwrap();
+        let jwt = JwtSecret::random();
+        let error =
+            BaseEngineClient::<RootProvider, RootProvider<Base>>::rpc_client::<Base>(addr, jwt)
+                .await
+                .unwrap_err();
+
+        assert!(error.to_string().contains(
+            "unsupported engine URL scheme 'htpp'; expected http, https, ws, wss, or file"
+        ));
+    }
+
     /// `rpc_client` with a `ws://` URL must complete the WebSocket handshake at build time.
     /// A real TCP + WS server is required because `WsConnect` connects eagerly.
     #[tokio::test]
@@ -499,7 +486,7 @@ mod tests {
     async fn engine_client_builder_http_builds() {
         use std::sync::Arc;
 
-        use base_consensus_genesis::RollupConfig;
+        use base_common_genesis::RollupConfig;
 
         let builder = EngineClientBuilder {
             l2: "http://127.0.0.1:8551".parse().unwrap(),
@@ -516,7 +503,7 @@ mod tests {
     async fn engine_client_builder_ws_connects() {
         use std::sync::Arc;
 
-        use base_consensus_genesis::RollupConfig;
+        use base_common_genesis::RollupConfig;
 
         let (listener, port) = free_port_listener().await;
         tokio::spawn(accept_one_ws(listener));

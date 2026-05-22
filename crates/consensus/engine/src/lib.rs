@@ -14,17 +14,16 @@ pub use task_queue::{
     BuildTask, BuildTaskError, ConsolidateInput, ConsolidateTask, ConsolidateTaskError,
     DelegatedForkchoiceTask, DelegatedForkchoiceTaskError, DelegatedForkchoiceUpdate, Engine,
     EngineBuildError, EngineResetError, EngineTask, EngineTaskError, EngineTaskErrorSeverity,
-    EngineTaskErrors, EngineTaskExt, FinalizeTask, FinalizeTaskError, GetPayloadTask, InsertTask,
-    InsertTaskError, SealTask, SealTaskError, SynchronizeTask, SynchronizeTaskError,
+    EngineTaskErrors, EngineTaskExt, FinalizeTask, FinalizeTaskError, GetPayloadTask,
+    InsertPayloadSafety, InsertTask, InsertTaskError, SealTask, SealTaskError, SynchronizeTask,
+    SynchronizeTaskError,
 };
 
 mod attributes;
 pub use attributes::{AttributesMatch, AttributesMismatch};
 
 mod client;
-pub use client::{
-    BaseEngineClient, EngineClient, EngineClientBuilder, EngineClientError, HyperAuthClient,
-};
+pub use client::{BaseEngineClient, EngineClient, EngineClientBuilder, EngineClientError};
 
 mod ws_connect;
 pub use ws_connect::JwtWsConnect;

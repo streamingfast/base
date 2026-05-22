@@ -2,17 +2,19 @@ use std::{fmt::Debug, sync::Arc};
 
 use alloy_eips::BlockNumHash;
 use alloy_genesis::ChainConfig;
+use alloy_signer_local::PrivateKeySigner;
 use base_common_consensus::{BaseBlock, BaseTxEnvelope};
-use base_consensus_derive::{DataAvailabilityProvider, PipelineBuilder, StatefulAttributesBuilder};
-use base_consensus_genesis::RollupConfig;
-use base_consensus_node::L1OriginSelector;
+use base_common_genesis::RollupConfig;
+use base_consensus_derive::{
+    DataAvailabilityProvider, EthereumDataSource, PipelineBuilder, StatefulAttributesBuilder,
+};
+use base_consensus_node::{GossipTransport, L1OriginSelector};
 use base_protocol::{BlockInfo, L1BlockInfoTx, L2BlockInfo};
 
 use crate::{
-    ActionBlobDataSource, ActionDataSource, ActionEngineClient, ActionL1ChainProvider,
-    ActionL2ChainProvider, ActionL2Source, ActionPipeline, BlobVerifierPipeline, L1Miner,
-    L1MinerConfig, L2Sequencer, SharedL1Chain, TestGossipTransport, TestRollupNode,
-    VerifierPipeline, block_info_from,
+    ActionBlobProvider, ActionEngineClient, ActionL1ChainProvider, ActionL2ChainProvider,
+    ActionL2Source, ActionPipeline, Batcher, BatcherConfig, L1Miner, L1MinerConfig, L2Sequencer,
+    SharedL1Chain, TestGossipTransport, TestRollupNode, VerifierPipeline, block_info_from,
 };
 
 /// Top-level test harness that owns all actors for a single action test.
@@ -71,6 +73,21 @@ impl ActionTestHarness {
     /// newly mined block for use in pipeline signals.
     pub fn mine_and_push(&mut self, chain: &SharedL1Chain) -> BlockInfo {
         self.l1.mine_block();
+        chain.push(self.l1.tip().clone());
+        block_info_from(self.l1.tip())
+    }
+
+    /// Submit L2 blocks through the batcher, then publish the mined L1 block.
+    ///
+    /// Returns the [`BlockInfo`] for the L1 block that carried the batcher submission.
+    pub async fn submit_l2_blocks(
+        &mut self,
+        chain: &SharedL1Chain,
+        batcher_cfg: BatcherConfig,
+        blocks: impl IntoIterator<Item = BaseBlock>,
+    ) -> BlockInfo {
+        let source = ActionL2Source::from_blocks(blocks);
+        Batcher::new(source, &self.rollup_config, batcher_cfg).advance(&mut self.l1).await;
         chain.push(self.l1.tip().clone());
         block_info_from(self.l1.tip())
     }
@@ -136,37 +153,14 @@ impl ActionTestHarness {
         l1_chain: SharedL1Chain,
         p2p: TestGossipTransport,
     ) -> TestRollupNode<VerifierPipeline> {
+        let l1_provider = ActionL1ChainProvider::new(l1_chain.clone());
+        let blob_provider = ActionBlobProvider::new(l1_chain.clone());
         let dap_source =
-            ActionDataSource::new(l1_chain.clone(), self.rollup_config.batch_inbox_address);
-        self.build_node_inner(sequencer, l1_chain, p2p, dap_source)
-    }
-
-    /// Create a [`TestRollupNode`] wired to blob DA.
-    ///
-    /// Identical to [`create_test_rollup_node`] but uses
-    /// [`ActionBlobDataSource`] so the pipeline reads blobs from the L1 chain
-    /// instead of calldata.
-    ///
-    /// [`create_test_rollup_node`]: ActionTestHarness::create_test_rollup_node
-    pub fn create_blob_test_rollup_node(
-        &self,
-        sequencer: &L2Sequencer,
-        l1_chain: SharedL1Chain,
-        p2p: TestGossipTransport,
-    ) -> TestRollupNode<BlobVerifierPipeline> {
-        let dap_source =
-            ActionBlobDataSource::new(l1_chain.clone(), self.rollup_config.batch_inbox_address);
+            EthereumDataSource::new_from_parts(l1_provider, blob_provider, &self.rollup_config);
         self.build_node_inner(sequencer, l1_chain, p2p, dap_source)
     }
 
     /// Build a [`TestRollupNode`] for any data-availability source.
-    ///
-    /// Shared implementation for [`create_test_rollup_node`] and
-    /// [`create_blob_test_rollup_node`]; the two public methods differ only in
-    /// which `dap_source` they construct before delegating here.
-    ///
-    /// [`create_test_rollup_node`]: ActionTestHarness::create_test_rollup_node
-    /// [`create_blob_test_rollup_node`]: ActionTestHarness::create_blob_test_rollup_node
     fn build_node_inner<D>(
         &self,
         sequencer: &L2Sequencer,
@@ -197,7 +191,7 @@ impl ActionTestHarness {
             .origin(genesis_l1)
             .chain_provider(l1_provider)
             .dap_source(dap_source)
-            .l2_chain_provider(l2_provider)
+            .l2_chain_provider(l2_provider.clone())
             .builder(attrs_builder)
             .build_polled();
 
@@ -216,14 +210,14 @@ impl ActionTestHarness {
             l1_chain,
         );
 
-        TestRollupNode::new(pipeline, engine, p2p, safe_head, rollup_config)
+        TestRollupNode::new(pipeline, engine, p2p, safe_head, rollup_config, l2_provider)
     }
 
     /// Create a [`TestRollupNode`] wired to a sequencer's block-hash registry, returning
     /// `(node, l1_chain)` for convenient L1-push-then-signal patterns.
     ///
     /// Wires `sequencer` to a fresh [`TestGossipTransport`] channel and builds the
-    /// full calldata derivation pipeline.
+    /// production-mode DA derivation pipeline.
     pub fn create_test_rollup_node_from_sequencer(
         &self,
         sequencer: &mut L2Sequencer,
@@ -234,20 +228,31 @@ impl ActionTestHarness {
         (node, l1_chain)
     }
 
-    /// Create a blob-DA [`TestRollupNode`] wired to a sequencer's block-hash registry,
-    /// returning `(node, l1_chain)`.
+    /// Create a [`SupervisedP2P`] / [`TestGossipTransport`] pair with real
+    /// signature signing and validation enabled.
     ///
-    /// Identical to [`create_test_rollup_node_from_sequencer`] but uses blob DA.
+    /// - Attaches `key` to `sequencer` so that [`L2Sequencer::broadcast_unsafe_block`]
+    ///   signs each gossipped block with the production formula.
+    /// - Configures the returned [`TestGossipTransport`] to validate incoming
+    ///   blocks against the same address, using the rollup config's chain ID.
     ///
-    /// [`create_test_rollup_node_from_sequencer`]: ActionTestHarness::create_test_rollup_node_from_sequencer
-    pub fn create_blob_test_rollup_node_from_sequencer(
+    /// Use this in place of [`create_supervised_p2p`] when a test needs to
+    /// exercise signature verification.
+    ///
+    /// [`create_supervised_p2p`]: ActionTestHarness::create_supervised_p2p
+    pub fn create_signing_p2p(
         &self,
         sequencer: &mut L2Sequencer,
-        l1_chain: SharedL1Chain,
-    ) -> (TestRollupNode<BlobVerifierPipeline>, SharedL1Chain) {
-        let transport = self.create_supervised_p2p(sequencer);
-        let node = self.create_blob_test_rollup_node(sequencer, l1_chain.clone(), transport);
-        (node, l1_chain)
+        key: PrivateKeySigner,
+    ) -> TestGossipTransport {
+        let address = key.address();
+        sequencer.set_unsafe_block_signer(key.clone());
+        let (p2p, mut transport) = TestGossipTransport::channel();
+        sequencer.set_supervised_p2p(p2p);
+        transport.set_block_signer(address);
+        transport.set_chain_id(self.rollup_config.l2_chain_id.id());
+        transport.set_signing_key(key);
+        transport
     }
 
     /// Create an [`L2Sequencer`] starting from L2 genesis, wired to a
@@ -255,7 +260,7 @@ impl ActionTestHarness {
     ///
     /// The returned sequencer generates real [`BaseBlock`]s using the production
     /// [`L1OriginSelector`], [`StatefulAttributesBuilder`], and
-    /// [`ActionEngineClient`] (backed by `OpPayloadBuilder`).
+    /// [`ActionEngineClient`] (backed by `BasePayloadBuilder`).
     ///
     /// Call `build_next_block_with_single_transaction().await` once per L2
     /// block to advance the sequencer.

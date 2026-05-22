@@ -45,7 +45,7 @@ pub fn unix_time_millis() -> u128 {
     }
 }
 
-/// Pool transaction for OP.
+/// Pool transaction for Base.
 ///
 /// This type wraps the actual transaction and caches values that are frequently used by the pool.
 /// For payload building this lazily tracks values that are required during payload building:
@@ -321,12 +321,12 @@ where
 
 /// Helper trait to provide payload builder with access to encoded bytes of
 /// transaction.
-pub trait OpPooledTx: PoolTransaction + DataAvailabilitySized {
+pub trait BasePooledTx: PoolTransaction + DataAvailabilitySized {
     /// Returns the EIP-2718 encoded bytes of the transaction.
     fn encoded_2718(&self) -> Cow<'_, Bytes>;
 }
 
-impl<Cons, Pooled> OpPooledTx for BasePooledTransaction<Cons, Pooled>
+impl<Cons, Pooled> BasePooledTx for BasePooledTransaction<Cons, Pooled>
 where
     Cons: SignedTransaction + From<Pooled>,
     Pooled: SignedTransaction + TryFrom<Cons>,
@@ -422,11 +422,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use alloy_consensus::transaction::Recovered;
     use alloy_eips::eip2718::Encodable2718;
     use alloy_primitives::{TxKind, U256};
     use base_common_consensus::{BasePrimitives, BaseTransactionSigned, TxDeposit};
-    use base_execution_chainspec::BASE_MAINNET;
+    use base_execution_chainspec::BaseChainSpec;
     use base_execution_evm::BaseEvmConfig;
     use reth_provider::test_utils::MockEthProvider;
     use reth_transaction_pool::{
@@ -434,18 +436,19 @@ mod tests {
         validate::EthTransactionValidatorBuilder,
     };
 
-    use crate::{BasePooledTransaction, OpTransactionValidator};
+    use crate::{BasePooledTransaction, BaseTransactionValidator};
     #[tokio::test]
     async fn validate_base_transaction() {
+        let chain_spec = Arc::new(BaseChainSpec::mainnet());
         let client = MockEthProvider::<BasePrimitives>::new()
-            .with_chain_spec(BASE_MAINNET.clone())
+            .with_chain_spec(Arc::clone(&chain_spec))
             .with_genesis_block();
-        let evm_config = BaseEvmConfig::optimism(BASE_MAINNET.clone());
+        let evm_config = BaseEvmConfig::base(chain_spec);
         let validator = EthTransactionValidatorBuilder::new(client, evm_config)
             .no_shanghai()
             .no_cancun()
             .build(InMemoryBlobStore::default());
-        let validator = OpTransactionValidator::new(validator);
+        let validator = BaseTransactionValidator::new(validator);
 
         let origin = TransactionOrigin::External;
         let signer = Default::default();

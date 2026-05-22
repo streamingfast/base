@@ -6,7 +6,7 @@ use alloy_eips::BlockNumHash;
 use alloy_primitives::{BlockHash, Bytes};
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use base_common_consensus::OpTxType;
-use base_consensus_genesis::RollupConfig;
+use base_common_genesis::RollupConfig;
 use tracing::warn;
 
 use crate::{BatchDropReason, BatchValidity, BlockInfo, L2BlockInfo};
@@ -60,7 +60,7 @@ impl SingleBatch {
     ///
     /// The batch format type is defined in the [Base Specs][specs].
     ///
-    /// [specs]: https://specs.optimism.io/protocol/derivation.html#batch-format
+    /// [specs]: https://specs.base.org/protocol/consensus/derivation#batch-format
     pub fn check_batch(
         &self,
         cfg: &RollupConfig,
@@ -194,7 +194,7 @@ mod tests {
     use alloy_primitives::{Address, Sealed, Signature, TxKind, U256};
     use alloy_rlp::{Decodable, Encodable};
     use base_common_consensus::{BaseTxEnvelope, TxDeposit};
-    use base_consensus_genesis::HardForkConfig;
+    use base_common_genesis::HardForkConfig;
     use tracing::Level;
     use tracing_subscriber::layer::SubscriberExt;
 

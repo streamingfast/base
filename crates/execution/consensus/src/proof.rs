@@ -10,7 +10,7 @@ use base_common_chains::Upgrades;
 use base_common_consensus::DepositReceiptExt;
 
 /// Calculates the receipt root for a header.
-pub fn calculate_receipt_root_optimism<R: DepositReceiptExt>(
+pub fn calculate_receipt_root<R: DepositReceiptExt>(
     receipts: &[ReceiptWithBloom<&R>],
     chain_spec: impl Upgrades,
     timestamp: u64,
@@ -40,10 +40,10 @@ pub fn calculate_receipt_root_optimism<R: DepositReceiptExt>(
     ordered_trie_root_with_encoder(receipts, |r, buf| r.encode_2718(buf))
 }
 
-/// Calculates the receipt root for a header for the reference type of an OP receipt.
+/// Calculates the receipt root for a header for the reference type of a Base receipt.
 ///
-/// NOTE: Prefer calculate receipt root optimism if you have log blooms memoized.
-pub fn calculate_receipt_root_no_memo_optimism<R: DepositReceiptExt>(
+/// NOTE: Prefer [`calculate_receipt_root`] if you have log blooms memoized.
+pub fn calculate_receipt_root_no_memo<R: DepositReceiptExt>(
     receipts: &[R],
     chain_spec: impl Upgrades,
     timestamp: u64,
@@ -82,7 +82,7 @@ mod tests {
     use alloy_consensus::{Receipt, ReceiptWithBloom, TxReceipt};
     use alloy_primitives::{Address, Bytes, Log, LogData, b256, bloom, hex};
     use base_common_consensus::{BaseReceipt, DepositReceipt};
-    use base_execution_chainspec::BASE_SEPOLIA;
+    use base_execution_chainspec::BaseChainSpec;
 
     use super::*;
 
@@ -90,7 +90,7 @@ mod tests {
     /// This was implemented due to a minor bug in op-geth and op-erigon where in
     /// the Regolith hardfork, the receipt root calculation does not include the
     /// deposit nonce in the receipt encoding.
-    /// To fix this an op-reth patch was applied to the receipt root calculation
+    /// To fix this, a downstream patch was applied to the receipt root calculation
     /// to strip the deposit nonce from each receipt before calculating the root.
     #[test]
     fn check_optimism_receipt_root() {
@@ -463,9 +463,9 @@ mod tests {
                     ],
                 }),
             ];
-            let root = calculate_receipt_root_optimism(
+            let root = calculate_receipt_root(
                 &receipts.iter().map(TxReceipt::with_bloom_ref).collect::<Vec<_>>(),
-                BASE_SEPOLIA.as_ref(),
+                BaseChainSpec::sepolia(),
                 case.1,
             );
             assert_eq!(root, case.2);
@@ -488,7 +488,7 @@ mod tests {
         });
         let receipt = ReceiptWithBloom { receipt: &inner, logs_bloom };
         let receipt = vec![receipt];
-        let root = calculate_receipt_root_optimism(&receipt, BASE_SEPOLIA.as_ref(), 0);
+        let root = calculate_receipt_root(&receipt, BaseChainSpec::sepolia(), 0);
         assert_eq!(
             root,
             b256!("0xfe70ae4a136d98944951b2123859698d59ad251a381abc9960fa81cae3d0d4a0")

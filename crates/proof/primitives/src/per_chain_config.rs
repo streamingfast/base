@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use alloy_chains::Chain;
 use alloy_eips::eip1898::BlockNumHash;
 use alloy_primitives::{Address, B256, U256, keccak256};
-use base_consensus_genesis::{
+use base_common_genesis::{
     ChainGenesis, FeeConfig, HardForkConfig, HardforkConfig, RollupConfig, SystemConfig,
 };
 
@@ -237,13 +237,13 @@ impl PerChainConfig {
                 pectra_blob_schedule_time: None,
                 isthmus_time: Some(0),
                 jovian_time: Some(0),
-                base: HardforkConfig { v1: Some(0) },
+                base: HardforkConfig { azul: Some(0), beryl: None },
             },
             chain_op_config: FeeConfig::base_mainnet(),
         }
     }
 
-    /// Convert to [`base_consensus_genesis::ChainGenesis`].
+    /// Convert to [`base_common_genesis::ChainGenesis`].
     const fn to_chain_genesis(&self) -> ChainGenesis {
         ChainGenesis {
             l1: BlockNumHash { hash: self.genesis.l1.hash, number: self.genesis.l1.number },

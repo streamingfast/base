@@ -14,9 +14,9 @@ use base_node_core::{
     args::RollupArgs,
     node::{
         BaseConsensusBuilder, BaseExecutorBuilder, BaseNetworkBuilder, BaseNodeComponentBuilder,
-        BaseNodeTypes, BasePoolBuilder, OpPayloadBuilder,
+        BaseNodeTypes, BasePayloadBuilder, BasePoolBuilder,
     },
-    utils::optimism_payload_attributes,
+    utils::payload_attributes,
 };
 use reth_chainspec::EthChainSpec;
 use reth_db::test_utils::create_test_rw_db_with_path;
@@ -89,7 +89,7 @@ impl BasePayloadTransactions<BasePooledTransaction> for CustomTxPriority {
 /// Builds the node with custom transaction priority service within default payload builder.
 fn build_components<Node>(
     chain_id: ChainId,
-) -> BaseNodeComponentBuilder<Node, OpPayloadBuilder<CustomTxPriority>>
+) -> BaseNodeComponentBuilder<Node, BasePayloadBuilder<CustomTxPriority>>
 where
     Node: FullNodeTypes<Types: BaseNodeTypes>,
 {
@@ -105,7 +105,7 @@ where
         .pool(BasePoolBuilder::default())
         .executor(BaseExecutorBuilder::default())
         .payload(BasicPayloadServiceBuilder::new(
-            OpPayloadBuilder::new(compute_pending_block)
+            BasePayloadBuilder::new(compute_pending_block)
                 .with_transactions(CustomTxPriority { chain_id }),
         ))
         .network(BaseNetworkBuilder::new(disable_txpool_gossip, !discovery_v4, base_protocol))
@@ -158,7 +158,7 @@ async fn test_custom_block_priority_config() {
         .expect("Failed to launch node");
 
     // Advance the chain with a single block.
-    let block_payloads = NodeTestContext::new(node_handle.node, optimism_payload_attributes)
+    let block_payloads = NodeTestContext::new(node_handle.node, payload_attributes)
         .await
         .unwrap()
         .advance(1, |_| {

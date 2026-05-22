@@ -28,6 +28,8 @@ base_metrics::define_metrics! {
     bundles_exceeded_metering_time: counter,
     #[describe("Size of buffered meter bundle responses")]
     buffered_meter_bundle_responses_size: gauge,
+    #[describe("Number of audit events dropped because the channel was full")]
+    audit_channel_full: counter,
     #[describe("RPC call latency")]
     #[label(rpc)]
     rpc_latency: histogram,

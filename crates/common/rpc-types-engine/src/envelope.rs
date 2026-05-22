@@ -37,7 +37,7 @@ pub struct BaseExecutionPayloadEnvelope {
 impl BaseExecutionPayloadEnvelope {
     /// Returns the payload hash over the ssz encoded payload envelope data.
     ///
-    /// <https://specs.optimism.io/protocol/rollup-node-p2p.html#block-signatures>
+    /// <https://specs.base.org/protocol/consensus/p2p#block-signatures>
     #[cfg(feature = "std")]
     pub fn payload_hash(&self) -> crate::PayloadHash {
         use ssz::Encode;
@@ -54,7 +54,7 @@ impl ssz::Encode for BaseExecutionPayloadEnvelope {
 
     fn ssz_append(&self, buf: &mut Vec<u8>) {
         // Write parent beacon block root only if the payload is not a v1 or v2 payload.
-        // <https://specs.optimism.io/protocol/rollup-node-p2p.html#block-encoding>
+        // <https://specs.base.org/protocol/consensus/p2p#block-encoding>
         if !matches!(
             self.execution_payload,
             BaseExecutionPayload::V1(_) | BaseExecutionPayload::V2(_)
@@ -164,14 +164,14 @@ impl ExecutionData {
 
     /// Creates a new instance from args to engine API method `newPayloadV2`.
     ///
-    /// Spec: <https://specs.optimism.io/protocol/exec-engine.html#engine_newpayloadv2>
+    /// Spec: <https://specs.base.org/protocol/execution#engine_newpayloadv2>
     pub fn v2(payload: ExecutionPayloadInputV2) -> Self {
         Self::new(BaseExecutionPayload::v2(payload), BaseExecutionPayloadSidecar::default())
     }
 
     /// Creates a new instance from args to engine API method `newPayloadV3`.
     ///
-    /// Spec: <https://specs.optimism.io/protocol/exec-engine.html#engine_newpayloadv3>
+    /// Spec: <https://specs.base.org/protocol/execution#engine_newpayloadv3>
     pub fn v3(
         payload: ExecutionPayloadV3,
         versioned_hashes: Vec<B256>,
@@ -188,7 +188,7 @@ impl ExecutionData {
 
     /// Creates a new instance from args to engine API method `newPayloadV4`.
     ///
-    /// Spec: <https://specs.optimism.io/protocol/exec-engine.html#engine_newpayloadv4>
+    /// Spec: <https://specs.base.org/protocol/execution#engine_newpayloadv4>
     pub fn v4(
         payload: BaseExecutionPayloadV4,
         versioned_hashes: Vec<B256>,
@@ -219,8 +219,8 @@ impl ExecutionData {
             BaseExecutionPayload::V3(execution_payload_v3) => {
                 Some(execution_payload_v3.withdrawals())
             }
-            BaseExecutionPayload::V4(op_execution_payload_v4) => {
-                Some(op_execution_payload_v4.payload_inner.withdrawals())
+            BaseExecutionPayload::V4(base_execution_payload_v4) => {
+                Some(base_execution_payload_v4.payload_inner.withdrawals())
             }
         }
     }
@@ -578,7 +578,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "serde")]
-    fn test_serde_roundtrip_op_execution_payload_envelope() {
+    fn test_serde_roundtrip_base_execution_payload_envelope() {
         let envelope_str = r#"{
             "executionPayload": {"parentHash":"0xe927a1448525fb5d32cb50ee1408461a945ba6c39bd5cf5621407d500ecc8de9","feeRecipient":"0x0000000000000000000000000000000000000000","stateRoot":"0x10f8a0830000e8edef6d00cc727ff833f064b1950afd591ae41357f97e543119","receiptsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","logsBloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","prevRandao":"0xe0d8b4521a7da1582a713244ffb6a86aa1726932087386e2dc7973f43fc6cb24","blockNumber":"0x1","gasLimit":"0x2ffbd2","gasUsed":"0x0","timestamp":"0x1235","extraData":"0xd883010d00846765746888676f312e32312e30856c696e7578","baseFeePerGas":"0x342770c0","blockHash":"0x44d0fa5f2f73a938ebb96a2a21679eb8dea3e7b7dd8fd9f35aa756dda8bf0a8a","transactions":[],"withdrawals":[],"blobGasUsed":"0x0","excessBlobGas":"0x0","withdrawalsRoot":"0x10f8a0830000e8edef6d00cc727ff833f064b1950afd591ae41357f97e543119"},
             "parentBeaconBlockRoot": "0x9999999999999999999999999999999999999999999999999999999999999999"

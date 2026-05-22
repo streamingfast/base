@@ -2,16 +2,21 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_rpc_types_eth::EIP1186AccountProofResponse;
 use async_trait::async_trait;
-use base_consensus_genesis::RollupConfig;
+use base_common_genesis::RollupConfig;
 use base_proof_contracts::{
-    AggregateVerifierClient, AnchorRoot, AnchorStateRegistryClient, ContractError,
-    DisputeGameFactoryClient, GameAtIndex, GameInfo,
+    AggregateVerifierClient, AnchorPreflight, AnchorRoot, AnchorSnapshot,
+    AnchorStateRegistryClient, ContractError, DisputeGameFactoryClient, GameAtIndex, GameInfo,
+    GameStatus,
 };
 use base_proof_primitives::{ProofResult, Proposal, ProverClient};
 use base_proof_rpc::{
@@ -128,19 +133,24 @@ impl RollupProvider for MockRollupClient {
             .unwrap_or_else(|| B256::repeat_byte(block_number as u8));
         Ok(OutputAtBlock { output_root: root, block_ref: test_l2_block_ref(block_number, root) })
     }
+    async fn fresh_output_at_block(&self, block_number: u64) -> RpcResult<OutputAtBlock> {
+        self.output_at_block(block_number).await
+    }
 }
 
 /// Mock anchor state registry contract client for tests.
 #[derive(Debug)]
 pub struct MockAnchorStateRegistry {
-    /// The anchor root returned by `get_anchor_root()`.
+    /// The anchor root returned by `anchor_snapshot()`.
     pub anchor_root: AnchorRoot,
+    /// The anchor game returned by `anchor_snapshot()`.
+    pub anchor_game: Address,
 }
 
 #[async_trait]
 impl AnchorStateRegistryClient for MockAnchorStateRegistry {
-    async fn get_anchor_root(&self) -> Result<AnchorRoot, ContractError> {
-        Ok(self.anchor_root)
+    async fn anchor_snapshot(&self) -> Result<AnchorSnapshot, ContractError> {
+        Ok(AnchorSnapshot { anchor_root: self.anchor_root, anchor_game: self.anchor_game })
     }
 }
 
@@ -162,6 +172,8 @@ pub struct MockDisputeGameFactory {
     pub uuid_games: HashMap<(u32, B256, Bytes), Address>,
     /// When true, all `games()` calls return an error.
     pub games_should_fail: bool,
+    /// Optional counter incremented on every `game_count()` call.
+    pub game_count_calls: Option<Arc<AtomicUsize>>,
 }
 
 impl MockDisputeGameFactory {
@@ -172,6 +184,7 @@ impl MockDisputeGameFactory {
             game_count_override: None,
             uuid_games: HashMap::new(),
             games_should_fail: false,
+            game_count_calls: None,
         }
     }
 }
@@ -179,6 +192,9 @@ impl MockDisputeGameFactory {
 #[async_trait]
 impl DisputeGameFactoryClient for MockDisputeGameFactory {
     async fn game_count(&self) -> Result<u64, ContractError> {
+        if let Some(calls) = &self.game_count_calls {
+            calls.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(self.game_count_override.unwrap_or(self.games.len() as u64))
     }
     async fn game_at_index(&self, index: u64) -> Result<GameAtIndex, ContractError> {
@@ -212,6 +228,8 @@ impl DisputeGameFactoryClient for MockDisputeGameFactory {
 pub struct MockAggregateVerifier {
     /// Map of game address to game info returned by `game_info()`.
     pub game_info_map: HashMap<Address, GameInfo>,
+    /// Map of game address to status returned by `status()`.
+    pub status_map: HashMap<Address, GameStatus>,
     /// Addresses for which `game_info()` returns an error.
     pub failing_addresses: HashSet<Address>,
     /// Map of game address to intermediate output roots.
@@ -239,8 +257,8 @@ impl AggregateVerifierClient for MockAggregateVerifier {
             parent_address: Address::ZERO,
         }))
     }
-    async fn status(&self, _: Address) -> Result<u8, ContractError> {
-        Ok(0)
+    async fn status(&self, addr: Address) -> Result<GameStatus, ContractError> {
+        Ok(self.status_map.get(&addr).copied().unwrap_or(GameStatus::InProgress))
     }
     async fn zk_prover(&self, _: Address) -> Result<Address, ContractError> {
         Ok(Address::ZERO)
@@ -309,6 +327,26 @@ impl AggregateVerifierClient for MockAggregateVerifier {
     }
     async fn delayed_weth(&self, _: Address) -> Result<Address, ContractError> {
         Ok(Address::ZERO)
+    }
+    async fn anchor_state_registry(&self, _: Address) -> Result<Address, ContractError> {
+        Ok(Address::ZERO)
+    }
+    async fn is_game_finalized(&self, _: Address, _: Address) -> Result<bool, ContractError> {
+        Ok(true)
+    }
+
+    async fn anchor_preflight(
+        &self,
+        _: Address,
+        _: Address,
+    ) -> Result<AnchorPreflight, ContractError> {
+        Ok(AnchorPreflight {
+            blacklisted: false,
+            retired: false,
+            respected: true,
+            paused: false,
+            anchor_root: AnchorRoot { root: B256::ZERO, l2_block_number: 0 },
+        })
     }
 }
 

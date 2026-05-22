@@ -3,14 +3,15 @@
 use std::sync::Arc;
 
 use base_cli_utils::{LogConfig, RuntimeManager};
+use base_proof_succinct_host_utils::fetcher::RPCConfig;
 use base_zk_client::prover_service_server::ProverServiceServer as ProtoProverServiceServer;
 use base_zk_db::{DatabaseConfig, ProofRequestRepo};
 use base_zk_outbox::{DatabaseOutboxReader, OutboxProcessor};
 use base_zk_service::{
-    ArtifactClientWrapper, ArtifactStorageConfig, BackendConfig, BackendRegistry, MockBackend,
-    NetworkBackend, OpSuccinctBackend, OpSuccinctProvider, ProofRequestManager,
-    ProverServiceServer, ProverWorkerPool, ProxyConfigs, RateLimitConfig, StatusPoller,
-    start_all_proxies,
+    ArtifactClientWrapper, ArtifactStorageConfig, BackendConfig, BackendRegistry,
+    OpSuccinctClusterBackend, OpSuccinctMockBackend, OpSuccinctNetworkBackend, OpSuccinctProvider,
+    ProofRequestManager, ProverServiceServer, ProverWorkerPool, ProxyConfigs, RateLimitConfig,
+    StatusPoller, start_all_proxies,
 };
 use clap::Parser;
 use eyre::eyre;
@@ -18,6 +19,7 @@ use http::header;
 use tonic::transport::Server;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tracing::info;
+use url::Url;
 
 base_cli_utils::define_log_args!("BASE_PROVER_ZK");
 base_cli_utils::define_metrics_args!("BASE_PROVER_ZK", 7301);
@@ -91,6 +93,14 @@ struct ZkArgs {
 
     #[arg(long, env = "STUCK_REQUEST_TIMEOUT_MINS", default_value_t = 10)]
     stuck_request_timeout_mins: i32,
+
+    #[arg(
+        long,
+        env = "MAX_PROOF_RETRIES",
+        default_value_t = 3,
+        value_parser = clap::value_parser!(i32).range(0..)
+    )]
+    max_proof_retries: i32,
 
     #[arg(long, env = "SP1_PROVER", default_value = "cluster")]
     prover_mode: String,
@@ -186,54 +196,47 @@ impl ZkArgs {
 
         info!(l1_url = %l1_url, l2_url = %l2_url, beacon_url = %beacon_url, "using RPC URLs");
 
-        // Set OP-Succinct environment variables required by the data fetcher.
-        // SAFETY: called before spawning any threads; the tokio runtime is
-        // single-threaded at this point so no concurrent reads can race.
-        unsafe {
-            std::env::set_var("L1_RPC", &l1_url);
-            std::env::set_var("L1_BEACON_RPC", &beacon_url);
-            std::env::set_var("L2_RPC", &l2_url);
-            std::env::set_var("L2_NODE_RPC", &self.base_consensus_address);
-        }
-
-        info!(
-            l1_rpc = %l1_url,
-            l1_beacon_rpc = %beacon_url,
-            l2_rpc = %l2_url,
-            l2_node_rpc = %self.base_consensus_address,
-            "set OP-Succinct RPC environment variables"
-        );
+        let rpc_config = RPCConfig {
+            l1_rpc: Url::parse(&l1_url).map_err(|e| eyre!("invalid L1 RPC URL: {e}"))?,
+            l1_beacon_rpc: Some(
+                Url::parse(&beacon_url).map_err(|e| eyre!("invalid beacon RPC URL: {e}"))?,
+            ),
+            l2_rpc: Url::parse(&l2_url).map_err(|e| eyre!("invalid L2 RPC URL: {e}"))?,
+            l2_node_rpc: Url::parse(&self.base_consensus_address)
+                .map_err(|e| eyre!("invalid L2 node RPC URL: {e}"))?,
+        };
 
         info!("computing range and aggregation verifying keys");
-        let (range_pk, range_vk, agg_pk, agg_vk) = base_succinct_proof_utils::cluster_setup_keys()
-            .await
-            .map_err(|e| eyre!("failed to compute verifying keys: {e}"))?;
+        let (range_pk, range_vk, agg_pk, agg_vk) =
+            base_proof_succinct_proof_utils::cluster_setup_keys()
+                .await
+                .map_err(|e| eyre!("failed to compute verifying keys: {e}"))?;
         info!("verifying keys computed successfully");
 
         let mut backend_registry = BackendRegistry::new();
 
         if self.prover_mode == "mock" {
             info!("SP1_PROVER=mock: using MockBackend (instant fake proofs, no cluster)");
-            let mock_backend = MockBackend::new(range_vk, agg_vk);
+            let mock_backend = OpSuccinctMockBackend::new(range_vk, agg_vk);
             backend_registry.register(Arc::new(mock_backend));
         } else if self.prover_mode == "network" {
-            info!("SP1_PROVER=network: using OP-Succinct SP1 Network backend");
+            info!("SP1_PROVER=network: using Succinct SP1 Network backend");
 
             let fetcher = Arc::new(
-                base_succinct_host_utils::fetcher::OPSuccinctDataFetcher::new_with_rollup_config()
+                base_proof_succinct_host_utils::fetcher::OPSuccinctDataFetcher::from_rpc_config_with_rollup_config(rpc_config)
                     .await
                     .map_err(|e| eyre!("failed to create OPSuccinctDataFetcher: {e}"))?,
             );
             let provider = OpSuccinctProvider::new(fetcher);
 
             let fulfillment_strategy =
-                base_succinct_host_utils::network::parse_fulfillment_strategy(
+                base_proof_succinct_host_utils::network::parse_fulfillment_strategy(
                     self.sp1_fulfillment_strategy.clone(),
                 )
                 .map_err(|e| eyre!("invalid fulfillment strategy: {e}"))?;
 
             let network_signer =
-                base_succinct_host_utils::network::get_network_signer(self.use_kms_requester)
+                base_proof_succinct_host_utils::network::get_network_signer(self.use_kms_requester)
                     .await
                     .map_err(|e| eyre!("failed to create network signer: {e}"))?;
 
@@ -273,15 +276,14 @@ impl ZkArgs {
                 timeout_hours: self.sp1_cluster_timeout_hours,
             };
 
-            let backend = Arc::new(NetworkBackend::new(provider, config));
+            let backend = Arc::new(OpSuccinctNetworkBackend::new(provider, config));
             backend_registry.register(backend);
         } else {
-            info!("SP1_PROVER=cluster: using OP-Succinct cluster backend");
+            info!("SP1_PROVER=cluster: using Succinct cluster backend");
 
-            // Create OP-Succinct data fetcher and provider.
-            info!("creating OP-Succinct data fetcher");
+            info!("creating Succinct data fetcher");
             let fetcher = Arc::new(
-                base_succinct_host_utils::fetcher::OPSuccinctDataFetcher::new_with_rollup_config()
+                base_proof_succinct_host_utils::fetcher::OPSuccinctDataFetcher::from_rpc_config_with_rollup_config(rpc_config)
                     .await
                     .map_err(|e| eyre!("failed to create OPSuccinctDataFetcher: {e}"))?,
             );
@@ -317,7 +319,7 @@ impl ZkArgs {
                 range_vk,
             };
 
-            let backend = Arc::new(OpSuccinctBackend::new(provider, config));
+            let backend = Arc::new(OpSuccinctClusterBackend::new(provider, config));
             backend_registry.register(backend);
         }
 
@@ -347,12 +349,14 @@ impl ZkArgs {
             manager.clone(),
             self.status_poller_interval_secs,
             self.stuck_request_timeout_mins,
+            self.max_proof_retries,
         );
         let status_handle = tokio::spawn(async move {
             status_poller.run().await;
         });
 
-        let prover_server = ProverServiceServer::new(repo.clone(), manager.clone());
+        let prover_server =
+            ProverServiceServer::new(repo.clone(), manager.clone(), self.max_proof_retries);
 
         let addr = self.grpc_listen_addr.parse()?;
 

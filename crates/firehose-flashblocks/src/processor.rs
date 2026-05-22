@@ -14,7 +14,7 @@ use base_common_chains::Upgrades;
 use base_common_consensus::{BasePrimitives, BaseTxEnvelope};
 use base_common_evm::{BaseBlockExecutionCtx, BaseBlockExecutor};
 use base_common_flashblocks::Flashblock;
-use base_execution_evm::{BaseEvmConfig, OpNextBlockEnvAttributes};
+use base_execution_evm::{BaseEvmConfig, BaseNextBlockEnvAttributes};
 use base_execution_firehose::{OpPostTxExtras, OpPreTxAdjust};
 use base_flashblocks::{
     AssembledBlock, BlockAssembler, FlashblockSequenceValidator, FlashblocksReceiver,
@@ -103,11 +103,7 @@ where
 {
     /// Creates a new processor backed by the supplied client (provider) and dedicated tracer.
     pub const fn new(client: Client, tracer: FlashblocksTracerHandle) -> Self {
-        Self {
-            client,
-            state: Mutex::new(ProcessorState::new()),
-            tracer: Mutex::new(tracer),
-        }
+        Self { client, state: Mutex::new(ProcessorState::new()), tracer: Mutex::new(tracer) }
     }
 
     /// Process a single flashblock event. Errors are logged and swallowed: the processor sets
@@ -130,9 +126,9 @@ where
 
         // Validate sequence vs current state.
         if let Some(latest_block) = state.current_block_number {
-            let latest_idx = state.latest_flashblock_index.expect(
-                "latest_flashblock_index must be Some when current_block_number is Some",
-            );
+            let latest_idx = state
+                .latest_flashblock_index
+                .expect("latest_flashblock_index must be Some when current_block_number is Some");
             match FlashblockSequenceValidator::validate(
                 latest_block,
                 latest_idx,
@@ -185,8 +181,7 @@ where
             } else {
                 debug!(
                     block = block_number,
-                    index,
-                    "skipping flashblock while in error-recovery state"
+                    index, "skipping flashblock while in error-recovery state"
                 );
                 return Ok(());
             }
@@ -265,10 +260,7 @@ where
 
     fn bootstrap_provider(&self, parent_block: u64) -> Option<BoxedStateProvider> {
         for attempt in 0..STATE_PROVIDER_MAX_RETRIES {
-            match self
-                .client
-                .state_by_block_number_or_tag(BlockNumberOrTag::Number(parent_block))
-            {
+            match self.client.state_by_block_number_or_tag(BlockNumberOrTag::Number(parent_block)) {
                 Ok(provider) => return Some(provider),
                 Err(err) => {
                     debug!(
@@ -294,10 +286,10 @@ where
         let block_number = assembled.base.block_number;
         let parent_hash = assembled.base.parent_hash;
 
-        let evm_config = BaseEvmConfig::optimism(self.client.chain_spec());
+        let evm_config = BaseEvmConfig::base(self.client.chain_spec());
         let receipt_builder = *evm_config.block_executor_factory().receipt_builder();
 
-        let block_env_attributes = OpNextBlockEnvAttributes {
+        let block_env_attributes = BaseNextBlockEnvAttributes {
             timestamp: assembled.base.timestamp,
             suggested_fee_recipient: assembled.base.fee_recipient,
             prev_randao: assembled.base.prev_randao,
@@ -318,11 +310,12 @@ where
                 source: Box::new(std::io::Error::other("parent header missing")),
             })?;
 
-        let evm_env = evm_config
-            .next_evm_env(&parent_header, &block_env_attributes)
-            .map_err(|e| Error::EvmEnv {
-                block_number,
-                source: Box::new(std::io::Error::other(e.to_string())),
+        let evm_env =
+            evm_config.next_evm_env(&parent_header, &block_env_attributes).map_err(|e| {
+                Error::EvmEnv {
+                    block_number,
+                    source: Box::new(std::io::Error::other(e.to_string())),
+                }
             })?;
 
         let txs_with_senders = self.decode_and_recover_transactions(new_transactions)?;
@@ -359,9 +352,7 @@ where
             FirehoseWrappedExecutor::with_hooks(inner, withdrawals, OpPreTxAdjust, OpPostTxExtras);
 
         if index == 0 {
-            executor
-                .apply_pre_execution_changes()
-                .map_err(|e| Error::Execution(Box::new(e)))?;
+            executor.apply_pre_execution_changes().map_err(|e| Error::Execution(Box::new(e)))?;
         }
 
         let new_tx_count = new_transactions.len();
@@ -402,13 +393,12 @@ where
             .iter()
             .enumerate()
             .map(|(tx_index, bytes)| {
-                let tx =
-                    BaseTxEnvelope::decode_2718(&mut bytes.as_ref()).map_err(|err| {
-                        Error::TransactionDecoding {
-                            tx_index,
-                            message: format!("RLP decode failed: {err}"),
-                        }
-                    })?;
+                let tx = BaseTxEnvelope::decode_2718(&mut bytes.as_ref()).map_err(|err| {
+                    Error::TransactionDecoding {
+                        tx_index,
+                        message: format!("RLP decode failed: {err}"),
+                    }
+                })?;
                 let signer = tx.recover_signer().map_err(|err| Error::TransactionDecoding {
                     tx_index,
                     message: format!("sender recovery failed: {err}"),

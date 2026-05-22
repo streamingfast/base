@@ -7,8 +7,11 @@ base_metrics::define_metrics! {
     #[describe("Challenger is running")]
     up: gauge,
 
-    #[describe("Total number of games evaluated during scanning")]
+    #[describe("Total number of game indices evaluated during scanning, including tracked games")]
     games_scanned_total: counter,
+
+    #[describe("Number of in-progress game indices retained by the game scanner")]
+    scan_tracked_in_progress: gauge,
 
     #[describe("Latest factory index scanned by the game scanner")]
     scan_head: gauge,
@@ -103,6 +106,28 @@ base_metrics::define_metrics! {
     #[label(name = "error_type", default = ["game_fetch", "bond_read", "phase_read"])]
     bond_evaluation_errors_total: counter,
 
+    #[describe("Total anchor state update transaction outcomes")]
+    #[label(name = "status", default = ["success", "error", "skipped"])]
+    anchor_update_tx_outcome_total: counter,
+
+    #[describe(
+        "Number of otherwise-removable games currently retained while awaiting anchor state update"
+    )]
+    anchor_update_retained_games: gauge,
+
+    #[describe(
+        "Total games retained past bond lifecycle completion while awaiting anchor state update"
+    )]
+    anchor_update_retained_games_total: counter,
+
+    #[describe(
+        "L2 block number of the most recent anchor state successfully advanced by this challenger. \
+         Monotonically increases as the challenger drives the anchor forward; absent until the \
+         first successful setAnchorState() observation."
+    )]
+    #[no_zero]
+    anchor_l2_block_number: gauge,
+
     #[describe("Challenger account balance in wei")]
     account_balance_wei: gauge,
 }
@@ -120,6 +145,9 @@ impl ChallengerMetrics {
     /// Label value when a resolve was skipped because the game was already
     /// resolved on-chain (e.g. by another actor).
     pub const STATUS_ALREADY_RESOLVED: &str = "already_resolved";
+
+    /// Label value when an anchor update was skipped (game not eligible).
+    pub const STATUS_SKIPPED: &str = "skipped";
 
     /// Label value for a game fetch failure during bond evaluation.
     pub const EVAL_ERROR_GAME_FETCH: &str = "game_fetch";

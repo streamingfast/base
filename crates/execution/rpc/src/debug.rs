@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use base_common_chains::Upgrades;
 use base_execution_payload_builder::{
     Attributes, PayloadPrimitives,
-    builder::{Builder, OpPayloadBuilderCtx},
+    builder::{BasePayloadBuilderCtx, Builder},
 };
 use base_execution_trie::{BaseProofsStorage, BaseProofsStore};
 use base_execution_txpool::BasePooledTransaction;
@@ -33,7 +33,7 @@ use reth_rpc_eth_types::EthApiError;
 use reth_rpc_server_types::{ToRpcResult, result::internal_rpc_err};
 use reth_tasks::TaskSpawner;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::oneshot;
 
 use crate::{
     metrics::{DebugApiExtMetrics, DebugApis},
@@ -70,7 +70,7 @@ pub trait DebugApiOverride<Attributes> {
 }
 
 #[derive(Debug)]
-/// Overrides applied to the `debug_` namespace of the RPC API for the OP Proofs `ExEx`.
+/// Overrides applied to the `debug_` namespace of the RPC API for the proofs `ExEx`.
 pub struct DebugApiExt<Eth: FullEthApi, Storage, Provider, EvmConfig, Attrs> {
     inner: Arc<DebugApiExtInner<Eth, Storage, Provider, EvmConfig, Attrs>>,
 }
@@ -112,7 +112,6 @@ pub struct DebugApiExtInner<Eth: FullEthApi, Storage, Provider, EvmConfig, Attrs
     state_provider_factory: BaseStateProviderFactory<Eth, Storage>,
     evm_config: EvmConfig,
     task_spawner: Box<dyn TaskSpawner>,
-    semaphore: Semaphore,
     _attrs: PhantomData<Attrs>,
 }
 
@@ -137,7 +136,6 @@ where
             eth_api,
             evm_config,
             task_spawner,
-            semaphore: Semaphore::new(3),
             _attrs: PhantomData,
         }
     }
@@ -193,8 +191,6 @@ where
         attributes: Attrs::RpcPayloadAttributes,
     ) -> RpcResult<ExecutionWitness> {
         DebugApiExtMetrics::record_operation_async(DebugApis::DebugExecutePayload, async {
-            let _permit = self.inner.semaphore.acquire().await;
-
             let parent_header = self.parent_header(parent_block_hash).to_rpc_result()?;
 
             let (tx, rx) = oneshot::channel();
@@ -207,7 +203,7 @@ where
 
                     let config =
                         PayloadConfig { parent_header: Arc::new(parent_header), attributes };
-                    let ctx = OpPayloadBuilderCtx {
+                    let ctx = BasePayloadBuilderCtx {
                         evm_config: this.evm_config.clone(),
                         chain_spec: this.provider.chain_spec(),
                         config,
@@ -246,8 +242,6 @@ where
 
     async fn execution_witness(&self, block_id: BlockNumberOrTag) -> RpcResult<ExecutionWitness> {
         DebugApiExtMetrics::record_operation_async(DebugApis::DebugExecutionWitness, async {
-            let _permit = self.inner.semaphore.acquire().await;
-
             let block = self
                 .inner
                 .eth_api

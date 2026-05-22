@@ -4,13 +4,13 @@ use base_common_consensus::{BaseReceipt, BaseTransactionSigned, OpTxType};
 use base_common_evm::BaseReceiptBuilder;
 use reth_evm::Evm;
 
-/// A builder that operates on op-reth primitive types, specifically [`BaseTransactionSigned`] and
+/// A builder that operates on Base primitive types, specifically [`BaseTransactionSigned`] and
 /// [`BaseReceipt`].
 #[derive(Debug, Default, Clone, Copy)]
 #[non_exhaustive]
-pub struct OpRethReceiptBuilder;
+pub struct BaseRethReceiptBuilder;
 
-impl BaseReceiptBuilder for OpRethReceiptBuilder {
+impl BaseReceiptBuilder for BaseRethReceiptBuilder {
     type Transaction = BaseTransactionSigned;
     type Receipt = BaseReceipt;
 

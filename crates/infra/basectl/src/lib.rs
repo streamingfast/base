@@ -3,9 +3,9 @@
 mod app;
 pub use app::{
     Action, App, CommandCenterView, ConductorState, ConductorView, ConfigView, DaMonitorView,
-    DaState, FlashState, FlashblocksView, HomeView, LoadTestTask, LoadTestView, ProofsState,
-    ProofsView, Resources, Router, TransactionPane, UpgradesView, ValidatorState, View, ViewId,
-    create_view, run_app, run_flashblocks_json, start_background_services,
+    DaState, FlashState, FlashblocksView, HomeView, ProofsState, ProofsView, Resources, Router,
+    TransactionPane, UpgradesView, ValidatorState, View, ViewId, create_view, run_app,
+    run_flashblocks_json, start_background_services,
 };
 
 mod commands;
@@ -21,7 +21,7 @@ pub use commands::{
 };
 
 mod config;
-pub use config::{ChainConfig, ConductorNodeConfig, ProofsConfig, ValidatorNodeConfig};
+pub use config::{ConductorNodeConfig, MonitoringConfig, ProofsConfig, ValidatorNodeConfig};
 
 mod l1_client;
 pub use l1_client::fetch_full_system_config;

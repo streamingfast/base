@@ -1,4 +1,4 @@
-//! State provider factory for OP Proofs `ExEx`.
+//! State provider factory for Base Proofs `ExEx`.
 
 use alloy_eips::BlockId;
 use base_execution_trie::{
@@ -9,7 +9,7 @@ use reth_provider::{BlockIdReader, ProviderError, ProviderResult, StateProvider}
 use reth_rpc_api::eth::helpers::FullEthApi;
 use reth_rpc_eth_types::EthApiError;
 
-/// Creates a factory for state providers using OP Proofs external proofs storage.
+/// Creates a factory for state providers using external proofs storage.
 #[derive(Debug)]
 pub struct BaseStateProviderFactory<Eth, P> {
     eth_api: Eth,

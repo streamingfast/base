@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "OP-Reth Transaction Pool"
+description = "Base Transaction Pool"
 
 [lints]
 workspace = true
@@ -30,6 +30,7 @@ reth-primitives-traits.workspace = true
 base-common-flz.workspace = true
 base-common-chains.workspace = true
 base-common-evm.workspace = true
+base-common-genesis.workspace = true
 base-execution-evm.workspace = true
 base-common-consensus = { workspace = true, features = ["reth"] }
 
@@ -43,6 +44,7 @@ serde.workspace = true
 c-kzg.workspace = true
 futures.workspace = true
 tracing.workspace = true
+thiserror.workspace = true
 tokio-util.workspace = true
 async-trait.workspace = true
 derive_more.workspace = true
@@ -52,6 +54,8 @@ tokio = { workspace = true, features = ["sync", "rt", "time"] }
 jsonrpsee = { workspace = true, features = ["http-client", "server", "macros"] }
 
 [dev-dependencies]
+alloy-signer.workspace = true
+alloy-signer-local.workspace = true
 base-test-utils.workspace = true
 base-execution-chainspec.workspace = true
 reth-provider = { workspace = true, features = ["test-utils"] }

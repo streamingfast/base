@@ -1,8 +1,8 @@
 //! The [`Engine`] is a task queue that receives and executes [`EngineTask`]s.
 
-use std::{collections::BinaryHeap, sync::Arc};
+use std::{cmp::Reverse, collections::BinaryHeap, sync::Arc};
 
-use base_consensus_genesis::RollupConfig;
+use base_common_genesis::RollupConfig;
 use base_protocol::{BaseBlockConversionError, L2BlockInfo};
 use thiserror::Error;
 use tokio::sync::watch::Sender;
@@ -26,7 +26,9 @@ use crate::{
 ///
 /// Tasks within the queue are also considered fallible. If they fail with a temporary error,
 /// they are not popped from the queue, the error is returned, and they are retried on the
-/// next call to [`Engine::drain`].
+/// next call to [`Engine::drain`]. Tasks that fail with a [`EngineTaskErrorSeverity::Flush`]
+/// error are popped from the queue before the error is returned, so that the derivation
+/// pipeline can be flushed without the offending task being retried in-place.
 #[derive(Debug)]
 pub struct Engine<EngineClient_: EngineClient> {
     /// The state of the engine.
@@ -36,7 +38,9 @@ pub struct Engine<EngineClient_: EngineClient> {
     /// A sender that can be used to notify the engine actor of task queue length changes.
     task_queue_length: Sender<usize>,
     /// The task queue.
-    tasks: BinaryHeap<EngineTask<EngineClient_>>,
+    tasks: BinaryHeap<(EngineTask<EngineClient_>, Reverse<u64>)>,
+    /// Monotonic sequence number used to preserve FIFO order within equal-priority tasks.
+    next_task_sequence: u64,
 }
 
 impl<EngineClient_: EngineClient> Engine<EngineClient_> {
@@ -46,7 +50,13 @@ impl<EngineClient_: EngineClient> Engine<EngineClient_> {
         state_sender: Sender<EngineState>,
         task_queue_length: Sender<usize>,
     ) -> Self {
-        Self { state: initial_state, state_sender, task_queue_length, tasks: BinaryHeap::default() }
+        Self {
+            state: initial_state,
+            state_sender,
+            task_queue_length,
+            tasks: BinaryHeap::default(),
+            next_task_sequence: 0,
+        }
     }
 
     /// Returns a reference to the inner [`EngineState`].
@@ -67,7 +77,10 @@ impl<EngineClient_: EngineClient> Engine<EngineClient_> {
     /// Enqueues a new [`EngineTask`] for execution.
     /// Updates the queue length and notifies listeners of the change.
     pub fn enqueue(&mut self, task: EngineTask<EngineClient_>) {
-        self.tasks.push(task);
+        let sequence = self.next_task_sequence;
+        self.next_task_sequence =
+            self.next_task_sequence.checked_add(1).expect("engine task sequence overflow");
+        self.tasks.push((task, Reverse(sequence)));
         self.task_queue_length.send_replace(self.tasks.len());
         Metrics::engine_task_queue_depth().set(self.tasks.len() as f64);
     }
@@ -112,7 +125,7 @@ impl<EngineClient_: EngineClient> Engine<EngineClient_> {
             }
         }
 
-        // Broadcast the updated state so watch-channel subscribers (e.g. op_syncStatus RPC)
+        // Broadcast the updated state so watch-channel subscribers (e.g. sync-status RPC)
         // see the new forkchoice immediately, without waiting for a task to pass through drain().
         self.state_sender.send_replace(self.state);
 
@@ -123,7 +136,7 @@ impl<EngineClient_: EngineClient> Engine<EngineClient_> {
 
     /// Seeds the engine sync state from an external source without sending a forkchoice update.
     ///
-    /// Pre-populates the [`EngineState`] watch channel so that callers such as `op_syncStatus`
+    /// Pre-populates the [`EngineState`] watch channel so that callers such as sync-status RPC
     /// never observe zeros during the bootstrap window. `el_sync_finished` is left unchanged —
     /// the engine has not confirmed validity via FCU and the existing reset-deferral logic must
     /// continue to gate on it.
@@ -164,16 +177,31 @@ impl<EngineClient_: EngineClient> Engine<EngineClient_> {
     /// Clears the task queue.
     pub fn clear(&mut self) {
         self.tasks.clear();
+        self.next_task_sequence = 0;
+        self.task_queue_length.send_replace(0);
+        Metrics::engine_task_queue_depth().set(0.0);
     }
 
     /// Attempts to drain the queue by executing all [`EngineTask`]s in-order. If any task returns
     /// an error along the way, it is not popped from the queue (in case it must be retried) and
     /// the error is returned.
+    ///
+    /// Exception: tasks that fail with [`EngineTaskErrorSeverity::Flush`] are popped from the
+    /// queue before the error is returned. The poisoned task must not be retried in-place — the
+    /// engine processor will signal the derivation pipeline to flush its buffered batch/channel
+    /// state and the next call to [`Engine::drain`] will proceed with the remaining tasks. Any
+    /// [`EngineState`] mutations the task made before failing are published to subscribers prior
+    /// to popping, mirroring the success path so watch consumers (e.g. the RPC state view) stay
+    /// in sync.
     pub async fn drain(&mut self) -> Result<(), EngineTaskErrors> {
         // Drain tasks in order of priority, halting on errors for a retry to be attempted.
-        while let Some(task) = self.tasks.peek() {
-            // Execute the task
-            task.execute(&mut self.state).await?;
+        while let Some((task, _)) = self.tasks.peek() {
+            // Execute the task.
+            let outcome = match task.execute(&mut self.state).await {
+                Ok(()) => Ok(()),
+                Err(err) if err.severity() == EngineTaskErrorSeverity::Flush => Err(err),
+                Err(err) => return Err(err),
+            };
 
             // Update the state and notify the engine actor.
             self.state_sender.send_replace(self.state);
@@ -183,6 +211,8 @@ impl<EngineClient_: EngineClient> Engine<EngineClient_> {
 
             self.task_queue_length.send_replace(self.tasks.len());
             Metrics::engine_task_queue_depth().set(self.tasks.len() as f64);
+
+            outcome?;
         }
 
         Ok(())
@@ -207,14 +237,31 @@ pub enum EngineResetError {
 mod tests {
     use std::sync::Arc;
 
-    use alloy_rpc_types_engine::{ForkchoiceUpdated, PayloadStatus, PayloadStatusEnum};
-    use base_consensus_genesis::RollupConfig;
+    use alloy_primitives::FixedBytes;
+    use alloy_rpc_types_engine::{ForkchoiceUpdated, PayloadId, PayloadStatus, PayloadStatusEnum};
+    use base_common_genesis::RollupConfig;
     use tokio::sync::watch;
 
     use crate::{
-        Engine, EngineState, EngineSyncStateUpdate,
-        test_utils::{test_block_info, test_engine_client_builder},
+        BuildTask, Engine, EngineState, EngineSyncStateUpdate, EngineTask, EngineTaskError,
+        EngineTaskErrorSeverity, EngineTaskErrors, GetPayloadTask, InsertPayloadSafety, SealTask,
+        test_utils::{
+            TestAttributesBuilder, TestEngineStateBuilder, test_block_info,
+            test_engine_client_builder,
+        },
     };
+
+    fn invalid_fcu() -> ForkchoiceUpdated {
+        ForkchoiceUpdated {
+            payload_status: PayloadStatus {
+                status: PayloadStatusEnum::Invalid {
+                    validation_error: "malformed transaction".into(),
+                },
+                latest_valid_hash: Some(FixedBytes([2u8; 32])),
+            },
+            payload_id: None,
+        }
+    }
 
     fn syncing_fcu() -> ForkchoiceUpdated {
         ForkchoiceUpdated {
@@ -234,6 +281,122 @@ mod tests {
             },
             payload_id: None,
         }
+    }
+
+    fn test_engine() -> Engine<crate::test_utils::MockEngineClient> {
+        let (state_tx, _) = watch::channel(EngineState::default());
+        let (queue_tx, _) = watch::channel(0usize);
+        Engine::new(EngineState::default(), state_tx, queue_tx)
+    }
+
+    #[test]
+    fn equal_priority_build_tasks_are_fifo() {
+        let client = Arc::new(test_engine_client_builder().build());
+        let cfg = Arc::new(RollupConfig::default());
+        let mut engine = test_engine();
+
+        let first_timestamp = 1;
+        let second_timestamp = 2;
+
+        engine.enqueue(EngineTask::Build(Box::new(BuildTask::new(
+            Arc::clone(&client),
+            Arc::clone(&cfg),
+            TestAttributesBuilder::new().with_timestamp(first_timestamp).build(),
+            None,
+        ))));
+        engine.enqueue(EngineTask::Build(Box::new(BuildTask::new(
+            Arc::clone(&client),
+            Arc::clone(&cfg),
+            TestAttributesBuilder::new().with_timestamp(second_timestamp).build(),
+            None,
+        ))));
+
+        let (first, _) = engine.tasks.pop().expect("first task should be queued");
+        let (second, _) = engine.tasks.pop().expect("second task should be queued");
+
+        match first {
+            EngineTask::Build(task) => {
+                assert_eq!(
+                    task.attributes.attributes().payload_attributes.timestamp,
+                    first_timestamp
+                );
+            }
+            other => panic!("expected first build task, got {other:?}"),
+        }
+
+        match second {
+            EngineTask::Build(task) => {
+                assert_eq!(
+                    task.attributes.attributes().payload_attributes.timestamp,
+                    second_timestamp
+                );
+            }
+            other => panic!("expected second build task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn equal_priority_seal_and_get_payload_tasks_are_fifo() {
+        let client = Arc::new(test_engine_client_builder().build());
+        let cfg = Arc::new(RollupConfig::default());
+        let attributes = TestAttributesBuilder::new().build();
+        let mut engine = test_engine();
+        let first_payload_id = PayloadId::new([1; 8]);
+        let second_payload_id = PayloadId::new([2; 8]);
+
+        engine.enqueue(EngineTask::Seal(Box::new(SealTask::new(
+            Arc::clone(&client),
+            Arc::clone(&cfg),
+            first_payload_id,
+            attributes.clone(),
+            InsertPayloadSafety::Unsafe,
+            None,
+        ))));
+        engine.enqueue(EngineTask::GetPayload(Box::new(GetPayloadTask::new(
+            Arc::clone(&client),
+            Arc::clone(&cfg),
+            second_payload_id,
+            attributes,
+            None,
+        ))));
+
+        let (first, _) = engine.tasks.pop().expect("first task should be queued");
+        let (second, _) = engine.tasks.pop().expect("second task should be queued");
+
+        match first {
+            EngineTask::Seal(task) => {
+                assert_eq!(task.payload_id, first_payload_id);
+            }
+            other => panic!("expected first seal task, got {other:?}"),
+        }
+
+        match second {
+            EngineTask::GetPayload(task) => {
+                assert_eq!(task.payload_id, second_payload_id);
+            }
+            other => panic!("expected second get-payload task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clear_publishes_zero_queue_length() {
+        let (state_tx, _) = watch::channel(EngineState::default());
+        let (queue_tx, queue_rx) = watch::channel(0usize);
+        let client = Arc::new(test_engine_client_builder().build());
+        let cfg = Arc::new(RollupConfig::default());
+        let mut engine = Engine::new(EngineState::default(), state_tx, queue_tx);
+
+        engine.enqueue(EngineTask::Build(Box::new(BuildTask::new(
+            client,
+            cfg,
+            TestAttributesBuilder::new().build(),
+            None,
+        ))));
+        assert_eq!(*queue_rx.borrow(), 1);
+
+        engine.clear();
+
+        assert_eq!(*queue_rx.borrow(), 0);
     }
 
     #[tokio::test]
@@ -324,5 +487,93 @@ mod tests {
         // el_sync_finished stays false despite Valid being configured.
         assert!(!confirmed, "probe after seed short-circuits — documents the invariant");
         assert!(!engine.state().el_sync_finished);
+    }
+
+    /// Regression test: a [`BuildTask`] whose attr-bearing FCU returns
+    /// `PayloadStatusEnum::Invalid` must surface as [`EngineTaskErrorSeverity::Flush`] and the
+    /// poisoned task must be popped from the head of the queue, otherwise the engine processor
+    /// would re-execute the same task on every drain and starve every later request behind it.
+    #[tokio::test]
+    async fn drain_pops_head_on_flush_severity() {
+        let parent_block = test_block_info(0);
+        let unsafe_block = test_block_info(1);
+        let attributes_timestamp = unsafe_block.block_info.timestamp;
+
+        let mut cfg = RollupConfig::default();
+        // Force the FCU-with-attrs codepath through V3 (Ecotone active at attr timestamp).
+        cfg.hardforks.ecotone_time = Some(attributes_timestamp);
+
+        let client = Arc::new(
+            test_engine_client_builder()
+                .with_fork_choice_updated_v3_response(invalid_fcu())
+                .build(),
+        );
+        let cfg = Arc::new(cfg);
+
+        let attributes = TestAttributesBuilder::new()
+            .with_parent(parent_block)
+            .with_timestamp(attributes_timestamp)
+            .build();
+
+        let initial_state = TestEngineStateBuilder::new()
+            .with_unsafe_head(unsafe_block)
+            .with_safe_head(parent_block)
+            .with_finalized_head(parent_block)
+            .build();
+
+        let (state_tx, _state_rx) = watch::channel(initial_state);
+        let (queue_tx, queue_rx) = watch::channel(0usize);
+        let mut engine = Engine::new(initial_state, state_tx, queue_tx);
+
+        // Head: poisoned build task. Tail: a follow-up build task that should remain queued so
+        // we can also assert that drain only removes the failing head, not the rest of the
+        // queue (queued tasks may still be valid since they were enqueued from independent
+        // requests).
+        engine.enqueue(EngineTask::Build(Box::new(BuildTask::new(
+            Arc::clone(&client),
+            Arc::clone(&cfg),
+            attributes.clone(),
+            None,
+        ))));
+        engine.enqueue(EngineTask::Build(Box::new(BuildTask::new(
+            Arc::clone(&client),
+            Arc::clone(&cfg),
+            attributes,
+            None,
+        ))));
+        assert_eq!(*queue_rx.borrow(), 2);
+
+        let err = engine.drain().await.expect_err("invalid FCU must fail drain");
+        match &err {
+            EngineTaskErrors::Build(build_err) => assert_eq!(
+                build_err.severity(),
+                EngineTaskErrorSeverity::Flush,
+                "InvalidPayload must surface as Flush"
+            ),
+            other => panic!("expected Build error, got {other:?}"),
+        }
+        assert_eq!(err.severity(), EngineTaskErrorSeverity::Flush);
+
+        // Poisoned head popped, follow-up still in queue, metrics watch updated.
+        assert_eq!(engine.tasks.len(), 1, "only the poisoned head should be popped on Flush");
+        assert_eq!(*queue_rx.borrow(), 1, "queue length watch must be republished after pop");
+
+        // Now flip the EL's response to a valid FCU and re-drain. This proves that drain
+        // *resumes* after a flush — the surviving follow-up task must execute and be popped,
+        // emptying the queue. Without the head-pop fix, this second drain would re-execute the
+        // poisoned task forever and never reach the follow-up.
+        client
+            .set_fork_choice_updated_v3_response(ForkchoiceUpdated {
+                payload_status: PayloadStatus {
+                    status: PayloadStatusEnum::Valid,
+                    latest_valid_hash: Some(FixedBytes([3u8; 32])),
+                },
+                payload_id: Some(PayloadId::new([7u8; 8])),
+            })
+            .await;
+
+        engine.drain().await.expect("drain must succeed once the EL accepts the follow-up");
+        assert_eq!(engine.tasks.len(), 0, "follow-up task should drain to completion");
+        assert_eq!(*queue_rx.borrow(), 0, "queue length watch must reflect empty queue");
     }
 }

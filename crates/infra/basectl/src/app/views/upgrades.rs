@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashMap,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base_common_chains::ChainConfig;
@@ -80,7 +80,8 @@ fn specs_from_config(cfg: &ChainConfig) -> Vec<UpgradeSpec> {
         UpgradeSpec { name: "Holocene", timestamp: Some(cfg.holocene_timestamp) },
         UpgradeSpec { name: "Isthmus", timestamp: Some(cfg.isthmus_timestamp) },
         UpgradeSpec { name: "Jovian", timestamp: Some(cfg.jovian_timestamp) },
-        UpgradeSpec { name: "V1", timestamp: cfg.base_v1_timestamp },
+        UpgradeSpec { name: "Azul", timestamp: cfg.azul_timestamp },
+        UpgradeSpec { name: "Beryl", timestamp: cfg.beryl_timestamp },
     ]
 }
 
@@ -103,8 +104,8 @@ fn all_chains() -> [ChainUpgrades; 4] {
     [
         ChainUpgrades {
             display_name: "Devnet",
-            rpc: user_config_rpc("alpha").or_else(|| user_config_rpc("devnet")),
-            specs: specs_from_config(ChainConfig::alpha()),
+            rpc: user_config_rpc("devnet"),
+            specs: specs_from_config(ChainConfig::devnet()),
         },
         ChainUpgrades {
             display_name: "Zeronet",
@@ -128,8 +129,8 @@ fn all_chains() -> [ChainUpgrades; 4] {
 
 // ── Check types ───────────────────────────────────────────────────────────────
 
-/// Expected check names for V1, in execution order.
-const V1_CHECK_NAMES: &[&str] = &[
+/// Expected check names for Azul, in execution order.
+const AZUL_CHECK_NAMES: &[&str] = &[
     "CLZ zero",
     "CLZ one",
     "CLZ high-bit",
@@ -145,7 +146,7 @@ const JOVIAN_CHECK_NAMES: &[&str] = &["bn256Pairing limit", "extra data v1", "GP
 
 fn check_names_for(hardfork: &str) -> &'static [&'static str] {
     match hardfork {
-        "V1" => V1_CHECK_NAMES,
+        "Azul" => AZUL_CHECK_NAMES,
         "Jovian" => JOVIAN_CHECK_NAMES,
         _ => &[],
     }
@@ -198,6 +199,10 @@ struct ChecksPanel {
     running: bool,
     rx: Option<mpsc::Receiver<CheckUpdate>>,
     handle: Option<JoinHandle<()>>,
+    /// Wall-clock instant the most recent run was started. Used to throttle
+    /// auto-refresh so we don't re-issue checks faster than the configured
+    /// cadence even if the previous run finished quickly.
+    last_run_at: Option<Instant>,
 }
 
 impl ChecksPanel {
@@ -208,15 +213,26 @@ impl ChecksPanel {
         hardfork: &'static str,
         mode: CheckMode,
     ) {
+        if let Some(h) = self.handle.take() {
+            h.abort();
+        }
         let (tx, rx) = mpsc::channel(64);
+        let chain_changed = self.chain_idx != Some(chain_idx);
+        let hardfork_changed = self.hardfork != Some(hardfork);
         self.chain_idx = Some(chain_idx);
         self.hardfork = Some(hardfork);
         self.mode = Some(mode);
         self.rpc_url = rpc_url.clone();
         self.current = None;
-        self.results.clear();
+        // Preserve previous results across auto-refreshes so the table updates
+        // in-place rather than blanking on every tick. Only clear when the
+        // target context actually changed.
+        if chain_changed || hardfork_changed {
+            self.results.clear();
+        }
         self.running = true;
         self.rx = Some(rx);
+        self.last_run_at = Some(Instant::now());
         self.handle = Some(tokio::spawn(run_checks_streaming(hardfork, rpc_url, mode, tx)));
     }
 
@@ -232,6 +248,7 @@ impl ChecksPanel {
         self.results.clear();
         self.running = false;
         self.rx = None;
+        self.last_run_at = None;
     }
 
     fn poll(&mut self) {
@@ -239,6 +256,11 @@ impl ChecksPanel {
         loop {
             match rx.try_recv() {
                 Ok(CheckUpdate::Starting(name)) => {
+                    // Drop any prior result for this check so the row shows the
+                    // spinner instead of a stale PASS/FAIL while the re-run is
+                    // in flight. Without this, an auto-refresh would silently
+                    // display old verdicts until each check completes again.
+                    self.results.remove(&name);
                     self.current = Some(name);
                 }
                 Ok(CheckUpdate::Completed { name, result }) => {
@@ -330,10 +352,14 @@ fn fmt_elapsed(elapsed_secs: u64) -> String {
 const KEYBINDINGS: &[Keybinding] = &[
     Keybinding { key: "←/→", description: "Switch chain" },
     Keybinding { key: "1-4", description: "Jump to chain" },
-    Keybinding { key: "r", description: "Run checks" },
+    Keybinding { key: "r", description: "Run checks now" },
+    Keybinding { key: "a", description: "Toggle auto-refresh" },
     Keybinding { key: "Esc", description: "Back to home" },
     Keybinding { key: "?", description: "Toggle help" },
 ];
+
+/// Cadence at which checks are re-run when auto-refresh is enabled.
+const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Network upgrade activation countdown and history view.
 #[derive(Debug)]
@@ -342,6 +368,9 @@ pub struct UpgradesView {
     selected_chain: usize,
     tick_count: u64,
     checks: ChecksPanel,
+    /// When true, re-run the activation checks on the configured cadence
+    /// without requiring the user to press [r].
+    auto_refresh: bool,
 }
 
 impl Default for UpgradesView {
@@ -367,8 +396,26 @@ impl UpgradesView {
                 running: false,
                 rx: None,
                 handle: None,
+                last_run_at: None,
             },
+            auto_refresh: true,
         }
+    }
+
+    /// Kick off an activation-check run for the currently selected chain, if
+    /// the chain has a hardfork with defined checks and a usable RPC URL.
+    fn start_checks(&mut self, resources: &Resources) {
+        let now = now_unix();
+        let chain = &self.chains[self.selected_chain];
+        let Some(spec) =
+            target_hardfork(chain).and_then(|name| chain.specs.iter().find(|s| s.name == name))
+        else {
+            return;
+        };
+        let ts = spec.timestamp.unwrap();
+        let Some(rpc) = self.rpc_for_selected(resources) else { return };
+        let mode = if ts > now { CheckMode::Before } else { CheckMode::After };
+        self.checks.start(self.selected_chain, rpc, spec.name, mode);
     }
 
     fn rpc_for_selected(&self, resources: &Resources) -> Option<String> {
@@ -411,29 +458,27 @@ impl View for UpgradesView {
                 }
             }
             KeyCode::Char('r') if !self.checks.running => {
-                let now = now_unix();
-                let chain = &self.chains[self.selected_chain];
-                // Find the last hardfork that has a scheduled timestamp and has
-                // defined checks. This lets mainnet run Jovian checks instead of
-                // silently doing nothing when V1 has no timestamp.
-                if let Some(spec) = target_hardfork(chain)
-                    .and_then(|name| chain.specs.iter().find(|s| s.name == name))
-                {
-                    let ts = spec.timestamp.unwrap();
-                    if let Some(rpc) = self.rpc_for_selected(resources) {
-                        let mode = if ts > now { CheckMode::Before } else { CheckMode::After };
-                        self.checks.start(self.selected_chain, rpc, spec.name, mode);
-                    }
-                }
+                self.start_checks(resources);
+            }
+            KeyCode::Char('a') => {
+                self.auto_refresh = !self.auto_refresh;
             }
             _ => {}
         }
         Action::None
     }
 
-    fn tick(&mut self, _resources: &mut Resources) -> Action {
+    fn tick(&mut self, resources: &mut Resources) -> Action {
         self.tick_count = self.tick_count.wrapping_add(1);
         self.checks.poll();
+
+        if self.auto_refresh && !self.checks.running {
+            let due = self.checks.last_run_at.is_none_or(|t| t.elapsed() >= AUTO_REFRESH_INTERVAL);
+            if due {
+                self.start_checks(resources);
+            }
+        }
+
         Action::None
     }
 
@@ -513,8 +558,15 @@ impl View for UpgradesView {
 
         render_history(frame, bottom[0], chain, now);
         let active_hf = target_hardfork(chain);
-        render_checks_panel(frame, bottom[1], &self.checks, self.tick_count, active_hf);
-        render_footer(frame, outer[3], self.checks.running);
+        render_checks_panel(
+            frame,
+            bottom[1],
+            &self.checks,
+            self.tick_count,
+            active_hf,
+            self.auto_refresh,
+        );
+        render_footer(frame, outer[3], self.checks.running, self.auto_refresh);
     }
 }
 
@@ -727,6 +779,7 @@ fn render_checks_panel(
     panel: &ChecksPanel,
     tick: u64,
     active_hardfork: Option<&'static str>,
+    auto_refresh: bool,
 ) {
     let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -734,7 +787,11 @@ fn render_checks_panel(
     if panel.chain_idx.is_none() {
         let hf_name = active_hardfork.unwrap_or("?");
         let check_list = check_names_for(hf_name).join(" · ");
-        let hint = format!("Press [r] to run {hf_name} post-upgrade checks");
+        let hint = if auto_refresh {
+            format!("Auto-refreshing {hf_name} checks every 2s — [a] to disable")
+        } else {
+            format!("Press [r] to run {hf_name} post-upgrade checks · [a] to enable auto-refresh")
+        };
         let lines: Vec<Line<'static>> = vec![
             Line::from(""),
             Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
@@ -764,13 +821,14 @@ fn render_checks_panel(
     let passed = panel.results.values().filter(|r| r.passed == Some(true)).count();
     let failed = panel.results.values().filter(|r| r.passed == Some(false)).count();
 
+    let auto_tag = if auto_refresh { "  · auto" } else { "" };
     let (title, border_color) = if panel.running {
         let spin = spinner[(tick / 2) as usize % spinner.len()];
-        (format!(" {hf} Checks ({mode_str})  {spin} running… "), Color::Yellow)
+        (format!(" {hf} Checks ({mode_str})  {spin} running…{auto_tag} "), Color::Yellow)
     } else if failed > 0 {
-        (format!(" {hf} Checks ({mode_str})  ✓ {passed}  ✗ {failed} "), Color::Red)
+        (format!(" {hf} Checks ({mode_str})  ✓ {passed}  ✗ {failed}{auto_tag} "), Color::Red)
     } else {
-        (format!(" {hf} Checks ({mode_str})  ✓ {passed} passed "), Color::LightGreen)
+        (format!(" {hf} Checks ({mode_str})  ✓ {passed} passed{auto_tag} "), Color::LightGreen)
     };
 
     let rows: Vec<Row<'static>> = check_names
@@ -846,7 +904,7 @@ fn render_checks_panel(
     );
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, checks_running: bool) {
+fn render_footer(frame: &mut Frame<'_>, area: Rect, checks_running: bool, auto_refresh: bool) {
     let key_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
     let desc_style = Style::default().fg(Color::DarkGray);
     let sep = Span::styled("  │  ", Style::default().fg(Color::DarkGray));
@@ -873,6 +931,12 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, checks_running: bool) {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("run checks", desc_style));
     }
+
+    spans.push(sep.clone());
+    spans.push(Span::styled("[a]", key_style));
+    spans.push(Span::raw(" "));
+    let auto_label = if auto_refresh { "auto-refresh: on" } else { "auto-refresh: off" };
+    spans.push(Span::styled(auto_label, desc_style));
 
     spans.push(sep);
     spans.push(Span::styled("[?]", key_style));
@@ -947,7 +1011,7 @@ async fn run_checks_streaming(
     tx: mpsc::Sender<CheckUpdate>,
 ) {
     match hardfork {
-        "V1" => run_v1_checks_streaming(rpc_url, tx).await,
+        "Azul" => run_azul_checks_streaming(rpc_url, tx).await,
         "Jovian" => run_jovian_checks_streaming(rpc_url, mode, tx).await,
         _ => {}
     }
@@ -1131,7 +1195,7 @@ async fn run_jovian_checks_streaming(
     send_result!("GPO implementation", gpo_check);
 }
 
-// ── V1 activation checks (ported from v1.py run_v1_checks) ───────────────────
+// ── Azul activation checks ────────────────────────────────────────────────────
 
 const CLZ_PROBE_ADDR: &str = "0x000000000000000000000000000000000000001e";
 const CLZ_RUNTIME: &str = "0x6000351e60005260206000f3";
@@ -1230,14 +1294,14 @@ fn evaluate_gas_probe(
     let success_val = norm(PROBE_SUCCESS);
 
     let (passed, detail) = if actual == success_val {
-        (false, format!("{gas_label} CALL succeeded — expected OOG ({after_desc} after V1)"))
+        (false, format!("{gas_label} CALL succeeded — expected OOG ({after_desc} after Azul)"))
     } else {
-        (true, format!("{gas_label} CALL OOG ({after_desc} after V1)"))
+        (true, format!("{gas_label} CALL OOG ({after_desc} after Azul)"))
     };
     CheckResult { passed: Some(passed), detail }
 }
 
-async fn run_v1_checks_streaming(rpc_url: String, tx: mpsc::Sender<CheckUpdate>) {
+async fn run_azul_checks_streaming(rpc_url: String, tx: mpsc::Sender<CheckUpdate>) {
     macro_rules! send_start {
         ($name:expr) => {
             if tx.send(CheckUpdate::Starting($name.to_string())).await.is_err() {
@@ -1265,7 +1329,7 @@ async fn run_v1_checks_streaming(rpc_url: String, tx: mpsc::Sender<CheckUpdate>)
                 detail: format!("cannot build client for {rpc_url}: {e}"),
             };
             send_result!("CLZ zero", conn_result);
-            for &name in &V1_CHECK_NAMES[1..] {
+            for &name in &AZUL_CHECK_NAMES[1..] {
                 send_result!(
                     name,
                     CheckResult { passed: None, detail: "skipped (no connection)".into() }
@@ -1282,7 +1346,7 @@ async fn run_v1_checks_streaming(rpc_url: String, tx: mpsc::Sender<CheckUpdate>)
             let conn_result =
                 CheckResult { passed: Some(false), detail: format!("cannot reach {rpc_url}: {e}") };
             send_result!("CLZ zero", conn_result);
-            for &name in &V1_CHECK_NAMES[1..] {
+            for &name in &AZUL_CHECK_NAMES[1..] {
                 send_result!(
                     name,
                     CheckResult { passed: None, detail: "skipped (no connection)".into() }
@@ -1349,8 +1413,10 @@ async fn run_v1_checks_streaming(rpc_url: String, tx: mpsc::Sender<CheckUpdate>)
             .await
             .map_err(|e| e.to_string());
     let eth_config_check = match cfg_result {
-        Ok(_) => CheckResult { passed: Some(true), detail: "available after V1".to_string() },
-        Err(e) => CheckResult { passed: Some(false), detail: format!("unavailable after V1: {e}") },
+        Ok(_) => CheckResult { passed: Some(true), detail: "available after Azul".to_string() },
+        Err(e) => {
+            CheckResult { passed: Some(false), detail: format!("unavailable after Azul: {e}") }
+        }
     };
     send_result!("eth_config", eth_config_check);
 }
