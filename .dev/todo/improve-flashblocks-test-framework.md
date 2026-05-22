@@ -50,6 +50,8 @@ This change enables better coverage where we can simulate when a canonical block
 
 **Applied in commit `94053caa4`.**
 
+2. Rebase on top of firehose/0.x branch
+
 ## Spec & Implementation
 
 ### TestEvent Enum
