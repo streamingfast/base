@@ -1,7 +1,7 @@
 # Improve Flashblocks Test Framework
 
 mode: feature
-state: ready
+state: review
 root_git: .worktrees/feature/improve-flashblocks-test-framework
 worktree: .worktrees/feature/improve-flashblocks-test-framework
 branch: feature/improve-flashblocks-test-framework
@@ -49,14 +49,46 @@ This change enables better coverage where we can simulate when a canonical block
 
 ## Spec & Implementation
 
-<agent to fill in>
+### TestEvent Enum
+
+Added `TestEvent` enum in `framework/mod.rs`:
+- `Flashblock(Box<Flashblock>)` — boxed to avoid large-variant clippy warning (Flashblock is 688 bytes vs u64's 8 bytes)
+- `CanonicalBlock(u64)` — marks a block number as available in the provider
+
+Constructor helpers:
+- `TestEvent::flashblock(fb: Flashblock) -> Self`
+- `TestEvent::canonical_block(block_number: u64) -> Self` (const fn)
+
+### GenesisClient Changes
+
+Added `Arc<Mutex<GenesisClientInner>>` inner state to `GenesisClient`. `GenesisClientInner` holds `available_blocks: HashSet<u64>`.
+
+Key behavior changes:
+- `is_block_available(n)` returns `true` for block 0 (genesis) unconditionally, and for any block N that was marked via `mark_canonical_block_available(N)`.
+- `state_by_block_number_or_tag(BlockNumberOrTag::Number(n))` now returns `Err(ProviderError::BlockBodyIndicesNotFound(n))` if block `n` is not available. All other tag variants (Latest, Pending, etc.) still return genesis state.
+- `GenesisClient` remains `Clone` because the inner state is wrapped in `Arc<Mutex<...>>`.
+
+### run_flashblock_sequence Changes
+
+Signature changed from `Vec<Flashblock>` to `Vec<TestEvent>`. Events are pre-processed before the WS server starts: `CanonicalBlock` events call `client.mark_canonical_block_available(n)` synchronously; `Flashblock` events are collected and forwarded to `ws_server_once`.
+
+This pre-processing approach (apply canonical blocks before starting the subscriber) means provider calls succeed on the first attempt in tests, avoiding the 20-retry timeout.
+
+### New Tests
+
+Two new tests added:
+1. `canonical_block_unblocks_next_base` — sends base_1, marks block 1 canonical, sends base_2; verifies both produce FIRE BLOCK events.
+2. `canonical_block_unblocks_non_sequential_gap` — sends base_2 as the very first flashblock (no prior context); without `canonical_block(1)`, the provider would fail and block 2 would be skipped. With it, block 2 processes successfully.
+
+Total: 12 integration tests, all passing.
 
 ## State Tracker
 
 **Last Updated:** 2026-05-22
-**Current Step:** Step 1 — Start
-**Status:** Ready for implementation
+**Current Step:** Step 2 — Implementation complete, ready for review
+**Status:** Ready for review
 
 | Step | Status | Notes |
 |---|---|---|
 | Initial setup | Done | Worktree created at .worktrees/feature/improve-flashblocks-test-framework |
+| Implementation | Done | TestEvent enum, GenesisClient inner state, updated tests, 2 new tests, all 12 pass, clippy clean |
