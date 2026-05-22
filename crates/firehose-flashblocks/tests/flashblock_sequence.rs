@@ -1,8 +1,8 @@
 //! Integration tests for the firehose flashblocks processor.
 //!
-//! The test framework lives in [`framework`] and provides WS server helpers, flashblock
-//! builders, output parsers, and the [`run_flashblock_sequence`] harness. This file
-//! contains only the individual test cases.
+//! The test framework lives in [`framework`] and provides flashblock builders, output parsers,
+//! and the [`run_flashblock_sequence`] harness. This file contains only the individual test
+//! cases.
 //!
 //! # Adding new test cases
 //!
@@ -31,18 +31,18 @@ use framework::{
 /// also 0. The FIRE protocol does not distinguish a canonical block from a base flashblock at the
 /// wire level when `flash_idx == 0`; the two streams are distinguished by their distinct
 /// `FIRE INIT` headers in live operation. Both map to `FireEvent::Block` in the parser.
-#[tokio::test]
-async fn flash_base_emits_fire_block() {
+#[test]
+fn flash_base_emits_fire_block() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
 
-    let client = GenesisClient::new(genesis.clone());
+    let client = GenesisClient::new(genesis);
 
     // Block 1, parent = genesis block hash, timestamp = genesis + 2 seconds.
     let genesis_timestamp = 0x67d00000u64;
     let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
 
-    let raw = run_flashblock_sequence(client, vec![base1]).await;
+    let raw = run_flashblock_sequence(client,vec![base1]);
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -57,18 +57,18 @@ async fn flash_base_emits_fire_block() {
 ///
 /// - Block 1, index 0 (base): printed `flash_idx` = 0 → `FireEvent::Block`.
 /// - Block 1, index 1 (delta): printed `flash_idx` = 1 → `FireEvent::FlashBlock { flash_idx: 1 }`.
-#[tokio::test]
-async fn base_plus_delta_emits_two_fire_blocks() {
+#[test]
+fn base_plus_delta_emits_two_fire_blocks() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
 
-    let client = GenesisClient::new(genesis.clone());
+    let client = GenesisClient::new(genesis);
 
     let genesis_timestamp = 0x67d00000u64;
     let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
     let delta1_1 = flash_delta(1, 1);
 
-    let raw = run_flashblock_sequence(client, vec![base1, delta1_1]).await;
+    let raw = run_flashblock_sequence(client,vec![base1, delta1_1]);
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -96,12 +96,12 @@ async fn base_plus_delta_emits_two_fire_blocks() {
 /// This exercises the cross-block state carry-forward path where the accumulated EVM state from
 /// block N is carried forward to seed block N+1 without waiting for the canonical `StateProvider`
 /// to reflect block N.
-#[tokio::test]
-async fn base_plus_delta_plus_next_base() {
+#[test]
+fn base_plus_delta_plus_next_base() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
 
-    let client = GenesisClient::new(genesis.clone());
+    let client = GenesisClient::new(genesis);
 
     let genesis_timestamp = 0x67d00000u64;
     let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
@@ -111,7 +111,7 @@ async fn base_plus_delta_plus_next_base() {
     // simplicity — the mock ignores the parent hash when looking up state).
     let base2 = flash_base(2, genesis_hash, genesis_timestamp + 4);
 
-    let raw = run_flashblock_sequence(client, vec![base1, delta1_1, base2]).await;
+    let raw = run_flashblock_sequence(client,vec![base1, delta1_1, base2]);
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -132,17 +132,17 @@ async fn base_plus_delta_plus_next_base() {
 ///
 /// The sequence validator returns `Duplicate` for the second base; the processor logs and
 /// discards it without re-executing or emitting a second FIRE line.
-#[tokio::test]
-async fn duplicate_base_is_ignored() {
+#[test]
+fn duplicate_base_is_ignored() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
 
-    let client = GenesisClient::new(genesis.clone());
+    let client = GenesisClient::new(genesis);
 
     let genesis_timestamp = 0x67d00000u64;
     let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
     // Send the same base twice.
-    let raw = run_flashblock_sequence(client, vec![base1.clone(), base1]).await;
+    let raw = run_flashblock_sequence(client,vec![base1.clone(), base1]);
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -158,19 +158,19 @@ async fn duplicate_base_is_ignored() {
 /// Asserts that only one `FIRE BLOCK` is emitted (for the base). The gap causes the
 /// sequence validator to return `NonSequentialGap`, which resets the processor state. No
 /// further FIRE lines are emitted for the out-of-sequence delta.
-#[tokio::test]
-async fn non_sequential_delta_is_skipped() {
+#[test]
+fn non_sequential_delta_is_skipped() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
 
-    let client = GenesisClient::new(genesis.clone());
+    let client = GenesisClient::new(genesis);
 
     let genesis_timestamp = 0x67d00000u64;
     let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
     // Skip index 1 and send index 2 directly — creates a NonSequentialGap.
     let delta1_2 = flash_delta(1, 2);
 
-    let raw = run_flashblock_sequence(client, vec![base1, delta1_2]).await;
+    let raw = run_flashblock_sequence(client,vec![base1, delta1_2]);
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -185,19 +185,19 @@ async fn non_sequential_delta_is_skipped() {
 ///
 /// Asserts three events: `Block(1)`, `FlashBlock(1, idx=1)`, `FlashBlock(1, idx=2)`.
 /// Tests that consecutive deltas on the same block are all processed and emitted in order.
-#[tokio::test]
-async fn two_successive_deltas() {
+#[test]
+fn two_successive_deltas() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
 
-    let client = GenesisClient::new(genesis.clone());
+    let client = GenesisClient::new(genesis);
 
     let genesis_timestamp = 0x67d00000u64;
     let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
     let delta1_1 = flash_delta(1, 1);
     let delta1_2 = flash_delta(1, 2);
 
-    let raw = run_flashblock_sequence(client, vec![base1, delta1_1, delta1_2]).await;
+    let raw = run_flashblock_sequence(client,vec![base1, delta1_1, delta1_2]);
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -220,19 +220,19 @@ async fn two_successive_deltas() {
 /// consistent: the gap at idx=2 triggers `NonSequentialGap`, the processor resets its state,
 /// and only the base `FIRE BLOCK` is emitted. Any further deltas on the same block after the
 /// reset are also dropped (no in-flight sequence + non-zero index → dropped).
-#[tokio::test]
-async fn jumping_delta_is_skipped() {
+#[test]
+fn jumping_delta_is_skipped() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
 
-    let client = GenesisClient::new(genesis.clone());
+    let client = GenesisClient::new(genesis);
 
     let genesis_timestamp = 0x67d00000u64;
     let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
     // Jump directly to idx=2, skipping idx=1.
     let delta1_2 = flash_delta(1, 2);
 
-    let raw = run_flashblock_sequence(client, vec![base1, delta1_2]).await;
+    let raw = run_flashblock_sequence(client,vec![base1, delta1_2]);
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -246,12 +246,12 @@ async fn jumping_delta_is_skipped() {
 ///
 /// Asserts four events in total, verifying that the processor correctly sequences three
 /// consecutive delta flashblocks and emits a `FIRE BLOCK` for each.
-#[tokio::test]
-async fn three_successive_deltas() {
+#[test]
+fn three_successive_deltas() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
 
-    let client = GenesisClient::new(genesis.clone());
+    let client = GenesisClient::new(genesis);
 
     let genesis_timestamp = 0x67d00000u64;
     let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
@@ -260,7 +260,7 @@ async fn three_successive_deltas() {
     let delta1_3 = flash_delta(1, 3);
 
     let raw =
-        run_flashblock_sequence(client, vec![base1, delta1_1, delta1_2, delta1_3]).await;
+        run_flashblock_sequence(client,vec![base1, delta1_1, delta1_2, delta1_3]);
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -282,12 +282,12 @@ async fn three_successive_deltas() {
 ///
 /// Asserts four events: `Block(N)`, `FlashBlock(N,1)`, `Block(N+1)`, `FlashBlock(N+1,1)`.
 /// Exercises cross-block state carry-forward together with inter-block delta processing.
-#[tokio::test]
-async fn two_blocks_with_deltas() {
+#[test]
+fn two_blocks_with_deltas() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
 
-    let client = GenesisClient::new(genesis.clone());
+    let client = GenesisClient::new(genesis);
 
     let genesis_timestamp = 0x67d00000u64;
     let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
@@ -295,7 +295,7 @@ async fn two_blocks_with_deltas() {
     let base2 = flash_base(2, genesis_hash, genesis_timestamp + 4);
     let delta2_1 = flash_delta(2, 1);
 
-    let raw = run_flashblock_sequence(client, vec![base1, delta1_1, base2, delta2_1]).await;
+    let raw = run_flashblock_sequence(client,vec![base1, delta1_1, base2, delta2_1]);
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -320,17 +320,17 @@ async fn two_blocks_with_deltas() {
 /// (confirming the tracer encoded the block correctly and [`parse_fire_events`] decoded it).
 /// Then uses [`assert_fire_events_eq`] (full comparison including payload) to verify
 /// that the event roundtrips through the framework helpers correctly.
-#[tokio::test]
-async fn block_payload_has_correct_block_number() {
+#[test]
+fn block_payload_has_correct_block_number() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
 
-    let client = GenesisClient::new(genesis.clone());
+    let client = GenesisClient::new(genesis);
 
     let genesis_timestamp = 0x67d00000u64;
     let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
 
-    let raw = run_flashblock_sequence(client, vec![base1]).await;
+    let raw = run_flashblock_sequence(client,vec![base1]);
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -372,32 +372,25 @@ async fn block_payload_has_correct_block_number() {
 /// block. With the canonical block event applied, the provider returns successfully and the
 /// processor emits a `FIRE BLOCK` for block 2.
 ///
-/// This verifies the [`TestEvent::CanonicalBlock`] path: it marks the block as available in
-/// `GenesisClient` so that the bootstrap provider call succeeds on the first attempt.
-#[tokio::test]
-async fn canonical_block_unblocks_next_base() {
+/// This verifies the [`TestEvent::CanonicalBlock`] path: it both marks block 1 available in
+/// [`GenesisClient`] so that the bootstrap provider call succeeds, and emits a canonical FIRE
+/// BLOCK (simulating the global `ExEx` tracer), for a total of three emitted events.
+///
+/// - `base1` → Flash1 (flashblock tracer, block 1).
+/// - `canonical_block(1)` → Canonical1 (canonical tracer, block 1) + makes block 1 available.
+/// - `base2` → Flash2 (flashblock tracer, block 2, state carried forward via `accumulated_db`).
+#[test]
+fn canonical_block_unblocks_next_base() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
 
-    let client = GenesisClient::new(genesis.clone());
+    let client = GenesisClient::new(genesis);
 
     let genesis_timestamp = 0x67d00000u64;
-    // Block 1 base — bootstraps from genesis (block 0 is always available).
     let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
-    // Block 2 base — would need block 1 to be available to bootstrap from the provider,
-    // since block 2 is NOT the sequential successor of block 1 after we send base1 alone
-    // (no delta in between, but the processor still carries forward accumulated_db because
-    // block 2 == block 1 + 1; the key path tested here is that marking block 1 canonical
-    // allows the provider call to succeed even if accumulated_db were None).
-    //
-    // We send base1 → canonical_block(1) → base2 to verify that:
-    //   1. base1 produces a FIRE BLOCK for block 1.
-    //   2. canonical_block(1) marks block 1 as available without emitting anything.
-    //   3. base2 produces a FIRE BLOCK for block 2 (carried forward from accumulated_db).
     let base2 = flash_base(2, genesis_hash, genesis_timestamp + 4);
 
-    let raw =
-        run_flashblock_sequence(client, vec![base1, canonical_block(1), base2]).await;
+    let raw = run_flashblock_sequence(client, vec![base1, canonical_block(1), base2]);
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -406,7 +399,11 @@ async fn canonical_block_unblocks_next_base() {
 
     assert_fire_events_metadata_eq(
         &events,
-        &[FireEvent::canonical_block(1), FireEvent::canonical_block(2)],
+        &[
+            FireEvent::canonical_block(1), // Flash1 — flashblock tracer, flash_idx=0
+            FireEvent::canonical_block(1), // Canonical1 — canonical tracer
+            FireEvent::canonical_block(2), // Flash2 — flashblock tracer, flash_idx=0
+        ],
     );
 }
 
@@ -420,24 +417,85 @@ async fn canonical_block_unblocks_next_base() {
 ///
 /// This tests the bootstrap path in isolation: no prior flashblock context means
 /// `accumulated_db` is always `None` and the provider call for the parent block is mandatory.
-#[tokio::test]
-async fn canonical_block_unblocks_non_sequential_gap() {
+///
+/// The `canonical_block(1)` event also emits a canonical FIRE BLOCK (simulating the global
+/// `ExEx` tracer), so two events appear in total: Canonical1 then Flash2.
+#[test]
+fn canonical_block_unblocks_non_sequential_gap() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
 
-    let client = GenesisClient::new(genesis.clone());
+    let client = GenesisClient::new(genesis);
 
     let genesis_timestamp = 0x67d00000u64;
     // Send base for block 2 as the very first flashblock (no block 1 context).
     // The processor has no accumulated_db, so it must bootstrap from the provider at block 1.
     let base2 = flash_base(2, genesis_hash, genesis_timestamp + 4);
 
-    let raw = run_flashblock_sequence(client, vec![canonical_block(1), base2]).await;
+    let raw = run_flashblock_sequence(client, vec![canonical_block(1), base2]);
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
         .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
         .collect();
 
-    assert_fire_events_metadata_eq(&events, &[FireEvent::canonical_block(2)]);
+    assert_fire_events_metadata_eq(
+        &events,
+        &[
+            FireEvent::canonical_block(1), // Canonical1 — canonical tracer
+            FireEvent::canonical_block(2), // Flash2 — flashblock tracer, flash_idx=0
+        ],
+    );
+}
+
+/// Sends `base1 → canonical_block(1) → canonical_block(2) → base3` and verifies that four
+/// FIRE BLOCK lines are emitted in order: Flash1, Canonical1, Canonical2, Flash3.
+///
+/// Sequence breakdown:
+/// - `base1` → flashblock for block 1 (`flash_idx` 0) → Flash1 emitted by flashblock tracer.
+/// - `canonical_block(1)` → makes block 1 available **and** emits Canonical1 via the canonical
+///   tracer, simulating the global `ExEx` tracer finalising block 1.
+/// - `canonical_block(2)` → makes block 2 available **and** emits Canonical2 via the canonical
+///   tracer, simulating the global `ExEx` tracer finalising block 2 (even though no flashblock was
+///   sent for block 2).
+/// - `base3` → flashblock for block 3 (`flash_idx` 0). The processor detects a block gap
+///   (current = 1, incoming = 3) which triggers the bootstrap path. Because block 2 was already
+///   marked available by the preceding `canonical_block(2)`, `state_by_block_number_or_tag(2)`
+///   succeeds on the first attempt → Flash3 emitted.
+///
+/// All four FIRE BLOCK lines use `flash_idx == 0` and therefore appear as [`FireEvent::Block`].
+/// Flash1 and Flash3 come from the flashblock tracer; Canonical1 and Canonical2 from the
+/// canonical tracer. Both write to the same buffer, so ordering is determined by event
+/// processing order.
+#[test]
+fn base_canonical_gap_then_base_emits_four_fire_blocks() {
+    let genesis = test_genesis();
+    let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+
+    let client = GenesisClient::new(genesis);
+
+    let genesis_timestamp = 0x67d00000u64;
+    let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
+    // No flashblock for block 2 — only canonical events for blocks 1 and 2.
+    let base3 = flash_base(3, genesis_hash, genesis_timestamp + 6);
+
+    let raw = run_flashblock_sequence(
+        client,
+        vec![base1, canonical_block(1), canonical_block(2), base3],
+    );
+
+    let events: Vec<FireEvent> = parse_fire_events(&raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
+        .collect();
+
+    assert_fire_events_metadata_eq(
+        &events,
+        &[
+            FireEvent::canonical_block(1), // Flash1 — flashblock tracer, block 1, flash_idx=0
+            FireEvent::canonical_block(1), // Canonical1 — canonical tracer, block 1
+            FireEvent::canonical_block(2), // Canonical2 — canonical tracer, block 2
+            FireEvent::canonical_block(3), // Flash3 — flashblock tracer, block 3, flash_idx=0
+        ],
+    );
 }

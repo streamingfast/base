@@ -5,20 +5,17 @@
 //! - [`GenesisStateProvider`]: a thin [`StateProvider`] wrapper around [`StateProviderTest`].
 //! - [`flash_base`] / [`flash_delta`] / [`canonical_block`]: helpers to build [`TestEvent`] fixtures.
 //! - [`TestEvent`]: discriminated event type for test sequences (flashblock or canonical block).
-//! - [`ws_server_once`]: a transient WebSocket server that sends a sequence of messages once.
 //! - [`FireEvent`]: structured representation of a single FIRE output line (INIT or BLOCK).
 //! - [`parse_fire_events`]: parses all FIRE lines from raw tracer output.
-//! - [`run_flashblock_sequence`]: end-to-end harness — starts server, runs processor, returns output.
+//! - [`run_flashblock_sequence`]: end-to-end harness — drives the processor directly, returns output.
 
 use std::{
     collections::HashSet,
-    net::SocketAddr,
     ops::RangeInclusive,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
-use alloy_consensus::Header;
+use alloy_consensus::{BlockBody, Header};
 use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumberOrTag};
 use alloy_genesis::Genesis;
 use alloy_primitives::{
@@ -31,6 +28,7 @@ use base_common_flashblocks::{
     Metadata,
 };
 use base_execution_chainspec::BaseChainSpec;
+use base_flashblocks::FlashblocksReceiver;
 use base_firehose_flashblocks::{FirehoseFlashblocksProcessor, FlashblocksTracerHandle};
 use base64::Engine as _;
 use firehose_tracer::{
@@ -38,11 +36,11 @@ use firehose_tracer::{
     config::{ChainClient, ChainConfig, Config},
     pb::Block as EthBlock,
 };
-use futures::SinkExt as _;
 use prost::Message as _;
 use reth_chainspec::{ChainInfo, ChainSpecProvider, EthChainSpec};
 use reth_db_models::StoredBlockBodyIndices;
-use reth_primitives_traits::{Account, RecoveredBlock, SealedHeader};
+use reth_firehose::FirehoseBlockTracer;
+use reth_primitives_traits::{Account, RecoveredBlock, SealedBlock, SealedHeader};
 use reth_provider::{
     AccountReader, BlockBodyIndicesProvider, BlockHashReader, BlockIdReader, BlockNumReader,
     BlockReader, BlockReaderIdExt, BlockSource, BytecodeReader, HashedPostStateProvider,
@@ -57,12 +55,6 @@ use reth_trie::{
     StorageProof, TrieInput, updates::TrieUpdates,
 };
 use serde_json::json;
-use tokio::net::TcpListener;
-use tokio_tungstenite::{
-    accept_async,
-    tungstenite::{Message, Utf8Bytes},
-};
-use url::Url;
 
 // ── TestEvent ─────────────────────────────────────────────────────────────────
 
@@ -158,6 +150,21 @@ impl GenesisClient {
             .available_blocks
             .contains(&block_number)
     }
+
+    /// Synthesises a [`Header`] for the given block number.
+    ///
+    /// The genesis header is used as a template. `number` is set to `block_number` and
+    /// `timestamp` is advanced by 2 seconds per block from the genesis timestamp. All other
+    /// fields are inherited from genesis so that EVM environment construction produces a
+    /// consistent result regardless of which parent block the processor looks up.
+    pub(crate) fn header_for_block(&self, block_number: u64) -> Header {
+        Header {
+            number: block_number,
+            timestamp: self.genesis_header.timestamp + block_number * 2,
+            parent_hash: B256::ZERO,
+            ..self.genesis_header.clone()
+        }
+    }
 }
 
 impl ChainSpecProvider for GenesisClient {
@@ -225,9 +232,11 @@ impl HeaderProvider for GenesisClient {
         Ok(Some(self.genesis_header.clone()))
     }
 
-    fn header_by_number(&self, _n: u64) -> ProviderResult<Option<Header>> {
-        // The processor uses this to build the EVM env for block N; always return genesis.
-        Ok(Some(self.genesis_header.clone()))
+    fn header_by_number(&self, n: u64) -> ProviderResult<Option<Header>> {
+        // The processor calls this to build the EVM env for block N (looking up the parent
+        // header). Return a synthesised header with the correct block number so that
+        // `next_evm_env` computes `block_env.number = parent.number + 1` correctly.
+        Ok(Some(self.header_for_block(n)))
     }
 
     fn headers_range(
@@ -728,38 +737,6 @@ pub(crate) const fn canonical_block(block_number: u64) -> TestEvent {
     TestEvent::CanonicalBlock(block_number)
 }
 
-// ── WS server ────────────────────────────────────────────────────────────────
-
-/// Spins up a transient WebSocket server that sends each flashblock from `sequence` to the
-/// first client that connects, then closes the connection.
-///
-/// Returns the server's [`SocketAddr`] so the test can pass it to the subscriber.
-pub(crate) async fn ws_server_once(sequence: Vec<Flashblock>) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut ws = accept_async(stream).await.unwrap();
-
-        for fb in &sequence {
-            let payload = FlashblocksPayloadV1 {
-                payload_id: fb.payload_id,
-                index: fb.index,
-                base: fb.base.clone(),
-                diff: fb.diff.clone(),
-                metadata: json!({ "block_number": fb.metadata.block_number }),
-            };
-            let json = serde_json::to_string(&payload).unwrap();
-            ws.send(Message::Text(Utf8Bytes::from(json))).await.unwrap();
-        }
-
-        // Close gracefully after all messages are sent.
-        let _ = ws.send(Message::Close(None)).await;
-    });
-
-    addr
-}
 
 // ── FireEvent ────────────────────────────────────────────────────────────────
 
@@ -1127,56 +1104,77 @@ pub(crate) fn test_genesis() -> Genesis {
 
 // ── Test runner ──────────────────────────────────────────────────────────────
 
-/// Builds a [`FirehoseFlashblocksProcessor`] with a buffer-backed tracer, connects it to a
-/// one-shot WebSocket server serving the flashblock events from `events`, waits briefly for
-/// processing, and returns the captured raw tracer output.
+/// Drives a [`FirehoseFlashblocksProcessor`] with a buffer-backed tracer through `events` in
+/// strict order, and returns the captured raw tracer output.
 ///
-/// [`TestEvent::Flashblock`] events are serialised and sent over the WebSocket connection.
-/// [`TestEvent::CanonicalBlock`] events update [`GenesisClient`]'s internal state to mark the
-/// given block number as available; no WS message is emitted for canonical block events.
+/// Events are processed sequentially without any WebSocket indirection:
 ///
-/// The events are split before the runner starts: all flashblocks are forwarded to the WS
-/// server in their original relative order; canonical-block events are applied to the client
-/// immediately before starting the processor, enabling the `state_by_block_number_or_tag`
-/// bootstrap path to succeed on first call rather than requiring retries. This mirrors the
-/// real-world case where canonical state is available by the time the next flashblock arrives.
-pub(crate) async fn run_flashblock_sequence(
-    client: GenesisClient,
-    events: Vec<TestEvent>,
-) -> Vec<u8> {
-    // Split the event sequence into websocket-deliverable flashblocks and canonical-block
-    // markers. We collect canonical block numbers and apply them synchronously before starting
-    // the subscriber so `state_by_block_number_or_tag` never needs to retry in tests.
-    let mut flashblocks: Vec<Flashblock> = Vec::with_capacity(events.len());
-    for event in events {
-        match event {
-            TestEvent::Flashblock(fb) => flashblocks.push(*fb),
-            TestEvent::CanonicalBlock(n) => client.mark_canonical_block_available(n),
-        }
-    }
-
-    let addr = ws_server_once(flashblocks).await;
-    let ws_url = Url::parse(&format!("ws://127.0.0.1:{}", addr.port())).unwrap();
-
+/// - [`TestEvent::Flashblock`] — calls `processor.on_flashblock_received` directly so that
+///   FIRE BLOCK lines are emitted into the shared buffer immediately, in arrival order.
+/// - [`TestEvent::CanonicalBlock`] — marks the block available in [`GenesisClient`] *and*
+///   emits a canonical (non-flash) FIRE BLOCK line through a dedicated canonical tracer that
+///   writes to the same buffer. This simulates the live-node behaviour where the global
+///   `FirehoseExtension` `ExEx` emits a canonical FIRE BLOCK whenever a block is finalised by
+///   the engine, independent of the flashblock tracer.
+///
+/// Both the flashblock processor and the canonical tracer share the same [`InMemoryBuffer`], so
+/// FIRE BLOCK lines appear in the buffer in the exact order events are processed. The buffer is
+/// returned as raw bytes for parsing with [`parse_fire_events`].
+///
+/// Two `FIRE INIT` lines will be present in the output (one per tracer instance). Tests that
+/// filter for `Block` / `FlashBlock` variants are unaffected; tests that inspect `Init` lines
+/// should account for both.
+pub(crate) fn run_flashblock_sequence(client: GenesisClient, events: Vec<TestEvent>) -> Vec<u8> {
     let buffer = InMemoryBuffer::new();
-    let writer: Box<dyn std::io::Write + Send> = Box::new(buffer.clone());
     let chain_id = client.chain_spec().chain().id();
 
+    // Flashblock tracer — drives `FirehoseFlashblocksProcessor`.
+    let flash_writer: Box<dyn std::io::Write + Send> = Box::new(buffer.clone());
     let tracer_handle = FlashblocksTracerHandle::with_writer(
         Config { chain_client: ChainClient::Reth, ..Default::default() },
         ChainConfig::new(chain_id),
-        writer,
+        flash_writer,
     );
 
-    let processor = Arc::new(FirehoseFlashblocksProcessor::new(client, tracer_handle));
+    // Canonical tracer — emits non-flash FIRE BLOCK lines for `CanonicalBlock` events.
+    // Writes to the same buffer so output ordering matches event ordering.
+    let canonical_writer: Box<dyn std::io::Write + Send> = Box::new(buffer.clone());
+    let mut canonical_tracer = FlashblocksTracerHandle::with_writer(
+        Config { chain_client: ChainClient::Reth, ..Default::default() },
+        ChainConfig::new(chain_id),
+        canonical_writer,
+    );
 
-    // Use the subscriber to drive the processor via the live WS path.
-    let mut subscriber =
-        base_flashblocks::FlashblocksSubscriber::new(Arc::clone(&processor), ws_url);
-    subscriber.start();
+    let processor = FirehoseFlashblocksProcessor::new(client.clone(), tracer_handle);
 
-    // Allow time for the WS server to send all messages and the processor to handle them.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    for event in events {
+        match event {
+            TestEvent::Flashblock(fb) => {
+                processor.on_flashblock_received(*fb);
+            }
+            TestEvent::CanonicalBlock(n) => {
+                // Make the block available to the provider so that subsequent flashblocks
+                // that need to bootstrap from block N can find it.
+                client.mark_canonical_block_available(n);
+
+                // Emit a canonical FIRE BLOCK to simulate the global ExEx tracer emitting the
+                // finalised block. A minimal block with the correct number is sufficient; the
+                // test assertions use metadata-only comparisons.
+                let header = client.header_for_block(n);
+                let sealed = SealedBlock::new_unchecked(
+                    alloy_consensus::Block {
+                        header,
+                        body: BlockBody::<BaseTxEnvelope>::default(),
+                    },
+                    B256::ZERO,
+                );
+                let tracer = canonical_tracer.tracer_mut();
+                let block_tracer =
+                    FirehoseBlockTracer::start_local::<BasePrimitives>(tracer, &sealed, None);
+                block_tracer.mark_verified();
+            }
+        }
+    }
 
     buffer.get_bytes()
 }
