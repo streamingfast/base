@@ -6,8 +6,9 @@
 //!
 //! # Adding new test cases
 //!
-//! 1. Build a `Vec<TestEvent>` using [`framework::TestEvent::flashblock`] / [`framework::TestEvent::canonical_block`]
-//!    with flashblocks constructed via [`framework::flash_base`] / [`framework::flash_delta`].
+//! 1. Build a `Vec<TestEvent>` using the free helpers [`framework::flash_base`],
+//!    [`framework::flash_delta`], and [`framework::canonical_block`] — each returns a
+//!    [`framework::TestEvent`] directly, so no wrapping is needed.
 //! 2. Call [`framework::run_flashblock_sequence`] with the events and a [`framework::GenesisClient`].
 //! 3. Call [`framework::parse_fire_events`] to validate the emitted output.
 //! 4. Use [`framework::assert_fire_events_metadata_eq`] for metadata-only assertions or
@@ -18,8 +19,9 @@ mod framework;
 use base_execution_chainspec::BaseChainSpec;
 
 use framework::{
-    FireEvent, GenesisClient, TestEvent, assert_fire_events_eq, assert_fire_events_metadata_eq,
-    flash_base, flash_delta, parse_fire_events, run_flashblock_sequence, test_genesis,
+    FireEvent, GenesisClient, assert_fire_events_eq, assert_fire_events_metadata_eq,
+    canonical_block, flash_base, flash_delta, parse_fire_events, run_flashblock_sequence,
+    test_genesis,
 };
 
 /// Simplest possible test: send a single flash-base event (block 1, no transactions) and verify
@@ -38,9 +40,9 @@ async fn flash_base_emits_fire_block() {
 
     // Block 1, parent = genesis block hash, timestamp = genesis + 2 seconds.
     let genesis_timestamp = 0x67d00000u64;
-    let fb = flash_base(1, genesis_hash, genesis_timestamp + 2);
+    let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
 
-    let raw = run_flashblock_sequence(client, vec![TestEvent::flashblock(fb)]).await;
+    let raw = run_flashblock_sequence(client, vec![base1]).await;
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -63,14 +65,10 @@ async fn base_plus_delta_emits_two_fire_blocks() {
     let client = GenesisClient::new(genesis.clone());
 
     let genesis_timestamp = 0x67d00000u64;
-    let base = flash_base(1, genesis_hash, genesis_timestamp + 2);
-    let delta = flash_delta(1, 1);
+    let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
+    let delta1_1 = flash_delta(1, 1);
 
-    let raw = run_flashblock_sequence(
-        client,
-        vec![TestEvent::flashblock(base), TestEvent::flashblock(delta)],
-    )
-    .await;
+    let raw = run_flashblock_sequence(client, vec![base1, delta1_1]).await;
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -106,22 +104,14 @@ async fn base_plus_delta_plus_next_base() {
     let client = GenesisClient::new(genesis.clone());
 
     let genesis_timestamp = 0x67d00000u64;
-    let base_n = flash_base(1, genesis_hash, genesis_timestamp + 2);
-    let delta_n = flash_delta(1, 1);
+    let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
+    let delta1_1 = flash_delta(1, 1);
     // Block 2's parent hash is B256::ZERO in tests (the mock provider always returns genesis header
     // which has a zero block hash, so any non-zero B256 is fine for routing; use genesis_hash for
     // simplicity — the mock ignores the parent hash when looking up state).
-    let base_n1 = flash_base(2, genesis_hash, genesis_timestamp + 4);
+    let base2 = flash_base(2, genesis_hash, genesis_timestamp + 4);
 
-    let raw = run_flashblock_sequence(
-        client,
-        vec![
-            TestEvent::flashblock(base_n),
-            TestEvent::flashblock(delta_n),
-            TestEvent::flashblock(base_n1),
-        ],
-    )
-    .await;
+    let raw = run_flashblock_sequence(client, vec![base1, delta1_1, base2]).await;
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -150,13 +140,9 @@ async fn duplicate_base_is_ignored() {
     let client = GenesisClient::new(genesis.clone());
 
     let genesis_timestamp = 0x67d00000u64;
-    let base = flash_base(1, genesis_hash, genesis_timestamp + 2);
+    let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
     // Send the same base twice.
-    let raw = run_flashblock_sequence(
-        client,
-        vec![TestEvent::flashblock(base.clone()), TestEvent::flashblock(base)],
-    )
-    .await;
+    let raw = run_flashblock_sequence(client, vec![base1.clone(), base1]).await;
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -180,15 +166,11 @@ async fn non_sequential_delta_is_skipped() {
     let client = GenesisClient::new(genesis.clone());
 
     let genesis_timestamp = 0x67d00000u64;
-    let base = flash_base(1, genesis_hash, genesis_timestamp + 2);
+    let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
     // Skip index 1 and send index 2 directly — creates a NonSequentialGap.
-    let gap_delta = flash_delta(1, 2);
+    let delta1_2 = flash_delta(1, 2);
 
-    let raw = run_flashblock_sequence(
-        client,
-        vec![TestEvent::flashblock(base), TestEvent::flashblock(gap_delta)],
-    )
-    .await;
+    let raw = run_flashblock_sequence(client, vec![base1, delta1_2]).await;
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -211,19 +193,11 @@ async fn two_successive_deltas() {
     let client = GenesisClient::new(genesis.clone());
 
     let genesis_timestamp = 0x67d00000u64;
-    let base = flash_base(1, genesis_hash, genesis_timestamp + 2);
-    let delta1 = flash_delta(1, 1);
-    let delta2 = flash_delta(1, 2);
+    let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
+    let delta1_1 = flash_delta(1, 1);
+    let delta1_2 = flash_delta(1, 2);
 
-    let raw = run_flashblock_sequence(
-        client,
-        vec![
-            TestEvent::flashblock(base),
-            TestEvent::flashblock(delta1),
-            TestEvent::flashblock(delta2),
-        ],
-    )
-    .await;
+    let raw = run_flashblock_sequence(client, vec![base1, delta1_1, delta1_2]).await;
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -254,15 +228,11 @@ async fn jumping_delta_is_skipped() {
     let client = GenesisClient::new(genesis.clone());
 
     let genesis_timestamp = 0x67d00000u64;
-    let base = flash_base(1, genesis_hash, genesis_timestamp + 2);
+    let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
     // Jump directly to idx=2, skipping idx=1.
-    let gap_delta = flash_delta(1, 2);
+    let delta1_2 = flash_delta(1, 2);
 
-    let raw = run_flashblock_sequence(
-        client,
-        vec![TestEvent::flashblock(base), TestEvent::flashblock(gap_delta)],
-    )
-    .await;
+    let raw = run_flashblock_sequence(client, vec![base1, delta1_2]).await;
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -284,21 +254,13 @@ async fn three_successive_deltas() {
     let client = GenesisClient::new(genesis.clone());
 
     let genesis_timestamp = 0x67d00000u64;
-    let base = flash_base(1, genesis_hash, genesis_timestamp + 2);
-    let delta1 = flash_delta(1, 1);
-    let delta2 = flash_delta(1, 2);
-    let delta3 = flash_delta(1, 3);
+    let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
+    let delta1_1 = flash_delta(1, 1);
+    let delta1_2 = flash_delta(1, 2);
+    let delta1_3 = flash_delta(1, 3);
 
-    let raw = run_flashblock_sequence(
-        client,
-        vec![
-            TestEvent::flashblock(base),
-            TestEvent::flashblock(delta1),
-            TestEvent::flashblock(delta2),
-            TestEvent::flashblock(delta3),
-        ],
-    )
-    .await;
+    let raw =
+        run_flashblock_sequence(client, vec![base1, delta1_1, delta1_2, delta1_3]).await;
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -328,21 +290,12 @@ async fn two_blocks_with_deltas() {
     let client = GenesisClient::new(genesis.clone());
 
     let genesis_timestamp = 0x67d00000u64;
-    let base_1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
-    let delta_1 = flash_delta(1, 1);
-    let base_2 = flash_base(2, genesis_hash, genesis_timestamp + 4);
-    let delta_2 = flash_delta(2, 1);
+    let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
+    let delta1_1 = flash_delta(1, 1);
+    let base2 = flash_base(2, genesis_hash, genesis_timestamp + 4);
+    let delta2_1 = flash_delta(2, 1);
 
-    let raw = run_flashblock_sequence(
-        client,
-        vec![
-            TestEvent::flashblock(base_1),
-            TestEvent::flashblock(delta_1),
-            TestEvent::flashblock(base_2),
-            TestEvent::flashblock(delta_2),
-        ],
-    )
-    .await;
+    let raw = run_flashblock_sequence(client, vec![base1, delta1_1, base2, delta2_1]).await;
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -375,9 +328,9 @@ async fn block_payload_has_correct_block_number() {
     let client = GenesisClient::new(genesis.clone());
 
     let genesis_timestamp = 0x67d00000u64;
-    let fb = flash_base(1, genesis_hash, genesis_timestamp + 2);
+    let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
 
-    let raw = run_flashblock_sequence(client, vec![TestEvent::flashblock(fb)]).await;
+    let raw = run_flashblock_sequence(client, vec![base1]).await;
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -430,28 +383,21 @@ async fn canonical_block_unblocks_next_base() {
 
     let genesis_timestamp = 0x67d00000u64;
     // Block 1 base — bootstraps from genesis (block 0 is always available).
-    let base_1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
+    let base1 = flash_base(1, genesis_hash, genesis_timestamp + 2);
     // Block 2 base — would need block 1 to be available to bootstrap from the provider,
-    // since block 2 is NOT the sequential successor of block 1 after we send base_1 alone
-    // (no delta_1 in between, but the processor still carries forward accumulated_db because
+    // since block 2 is NOT the sequential successor of block 1 after we send base1 alone
+    // (no delta in between, but the processor still carries forward accumulated_db because
     // block 2 == block 1 + 1; the key path tested here is that marking block 1 canonical
     // allows the provider call to succeed even if accumulated_db were None).
     //
-    // We send base_1 → canonical_block(1) → base_2 to verify that:
-    //   1. base_1 produces a FIRE BLOCK for block 1.
+    // We send base1 → canonical_block(1) → base2 to verify that:
+    //   1. base1 produces a FIRE BLOCK for block 1.
     //   2. canonical_block(1) marks block 1 as available without emitting anything.
-    //   3. base_2 produces a FIRE BLOCK for block 2 (carried forward from accumulated_db).
-    let base_2 = flash_base(2, genesis_hash, genesis_timestamp + 4);
+    //   3. base2 produces a FIRE BLOCK for block 2 (carried forward from accumulated_db).
+    let base2 = flash_base(2, genesis_hash, genesis_timestamp + 4);
 
-    let raw = run_flashblock_sequence(
-        client,
-        vec![
-            TestEvent::flashblock(base_1),
-            TestEvent::canonical_block(1),
-            TestEvent::flashblock(base_2),
-        ],
-    )
-    .await;
+    let raw =
+        run_flashblock_sequence(client, vec![base1, canonical_block(1), base2]).await;
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -484,13 +430,9 @@ async fn canonical_block_unblocks_non_sequential_gap() {
     let genesis_timestamp = 0x67d00000u64;
     // Send base for block 2 as the very first flashblock (no block 1 context).
     // The processor has no accumulated_db, so it must bootstrap from the provider at block 1.
-    let base_2 = flash_base(2, genesis_hash, genesis_timestamp + 4);
+    let base2 = flash_base(2, genesis_hash, genesis_timestamp + 4);
 
-    let raw = run_flashblock_sequence(
-        client,
-        vec![TestEvent::canonical_block(1), TestEvent::flashblock(base_2)],
-    )
-    .await;
+    let raw = run_flashblock_sequence(client, vec![canonical_block(1), base2]).await;
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()

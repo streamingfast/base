@@ -3,7 +3,7 @@
 //! This module provides:
 //! - [`GenesisClient`]: a minimal in-memory reth provider mock backed by a genesis allocation.
 //! - [`GenesisStateProvider`]: a thin [`StateProvider`] wrapper around [`StateProviderTest`].
-//! - [`flash_base`] / [`flash_delta`]: helpers to build [`Flashblock`] fixtures.
+//! - [`flash_base`] / [`flash_delta`] / [`canonical_block`]: helpers to build [`TestEvent`] fixtures.
 //! - [`TestEvent`]: discriminated event type for test sequences (flashblock or canonical block).
 //! - [`ws_server_once`]: a transient WebSocket server that sends a sequence of messages once.
 //! - [`FireEvent`]: structured representation of a single FIRE output line (INIT or BLOCK).
@@ -73,6 +73,7 @@ use url::Url;
 /// - [`TestEvent::CanonicalBlock`] updates [`GenesisClient`]'s internal state to mark block N as
 ///   available; no WS message is emitted. This unblocks the processor's bootstrap path when it
 ///   calls `state_by_block_number_or_tag(BlockNumberOrTag::Number(N))`.
+#[derive(Clone)]
 pub(crate) enum TestEvent {
     /// A flashblock to be sent over the WebSocket connection.
     ///
@@ -86,11 +87,6 @@ impl TestEvent {
     /// Wraps a [`Flashblock`] as a [`TestEvent::Flashblock`].
     pub(crate) fn flashblock(fb: Flashblock) -> Self {
         Self::Flashblock(Box::new(fb))
-    }
-
-    /// Signals that canonical block `block_number` is now available from the provider.
-    pub(crate) const fn canonical_block(block_number: u64) -> Self {
-        Self::CanonicalBlock(block_number)
     }
 }
 
@@ -650,14 +646,10 @@ impl StateProviderFactory for GenesisClient {
 
 // ── Flashblock builders ──────────────────────────────────────────────────────
 
-/// Constructs a base flashblock (index 0) for the given block number.
+/// Constructs a base flashblock (index 0) for the given block number, wrapped as a [`TestEvent`].
 ///
 /// All optional fields use sensible defaults. The base flashblock carries no transactions.
-pub(crate) fn flash_base(
-    block_number: u64,
-    parent_hash: B256,
-    timestamp: u64,
-) -> Flashblock {
+pub(crate) fn flash_base(block_number: u64, parent_hash: B256, timestamp: u64) -> TestEvent {
     let base = ExecutionPayloadBaseV1 {
         parent_beacon_block_root: B256::ZERO,
         parent_hash,
@@ -692,19 +684,19 @@ pub(crate) fn flash_base(
 
     let metadata = Metadata { block_number };
 
-    Flashblock {
+    TestEvent::flashblock(Flashblock {
         payload_id: payload.payload_id,
         index: payload.index,
         base: payload.base,
         diff: payload.diff,
         metadata,
-    }
+    })
 }
 
-/// Constructs a delta flashblock (index > 0) for the given block number.
+/// Constructs a delta flashblock (index > 0) for the given block number, wrapped as a [`TestEvent`].
 ///
 /// Carries no new transactions; used to test sequence progression.
-pub(crate) fn flash_delta(block_number: u64, index: u64) -> Flashblock {
+pub(crate) fn flash_delta(block_number: u64, index: u64) -> TestEvent {
     let diff = ExecutionPayloadFlashblockDeltaV1 {
         state_root: B256::ZERO,
         receipts_root: B256::ZERO,
@@ -719,13 +711,21 @@ pub(crate) fn flash_delta(block_number: u64, index: u64) -> Flashblock {
 
     let metadata = Metadata { block_number };
 
-    Flashblock {
+    TestEvent::flashblock(Flashblock {
         payload_id: PayloadId::new([0u8; 8]),
         index,
         base: None,
         diff,
         metadata,
-    }
+    })
+}
+
+/// Signals that canonical block `block_number` is now available from the provider.
+///
+/// This is a convenience wrapper around [`TestEvent::canonical_block`] for use in test
+/// event sequences alongside [`flash_base`] and [`flash_delta`].
+pub(crate) const fn canonical_block(block_number: u64) -> TestEvent {
+    TestEvent::CanonicalBlock(block_number)
 }
 
 // ── WS server ────────────────────────────────────────────────────────────────
