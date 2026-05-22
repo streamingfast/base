@@ -4,15 +4,17 @@
 //! - [`GenesisClient`]: a minimal in-memory reth provider mock backed by a genesis allocation.
 //! - [`GenesisStateProvider`]: a thin [`StateProvider`] wrapper around [`StateProviderTest`].
 //! - [`flash_base`] / [`flash_delta`]: helpers to build [`Flashblock`] fixtures.
+//! - [`TestEvent`]: discriminated event type for test sequences (flashblock or canonical block).
 //! - [`ws_server_once`]: a transient WebSocket server that sends a sequence of messages once.
 //! - [`FireEvent`]: structured representation of a single FIRE output line (INIT or BLOCK).
 //! - [`parse_fire_events`]: parses all FIRE lines from raw tracer output.
 //! - [`run_flashblock_sequence`]: end-to-end harness — starts server, runs processor, returns output.
 
 use std::{
+    collections::HashSet,
     net::SocketAddr,
     ops::RangeInclusive,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -23,25 +25,21 @@ use alloy_primitives::{
     Address, BlockHash, BlockNumber, Bloom, Bytes, StorageKey, TxHash, TxNumber, B256, U256,
 };
 use alloy_rpc_types_engine::PayloadId;
-use base_common_consensus::{
-    BaseBlock, BasePrimitives, BaseReceipt, BaseTxEnvelope,
-};
+use base_common_consensus::{BaseBlock, BasePrimitives, BaseReceipt, BaseTxEnvelope};
 use base_common_flashblocks::{
     ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, Flashblock, FlashblocksPayloadV1,
     Metadata,
 };
 use base_execution_chainspec::BaseChainSpec;
-use base_firehose_flashblocks::{
-    FirehoseFlashblocksProcessor, FlashblocksTracerHandle,
-};
+use base_firehose_flashblocks::{FirehoseFlashblocksProcessor, FlashblocksTracerHandle};
 use base64::Engine as _;
 use firehose_tracer::{
     InMemoryBuffer,
     config::{ChainClient, ChainConfig, Config},
     pb::Block as EthBlock,
 };
-use prost::Message as _;
 use futures::SinkExt as _;
+use prost::Message as _;
 use reth_chainspec::{ChainInfo, ChainSpecProvider, EthChainSpec};
 use reth_db_models::StoredBlockBodyIndices;
 use reth_primitives_traits::{Account, RecoveredBlock, SealedHeader};
@@ -66,13 +64,54 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
+// ── TestEvent ─────────────────────────────────────────────────────────────────
+
+/// A discriminated event for test sequences fed into [`run_flashblock_sequence`].
+///
+/// The runner processes events in order:
+/// - [`TestEvent::Flashblock`] is serialised and sent over the WS connection (same as today).
+/// - [`TestEvent::CanonicalBlock`] updates [`GenesisClient`]'s internal state to mark block N as
+///   available; no WS message is emitted. This unblocks the processor's bootstrap path when it
+///   calls `state_by_block_number_or_tag(BlockNumberOrTag::Number(N))`.
+pub(crate) enum TestEvent {
+    /// A flashblock to be sent over the WebSocket connection.
+    ///
+    /// Boxed to avoid a large-variant size imbalance with [`TestEvent::CanonicalBlock`].
+    Flashblock(Box<Flashblock>),
+    /// Signals that canonical block N is now available from the chain provider.
+    CanonicalBlock(u64),
+}
+
+impl TestEvent {
+    /// Wraps a [`Flashblock`] as a [`TestEvent::Flashblock`].
+    pub(crate) fn flashblock(fb: Flashblock) -> Self {
+        Self::Flashblock(Box::new(fb))
+    }
+
+    /// Signals that canonical block `block_number` is now available from the provider.
+    pub(crate) const fn canonical_block(block_number: u64) -> Self {
+        Self::CanonicalBlock(block_number)
+    }
+}
+
 // ── Mock client ──────────────────────────────────────────────────────────────
+
+/// Inner mutable state for [`GenesisClient`], shared via `Arc<Mutex<...>>`.
+#[derive(Debug, Default)]
+struct GenesisClientInner {
+    /// Block numbers that have been made available via a [`TestEvent::CanonicalBlock`] event.
+    available_blocks: HashSet<u64>,
+}
 
 /// A minimal in-memory client for use in tests.
 ///
 /// Holds a genesis (used to seed account state and chain spec) and a pre-built genesis header.
 /// Only the three methods called by [`FirehoseFlashblocksProcessor`] are implemented; all others
 /// return `Ok(None)` / `Ok(Vec::new())` or delegate to [`StateProviderTest`].
+///
+/// [`GenesisClient`] tracks which canonical blocks are "available" so that the processor's
+/// bootstrap path (via `state_by_block_number_or_tag`) can be unblocked by a
+/// [`TestEvent::CanonicalBlock`] event without sending anything over the WebSocket connection.
 #[derive(Clone, Debug)]
 pub(crate) struct GenesisClient {
     /// The chain spec derived from the genesis.
@@ -81,6 +120,8 @@ pub(crate) struct GenesisClient {
     pub(crate) genesis: Genesis,
     /// The genesis block header computed from the genesis.
     pub(crate) genesis_header: Header,
+    /// Shared inner state tracking which canonical blocks are available.
+    inner: Arc<Mutex<GenesisClientInner>>,
 }
 
 impl GenesisClient {
@@ -89,7 +130,37 @@ impl GenesisClient {
         let chain_spec = Arc::new(BaseChainSpec::from_genesis(genesis.clone()));
         let genesis_header =
             reth_chainspec::make_genesis_header(&genesis, &chain_spec.inner.hardforks);
-        Self { chain_spec, genesis, genesis_header }
+        Self {
+            chain_spec,
+            genesis,
+            genesis_header,
+            inner: Arc::new(Mutex::new(GenesisClientInner::default())),
+        }
+    }
+
+    /// Marks canonical block `block_number` as available to the provider.
+    ///
+    /// After this call, `state_by_block_number_or_tag(BlockNumberOrTag::Number(block_number))`
+    /// will succeed and return a genesis-seeded state provider for that block number.
+    pub(crate) fn mark_canonical_block_available(&self, block_number: u64) {
+        self.inner
+            .lock()
+            .expect("genesis client inner mutex poisoned")
+            .available_blocks
+            .insert(block_number);
+    }
+
+    /// Returns `true` if `block_number` is the genesis block (block 0) or has been explicitly
+    /// marked as available via [`mark_canonical_block_available`].
+    fn is_block_available(&self, block_number: u64) -> bool {
+        if block_number == 0 {
+            return true;
+        }
+        self.inner
+            .lock()
+            .expect("genesis client inner mutex poisoned")
+            .available_blocks
+            .contains(&block_number)
     }
 }
 
@@ -539,9 +610,14 @@ impl StateProviderFactory for GenesisClient {
 
     fn state_by_block_number_or_tag(
         &self,
-        _n: BlockNumberOrTag,
+        number_or_tag: BlockNumberOrTag,
     ) -> ProviderResult<StateProviderBox> {
-        Ok(Box::new(GenesisStateProvider::new(&self.genesis)))
+        match number_or_tag {
+            BlockNumberOrTag::Number(n) if !self.is_block_available(n) => {
+                Err(ProviderError::BlockBodyIndicesNotFound(n))
+            }
+            _ => Ok(Box::new(GenesisStateProvider::new(&self.genesis))),
+        }
     }
 
     fn history_by_block_number(&self, _n: BlockNumber) -> ProviderResult<StateProviderBox> {
@@ -1052,13 +1128,34 @@ pub(crate) fn test_genesis() -> Genesis {
 // ── Test runner ──────────────────────────────────────────────────────────────
 
 /// Builds a [`FirehoseFlashblocksProcessor`] with a buffer-backed tracer, connects it to a
-/// one-shot WebSocket server serving `sequence`, waits briefly for processing, and returns
-/// the captured raw tracer output.
+/// one-shot WebSocket server serving the flashblock events from `events`, waits briefly for
+/// processing, and returns the captured raw tracer output.
+///
+/// [`TestEvent::Flashblock`] events are serialised and sent over the WebSocket connection.
+/// [`TestEvent::CanonicalBlock`] events update [`GenesisClient`]'s internal state to mark the
+/// given block number as available; no WS message is emitted for canonical block events.
+///
+/// The events are split before the runner starts: all flashblocks are forwarded to the WS
+/// server in their original relative order; canonical-block events are applied to the client
+/// immediately before starting the processor, enabling the `state_by_block_number_or_tag`
+/// bootstrap path to succeed on first call rather than requiring retries. This mirrors the
+/// real-world case where canonical state is available by the time the next flashblock arrives.
 pub(crate) async fn run_flashblock_sequence(
     client: GenesisClient,
-    sequence: Vec<Flashblock>,
+    events: Vec<TestEvent>,
 ) -> Vec<u8> {
-    let addr = ws_server_once(sequence).await;
+    // Split the event sequence into websocket-deliverable flashblocks and canonical-block
+    // markers. We collect canonical block numbers and apply them synchronously before starting
+    // the subscriber so `state_by_block_number_or_tag` never needs to retry in tests.
+    let mut flashblocks: Vec<Flashblock> = Vec::with_capacity(events.len());
+    for event in events {
+        match event {
+            TestEvent::Flashblock(fb) => flashblocks.push(*fb),
+            TestEvent::CanonicalBlock(n) => client.mark_canonical_block_available(n),
+        }
+    }
+
+    let addr = ws_server_once(flashblocks).await;
     let ws_url = Url::parse(&format!("ws://127.0.0.1:{}", addr.port())).unwrap();
 
     let buffer = InMemoryBuffer::new();
