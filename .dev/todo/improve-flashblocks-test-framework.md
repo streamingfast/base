@@ -45,12 +45,26 @@ This change enables better coverage where we can simulate when a canonical block
 
 ## Dev Feedback
 
-1. flash_base and flash_delta, they both should return right away a `TestEvent` object so we avoid having to wrap all emitted events inside `TestEvent::flashblock`, same for `TestEvent::canonical_block(1),` we should have locally a `canonical_block` helper or it can be assigned to a variable like other test cases.
-1. Modify all delta variables to be on the form `delta<blockNum>_<flashIndex>` so it reads like `vec![base1, delta1_1, delta1_2, base2, etc...]`
+2. It seems `GenesisClient` .header_by_number which is used in processor.rs for flashblocks isn't properly implemented, should look into canonical block list to return the correct one.
+2. Add a test that check for `base1, canonical 1, canonical 2, base3` sequence which should correctly emit Flash1 Canonical1 Canonical2 Flash3.
 
-**Applied in commit `94053caa4`.**
+### Applied (2026-05-22)
 
-2. Rebase on top of firehose/0.x branch
+**Item 1 — Fix `header_by_number`:**
+Added `header_for_block(n)` method to `GenesisClient` that synthesises a header with `number = n` and `timestamp = genesis_timestamp + n * 2` using the genesis header as a template. `header_by_number(n)` now delegates to this helper so the processor's `next_evm_env` correctly computes `block_env.number = parent.number + 1` for any block N.
+
+**Item 2 — Canonical FIRE BLOCK emission + new test:**
+Changed `run_flashblock_sequence` from WS-based to direct sequential processing:
+- `TestEvent::Flashblock` → calls `processor.on_flashblock_received` directly (synchronous, preserves ordering).
+- `TestEvent::CanonicalBlock(n)` → marks block N available in the provider AND emits a canonical FIRE BLOCK through a dedicated canonical tracer sharing the same `InMemoryBuffer`.
+
+Two tracers write to the same buffer so output ordering exactly mirrors event processing order. Tests are now plain `#[test]` (no longer `#[tokio::test]`).
+
+Added `base_canonical_gap_then_base_emits_four_fire_blocks` test verifying `base1 → canonical_block(1) → canonical_block(2) → base3` emits Flash1, Canonical1, Canonical2, Flash3.
+
+Updated `canonical_block_unblocks_next_base` and `canonical_block_unblocks_non_sequential_gap` to expect the canonical FIRE BLOCK now emitted alongside provider availability.
+
+All 13 integration tests pass; clippy clean.
 
 ## Spec & Implementation
 
@@ -81,20 +95,22 @@ This pre-processing approach (apply canonical blocks before starting the subscri
 
 ### New Tests
 
-Two new tests added:
-1. `canonical_block_unblocks_next_base` — sends base_1, marks block 1 canonical, sends base_2; verifies both produce FIRE BLOCK events.
-2. `canonical_block_unblocks_non_sequential_gap` — sends base_2 as the very first flashblock (no prior context); without `canonical_block(1)`, the provider would fail and block 2 would be skipped. With it, block 2 processes successfully.
+Three new tests total:
+1. `canonical_block_unblocks_next_base` — sends base_1, marks block 1 canonical, sends base_2; verifies three events (Flash1, Canonical1, Flash2).
+2. `canonical_block_unblocks_non_sequential_gap` — sends canonical_block(1) then base_2; verifies two events (Canonical1, Flash2).
+3. `base_canonical_gap_then_base_emits_four_fire_blocks` — sends base1, canonical_block(1), canonical_block(2), base3; verifies four events (Flash1, Canonical1, Canonical2, Flash3).
 
-Total: 12 integration tests, all passing.
+Total: 13 integration tests, all passing.
 
 ## State Tracker
 
 **Last Updated:** 2026-05-22
-**Current Step:** Step 3 — Dev feedback applied, ready for review
+**Current Step:** Step 4 — Second dev feedback applied, ready for review
 **Status:** Ready for review
 
 | Step | Status | Notes |
 |---|---|---|
 | Initial setup | Done | Worktree created at .worktrees/feature/improve-flashblocks-test-framework |
 | Implementation | Done | TestEvent enum, GenesisClient inner state, updated tests, 2 new tests, all 12 pass, clippy clean |
-| Dev feedback | Done | flash_base/flash_delta/canonical_block return TestEvent directly; delta vars renamed to delta<N>_<I> pattern; all 12 tests pass, clippy clean |
+| Dev feedback (round 1) | Done | flash_base/flash_delta/canonical_block return TestEvent directly; delta vars renamed to delta<N>_<I> pattern; all 12 tests pass, clippy clean |
+| Dev feedback (round 2) | Done | Fixed header_by_number; canonical FIRE BLOCK emission; WS server removed; new 4-event sequence test; all 13 tests pass, clippy clean |
