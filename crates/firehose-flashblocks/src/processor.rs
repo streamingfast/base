@@ -9,7 +9,7 @@ use alloy_consensus::{
 };
 use alloy_eips::{BlockNumberOrTag, eip2718::Decodable2718};
 use alloy_evm::block::BlockExecutor;
-use alloy_primitives::{B256, Bytes};
+use alloy_primitives::Bytes;
 use base_common_chains::Upgrades;
 use base_common_consensus::{BasePrimitives, BaseTxEnvelope};
 use base_common_evm::{BaseBlockExecutionCtx, BaseBlockExecutor};
@@ -322,8 +322,14 @@ where
 
         let txs_with_senders = self.decode_and_recover_transactions(new_transactions)?;
 
+        let block_hash = assembled
+            .flashblocks
+            .last()
+            .expect("assembled block has at least one flashblock")
+            .diff
+            .block_hash;
         let sealed_block: SealedBlock<base_common_consensus::BaseBlock> =
-            SealedBlock::new_unchecked(assembled.block.clone(), B256::ZERO);
+            SealedBlock::new_unchecked(assembled.block.clone(), block_hash);
 
         let mut tracer = self.tracer.lock().expect("flashblock tracer mutex poisoned");
         let is_final = false;
