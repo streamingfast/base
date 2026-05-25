@@ -1,7 +1,10 @@
 //! Core Firehose flashblock processor: turns incoming [`Flashblock`] events into per-flashblock
 //! `FIRE BLOCK` partial-block emissions on a dedicated tracer.
 
-use std::{sync::Mutex, thread::sleep, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use alloy_consensus::{
     Header,
@@ -9,7 +12,7 @@ use alloy_consensus::{
 };
 use alloy_eips::{BlockNumberOrTag, eip2718::Decodable2718};
 use alloy_evm::block::BlockExecutor;
-use alloy_primitives::Bytes;
+use alloy_primitives::{B256, Bytes};
 use base_common_chains::Upgrades;
 use base_common_consensus::{BasePrimitives, BaseTxEnvelope};
 use base_common_evm::{BaseBlockExecutionCtx, BaseBlockExecutor};
@@ -30,15 +33,24 @@ use tracing::{debug, error, info, warn};
 
 use crate::{Error, FlashblocksTracerHandle};
 
-/// Number of retries when waiting for a parent [`StateProvider`] to materialize.
+/// Maximum age (in seconds) of an incoming flashblock relative to the processor's clock
+/// before it is considered stale. Stale flashblocks are dropped without affecting state —
+/// they don't trigger a reset, since later flashblocks for the same block would be
+/// equally stale and the next live base will simply restart the sequence.
 ///
-/// The processor retries `state_by_block_number_or_tag(parent)` this many times with
-/// [`STATE_PROVIDER_RETRY_DELAY`] between attempts before giving up and clearing the
-/// processor state so the next base flashblock restarts tracking from scratch.
-const STATE_PROVIDER_MAX_RETRIES: u32 = 20;
+/// Flashblocks arrive every ~200 ms in normal operation, so 5 seconds (≈25 flashblocks) of
+/// lag is plenty of slack for transient network or processing jitter — anything older
+/// than that is almost certainly a stale message we should drop rather than execute.
+const STALE_THRESHOLD_SECS: u64 = 5;
 
-/// Sleep duration between [`StateProviderFactory`] retries on the bootstrap path.
-const STATE_PROVIDER_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// Function that returns the current Unix timestamp in seconds, used for the staleness
+/// check. Boxed behind an `Arc` so it can be cheaply cloned and shared across threads.
+pub type ClockFn = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// Returns the current Unix timestamp in seconds. Used as the default [`ClockFn`].
+fn system_clock() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
 
 /// Boxed dynamically-dispatched [`StateProvider`] (matches `reth_provider::StateProviderBox`).
 type BoxedStateProvider = Box<dyn StateProvider + Send + 'static>;
@@ -66,6 +78,31 @@ struct ProcessorState {
     stored_flashblocks: Vec<Flashblock>,
     /// EVM state shared across flashblocks (and across blocks on the sequential fast path).
     accumulated_db: Option<AccumulatedDb>,
+    /// True when we have accumulated flashblocks for `current_block_number` but cannot yet
+    /// execute them because the parent block's state is not available from the provider.
+    ///
+    /// While pending, incoming flashblocks for the same block are still accepted by the
+    /// sequence validator and pushed onto `stored_flashblocks`, but no FIRE BLOCK lines are
+    /// emitted. A subsequent call to [`FirehoseFlashblocksProcessor::on_canonical_block`]
+    /// for the parent block triggers replay: every stored flashblock is executed in order,
+    /// emitting one FIRE BLOCK line each, and the pending flag is cleared.
+    pending_state: bool,
+    /// True when the flashblocks currently stored for `current_block_number` were produced
+    /// via a replay (i.e., previously pending and then unblocked by a canonical-block
+    /// notification on the parent). The flashblock chain's tip for this block has therefore
+    /// not yet been confirmed against the canonical chain; until a canonical-block
+    /// notification arrives for `current_block_number` to confirm (or contradict) that tip,
+    /// the processor must defer the next-block transition rather than continuing on the
+    /// optimistic sequential fast path — otherwise a divergent fork would silently be
+    /// extended through subsequent blocks.
+    awaiting_canonical_confirmation: bool,
+    /// Most recent canonical-block notification (block number + hash) seen by the
+    /// processor. Used to validate a new-block base's `parent_hash` against the
+    /// canonical chain at the moment the base is observed — when the canonical hash for
+    /// block N-1 is known and disagrees with the incoming base N's parent_hash, the
+    /// flashblock chain has diverged and the base (plus any subsequent deltas) is
+    /// discarded rather than emitted.
+    latest_canonical: Option<(u64, B256)>,
 }
 
 impl ProcessorState {
@@ -75,16 +112,23 @@ impl ProcessorState {
             latest_flashblock_index: None,
             stored_flashblocks: Vec::new(),
             accumulated_db: None,
+            pending_state: false,
+            awaiting_canonical_confirmation: false,
+            latest_canonical: None,
         }
     }
 
     /// Clear all per-sequence state, forcing the next flashblock to start a fresh sequence
     /// (only a base flashblock at index 0 will be accepted; non-zero indices are dropped).
+    /// Leaves `latest_canonical` untouched: knowledge of the canonical chain survives
+    /// processor resets so that subsequent flashblocks are still validated against it.
     fn reset(&mut self) {
         self.current_block_number = None;
         self.latest_flashblock_index = None;
         self.stored_flashblocks.clear();
         self.accumulated_db = None;
+        self.pending_state = false;
+        self.awaiting_canonical_confirmation = false;
     }
 
     /// Begin (or restart) a sequence on a fresh base flashblock at index 0. The accumulated
@@ -95,6 +139,9 @@ impl ProcessorState {
         self.current_block_number = Some(flashblock.metadata.block_number);
         self.latest_flashblock_index = Some(0);
         self.stored_flashblocks = vec![flashblock];
+        // Starting a fresh sequence invalidates any prior pending accumulation.
+        self.pending_state = false;
+        self.awaiting_canonical_confirmation = false;
     }
 }
 
@@ -105,11 +152,24 @@ impl ProcessorState {
 /// [`base_flashblocks::FlashblocksSubscriber`]. Construction order matters: build this AFTER
 /// [`reth_firehose::init_tracer`] has been called — [`FlashblocksTracerHandle`] needs the
 /// shared stdout lock that `init_tracer` installs.
-#[derive(Debug)]
 pub struct FirehoseFlashblocksProcessor<Client> {
     client: Client,
     state: Mutex<ProcessorState>,
     tracer: Mutex<FlashblocksTracerHandle>,
+    /// Source of "now" for the staleness check. Production wraps [`SystemTime::now`];
+    /// tests inject a constant so timestamps in fixtures are deterministic relative to
+    /// the configured clock.
+    clock: ClockFn,
+}
+
+impl<Client: std::fmt::Debug> std::fmt::Debug for FirehoseFlashblocksProcessor<Client> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FirehoseFlashblocksProcessor")
+            .field("client", &self.client)
+            .field("state", &self.state)
+            .field("tracer", &self.tracer)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<Client> FirehoseFlashblocksProcessor<Client>
@@ -122,9 +182,26 @@ where
         + Sync
         + 'static,
 {
-    /// Creates a new processor backed by the supplied client (provider) and dedicated tracer.
-    pub const fn new(client: Client, tracer: FlashblocksTracerHandle) -> Self {
-        Self { client, state: Mutex::new(ProcessorState::new()), tracer: Mutex::new(tracer) }
+    /// Creates a new processor backed by the supplied client (provider) and dedicated
+    /// tracer. The staleness clock defaults to wall-clock Unix time; tests that need
+    /// deterministic time-of-day should use [`Self::with_clock`] instead.
+    pub fn new(client: Client, tracer: FlashblocksTracerHandle) -> Self {
+        Self::with_clock(client, tracer, Arc::new(system_clock))
+    }
+
+    /// Like [`Self::new`] but accepts a custom clock used to evaluate flashblock
+    /// staleness. The closure returns the current Unix timestamp in seconds.
+    pub fn with_clock(
+        client: Client,
+        tracer: FlashblocksTracerHandle,
+        clock: ClockFn,
+    ) -> Self {
+        Self {
+            client,
+            state: Mutex::new(ProcessorState::new()),
+            tracer: Mutex::new(tracer),
+            clock,
+        }
     }
 
     /// Process a single flashblock event. Errors are logged and swallowed: the processor clears
@@ -137,11 +214,124 @@ where
         }
     }
 
+    /// Returns `true` if a new-block base's `parent_hash` is consistent with the most
+    /// recently observed canonical-block notification (or if there is no canonical
+    /// reference point to validate against yet). Returns `false` when the canonical
+    /// chain has confirmed a hash for the parent block that disagrees with the base —
+    /// the flashblock sequence has diverged and should be discarded.
+    ///
+    /// Validation is only attempted when the latest known canonical block number is the
+    /// immediate parent of the incoming base. Older canonical info isn't used to validate
+    /// further-future bases, since intermediate blocks may have arrived as canonicals we
+    /// haven't yet remembered.
+    fn parent_matches_canonical(
+        latest_canonical: Option<(u64, B256)>,
+        base_block_number: u64,
+        base_parent_hash: B256,
+    ) -> bool {
+        match latest_canonical {
+            Some((n, hash)) if n == base_block_number.saturating_sub(1) => {
+                hash == base_parent_hash
+            }
+            _ => true,
+        }
+    }
+
     fn process_inner(&self, flashblock: Flashblock) -> Result<(), Error> {
         let block_number = flashblock.metadata.block_number;
         let index = flashblock.index;
 
         let mut state = self.state.lock().expect("flashblock state mutex poisoned");
+
+        // Staleness check: if the incoming flashblock describes a block whose timestamp
+        // is more than `STALE_THRESHOLD_SECS` behind the current clock, discard it
+        // outright. Base flashblocks (index 0) carry the timestamp directly; deltas
+        // inherit it from the in-flight base. We deliberately do not mutate `state`
+        // here — a stale base will simply not start a sequence, and a stale delta lands
+        // before the validator updates `latest_flashblock_index`, so subsequent flashblocks
+        // for the same block see no progression and are dropped via the normal paths.
+        let block_timestamp = if index == 0 {
+            flashblock.base.as_ref().map(|b| b.timestamp)
+        } else {
+            state
+                .stored_flashblocks
+                .first()
+                .and_then(|fb| fb.base.as_ref().map(|b| b.timestamp))
+        };
+        if let Some(ts) = block_timestamp {
+            let now = (self.clock)();
+            let age = now.saturating_sub(ts);
+            if age > STALE_THRESHOLD_SECS {
+                warn!(
+                    block = block_number,
+                    index,
+                    flashblock_timestamp = ts,
+                    now_secs = now,
+                    age_secs = age,
+                    threshold_secs = STALE_THRESHOLD_SECS,
+                    "flashblock too far in the past; skipping execution"
+                );
+                return Ok(());
+            }
+        }
+
+        // Parent-hash sanity check: any base (index 0) must descend from a parent block
+        // whose hash the processor has already accepted. Two cases:
+        //
+        // 1. If a canonical-block notification for the parent block (block_number - 1) has
+        //    already been observed, that hash is authoritative — discard on mismatch.
+        // 2. Otherwise, if an in-flight flashblock chain exists for the parent block (the
+        //    current in-flight `current_block_number == block_number - 1`), the parent
+        //    must match the latest emitted tip of that chain. Without this, a base for
+        //    block N+1 could silently extend a fork whose tip the processor has no way to
+        //    obtain canonical state for.
+        //
+        // Non-base flashblocks (deltas) inherit the verdict via the in-flight block — they
+        // target an already-validated sequence.
+        if index == 0 {
+            let incoming_parent_hash =
+                flashblock.base.as_ref().map(|b| b.parent_hash).unwrap_or_default();
+            if !Self::parent_matches_canonical(
+                state.latest_canonical,
+                block_number,
+                incoming_parent_hash,
+            ) {
+                let (canon_num, canon_hash) =
+                    state.latest_canonical.expect("mismatch implies latest_canonical is Some");
+                warn!(
+                    block = block_number,
+                    incoming_parent_hash = %incoming_parent_hash,
+                    canonical_block = canon_num,
+                    canonical_hash = %canon_hash,
+                    "base flashblock parent_hash disagrees with latest canonical; discarding and resetting state"
+                );
+                state.reset();
+                return Ok(());
+            }
+            let canonical_known_for_parent = matches!(
+                state.latest_canonical,
+                Some((n, _)) if n == block_number.saturating_sub(1)
+            );
+            if !canonical_known_for_parent
+                && state.current_block_number == Some(block_number.saturating_sub(1))
+            {
+                let tip_hash = state
+                    .stored_flashblocks
+                    .last()
+                    .map(|fb| fb.diff.block_hash)
+                    .unwrap_or_default();
+                if tip_hash != incoming_parent_hash {
+                    warn!(
+                        block = block_number,
+                        incoming_parent_hash = %incoming_parent_hash,
+                        in_flight_tip_hash = %tip_hash,
+                        "base flashblock parent_hash disagrees with in-flight chain tip and no canonical confirms the parent; discarding and resetting state"
+                    );
+                    state.reset();
+                    return Ok(());
+                }
+            }
+        }
 
         match state.current_block_number {
             // No prior state: only a base flashblock can start (or restart) a sequence.
@@ -167,13 +357,59 @@ where
                     index,
                 ) {
                     SequenceValidationResult::NextInSequence => {
+                        // A delta must belong to the same payload as the in-flight base —
+                        // its `payload_id` should equal the base flashblock's. A mismatch
+                        // means this delta was produced for a different payload (e.g. the
+                        // sequencer started a fresh build) and cannot be applied on top of
+                        // the current accumulation; treat it as a non-consecutive event,
+                        // reset, and wait for the next base flashblock.
+                        let base_payload_id = state
+                            .stored_flashblocks
+                            .first()
+                            .expect(
+                                "stored_flashblocks contains the base when current_block_number is Some",
+                            )
+                            .payload_id;
+                        if flashblock.payload_id != base_payload_id {
+                            warn!(
+                                block = block_number,
+                                index,
+                                base_payload_id = %base_payload_id,
+                                delta_payload_id = %flashblock.payload_id,
+                                "delta flashblock payload_id disagrees with in-flight base; resetting state and waiting for next base"
+                            );
+                            state.reset();
+                            return Ok(());
+                        }
                         state.stored_flashblocks.push(flashblock);
                         state.latest_flashblock_index = Some(index);
                     }
                     SequenceValidationResult::FirstOfNextBlock => {
                         // Strict successor block — keep accumulated_db so the sequential fast
                         // path can carry committed state forward without re-bootstrapping.
+                        let awaiting = state.awaiting_canonical_confirmation;
+                        let stored_parent_hash =
+                            flashblock.base.as_ref().map(|b| b.parent_hash).unwrap_or_default();
                         state.start_block(flashblock);
+                        if awaiting {
+                            // The previous block was replayed and has not yet been confirmed
+                            // by a canonical-block notification. Defer this transition: the
+                            // base is buffered, no FIRE line is emitted yet, and we wait for
+                            // the canonical-block signal to either confirm the parent
+                            // (replay block N+1) or contradict it (discard the buffered
+                            // flashblocks).
+                            state.pending_state = true;
+                            // Drop the carried-forward DB — if the canonical confirms a
+                            // different parent hash we cannot reuse this snapshot. A
+                            // matching canonical triggers a fresh bootstrap during replay.
+                            state.accumulated_db = None;
+                            debug!(
+                                block = block_number,
+                                parent_hash = %stored_parent_hash,
+                                "deferring next-block base while awaiting canonical confirmation of parent"
+                            );
+                            return Ok(());
+                        }
                     }
                     SequenceValidationResult::Duplicate => {
                         debug!(block = block_number, index, "duplicate flashblock; ignoring");
@@ -217,6 +453,18 @@ where
             }
         }
 
+        // If we're already pending on the parent's state, accept the new flashblock into
+        // the buffer (the validator above already pushed it) and defer execution until
+        // `on_canonical_block` triggers replay.
+        if state.pending_state {
+            debug!(
+                block = block_number,
+                index,
+                "parent state still unavailable; buffering flashblock for replay"
+            );
+            return Ok(());
+        }
+
         let stored_flashblocks = state.stored_flashblocks.clone();
         let mut accumulated_db = state.accumulated_db.take();
 
@@ -236,20 +484,32 @@ where
                 .clone()
         };
 
-        let parent_hash = assembled.base.parent_hash;
-
         if accumulated_db.is_none() {
             let parent_block = block_number.saturating_sub(1);
-            let provider = self
-                .bootstrap_provider(parent_block)
-                .ok_or(Error::StateProviderTimeout { block_number, parent_hash })?;
-            accumulated_db = Some(
-                State::builder()
-                    .with_database(StateProviderDatabase::new(provider))
-                    .with_bundle_update()
-                    .without_state_clear()
-                    .build(),
-            );
+            match self.try_bootstrap_provider(parent_block) {
+                Some(provider) => {
+                    accumulated_db = Some(
+                        State::builder()
+                            .with_database(StateProviderDatabase::new(provider))
+                            .with_bundle_update()
+                            .without_state_clear()
+                            .build(),
+                    );
+                }
+                None => {
+                    // Parent state not yet available. Mark the in-flight sequence as
+                    // pending; subsequent deltas accumulate in `stored_flashblocks` and
+                    // replay fires when `on_canonical_block(parent_block)` is invoked.
+                    let mut state = self.state.lock().expect("flashblock state mutex poisoned");
+                    state.pending_state = true;
+                    warn!(
+                        block = block_number,
+                        parent_block,
+                        "parent state not available; buffering flashblock for replay on canonical signal"
+                    );
+                    return Ok(());
+                }
+            }
         }
 
         let mut db = accumulated_db.expect("accumulated_db was populated just above");
@@ -260,22 +520,185 @@ where
         Ok(())
     }
 
-    fn bootstrap_provider(&self, parent_block: u64) -> Option<BoxedStateProvider> {
-        for attempt in 0..STATE_PROVIDER_MAX_RETRIES {
-            match self.client.state_by_block_number_or_tag(BlockNumberOrTag::Number(parent_block)) {
-                Ok(provider) => return Some(provider),
-                Err(err) => {
-                    debug!(
-                        attempt,
-                        parent_block,
-                        error = %err,
-                        "state provider not yet available; retrying"
-                    );
-                    sleep(STATE_PROVIDER_RETRY_DELAY);
-                }
+    /// Attempts a single [`StateProviderFactory`] lookup for `parent_block`.
+    ///
+    /// Returns `Some(provider)` if the parent state is available, `None` otherwise. There is
+    /// no retry loop: when state is not yet committed, callers fall back to the pending
+    /// buffer and wait for [`Self::on_canonical_block`] to retry once the parent block has
+    /// been finalised.
+    fn try_bootstrap_provider(&self, parent_block: u64) -> Option<BoxedStateProvider> {
+        match self.client.state_by_block_number_or_tag(BlockNumberOrTag::Number(parent_block)) {
+            Ok(provider) => Some(provider),
+            Err(err) => {
+                debug!(parent_block, error = %err, "parent state provider not available");
+                None
             }
         }
-        None
+    }
+
+    /// Signals that the canonical chain just committed block `canonical_block_number` with
+    /// hash `canonical_block_hash`. Drives two distinct flows:
+    ///
+    /// 1. **Replay or discard a pending buffer.** If the processor has buffered flashblocks
+    ///    for block `canonical_block_number + 1` (whose parent state was unavailable when
+    ///    they arrived), compare the buffered base's `parent_hash` with
+    ///    `canonical_block_hash`:
+    ///    - Match → bootstrap the parent state and replay every buffered flashblock,
+    ///      emitting one FIRE BLOCK line per entry. After a successful replay the in-flight
+    ///      block is itself unconfirmed, so [`awaiting_canonical_confirmation`] is set; the
+    ///      next-block base will be deferred until *its* parent is also canonically
+    ///      confirmed.
+    ///    - Mismatch → the buffered flashblocks descend from a tip that the canonical chain
+    ///      did not accept; discard them and reset the processor.
+    ///
+    /// 2. **Confirm or contradict the current in-flight block.** When the processor's
+    ///    in-flight block IS `canonical_block_number` (its flashblocks were already emitted
+    ///    — typically via a prior replay — and we have been waiting for the canonical chain
+    ///    to weigh in), compare the canonical hash with the latest emitted flashblock's
+    ///    tip:
+    ///    - Match → clear `awaiting_canonical_confirmation`; the next-block base may now
+    ///      take the sequential fast path.
+    ///    - Mismatch → reset; subsequent flashblocks that depend on the diverged tip would
+    ///      compound the error.
+    ///
+    /// All other cases (no pending buffer, no awaiting confirmation, mismatched block
+    /// numbers) are no-ops.
+    pub fn on_canonical_block(&self, canonical_block_number: u64, canonical_block_hash: B256) {
+        let mut state = self.state.lock().expect("flashblock state mutex poisoned");
+
+        // Always record the latest canonical so subsequent base flashblocks can validate
+        // their `parent_hash` against the canonical chain, regardless of any in-flight
+        // pending or awaiting-confirmation state.
+        if state
+            .latest_canonical
+            .is_none_or(|(prev_num, _)| canonical_block_number >= prev_num)
+        {
+            state.latest_canonical = Some((canonical_block_number, canonical_block_hash));
+        }
+
+        // Case 2: a canonical for the block we just (re)played — confirm or contradict tip.
+        if !state.pending_state && state.awaiting_canonical_confirmation {
+            if state.current_block_number == Some(canonical_block_number) {
+                let tip_hash = state
+                    .stored_flashblocks
+                    .last()
+                    .map(|fb| fb.diff.block_hash)
+                    .unwrap_or_default();
+                if tip_hash == canonical_block_hash {
+                    debug!(
+                        block = canonical_block_number,
+                        canonical_block_hash = %canonical_block_hash,
+                        "canonical confirms in-flight tip"
+                    );
+                    state.awaiting_canonical_confirmation = false;
+                } else {
+                    warn!(
+                        block = canonical_block_number,
+                        canonical_block_hash = %canonical_block_hash,
+                        flashblock_tip = %tip_hash,
+                        "canonical contradicts in-flight tip; resetting state"
+                    );
+                    state.reset();
+                }
+            }
+            return;
+        }
+
+        // Case 1: pending buffer waiting for parent state — replay on match, discard on
+        // mismatch.
+        if !state.pending_state {
+            return;
+        }
+        let pending_block = state
+            .current_block_number
+            .expect("pending_state implies an in-flight block");
+        if pending_block.saturating_sub(1) != canonical_block_number {
+            return;
+        }
+
+        let buffered_parent_hash = state
+            .stored_flashblocks
+            .first()
+            .and_then(|fb| fb.base.as_ref().map(|b| b.parent_hash))
+            .unwrap_or_default();
+        if buffered_parent_hash != canonical_block_hash {
+            warn!(
+                pending_block,
+                canonical_block_number,
+                canonical_block_hash = %canonical_block_hash,
+                buffered_parent_hash = %buffered_parent_hash,
+                "buffered flashblocks descend from a tip that did not canonicalize; discarding"
+            );
+            state.reset();
+            return;
+        }
+
+        let Some(provider) = self.try_bootstrap_provider(canonical_block_number) else {
+            debug!(
+                pending_block,
+                canonical_block_number,
+                "canonical block signalled but parent state still not available; staying pending"
+            );
+            return;
+        };
+
+        let stored = state.stored_flashblocks.clone();
+        state.pending_state = false;
+        drop(state);
+
+        let mut accumulated_db = State::builder()
+            .with_database(StateProviderDatabase::new(provider))
+            .with_bundle_update()
+            .without_state_clear()
+            .build();
+
+        for (i, fb) in stored.iter().enumerate() {
+            let partial = &stored[..=i];
+            let assembled = match BlockAssembler::assemble(partial) {
+                Ok(a) => a,
+                Err(err) => {
+                    error!(
+                        pending_block,
+                        replay_index = i,
+                        error = ?err,
+                        "replay block assembly failed; resetting state"
+                    );
+                    let mut state = self.state.lock().expect("flashblock state mutex poisoned");
+                    state.reset();
+                    return;
+                }
+            };
+            let new_transactions: Vec<Bytes> = if i == 0 {
+                assembled.flashblocks[0].diff.transactions.clone()
+            } else {
+                fb.diff.transactions.clone()
+            };
+            if let Err(err) =
+                self.execute_flashblock(&assembled, fb.index, &new_transactions, &mut accumulated_db)
+            {
+                error!(
+                    pending_block,
+                    replay_index = i,
+                    error = %err,
+                    "replay execution failed; resetting state"
+                );
+                let mut state = self.state.lock().expect("flashblock state mutex poisoned");
+                state.reset();
+                return;
+            }
+        }
+
+        let mut state = self.state.lock().expect("flashblock state mutex poisoned");
+        state.accumulated_db = Some(accumulated_db);
+        // The just-replayed in-flight block has not yet been confirmed by the canonical
+        // chain. Defer the next-block transition until that confirmation arrives.
+        state.awaiting_canonical_confirmation = true;
+        info!(
+            pending_block,
+            canonical_block_number,
+            replayed = stored.len(),
+            "replayed buffered flashblocks after canonical block became available"
+        );
     }
 
     fn execute_flashblock(

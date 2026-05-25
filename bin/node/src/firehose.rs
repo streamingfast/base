@@ -11,7 +11,9 @@ use base_firehose_flashblocks::{
     FirehoseFlashblocksProcessor, FirehoseFlashblocksStreamer, FlashblocksTracerHandle,
 };
 use base_node_runner::{BaseNodeExtension, FromExtensionConfig, NodeHooks};
+use reth_chain_state::CanonStateSubscriptions;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
+use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{info, warn};
 use url::Url;
 
@@ -80,9 +82,33 @@ impl BaseNodeExtension for FirehoseFlashblocksExtension {
                 ..Default::default()
             };
             let tracer = FlashblocksTracerHandle::new(tracer_config, chain_config);
-            let processor = FirehoseFlashblocksProcessor::new(full_node.provider, tracer);
+            let processor =
+                FirehoseFlashblocksProcessor::new(full_node.provider.clone(), tracer);
             info!(url = %ws_url, "starting Firehose flashblocks streamer");
-            FirehoseFlashblocksStreamer::new(processor, ws_url).start();
+            let streamer = FirehoseFlashblocksStreamer::new(processor, ws_url);
+            let processor_for_canonical = streamer.processor();
+            streamer.start();
+
+            // Drive `FirehoseFlashblocksProcessor::on_canonical_block` from the node's
+            // canonical-state notifications. When a block N becomes canonical, any flashblocks
+            // for block N+1 that were buffered because their parent state wasn't yet committed
+            // get replayed and emitted to the dedicated flashblocks tracer.
+            let mut canonical_stream =
+                BroadcastStream::new(full_node.provider.subscribe_to_canonical_state());
+            tokio::spawn(async move {
+                while let Some(notification) = canonical_stream.next().await {
+                    let notification = match notification {
+                        Ok(n) => n,
+                        Err(err) => {
+                            warn!(error = %err, "canonical-state broadcast lagged; continuing");
+                            continue;
+                        }
+                    };
+                    for block in notification.committed().blocks_iter() {
+                        processor_for_canonical.on_canonical_block(block.number, block.hash());
+                    }
+                }
+            });
             Ok(())
         })
     }

@@ -5628,9 +5628,12 @@ dependencies = [
  "base-reth-cli",
  "clap",
  "firehose-tracer",
+ "reth-chain-state",
  "reth-chainspec",
  "reth-cli-util",
  "reth-firehose",
+ "tokio",
+ "tokio-stream",
  "tracing",
  "url",
 ]

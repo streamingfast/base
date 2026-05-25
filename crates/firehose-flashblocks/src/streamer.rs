@@ -37,6 +37,14 @@ where
         Self { processor: Arc::new(processor), ws_url }
     }
 
+    /// Returns a clone of the shared processor handle. Useful for callers that need to wire
+    /// additional notification streams to the processor (e.g. a canonical-state subscription
+    /// driving [`FirehoseFlashblocksProcessor::on_canonical_block`]) alongside the WebSocket
+    /// subscriber.
+    pub fn processor(&self) -> Arc<FirehoseFlashblocksProcessor<Client>> {
+        Arc::clone(&self.processor)
+    }
+
     /// Spawns the subscriber. The subscriber owns its own reconnect-backoff loop, so this call
     /// returns immediately and the resulting tasks run for the lifetime of the tokio runtime.
     pub fn start(self) {

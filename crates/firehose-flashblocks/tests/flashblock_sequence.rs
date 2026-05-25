@@ -20,8 +20,8 @@ use base_execution_chainspec::BaseChainSpec;
 
 use framework::{
     FireEvent, GenesisClient, assert_fire_events_eq, assert_fire_events_metadata_eq,
-    canonical_block, flash_base, flash_delta, hash, parse_fire_events, run_flashblock_sequence,
-    test_genesis,
+    canonical_block, flash_base, flash_delta, flash_delta_with_payload_id, hash,
+    parse_fire_events, run_flashblock_sequence, run_flashblock_sequence_at, test_genesis,
 };
 
 /// Simplest possible test: send a single flash-base event (block 1, no transactions) and verify
@@ -38,14 +38,14 @@ use framework::{
 fn flash_base_emits_fire_block() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
-
     let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
 
-    // Block 1, parent = genesis block hash, timestamp = genesis + 2 seconds.
-    let genesis_timestamp = 0x67d00000u64;
-    let base1 = flash_base(1, hash("1a"), genesis_hash, genesis_timestamp + 2);
-
-    let raw = run_flashblock_sequence(client, vec![base1]);
+    let raw = run_flashblock_sequence(
+        client,
+        // Block 1, parent = genesis block hash, timestamp = genesis + 2 seconds.
+        vec![flash_base(1, hash("1a"), genesis_hash, ts + 2)],
+    );
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -65,14 +65,13 @@ fn flash_base_emits_fire_block() {
 fn base_plus_delta_emits_two_fire_blocks() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
-
     let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
 
-    let genesis_timestamp = 0x67d00000u64;
-    let base1 = flash_base(1, hash("1a"), genesis_hash, genesis_timestamp + 2);
-    let delta1_1 = flash_delta(1, hash("1a"), 1);
-
-    let raw = run_flashblock_sequence(client, vec![base1, delta1_1]);
+    let raw = run_flashblock_sequence(
+        client,
+        vec![flash_base(1, hash("1a"), genesis_hash, ts + 2), flash_delta(1, hash("1a"), 1)],
+    );
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -105,18 +104,18 @@ fn base_plus_delta_emits_two_fire_blocks() {
 fn base_plus_delta_plus_next_base() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
-
     let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
 
-    let genesis_timestamp = 0x67d00000u64;
-    let base1 = flash_base(1, hash("1a"), genesis_hash, genesis_timestamp + 2);
-    let delta1_1 = flash_delta(1, hash("1a"), 1);
-    // Block 2's parent hash is B256::ZERO in tests (the mock provider always returns genesis header
-    // which has a zero block hash, so any non-zero B256 is fine for routing; use genesis_hash for
-    // simplicity — the mock ignores the parent hash when looking up state).
-    let base2 = flash_base(2, hash("2a"), genesis_hash, genesis_timestamp + 4);
-
-    let raw = run_flashblock_sequence(client, vec![base1, delta1_1, base2]);
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            flash_delta(1, hash("1a"), 1),
+            // No canonical event for block 1, this will not get sent
+            flash_base(2, hash("2a"), hash("1b"), ts + 4),
+        ],
+    );
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -128,6 +127,39 @@ fn base_plus_delta_plus_next_base() {
         &[
             FireEvent::flash_block(1, hash("1a"), 0, false),
             FireEvent::flash_block(1, hash("1a"), 1, false),
+        ],
+    );
+}
+
+#[test]
+fn base_plus_delta_plus_next_base_but_no_state_yet() {
+    let genesis = test_genesis();
+    let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            flash_delta(1, hash("1b"), 1),
+            // Block 2's parent matches the in-flight tip "1b". Even without a canonical
+            // confirmation for block 1, the sequential fast path executes base2 on top of
+            // the in-memory `accumulated_db` carried forward from block 1's flashblocks.
+            flash_base(2, hash("2a"), hash("1b"), ts + 4),
+        ],
+    );
+
+    let events: Vec<FireEvent> = parse_fire_events(&raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
+        .collect();
+
+    assert_fire_events_metadata_eq(
+        &events,
+        &[
+            FireEvent::flash_block(1, hash("1a"), 0, false),
+            FireEvent::flash_block(1, hash("1b"), 1, false),
             FireEvent::flash_block(2, hash("2a"), 0, false),
         ],
     );
@@ -141,13 +173,17 @@ fn base_plus_delta_plus_next_base() {
 fn duplicate_base_is_ignored() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
-
     let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
 
-    let genesis_timestamp = 0x67d00000u64;
-    let base1 = flash_base(1, hash("1a"), genesis_hash, genesis_timestamp + 2);
-    // Send the same base twice.
-    let raw = run_flashblock_sequence(client, vec![base1.clone(), base1]);
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            // Send the same base twice — the duplicate is silently dropped.
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+        ],
+    );
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -167,15 +203,17 @@ fn duplicate_base_is_ignored() {
 fn non_sequential_delta_is_skipped() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
-
     let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
 
-    let genesis_timestamp = 0x67d00000u64;
-    let base1 = flash_base(1, hash("1a"), genesis_hash, genesis_timestamp + 2);
-    // Skip index 1 and send index 2 directly — creates a NonSequentialGap.
-    let delta1_2 = flash_delta(1, hash("1a"), 2);
-
-    let raw = run_flashblock_sequence(client, vec![base1, delta1_2]);
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            // Skip index 1 and send index 2 directly — creates a NonSequentialGap.
+            flash_delta(1, hash("1a"), 2),
+        ],
+    );
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -194,15 +232,17 @@ fn non_sequential_delta_is_skipped() {
 fn two_successive_deltas() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
-
     let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
 
-    let genesis_timestamp = 0x67d00000u64;
-    let base1 = flash_base(1, hash("1a"), genesis_hash, genesis_timestamp + 2);
-    let delta1_1 = flash_delta(1, hash("1a"), 1);
-    let delta1_2 = flash_delta(1, hash("1a"), 2);
-
-    let raw = run_flashblock_sequence(client, vec![base1, delta1_1, delta1_2]);
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            flash_delta(1, hash("1a"), 1),
+            flash_delta(1, hash("1a"), 2),
+        ],
+    );
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -229,15 +269,17 @@ fn two_successive_deltas() {
 fn jumping_delta_is_skipped() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
-
     let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
 
-    let genesis_timestamp = 0x67d00000u64;
-    let base1 = flash_base(1, hash("1a"), genesis_hash, genesis_timestamp + 2);
-    // Jump directly to idx=2, skipping idx=1.
-    let delta1_2 = flash_delta(1, hash("1a"), 2);
-
-    let raw = run_flashblock_sequence(client, vec![base1, delta1_2]);
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            // Jump directly to idx=2, skipping idx=1.
+            flash_delta(1, hash("1a"), 2),
+        ],
+    );
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -255,16 +297,18 @@ fn jumping_delta_is_skipped() {
 fn three_successive_deltas() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
-
     let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
 
-    let genesis_timestamp = 0x67d00000u64;
-    let base1 = flash_base(1, hash("1a"), genesis_hash, genesis_timestamp + 2);
-    let delta1_1 = flash_delta(1, hash("1a"), 1);
-    let delta1_2 = flash_delta(1, hash("1a"), 2);
-    let delta1_3 = flash_delta(1, hash("1a"), 3);
-
-    let raw = run_flashblock_sequence(client, vec![base1, delta1_1, delta1_2, delta1_3]);
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            flash_delta(1, hash("1a"), 1),
+            flash_delta(1, hash("1a"), 2),
+            flash_delta(1, hash("1a"), 3),
+        ],
+    );
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -291,16 +335,21 @@ fn three_successive_deltas() {
 fn two_blocks_with_deltas() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
-
     let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
 
-    let genesis_timestamp = 0x67d00000u64;
-    let base1 = flash_base(1, hash("1a"), genesis_hash, genesis_timestamp + 2);
-    let delta1_1 = flash_delta(1, hash("1a"), 1);
-    let base2 = flash_base(2, hash("2a"), genesis_hash, genesis_timestamp + 4);
-    let delta2_1 = flash_delta(2, hash("2a"), 1);
-
-    let raw = run_flashblock_sequence(client, vec![base1, delta1_1, base2, delta2_1]);
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            flash_delta(1, hash("1a"), 1),
+            // Block 2's parent must match block 1's in-flight tip hash, otherwise the
+            // processor's parent-hash sanity check discards the base as descending from
+            // an unconfirmed fork.
+            flash_base(2, hash("2a"), hash("1a"), ts + 4),
+            flash_delta(2, hash("2a"), 1),
+        ],
+    );
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -329,13 +378,11 @@ fn two_blocks_with_deltas() {
 fn block_payload_has_correct_block_number() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
-
     let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
 
-    let genesis_timestamp = 0x67d00000u64;
-    let base1 = flash_base(1, hash("1a"), genesis_hash, genesis_timestamp + 2);
-
-    let raw = run_flashblock_sequence(client, vec![base1]);
+    let raw =
+        run_flashblock_sequence(client, vec![flash_base(1, hash("1a"), genesis_hash, ts + 2)]);
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -391,14 +438,20 @@ fn block_payload_has_correct_block_number() {
 fn canonical_block_unblocks_next_base() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
-
     let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
 
-    let genesis_timestamp = 0x67d00000u64;
-    let base1 = flash_base(1, hash("1a"), genesis_hash, genesis_timestamp + 2);
-    let base2 = flash_base(2, hash("2a"), genesis_hash, genesis_timestamp + 4);
-
-    let raw = run_flashblock_sequence(client, vec![base1, canonical_block(1, hash("1a")), base2]);
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            canonical_block(1, hash("1a")),
+            // Block 2's parent must match canonical block 1's hash, otherwise the
+            // parent-hash sanity check would discard the base as descending from a
+            // divergent chain.
+            flash_base(2, hash("2a"), hash("1a"), ts + 4),
+        ],
+    );
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -431,16 +484,20 @@ fn canonical_block_unblocks_next_base() {
 #[test]
 fn canonical_block_unblocks_non_sequential_gap() {
     let genesis = test_genesis();
-    let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
-
     let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
 
-    let genesis_timestamp = 0x67d00000u64;
-    // Send base for block 2 as the very first flashblock (no block 1 context).
-    // The processor has no accumulated_db, so it must bootstrap from the provider at block 1.
-    let base2 = flash_base(2, hash("2a"), genesis_hash, genesis_timestamp + 4);
-
-    let raw = run_flashblock_sequence(client, vec![canonical_block(1, hash("1a")), base2]);
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            canonical_block(1, hash("1a")),
+            // Send base for block 2 as the very first flashblock (no block 1 context).
+            // The processor has no accumulated_db, so it must bootstrap from the provider
+            // at block 1. Block 2's parent must match canonical block 1's hash for the
+            // parent-hash sanity check.
+            flash_base(2, hash("2a"), hash("1a"), ts + 4),
+        ],
+    );
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
         .into_iter()
@@ -483,18 +540,21 @@ fn canonical_block_unblocks_non_sequential_gap() {
 fn base_canonical_gap_then_base_emits_four_fire_blocks() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
-
     let client = GenesisClient::new(genesis);
-
-    let genesis_timestamp = 0x67d00000u64;
-    let base1 = flash_base(1, hash("1a"), genesis_hash, genesis_timestamp + 2);
-    // No flashblock for block 2 — only canonical events for blocks 1 and 2.
-    let base3 = flash_base(3, hash("3a"), hash("2b"), genesis_timestamp + 6);
-    let flash3 = flash_delta(3, hash("3b"), 1);
+    let ts = 0x67d00000u64;
 
     let raw = run_flashblock_sequence(
         client,
-        vec![base1, canonical_block(1, hash("1a")), canonical_block(2, hash("2a")), base3, flash3],
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            // No flashblock for block 2 — only canonical events for blocks 1 and 2.
+            canonical_block(1, hash("1a")),
+            canonical_block(2, hash("2a")),
+            // Block 3's parent must match canonical block 2's hash for the parent-hash
+            // sanity check.
+            flash_base(3, hash("3a"), hash("2a"), ts + 6),
+            flash_delta(3, hash("3b"), 1),
+        ],
     );
 
     let events: Vec<FireEvent> = parse_fire_events(&raw)
@@ -511,5 +571,147 @@ fn base_canonical_gap_then_base_emits_four_fire_blocks() {
             FireEvent::flash_block(3, hash("3a"), 0, false), // Flash3 — flashblock tracer, block 3, flash_idx=0
             FireEvent::flash_block(3, hash("3b"), 1, false), // Flash3 — flashblock tracer, block 3, flash_idx=1
         ],
+    );
+}
+
+#[test]
+fn base_canonical_after_flashblock_flushes_buffer() {
+    let genesis = test_genesis();
+    let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+
+    let client = GenesisClient::new(genesis);
+
+    let ts = 0x67d00000u64;
+
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            canonical_block(1, hash("1a")),
+            // these will get accumulated in buffer
+            flash_base(3, hash("3a"), hash("2a"), ts + 6),
+            flash_delta(3, hash("3b"), 1),
+            // this triggers the flashblocks
+            canonical_block(2, hash("2a")),
+            // these will get accumulated in buffer
+            flash_base(4, hash("4a"), hash("3b"), ts + 8),
+            flash_delta(4, hash("4b"), 1),
+            // this should NOT trigger the flashblocks 4 because their parent is wrong
+            canonical_block(3, hash("3a")),
+        ],
+    );
+
+    let events: Vec<FireEvent> = parse_fire_events(&raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
+        .collect();
+
+    assert_fire_events_metadata_eq(
+        &events,
+        &[
+            FireEvent::flash_block(1, hash("1a"), 0, false), // Flash1 — flashblock tracer, block 1, flash_idx=0
+            FireEvent::canonical_block(1, hash("1a")), // Canonical1 — canonical tracer, block 1
+            FireEvent::canonical_block(2, hash("2a")), // Canonical2 — canonical tracer, block 2
+            FireEvent::flash_block(3, hash("3a"), 0, false), // Flash3 — flashblock tracer, block 3, flash_idx=0
+            FireEvent::flash_block(3, hash("3b"), 1, false), // Flash3 — flashblock tracer, block 3, flash_idx=1
+            FireEvent::canonical_block(3, hash("3a")), // Canonical3 — canonical tracer, block 3
+        ],
+    );
+}
+
+#[test]
+fn base_ordered_wrong_hash() {
+    let genesis = test_genesis();
+
+    let client = GenesisClient::new(genesis);
+
+    let ts = 0x67d00000u64;
+
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            // this overrides genesis
+            canonical_block(1, hash("1a")),
+            flash_base(2, hash("2a"), hash("1b"), ts + 4), // this has wrong parent hash, should not send
+            flash_delta(2, hash("2b"), 1),
+        ],
+    );
+
+    let events: Vec<FireEvent> = parse_fire_events(&raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
+        .collect();
+
+    assert_fire_events_metadata_eq(&events, &[FireEvent::canonical_block(1, hash("1a"))]);
+}
+
+/// Verifies that a delta whose `payload_id` differs from the in-flight base's is
+/// discarded, and the processor refuses any subsequent deltas until a fresh base
+/// starts a new sequence.
+///
+/// Sequence:
+/// 1. `base1` (payload_id = 0) → emit Flash1.0.
+/// 2. `delta1_1` with payload_id = 42 → mismatch with base's payload_id 0; discard and
+///    reset. No FIRE BLOCK emitted.
+/// 3. `delta1_2` with payload_id = 0 → no in-flight sequence after the reset, and a
+///    delta (index != 0) cannot start a sequence; dropped, waiting for next base.
+#[test]
+fn delta_with_wrong_payload_id_is_discarded() {
+    let genesis = test_genesis();
+    let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            // Base uses the default payload_id (all zeros).
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            // Delta with a different payload_id — must be discarded, and the processor
+            // must reset its in-flight sequence so any further deltas are also ignored
+            // until a fresh base arrives.
+            flash_delta_with_payload_id(1, hash("1b"), 1, 42),
+            // Even a delta with the correct payload_id won't be accepted now, because
+            // the prior mismatch reset the in-flight sequence.
+            flash_delta(1, hash("1c"), 2),
+        ],
+    );
+
+    let events: Vec<FireEvent> = parse_fire_events(&raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
+        .collect();
+
+    assert_fire_events_metadata_eq(&events, &[FireEvent::flash_block(1, hash("1a"), 0, false)]);
+}
+
+/// A flashblock whose timestamp is more than the staleness threshold (5 s) in the past
+/// is discarded without producing any FIRE BLOCK emission.
+///
+/// The processor's clock is pinned to `ts + 2 + 10` — 10 s ahead of the base flashblock's
+/// timestamp (`ts + 2`). With the threshold at 5 s the flashblock is ~10 s old → stale →
+/// skipped.
+#[test]
+fn stale_flashblock_is_skipped() {
+    let genesis = test_genesis();
+    let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    let raw = run_flashblock_sequence_at(
+        client,
+        vec![flash_base(1, hash("1a"), genesis_hash, ts + 2)],
+        ts + 2 + 10,
+    );
+
+    let events: Vec<FireEvent> = parse_fire_events(&raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
+        .collect();
+
+    assert!(
+        events.is_empty(),
+        "expected no FIRE BLOCK events for a stale flashblock, got {:?}",
+        events
     );
 }
