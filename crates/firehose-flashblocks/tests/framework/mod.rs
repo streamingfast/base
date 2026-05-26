@@ -1334,10 +1334,19 @@ pub(crate) fn run_flashblock_sequence_at(
     let mut flash_offset = 0usize;
     let mut canonical_offset = 0usize;
 
-    for event in events {
+    for (idx, event) in events.iter().enumerate() {
+        let event = event.clone();
         match event {
             TestEvent::Flashblock(fb) => {
-                processor.on_flashblock_received(*fb);
+                // Find the next queued Flashblock in the event list — that's the value
+                // the production subscriber's 1-element peek slot would surface, after
+                // skipping any intervening CanonicalBlock markers (which don't live on
+                // the flashblock WebSocket channel in production).
+                let peek = events.iter().skip(idx + 1).find_map(|e| match e {
+                    TestEvent::Flashblock(next) => Some(next.as_ref()),
+                    TestEvent::CanonicalBlock { .. } => None,
+                });
+                processor.on_flashblock_received_with_peek(*fb, peek);
 
                 let bytes = flash_buffer.get_bytes();
                 if bytes.len() > flash_offset {

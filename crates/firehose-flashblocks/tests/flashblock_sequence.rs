@@ -113,7 +113,11 @@ fn base_plus_delta_plus_next_base() {
         vec![
             flash_base(1, hash("1a"), genesis_hash, ts + 2),
             flash_delta(1, hash("1a"), 1),
-            // No canonical event for block 1, this will not get sent
+            // Block 2's parent_hash is "1b" — doesn't match the recomputed block-1 hash.
+            // Peek-driven is_final fires on delta(1,1): recompute hash, compare with
+            // "1b", mismatch → `mark_failed` drops the FIRE BLOCK for delta(1,1) and
+            // resets state. Block 2's base then sees an empty in-flight sequence and
+            // cannot bootstrap (block 1 not marked canonical) → pending_state, no emit.
             flash_base(2, hash("2a"), hash("1b"), ts + 4),
         ],
     );
@@ -125,10 +129,10 @@ fn base_plus_delta_plus_next_base() {
 
     assert_fire_events_metadata_eq(
         &events,
-        &[
-            FireEvent::flash_block(1, hash("1a"), 0, false),
-            FireEvent::flash_block(1, hash("1a"), 1, false),
-        ],
+        // Only the base for block 1 lands. delta(1,1) was dropped by the peek-driven
+        // is_final mismatch (geth-equivalent: OnBlockEnd(err) discards the block at
+        // the wire layer); block 2 never executes.
+        &[FireEvent::flash_block(1, hash("1a"), 0, false)],
     );
 }
 
@@ -167,8 +171,9 @@ fn base_plus_delta_plus_next_base_but_no_state_yet() {
         &events,
         &[
             FireEvent::flash_block(1, hash("1a"), 0, false),
-            FireEvent::flash_block(1, block1_recomputed, 1, false),
-            // is_final partial for block 1 (final_index = 1, printed as 1001).
+            // Peek-driven single-emission is_final: peek saw block 2's base, so
+            // delta(1,1) emits ONCE with the recomputed hash + is_final marker
+            // (printed as 1001).
             FireEvent::flash_block(1, block1_recomputed, 1, true),
             FireEvent::flash_block(2, hash("2a"), 0, false),
         ],
@@ -236,8 +241,13 @@ fn non_sequential_delta_is_skipped() {
 
 /// Sends a base + two successive deltas (idx=1, idx=2) for the same block.
 ///
-/// Asserts three [`FireEvent::FlashBlock`] events: `idx=0` (base), `idx=1`, `idx=2`.
-/// Tests that consecutive deltas on the same block are all processed and emitted in order.
+/// With the peek-driven squash optimisation, `delta(1,1)` is dropped from the
+/// emission stream because the runner's peek window sees `delta(1,2)` already
+/// queued. Only `delta(1,2)` runs through the EVM (with `delta(1,1)`'s transactions
+/// folded into the same execution) and emits a FIRE BLOCK.
+///
+/// Asserts two [`FireEvent::FlashBlock`] events: `idx=0` (base) and `idx=2` (the
+/// last accumulated delta). `idx=1` is silently squashed.
 #[test]
 fn two_successive_deltas() {
     let genesis = test_genesis();
@@ -263,7 +273,7 @@ fn two_successive_deltas() {
         &events,
         &[
             FireEvent::flash_block(1, hash("1a"), 0, false),
-            FireEvent::flash_block(1, hash("1a"), 1, false),
+            // delta(1,1) squashed; only the consolidated emission for idx=2 lands.
             FireEvent::flash_block(1, hash("1a"), 2, false),
         ],
     );
@@ -301,8 +311,10 @@ fn jumping_delta_is_skipped() {
 
 /// Sends a base + three successive deltas (idx=1, idx=2, idx=3) for the same block.
 ///
-/// Asserts four events in total, verifying that the processor correctly sequences three
-/// consecutive delta flashblocks and emits a `FIRE BLOCK` for each.
+/// With the peek-driven squash optimisation, the runner pre-feeds all events, so
+/// when each of `delta(1,1)` and `delta(1,2)` is processed the peek window already
+/// shows the next same-block delta. Both are squashed; only `delta(1,3)` executes
+/// (with all squashed deltas' transactions gathered in one EVM pass) and emits.
 #[test]
 fn three_successive_deltas() {
     let genesis = test_genesis();
@@ -329,8 +341,7 @@ fn three_successive_deltas() {
         &events,
         &[
             FireEvent::flash_block(1, hash("1a"), 0, false),
-            FireEvent::flash_block(1, hash("1a"), 1, false),
-            FireEvent::flash_block(1, hash("1a"), 2, false),
+            // delta(1,1) and delta(1,2) squashed; only the consolidated emission at idx=3.
             FireEvent::flash_block(1, hash("1a"), 3, false),
         ],
     );
@@ -375,8 +386,7 @@ fn two_blocks_with_deltas() {
         &events,
         &[
             FireEvent::flash_block(1, hash("1a"), 0, false),
-            FireEvent::flash_block(1, block1_recomputed, 1, false),
-            // is_final partial for block 1.
+            // Peek caught block 2's base → delta(1,1) emits once as is_final.
             FireEvent::flash_block(1, block1_recomputed, 1, true),
             FireEvent::flash_block(2, hash("2a"), 0, false),
             FireEvent::flash_block(2, hash("2a"), 1, false),
@@ -481,11 +491,13 @@ fn canonical_block_unblocks_next_base() {
     assert_fire_events_metadata_eq(
         &events,
         &[
-            FireEvent::flash_block(1, hash("1a"), 0, false), // Flash1 base — flashblock tracer
-            FireEvent::canonical_block(1, block1_recomputed), // Canonical1 — canonical tracer
-            // is_final partial for block 1 (base alone — final_index = 0, printed as 1000).
+            // Peek for flash_base(1) skips the canonical event and sees flash_base(2);
+            // block 2's base is for block N+1, so flash_base(1) is treated as the
+            // final partial for block 1. Single FIRE BLOCK sealed with the recomputed
+            // hash and is_final marker (printed 1000).
             FireEvent::flash_block(1, block1_recomputed, 0, true),
-            FireEvent::flash_block(2, hash("2a"), 0, false), // Flash2 base — flashblock tracer
+            FireEvent::canonical_block(1, block1_recomputed), // Canonical1 — canonical tracer
+            FireEvent::flash_block(2, hash("2a"), 0, false),  // Flash2 base — flashblock tracer
         ],
     );
 }
@@ -797,34 +809,132 @@ fn is_final_emitted_on_next_base_match() {
         &events,
         &[
             FireEvent::flash_block(1, hash("1a"), 0, false),
-            FireEvent::flash_block(1, expected_block1_hash, 1, false),
+            // Peek-driven single-emission is_final: only ONE FIRE BLOCK lands for
+            // delta(1,1), sealed with the recomputed hash and stamped is_final (no
+            // separate non-final partial). Matches geth's `SetFinalFlashBlock` +
+            // `OnBlockEnd` single-flush pattern.
             FireEvent::flash_block(1, expected_block1_hash, 1, true),
             FireEvent::flash_block(2, hash("2a"), 0, false),
         ],
     );
 }
 
-/// is_final hash mismatch on a FirstOfNextBlock transition: the processor matches
-/// geth's `controller.go:300-306` behavior — set `Skipping=true` (in our model:
-/// `state.reset()`) and drop the new base. No is_final FIRE BLOCK is emitted, and
-/// the new block N+1's base is silently discarded. Subsequent flashblocks for
-/// block N+1 are also dropped (no in-flight sequence). A later canonical
-/// notification for block N is **not** treated as a fallback trigger — the
-/// canonical FIRE BLOCK emitted on the live-block tracer is considered sufficient
-/// signal of finality.
+/// Peek-driven squash: when a same-block delta is already waiting in the dispatch
+/// queue at the moment we're about to execute the current delta, the current delta's
+/// EVM execution and FIRE BLOCK emission are deferred. The queued delta executes
+/// later with all the deferred transactions folded in.
+///
+/// This explicitly verifies the peek mechanism on a long burst:
+/// - `flash_base(1,…)` is the base; bases are never squashed.
+/// - `flash_delta(1,1)`, `flash_delta(1,2)`, `flash_delta(1,3)`, `flash_delta(1,4)`
+///   are queued in the runner. Each one (except the last) is squashed because the
+///   next item in the runner's peek window is another same-block flashblock.
+/// - Only `flash_delta(1,4)` runs through the EVM (with txs from idx 1..4 gathered)
+///   and emits.
+///
+/// Behaviour matches the user-requested "broader skip intermediate deltas": data is
+/// preserved (prepended to the executed delta's tx list), only emission count drops.
+#[test]
+fn squash_chain_collapses_intermediate_deltas_into_last() {
+    let genesis = test_genesis();
+    let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            flash_delta(1, hash("1a"), 1),
+            flash_delta(1, hash("1a"), 2),
+            flash_delta(1, hash("1a"), 3),
+            flash_delta(1, hash("1a"), 4),
+        ],
+    );
+
+    let events: Vec<FireEvent> = parse_fire_events(&raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
+        .collect();
+
+    assert_fire_events_metadata_eq(
+        &events,
+        &[
+            FireEvent::flash_block(1, hash("1a"), 0, false),
+            // 1, 2, 3 all squashed; only the consolidated idx=4 emission lands.
+            FireEvent::flash_block(1, hash("1a"), 4, false),
+        ],
+    );
+}
+
+/// Peek-driven squash does NOT apply when the next queued message is for a different
+/// block — the current delta executes normally.
+///
+/// Sequence: `flash_base(1,…)`, `flash_delta(1,1)`, then `flash_base(2,…)` whose
+/// parent_hash equals block 1's recomputed hash so the transition succeeds. The
+/// peek at `flash_delta(1,1)` sees `flash_base(2,…)` — different block number, no
+/// squash. `flash_delta(1,1)` executes and emits, then the FirstOfNextBlock
+/// transition re-emits is_final for block 1.
+#[test]
+fn squash_does_not_apply_across_block_boundaries() {
+    let genesis = test_genesis();
+    let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    let placeholder =
+        vec![flash_base(1, hash("1a"), genesis_hash, ts + 2), flash_delta(1, hash("1a"), 1)];
+    let block1_recomputed = assembled_block_hash(&placeholder);
+
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            flash_delta(1, block1_recomputed, 1),
+            flash_base(2, hash("2a"), block1_recomputed, ts + 4),
+        ],
+    );
+
+    let events: Vec<FireEvent> = parse_fire_events(&raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
+        .collect();
+
+    assert_fire_events_metadata_eq(
+        &events,
+        &[
+            FireEvent::flash_block(1, hash("1a"), 0, false),
+            // delta(1,1) executes — peek shows block 2's base, NOT a same-block
+            // delta, so squash does not apply. Instead the peek classifies as
+            // is_final (next-block base) and delta(1,1) emits ONCE with the
+            // recomputed hash + is_final marker (printed 1001).
+            FireEvent::flash_block(1, block1_recomputed, 1, true),
+            FireEvent::flash_block(2, hash("2a"), 0, false),
+        ],
+    );
+}
+
+/// is_final hash mismatch on a peek-driven path: the processor matches geth's
+/// `controller.go:300-306` behavior — when the recomputed block hash disagrees with
+/// the next-block base's `parent_hash`, the FIRE BLOCK for the current delta is
+/// dropped at the wire layer via `mark_failed` (geth's `OnBlockEnd(err)`),
+/// `Skipping=true` is set (in our model: `state.reset()`), and a later canonical
+/// notification is **not** treated as a fallback trigger.
 ///
 /// Sequence:
 /// 1. Block 1 base + delta with the in-flight tip `hash("1b")`.
 /// 2. Block 2 base whose `parent_hash` is also `hash("1b")` — passes the in-flight
-///    parent-hash sanity check, so the validator returns `FirstOfNextBlock`. The
-///    new is_final attempt then compares the recomputed block-1 hash (with
-///    `state_root = ZERO` via the mock provider) against `hash("1b")` —
-///    these differ, so the processor resets and drops the new base.
-/// 3. A delta for block 2 arrives. Because state was reset, the validator's "no
-///    in-flight sequence and non-base flashblock" guard drops it.
-/// 4. `canonical_block(1, hash("wrong-1"))` is emitted to confirm that the
-///    canonical-block path no longer triggers any is_final fallback (geth doesn't
-///    either: `controller.go:268` short-circuits on `Skipping=true`).
+///    parent-hash sanity check. Peek for `flash_delta(1, "1b")` sees `flash_base(2,
+///    "1b")`, classifies as is_final with `expected_parent_hash = "1b"`. The
+///    processor executes the delta, recomputes the block hash (with `state_root =
+///    ZERO` via the mock provider), compares against `"1b"`, **mismatch** → the
+///    delta's FIRE BLOCK is `mark_failed`'d and dropped at the wire layer, the
+///    processor resets state.
+/// 3. A delta for block 2 then arrives and is buffered (parent state for block 1
+///    not available) — no FIRE BLOCK.
+/// 4. `canonical_block(1, hash("wrong-1"))` discards the buffered block-2
+///    flashblocks because their base's `parent_hash` (`"1b"`) disagrees with the
+///    canonical hash for block 1 (`"wrong-1"`).
 #[test]
 fn is_final_mismatch_resets_state_and_drops_new_block() {
     let genesis = test_genesis();
@@ -839,13 +949,14 @@ fn is_final_mismatch_resets_state_and_drops_new_block() {
             flash_delta(1, hash("1b"), 1),
             // Block 2's parent_hash matches block 1's in-flight tip (`hash("1b")`)
             // so the in-flight parent-hash sanity check passes — but it differs
-            // from the locally-recomputed block-1 hash, so the is_final attempt
-            // fails and the processor resets.
+            // from the locally-recomputed block-1 hash, so the peek-driven
+            // is_final on delta(1,1) fails and the processor resets.
             flash_base(2, hash("2a"), hash("1b"), ts + 4),
-            // Dropped after reset: no in-flight sequence accepts a non-base.
+            // Buffered after reset → bootstrap of block-1 state fails (block 1
+            // never marked canonical) → no FIRE BLOCK.
             flash_delta(2, hash("2b"), 1),
-            // Confirms canonical-fallback is gone: even a canonical for block 1
-            // arriving later does not emit a deferred is_final partial.
+            // Canonical for block 1 with the wrong hash: buffered block-2
+            // flashblocks are discarded because their base's parent_hash differs.
             canonical_block(1, hash("wrong-1")),
         ],
     );
@@ -859,9 +970,9 @@ fn is_final_mismatch_resets_state_and_drops_new_block() {
         &events,
         &[
             FireEvent::flash_block(1, hash("1a"), 0, false),
-            FireEvent::flash_block(1, hash("1b"), 1, false),
-            // No FIRE BLOCK for block 2's base, no is_final for block 1, no FIRE
-            // BLOCK for block 2's delta.
+            // delta(1,1) dropped (peek-driven is_final mismatch → mark_failed).
+            // block 2's base and delta both buffered + later discarded → no FIRE
+            // BLOCKs for them.
             FireEvent::canonical_block(1, hash("wrong-1")),
         ],
     );

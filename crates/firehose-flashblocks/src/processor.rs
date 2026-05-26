@@ -74,6 +74,15 @@ struct ProcessorState {
     /// Latest flashblock index applied for `current_block_number`. `None` whenever
     /// `current_block_number` is `None`.
     latest_flashblock_index: Option<u64>,
+    /// Highest flashblock index that has actually been **executed** (and hence emitted as a
+    /// FIRE BLOCK) for `current_block_number`. May trail [`latest_flashblock_index`] by one
+    /// or more positions when intermediate same-block deltas were *squashed* via the peek
+    /// path — those deltas were accumulated into `stored_flashblocks` but their EVM
+    /// execution and FIRE BLOCK emission were deferred until a non-squashed delta arrives
+    /// and runs through all the held-back transactions in one pass. `None` whenever no
+    /// flashblock has been executed yet for the current block (e.g. immediately after a
+    /// `start_block`).
+    last_executed_index: Option<u64>,
     /// All flashblocks accumulated for the current block. Cleared whenever state is reset.
     stored_flashblocks: Vec<Flashblock>,
     /// EVM state shared across flashblocks (and across blocks on the sequential fast path).
@@ -103,6 +112,13 @@ struct ProcessorState {
     /// flashblock chain has diverged and the base (plus any subsequent deltas) is
     /// discarded rather than emitted.
     latest_canonical: Option<(u64, B256)>,
+    /// `true` once the is_final FIRE BLOCK for the current block has been emitted.
+    /// Set by the peek-driven path inside [`execute_flashblock`] after a successful
+    /// [`firehose_tracer::Tracer::set_final_flash_block`] override. Read on the
+    /// `FirstOfNextBlock` transition to suppress the fallback re-emission so we don't
+    /// emit two is_final FIRE BLOCKs for the same block. Mirrors geth's
+    /// `c.state.FinalPartSent` at `controller.go:284-300`.
+    final_part_sent: bool,
 }
 
 /// Carries an `is_final` FIRE BLOCK ready to emit on the flashblock tracer once the
@@ -122,11 +138,13 @@ impl ProcessorState {
         Self {
             current_block_number: None,
             latest_flashblock_index: None,
+            last_executed_index: None,
             stored_flashblocks: Vec::new(),
             accumulated_db: None,
             pending_state: false,
             awaiting_canonical_confirmation: false,
             latest_canonical: None,
+            final_part_sent: false,
         }
     }
 
@@ -137,10 +155,12 @@ impl ProcessorState {
     fn reset(&mut self) {
         self.current_block_number = None;
         self.latest_flashblock_index = None;
+        self.last_executed_index = None;
         self.stored_flashblocks.clear();
         self.accumulated_db = None;
         self.pending_state = false;
         self.awaiting_canonical_confirmation = false;
+        self.final_part_sent = false;
     }
 
     /// Begin (or restart) a sequence on a fresh base flashblock at index 0. The accumulated
@@ -150,10 +170,13 @@ impl ProcessorState {
         debug_assert_eq!(flashblock.index, 0, "start_block requires a base flashblock");
         self.current_block_number = Some(flashblock.metadata.block_number);
         self.latest_flashblock_index = Some(0);
+        self.last_executed_index = None;
         self.stored_flashblocks = vec![flashblock];
         // Starting a fresh sequence invalidates any prior pending accumulation.
         self.pending_state = false;
         self.awaiting_canonical_confirmation = false;
+        // The new block hasn't been finalized yet.
+        self.final_part_sent = false;
     }
 }
 
@@ -209,12 +232,68 @@ where
 
     /// Process a single flashblock event. Errors are logged and swallowed: the processor clears
     /// its in-flight state and accumulated DB so the next base flashblock restarts tracking.
-    fn process(&self, flashblock: Flashblock) {
-        if let Err(err) = self.process_inner(flashblock) {
+    ///
+    /// `squash` carries the verdict of [`Self::classify_peek`]: when `true`, the validator
+    /// still accepts the message into `stored_flashblocks` (so its transactions are not
+    /// lost) but EVM execution and FIRE BLOCK emission are deferred to the next
+    /// non-squashed flashblock — which will gather and execute all the held-back
+    /// transactions in a single pass.
+    ///
+    /// `is_final_expected_hash` is `Some(expected_parent_hash)` when the peeked next message
+    /// is the base of the immediately next block — i.e. the current flashblock IS the final
+    /// partial for its block. The execute path will then call
+    /// [`firehose_tracer::Tracer::set_final_flash_block`] with the locally-recomputed hash
+    /// and state_root before the FIRE BLOCK is flushed, matching geth's
+    /// `Firehose.SetFinalFlashBlock` + `OnBlockEnd` pattern.
+    fn process(&self, flashblock: Flashblock, squash: bool, is_final_expected_hash: Option<B256>) {
+        if let Err(err) = self.process_inner(flashblock, squash, is_final_expected_hash) {
             error!(error = %err, "flashblock processing failed; resetting state and waiting for next base");
             let mut state = self.state.lock().expect("flashblock state mutex poisoned");
             state.reset();
         }
+    }
+
+    /// Classifies the peeked next message and produces `(squash, is_final_expected_hash)`.
+    ///
+    /// Exactly one of the two values is "active" (or neither, if the peek is empty or
+    /// unrelated):
+    ///
+    /// - **Squash** — `(true, None)`: the current flashblock is a delta (`index > 0`) and
+    ///   the peek shows another message for the same block (a higher-index delta or a
+    ///   same-block restart base). The current flashblock's data is accumulated into
+    ///   `stored_flashblocks`, but EVM execution and FIRE BLOCK emission are deferred to
+    ///   the next non-squashed flashblock. Geth's strict version at `controller.go:394-396`
+    ///   only squashes on a same-block restart base; this implementation extends to also
+    ///   squash same-block higher-index deltas.
+    ///
+    /// - **is_final** — `(false, Some(expected_parent_hash))`: the peek shows the base of
+    ///   the immediately next block (`peek.block_number == current.block_number + 1` and
+    ///   `peek.index == 0`). The current flashblock will execute through the EVM, and just
+    ///   before the FIRE BLOCK is flushed the processor will recompute the canonical block
+    ///   hash from the post-execution state and override it on the tracer via
+    ///   `set_final_flash_block`. The wire emission becomes a single FIRE BLOCK stamped
+    ///   `idx + 1000` and sealed with the recomputed hash — matching geth's peek path at
+    ///   `controller.go:398-405`.
+    ///
+    /// - **None** — `(false, None)`: peek is absent or unrelated; the current flashblock
+    ///   executes and emits as a non-final partial.
+    fn classify_peek(
+        current: &Flashblock,
+        peek: Option<&Flashblock>,
+    ) -> (bool, Option<B256>) {
+        let Some(peek) = peek else { return (false, None) };
+        let cur_block = current.metadata.block_number;
+        let peek_block = peek.metadata.block_number;
+        if peek_block == cur_block && current.index > 0 {
+            return (true, None);
+        }
+        if peek_block == cur_block + 1
+            && peek.index == 0
+            && let Some(base) = peek.base.as_ref()
+        {
+            return (false, Some(base.parent_hash));
+        }
+        (false, None)
     }
 
     /// Returns `true` if a new-block base's `parent_hash` is consistent with the most
@@ -238,7 +317,12 @@ where
         }
     }
 
-    fn process_inner(&self, flashblock: Flashblock) -> Result<(), Error> {
+    fn process_inner(
+        &self,
+        flashblock: Flashblock,
+        squash: bool,
+        is_final_expected_hash: Option<B256>,
+    ) -> Result<(), Error> {
         let block_number = flashblock.metadata.block_number;
         let index = flashblock.index;
 
@@ -400,7 +484,11 @@ where
                         // `Skipping=true` and abandons the new base via early return; we
                         // model that by resetting state (which leaves the processor only
                         // accepting a fresh base, dropping subsequent deltas).
-                        if !state.stored_flashblocks.is_empty() {
+                        //
+                        // Fallback only — skipped when the peek-driven path already
+                        // emitted the is_final partial for the previous block (matching
+                        // geth's `!c.state.FinalPartSent` guard at `controller.go:284`).
+                        if !state.final_part_sent && !state.stored_flashblocks.is_empty() {
                             match Self::build_is_final_emission(
                                 latest_block,
                                 latest_idx,
@@ -499,7 +587,20 @@ where
             return Ok(());
         }
 
+        // Squash: the caller's peek showed another same-block message already queued, so
+        // the EVM execution + FIRE BLOCK emission for *this* flashblock is deferred.
+        // `stored_flashblocks` keeps the data; the next non-squashed flashblock will pick
+        // it up via the `last_executed_index` gather logic below.
+        if squash {
+            debug!(
+                block = block_number,
+                index, "squashing flashblock execution; accumulated for next non-squashed flashblock"
+            );
+            return Ok(());
+        }
+
         let stored_flashblocks = state.stored_flashblocks.clone();
+        let last_executed_index = state.last_executed_index;
         let mut accumulated_db = state.accumulated_db.take();
 
         drop(state); // release the lock on the state
@@ -513,16 +614,23 @@ where
         let assembled = BlockAssembler::assemble(&stored_flashblocks)
             .map_err(|e| Error::BlockAssembly(Box::new(e)))?;
 
-        let new_transactions: Vec<Bytes> = if index == 0 {
-            assembled.flashblocks[0].diff.transactions.clone()
-        } else {
-            stored_flashblocks
-                .last()
-                .expect("stored_flashblocks contains at least the new delta")
-                .diff
-                .transactions
-                .clone()
-        };
+        // Gather transactions to execute. When prior same-block flashblocks were squashed
+        // (their EVM execution deferred), their transactions land in `stored_flashblocks`
+        // but past `last_executed_index`; we replay them here so the deferred work runs
+        // through the EVM as part of this delta's execution.
+        let new_transactions: Vec<Bytes> = stored_flashblocks
+            .iter()
+            .filter(|fb| match last_executed_index {
+                None => true,
+                Some(last) => fb.index > last,
+            })
+            .flat_map(|fb| fb.diff.transactions.clone())
+            .collect();
+        // Pre-execution changes (EIP-4788 etc.) apply once per block, on the first EVM
+        // run for that block. With squashing, "first run" isn't necessarily `index == 0`:
+        // the base may have been squashed and the first execution might happen on a later
+        // delta. Track this via `last_executed_index == None`.
+        let is_first_execution_for_block = last_executed_index.is_none();
 
         if accumulated_db.is_none() {
             let parent_block = block_number.saturating_sub(1);
@@ -553,10 +661,23 @@ where
         }
 
         let mut db = accumulated_db.expect("accumulated_db was populated just above");
-        self.execute_flashblock(&assembled, index, &new_transactions, &mut db)?;
+        let emitted_is_final = self.execute_flashblock(
+            &assembled,
+            index,
+            &new_transactions,
+            is_first_execution_for_block,
+            is_final_expected_hash,
+            &mut db,
+        )?;
 
         let mut state_guard = self.state.lock().expect("flashblock state mutex poisoned");
         state_guard.accumulated_db = Some(db);
+        state_guard.last_executed_index = Some(index);
+        if emitted_is_final {
+            // Suppress the FirstOfNextBlock fallback re-emission when the new-block base
+            // actually arrives — the is_final FIRE BLOCK has already been emitted inline.
+            state_guard.final_part_sent = true;
+        }
         Ok(())
     }
 
@@ -720,6 +841,12 @@ where
                 &assembled,
                 fb.index,
                 &new_transactions,
+                i == 0,
+                // Replay path never claims is_final — block N's flashblocks were
+                // buffered before the canonical chain was known and we don't yet know
+                // its final hash. The next-block transition (or its own peek-driven
+                // pass) will handle is_final later.
+                None,
                 &mut accumulated_db,
             ) {
                 error!(
@@ -835,13 +962,32 @@ where
         );
     }
 
+    /// Executes the new transactions of a flashblock and emits a FIRE BLOCK on the
+    /// flashblock tracer. Returns `Ok(true)` when the FIRE BLOCK was emitted as the
+    /// is_final partial for its block via the peek-driven path (and the caller should
+    /// suppress the FirstOfNextBlock fallback by flipping `final_part_sent`);
+    /// `Ok(false)` for a normal non-final partial emission.
+    ///
+    /// When `is_final_expected_hash` is `Some(expected)`, after `executor.finish()`:
+    /// 1. The post-execution state root is derived from the EVM bundle.
+    /// 2. The assembled header is re-sealed with that state_root via `hash_slow`.
+    /// 3. If the recomputed hash equals `expected`, the in-progress block on the tracer
+    ///    is mutated through [`firehose_tracer::Tracer::set_final_flash_block`] so the
+    ///    next `on_block_end` flush carries the recomputed hash and the `+1000` printed
+    ///    flash index (single FIRE BLOCK, matching geth's
+    ///    `Firehose.SetFinalFlashBlock` + `OnBlockEnd` pattern).
+    /// 4. If the recomputed hash mismatches the expected value, the FIRE BLOCK is
+    ///    dropped via `mark_failed` and an [`Error::Execution`] is returned — the
+    ///    caller resets state, mirroring geth's `Skipping=true` recovery path.
     fn execute_flashblock(
         &self,
         assembled: &AssembledBlock,
         index: u64,
         new_transactions: &[Bytes],
+        is_first_execution_for_block: bool,
+        is_final_expected_hash: Option<B256>,
         accumulated_db: &mut AccumulatedDb,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         let block_number = assembled.base.block_number;
         let parent_hash = assembled.base.parent_hash;
 
@@ -904,7 +1050,10 @@ where
             extra_data: assembled.base.extra_data.clone(),
         };
         let inspector = block_tracer.inspector();
-        let evm = evm_config.evm_with_env_and_inspector(accumulated_db, evm_env, inspector);
+        // Reborrow `accumulated_db` so the outer `&mut` is preserved past the EVM
+        // run — we need it again after `executor.finish()` to compute the
+        // post-execution state_root for the peek-driven is_final override.
+        let evm = evm_config.evm_with_env_and_inspector(&mut *accumulated_db, evm_env, inspector);
         let inner = BaseBlockExecutor::new(evm, ctx, self.client.chain_spec(), receipt_builder);
 
         let withdrawals = assembled
@@ -916,7 +1065,7 @@ where
         let mut executor =
             FirehoseWrappedExecutor::with_hooks(inner, withdrawals, OpPreTxAdjust, OpPostTxExtras);
 
-        if index == 0 {
+        if is_first_execution_for_block {
             executor.apply_pre_execution_changes().map_err(|e| Error::Execution(Box::new(e)))?;
         }
 
@@ -937,6 +1086,59 @@ where
 
         executor.finish().map_err(|e| Error::Execution(Box::new(e)))?;
 
+        let mut emitted_is_final = false;
+        if let Some(expected_parent_hash) = is_final_expected_hash {
+            // Peek-driven is_final path: derive the post-execution state_root, recompute
+            // the canonical block hash, and override the tracer's in-progress block so
+            // the upcoming `on_block_end` flush emits a single FIRE BLOCK already
+            // marked is_final and sealed with the recomputed hash.
+            let state_root_result = Self::compute_state_root(Some(&*accumulated_db));
+            match state_root_result {
+                Ok(state_root) => {
+                    let mut recomputed_header = assembled.block.header.clone();
+                    recomputed_header.state_root = state_root;
+                    let recomputed_hash = recomputed_header.hash_slow();
+                    if recomputed_hash == expected_parent_hash {
+                        block_tracer.tracer_mut().set_final_flash_block(recomputed_hash, state_root);
+                        emitted_is_final = true;
+                        debug!(
+                            block = block_number,
+                            index,
+                            recomputed_hash = %recomputed_hash,
+                            state_root = %state_root,
+                            "peek-driven is_final: tracer hash + state_root overridden before flush"
+                        );
+                    } else {
+                        let err = std::io::Error::other(format!(
+                            "block {block_number} recomputed hash {recomputed_hash} (state_root {state_root}) does not match expected parent_hash {expected_parent_hash}"
+                        ));
+                        warn!(
+                            block = block_number,
+                            index,
+                            recomputed_hash = %recomputed_hash,
+                            expected = %expected_parent_hash,
+                            "peek-driven is_final: hash mismatch; dropping FIRE BLOCK and resetting state"
+                        );
+                        block_tracer.mark_failed(&err);
+                        return Err(Error::Execution(Box::new(err)));
+                    }
+                }
+                Err(err) => {
+                    let io_err = std::io::Error::other(format!(
+                        "state_root computation failed: {err}"
+                    ));
+                    warn!(
+                        block = block_number,
+                        index,
+                        error = %err,
+                        "peek-driven is_final: state_root computation failed; dropping FIRE BLOCK and resetting state"
+                    );
+                    block_tracer.mark_failed(&io_err);
+                    return Err(Error::Execution(Box::new(io_err)));
+                }
+            }
+        }
+
         block_tracer.mark_flashblock();
         drop(tracer);
 
@@ -944,10 +1146,11 @@ where
             block = block_number,
             index,
             tx_count = new_tx_count,
+            is_final = emitted_is_final,
             "emitted flashblock partial FIRE event"
         );
 
-        Ok(())
+        Ok(emitted_is_final)
     }
 
     fn decode_and_recover_transactions(
@@ -985,6 +1188,19 @@ where
         + 'static,
 {
     fn on_flashblock_received(&self, flashblock: Flashblock) {
-        self.process(flashblock);
+        // Direct (no-peek) entry point. Without look-ahead we can't classify the
+        // current message as squashable nor as the final partial — every flashblock
+        // executes individually and the FirstOfNextBlock fallback handles is_final
+        // re-emission when the next-block base eventually arrives.
+        self.process(flashblock, false, None);
+    }
+
+    fn on_flashblock_received_with_peek(
+        &self,
+        flashblock: Flashblock,
+        peek: Option<&Flashblock>,
+    ) {
+        let (squash, is_final_expected_hash) = Self::classify_peek(&flashblock, peek);
+        self.process(flashblock, squash, is_final_expected_hash);
     }
 }

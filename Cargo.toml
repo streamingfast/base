@@ -621,7 +621,7 @@ ark-bls12-381 = { version = "0.5.0", default-features = false }
 # Firehose tracer (defined by the streamingfast reth fork, release/reth-1.x branch).
 reth-firehose = { git = "https://github.com/streamingfast/reth.git", tag = "v1.11.4-fh-2" }
 reth-firehose-tests = { git = "https://github.com/streamingfast/reth.git", tag = "v1.11.4-fh-2" }
-firehose-tracer = "5.1.1"
+firehose-tracer = "5.2.0"
 
 [patch.crates-io]
 # The crates.io SP1 v6.1.0 release is partially broken: several crates were never

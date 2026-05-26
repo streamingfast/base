@@ -18,6 +18,27 @@ use crate::PendingBlocks;
 pub trait FlashblocksReceiver {
     /// Called when a new flashblock is received.
     fn on_flashblock_received(&self, flashblock: Flashblock);
+
+    /// Like [`Self::on_flashblock_received`] but with an optional peek at the next
+    /// already-queued flashblock (i.e. the one the dispatch loop will deliver next
+    /// if any is currently buffered, without blocking).
+    ///
+    /// Receivers can use the peek to implement look-ahead optimisations such as
+    /// squashing intermediate same-block deltas (executing them only when the
+    /// next delta of the same block is not already waiting) or driving is_final
+    /// directly when the next-block base is already queued.
+    ///
+    /// The default implementation discards the peek and delegates to
+    /// [`Self::on_flashblock_received`], so existing receivers continue to work
+    /// unchanged.
+    fn on_flashblock_received_with_peek(
+        &self,
+        flashblock: Flashblock,
+        peek: Option<&Flashblock>,
+    ) {
+        let _ = peek;
+        self.on_flashblock_received(flashblock);
+    }
 }
 
 /// Core API for accessing flashblock state and data.
