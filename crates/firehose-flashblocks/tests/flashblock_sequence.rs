@@ -22,7 +22,7 @@ use framework::{
     FireEvent, GenesisClient, assembled_block_hash, assert_fire_events_eq,
     assert_fire_events_metadata_eq, canonical_block, flash_base, flash_delta,
     flash_delta_with_payload_id, hash, parse_fire_events, run_flashblock_sequence,
-    run_flashblock_sequence_at, test_genesis,
+    run_flashblock_sequence_at, run_flashblock_sequence_at_with_processor, test_genesis,
 };
 
 /// Simplest possible test: send a single flash-base event (block 1, no transactions) and verify
@@ -975,5 +975,162 @@ fn is_final_mismatch_resets_state_and_drops_new_block() {
             // BLOCKs for them.
             FireEvent::canonical_block(1, hash("wrong-1")),
         ],
+    );
+}
+
+/// Asserts that the firehose tracer's flashblock snapshot mechanism is wired up:
+/// each emitted FIRE BLOCK at index K must carry the **cumulative** trace from
+/// indices `0..=K`, not just the contributions new to iteration K. Mirrors geth's
+/// `firehoseTracer.SnapshotFlashBlockForNextIteration()` call before the early
+/// return on `!isLastFlashBlock` at `eth/tracers/firehose.go:180`.
+///
+/// Sequence + reasoning:
+/// 1. `flash_base(2, …)` and `flash_delta(2, 1)` arrive before block 1 is
+///    canonical → buffered.
+/// 2. `canonical_block(1, …)` triggers the replay path, which calls
+///    `execute_flashblock` **once per buffered flashblock** in separate EVM
+///    invocations. This is the codepath where the snapshot mechanism matters
+///    most: each iteration's `on_block_start` clears the in-progress block, so
+///    without the snapshot the second emission would lose the first's tracer
+///    contributions entirely.
+/// 3. The base flashblock executes pre-execution changes (EIP-4788 beacon-roots
+///    write) which the firehose tracer records as a `system_call`. The delta
+///    has no further pre-execution changes (only the first execution per block
+///    fires them), so any `system_calls` count > 0 on the delta's FIRE BLOCK
+///    can only have come from the snapshot/restore round-trip.
+///
+/// Asserts:
+/// - The base's FIRE BLOCK carries `system_calls.len() == 1` (the EIP-4788 write).
+/// - The delta's FIRE BLOCK also carries `system_calls.len() == 1` (the base's
+///   system_call, restored via `snapshot_flash_block_for_next_iteration` →
+///   `restore_flash_block_snapshot`). Without the snapshot call, this would be 0.
+#[test]
+fn snapshot_carries_cumulative_traces_across_replay() {
+    let genesis = test_genesis();
+    let _genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            // Buffered: block 1 isn't canonical yet, so base + delta wait in the
+            // pending buffer with no FIRE BLOCK emission.
+            flash_base(2, hash("2a"), hash("1a"), ts + 4),
+            flash_delta(2, hash("2b"), 1),
+            // canonical(1) triggers the replay path — base and delta execute
+            // through `execute_flashblock` in separate iterations (NOT squashed
+            // into one EVM call), which is the case where the snapshot mechanism
+            // is required to preserve cumulative trace state.
+            canonical_block(1, hash("1a")),
+        ],
+    );
+
+    let flash_events: Vec<FireEvent> = parse_fire_events(&raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::FlashBlock { .. }))
+        .collect();
+
+    assert_eq!(flash_events.len(), 2, "expected 2 FIRE BLOCK lines for block 2 (base + delta)");
+
+    let FireEvent::FlashBlock { flash_idx: base_idx, block: ref base_block, .. } = flash_events[0]
+    else {
+        panic!("expected FlashBlock");
+    };
+    assert_eq!(base_idx, 0, "first replayed flashblock is the base (idx 0)");
+    assert_eq!(
+        base_block.system_calls.len(),
+        1,
+        "base flashblock must carry the EIP-4788 beacon-roots pre-execution system call"
+    );
+
+    let FireEvent::FlashBlock { flash_idx: delta_idx, block: ref delta_block, .. } =
+        flash_events[1]
+    else {
+        panic!("expected FlashBlock");
+    };
+    assert_eq!(delta_idx, 1, "second replayed flashblock is the delta (idx 1)");
+    // This is the regression assertion. Without
+    // `snapshot_flash_block_for_next_iteration` between iterations, the delta's
+    // FIRE BLOCK would carry `system_calls.len() == 0` because `on_block_start`
+    // clears the in-progress block at the start of each iteration. The snapshot
+    // is what restores the base's system_call into the delta's emission.
+    assert_eq!(
+        delta_block.system_calls.len(),
+        1,
+        "delta FIRE BLOCK must carry the cumulative system_calls from base — \
+         without snapshot_flash_block_for_next_iteration this is 0 and the wire \
+         stream diverges from the geth flashblock contract"
+    );
+}
+
+/// Regression for a prod-observed `nonce too low` failure: after the canonical-driven
+/// replay path executes a buffered base + delta, [`ProcessorState::last_executed_index`]
+/// MUST be set to the last replayed index — otherwise the next delta arriving through
+/// the normal `process_inner` path sees `last_executed_index = None`, the multi-delta
+/// tx-gather filter ("include every stored flashblock whose index > last_executed")
+/// pulls in every previously-replayed delta's transactions, and the EVM trips on
+/// already-applied state (`nonce X too low, expected X+1`).
+///
+/// Sequence:
+/// 1. `flash_base(2, …)` and `flash_delta(2, 1)` arrive while block 1 is not yet
+///    canonical → both buffered (`pending_state = true`), no FIRE BLOCK lines.
+/// 2. `canonical_block(1, …)` triggers the replay path: both buffered flashblocks
+///    are executed and their FIRE BLOCK lines are emitted. After the loop, the
+///    processor stamps `last_executed_index = Some(1)` (the index of the last
+///    replayed flashblock).
+///
+/// Asserts:
+/// - Replay emits exactly two FIRE BLOCK lines (base + delta) for block 2.
+/// - `processor.last_executed_index_for_test() == Some(1)` after the canonical
+///   notification, proving the multi-delta gather won't re-execute the replayed
+///   transactions on the next delta.
+#[test]
+fn canonical_replay_stamps_last_executed_index() {
+    let genesis = test_genesis();
+    let _genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    // Match the prod scenario from the WARN log:
+    // - flashblocks for block N arrive before canonical(N-1) is committed
+    // - on_canonical_block(N-1) replays both buffered flashblocks
+    // - the next delta MUST execute only its own transactions, not the already-
+    //   applied ones from the replay.
+    let result = run_flashblock_sequence_at_with_processor(
+        client,
+        vec![
+            // Block 2 base + delta(1) buffered because block 1 is not yet canonical.
+            flash_base(2, hash("2a"), hash("1a"), ts + 4),
+            flash_delta(2, hash("2b"), 1),
+            // canonical(1) flushes the buffer.
+            canonical_block(1, hash("1a")),
+        ],
+        ts + 4,
+    );
+
+    let events: Vec<FireEvent> = parse_fire_events(&result.raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
+        .collect();
+
+    // Replay emitted the buffered base and delta.
+    assert_fire_events_metadata_eq(
+        &events,
+        &[
+            FireEvent::canonical_block(1, hash("1a")),
+            FireEvent::flash_block(2, hash("2a"), 0, false),
+            FireEvent::flash_block(2, hash("2b"), 1, false),
+        ],
+    );
+
+    // The exact assertion that catches the bug. Without the fix, this was None
+    // after replay and the next delta arriving through process_inner would have
+    // re-run base + delta(1)'s transactions, tripping "nonce too low" in prod.
+    assert_eq!(
+        result.processor.last_executed_index_for_test(),
+        Some(1),
+        "canonical replay must stamp last_executed_index = Some(highest replayed index) \
+         so the multi-delta tx-gather filter in process_inner doesn't re-execute already-applied transactions"
     );
 }

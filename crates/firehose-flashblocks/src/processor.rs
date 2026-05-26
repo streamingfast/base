@@ -230,6 +230,16 @@ where
         Self { client, state: Mutex::new(ProcessorState::new()), tracer: Mutex::new(tracer), clock }
     }
 
+    /// Returns the highest flashblock index that has actually been executed for the
+    /// current in-flight block. Test-only inspection point: integration tests use
+    /// this to verify that the canonical-driven replay path correctly stamps
+    /// `last_executed_index` so a subsequent delta arriving through `process_inner`
+    /// doesn't re-execute already-applied transactions.
+    #[doc(hidden)]
+    pub fn last_executed_index_for_test(&self) -> Option<u64> {
+        self.state.lock().expect("flashblock state mutex poisoned").last_executed_index
+    }
+
     /// Process a single flashblock event. Errors are logged and swallowed: the processor clears
     /// its in-flight state and accumulated DB so the next base flashblock restarts tracking.
     ///
@@ -863,6 +873,12 @@ where
 
         let mut state = self.state.lock().expect("flashblock state mutex poisoned");
         state.accumulated_db = Some(accumulated_db);
+        // Mark every replayed flashblock as already-executed. Without this, the next
+        // delta arriving through `process_inner` would see `last_executed_index = None`
+        // and the multi-delta tx-gather filter would include every previously-replayed
+        // delta's transactions in the next EVM run — re-applying them and tripping
+        // "nonce too low" on the second pass.
+        state.last_executed_index = stored.last().map(|fb| fb.index);
         // The just-replayed in-flight block has not yet been confirmed by the canonical
         // chain. Defer the next-block transition until that confirmation arrives.
         state.awaiting_canonical_confirmation = true;
@@ -1137,6 +1153,25 @@ where
                     return Err(Error::Execution(Box::new(io_err)));
                 }
             }
+        }
+
+        // When this isn't the final partial for the block, snapshot the in-progress
+        // block so the NEXT same-block flashblock iteration can restore these tx
+        // traces, balance/code changes, system calls, and ordinals into its own
+        // (initially empty) block buffer at `on_block_start`. Without this each
+        // FIRE BLOCK at index K would carry only the contributions new to that
+        // iteration, instead of the cumulative trace from indices `0..=K` that
+        // downstream firehose consumers expect.
+        //
+        // Mirrors geth's `firehoseTracer.SnapshotFlashBlockForNextIteration()` call
+        // at `eth/tracers/firehose.go:180` (inside `Process`, before the early
+        // return on `!isLastFlashBlock`). Safe to call unconditionally on the
+        // non-final path: a stale snapshot left over when no more same-block
+        // flashblocks arrive is discarded by the tracer's
+        // `handle_flash_block_start` block-number check the next time a
+        // flashblock for a *different* block arrives.
+        if !emitted_is_final {
+            block_tracer.tracer_mut().snapshot_flash_block_for_next_iteration();
         }
 
         block_tracer.mark_flashblock();

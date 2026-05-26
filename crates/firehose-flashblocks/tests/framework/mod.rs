@@ -1296,6 +1296,33 @@ pub(crate) fn run_flashblock_sequence(client: GenesisClient, events: Vec<TestEve
     run_flashblock_sequence_at(client, events, min_ts)
 }
 
+/// Output of [`run_flashblock_sequence_at_with_processor`].
+///
+/// Bundles the merged tracer output with the underlying processor handle so tests can
+/// inspect internal state (e.g. `last_executed_index`) at the end of the sequence.
+pub(crate) struct RunResult {
+    /// Merged FIRE BLOCK stream from both the flashblock tracer and the canonical
+    /// tracer, with `# SOURCE FLASH` / `# SOURCE CANON` markers separating per-event
+    /// emissions.
+    pub raw: Vec<u8>,
+    /// The processor used to drive the sequence; consume with
+    /// `processor.last_executed_index_for_test()` to verify internal state.
+    pub processor: std::sync::Arc<FirehoseFlashblocksProcessor<GenesisClient>>,
+}
+
+/// Like [`run_flashblock_sequence_at`] but also returns a handle to the underlying
+/// [`FirehoseFlashblocksProcessor`] so tests can assert against its internal state
+/// (e.g. that the canonical-driven replay path correctly stamped
+/// `last_executed_index` to suppress double-execution of replayed deltas).
+pub(crate) fn run_flashblock_sequence_at_with_processor(
+    client: GenesisClient,
+    events: Vec<TestEvent>,
+    now_secs: u64,
+) -> RunResult {
+    let (raw, processor) = run_flashblock_sequence_internal(client, events, now_secs);
+    RunResult { raw, processor }
+}
+
 /// Like [`run_flashblock_sequence`] but pins the processor's clock to `now_secs`. Use
 /// this to test the staleness check by configuring `now_secs` far ahead of the
 /// flashblocks' timestamps.
@@ -1304,6 +1331,14 @@ pub(crate) fn run_flashblock_sequence_at(
     events: Vec<TestEvent>,
     now_secs: u64,
 ) -> Vec<u8> {
+    run_flashblock_sequence_internal(client, events, now_secs).0
+}
+
+fn run_flashblock_sequence_internal(
+    client: GenesisClient,
+    events: Vec<TestEvent>,
+    now_secs: u64,
+) -> (Vec<u8>, std::sync::Arc<FirehoseFlashblocksProcessor<GenesisClient>>) {
     let flash_buffer = InMemoryBuffer::new();
     let canonical_buffer = InMemoryBuffer::new();
     let mut output: Vec<u8> = Vec::new();
@@ -1326,8 +1361,11 @@ pub(crate) fn run_flashblock_sequence_at(
     );
 
     let clock: ClockFn = std::sync::Arc::new(move || now_secs);
-    let processor =
-        FirehoseFlashblocksProcessor::with_clock(client.clone(), tracer_handle, clock);
+    let processor = std::sync::Arc::new(FirehoseFlashblocksProcessor::with_clock(
+        client.clone(),
+        tracer_handle,
+        clock,
+    ));
 
     // Track how much of each per-tracer buffer we've already flushed to `output`, so that
     // each event's emissions are tagged with its source marker in the merged stream.
@@ -1395,5 +1433,5 @@ pub(crate) fn run_flashblock_sequence_at(
         }
     }
 
-    output
+    (output, processor)
 }
