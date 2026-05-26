@@ -816,9 +816,24 @@ where
             return;
         };
 
+        // Hold the state mutex for the ENTIRE replay loop. The previous version
+        // dropped state before the loop and relied on a `pending_state = true`
+        // boolean as a "soft" defer signal for concurrent WS arrivals — but that
+        // boolean is also touched by `start_block` (via `FirstOfNextBlock` /
+        // `InvalidNewBlockIndex{0}`) and `reset` (via `NonSequentialGap`), so the
+        // soft guard could be cleared or mutated mid-replay by a concurrent
+        // `process_inner` call, opening the same race window the boolean was meant
+        // to close. Holding the lock is the only correct primitive: WS-subscriber
+        // calls to `process_inner` block on `self.state.lock()` for the lifetime
+        // of the loop, and `execute_flashblock` deliberately does not touch
+        // `self.state` (only `self.tracer`), so there is no deadlock risk.
+        //
+        // Cost: the WS consumer task waits on state.lock() during replay. The
+        // upstream mpsc channel (capacity 100) absorbs incoming flashblocks
+        // without dropping; once the loop ends and state is consistent again,
+        // the WS task drains its backlog through the normal squash + multi-delta
+        // tx-gather path.
         let stored = state.stored_flashblocks.clone();
-        state.pending_state = false;
-        drop(state);
 
         let mut accumulated_db = State::builder()
             .with_database(StateProviderDatabase::new(provider))
@@ -837,7 +852,6 @@ where
                         error = ?err,
                         "replay block assembly failed; resetting state"
                     );
-                    let mut state = self.state.lock().expect("flashblock state mutex poisoned");
                     state.reset();
                     return;
                 }
@@ -865,13 +879,15 @@ where
                     error = %err,
                     "replay execution failed; resetting state"
                 );
-                let mut state = self.state.lock().expect("flashblock state mutex poisoned");
                 state.reset();
                 return;
             }
         }
 
-        let mut state = self.state.lock().expect("flashblock state mutex poisoned");
+        // We still hold the state lock here — no concurrent `process_inner` call
+        // could have run during the loop, so the writes below land on a consistent
+        // ProcessorState snapshot.
+        state.pending_state = false;
         state.accumulated_db = Some(accumulated_db);
         // Mark every replayed flashblock as already-executed. Without this, the next
         // delta arriving through `process_inner` would see `last_executed_index = None`
