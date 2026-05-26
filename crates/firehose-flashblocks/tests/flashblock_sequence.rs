@@ -19,9 +19,10 @@ mod framework;
 use base_execution_chainspec::BaseChainSpec;
 
 use framework::{
-    FireEvent, GenesisClient, assert_fire_events_eq, assert_fire_events_metadata_eq,
-    canonical_block, flash_base, flash_delta, flash_delta_with_payload_id, hash,
-    parse_fire_events, run_flashblock_sequence, run_flashblock_sequence_at, test_genesis,
+    FireEvent, GenesisClient, assembled_block_hash, assert_fire_events_eq,
+    assert_fire_events_metadata_eq, canonical_block, flash_base, flash_delta,
+    flash_delta_with_payload_id, hash, parse_fire_events, run_flashblock_sequence,
+    run_flashblock_sequence_at, test_genesis,
 };
 
 /// Simplest possible test: send a single flash-base event (block 1, no transactions) and verify
@@ -138,15 +139,22 @@ fn base_plus_delta_plus_next_base_but_no_state_yet() {
     let client = GenesisClient::new(genesis);
     let ts = 0x67d00000u64;
 
+    // Block 2's `parent_hash` must equal the locally-recomputed block-1 hash so the
+    // FirstOfNextBlock is_final attempt validates. To also satisfy the in-flight-tip
+    // parent-hash sanity check (which compares the new base's `parent_hash` against
+    // block 1's last flashblock's `diff.block_hash`), seal the block-1 delta with the
+    // same value.
+    let placeholder =
+        vec![flash_base(1, hash("1a"), genesis_hash, ts + 2), flash_delta(1, hash("1b"), 1)];
+    let block1_recomputed = assembled_block_hash(&placeholder);
+
     let raw = run_flashblock_sequence(
         client,
         vec![
             flash_base(1, hash("1a"), genesis_hash, ts + 2),
-            flash_delta(1, hash("1b"), 1),
-            // Block 2's parent matches the in-flight tip "1b". Even without a canonical
-            // confirmation for block 1, the sequential fast path executes base2 on top of
-            // the in-memory `accumulated_db` carried forward from block 1's flashblocks.
-            flash_base(2, hash("2a"), hash("1b"), ts + 4),
+            flash_delta(1, block1_recomputed, 1),
+            // Sequential fast path: block 2's base lands on block 1's accumulated state.
+            flash_base(2, hash("2a"), block1_recomputed, ts + 4),
         ],
     );
 
@@ -159,7 +167,9 @@ fn base_plus_delta_plus_next_base_but_no_state_yet() {
         &events,
         &[
             FireEvent::flash_block(1, hash("1a"), 0, false),
-            FireEvent::flash_block(1, hash("1b"), 1, false),
+            FireEvent::flash_block(1, block1_recomputed, 1, false),
+            // is_final partial for block 1 (final_index = 1, printed as 1001).
+            FireEvent::flash_block(1, block1_recomputed, 1, true),
             FireEvent::flash_block(2, hash("2a"), 0, false),
         ],
     );
@@ -338,15 +348,20 @@ fn two_blocks_with_deltas() {
     let client = GenesisClient::new(genesis);
     let ts = 0x67d00000u64;
 
+    // Block 2's `parent_hash` must equal block 1's locally-recomputed hash so the
+    // FirstOfNextBlock is_final attempt validates and the transition proceeds.
+    // Mirror the recomputed hash onto block 1's last flashblock's `diff.block_hash`
+    // so the in-flight-tip parent-hash sanity check also passes.
+    let placeholder =
+        vec![flash_base(1, hash("1a"), genesis_hash, ts + 2), flash_delta(1, hash("1a"), 1)];
+    let block1_recomputed = assembled_block_hash(&placeholder);
+
     let raw = run_flashblock_sequence(
         client,
         vec![
             flash_base(1, hash("1a"), genesis_hash, ts + 2),
-            flash_delta(1, hash("1a"), 1),
-            // Block 2's parent must match block 1's in-flight tip hash, otherwise the
-            // processor's parent-hash sanity check discards the base as descending from
-            // an unconfirmed fork.
-            flash_base(2, hash("2a"), hash("1a"), ts + 4),
+            flash_delta(1, block1_recomputed, 1),
+            flash_base(2, hash("2a"), block1_recomputed, ts + 4),
             flash_delta(2, hash("2a"), 1),
         ],
     );
@@ -360,7 +375,9 @@ fn two_blocks_with_deltas() {
         &events,
         &[
             FireEvent::flash_block(1, hash("1a"), 0, false),
-            FireEvent::flash_block(1, hash("1a"), 1, false),
+            FireEvent::flash_block(1, block1_recomputed, 1, false),
+            // is_final partial for block 1.
+            FireEvent::flash_block(1, block1_recomputed, 1, true),
             FireEvent::flash_block(2, hash("2a"), 0, false),
             FireEvent::flash_block(2, hash("2a"), 1, false),
         ],
@@ -441,15 +458,18 @@ fn canonical_block_unblocks_next_base() {
     let client = GenesisClient::new(genesis);
     let ts = 0x67d00000u64;
 
+    // Block 2's `parent_hash` must equal the locally-recomputed block-1 hash so the
+    // FirstOfNextBlock is_final attempt validates. Use that same value as the
+    // canonical hash so the parent-hash sanity check against `latest_canonical` also
+    // passes.
+    let block1_recomputed = assembled_block_hash(&[flash_base(1, hash("1a"), genesis_hash, ts + 2)]);
+
     let raw = run_flashblock_sequence(
         client,
         vec![
             flash_base(1, hash("1a"), genesis_hash, ts + 2),
-            canonical_block(1, hash("1a")),
-            // Block 2's parent must match canonical block 1's hash, otherwise the
-            // parent-hash sanity check would discard the base as descending from a
-            // divergent chain.
-            flash_base(2, hash("2a"), hash("1a"), ts + 4),
+            canonical_block(1, block1_recomputed),
+            flash_base(2, hash("2a"), block1_recomputed, ts + 4),
         ],
     );
 
@@ -461,9 +481,11 @@ fn canonical_block_unblocks_next_base() {
     assert_fire_events_metadata_eq(
         &events,
         &[
-            FireEvent::flash_block(1, hash("1a"), 0, false), // Flash1 — flashblock tracer, flash_idx=0
-            FireEvent::canonical_block(1, hash("1a")),       // Canonical1 — canonical tracer
-            FireEvent::flash_block(2, hash("2a"), 0, false), // Flash2 — flashblock tracer, flash_idx=0
+            FireEvent::flash_block(1, hash("1a"), 0, false), // Flash1 base — flashblock tracer
+            FireEvent::canonical_block(1, block1_recomputed), // Canonical1 — canonical tracer
+            // is_final partial for block 1 (base alone — final_index = 0, printed as 1000).
+            FireEvent::flash_block(1, block1_recomputed, 0, true),
+            FireEvent::flash_block(2, hash("2a"), 0, false), // Flash2 base — flashblock tracer
         ],
     );
 }
@@ -713,5 +735,134 @@ fn stale_flashblock_is_skipped() {
         events.is_empty(),
         "expected no FIRE BLOCK events for a stale flashblock, got {:?}",
         events
+    );
+}
+
+/// Trigger A for is_final emission: the first flashblock of block N+1 arrives, and its
+/// `parent_hash` matches the hash recomputed from block N's accumulated flashblocks.
+///
+/// Sequence:
+/// 1. Block 1 has a base + a delta. The processor recomputes the block hash by
+///    deriving the post-execution `state_root` from the EVM bundle (the wire's
+///    state_root is unused). In tests the mock provider returns `B256::ZERO`, so the
+///    sealed header carries `state_root = ZERO` — same as the assembled header used
+///    by [`assembled_block_hash`], which lets us predict the recomputed hash.
+/// 2. We pre-compute that hash via [`assembled_block_hash`] and feed it as the
+///    `parent_hash` of block 2's base flashblock.
+/// 3. The processor sees the match on `FirstOfNextBlock` and emits one extra FIRE BLOCK
+///    line for block 1's final partial with `is_final = true` (printed flash index =
+///    final_index + 1000), sealed with the recomputed hash.
+///
+/// Expected order:
+/// - Block 1 base (idx 0) — non-final
+/// - Block 1 delta (idx 1) — non-final
+/// - Block 1 is_final partial (idx 1, is_final = true) — emitted just before block 2
+///   starts executing
+/// - Block 2 base (idx 0) — non-final
+#[test]
+fn is_final_emitted_on_next_base_match() {
+    let genesis = test_genesis();
+    let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    // First, build a placeholder block-1 sequence to extract the recomputed hash via
+    // `assembled_block_hash`. The placeholder diff.block_hash doesn't affect
+    // `Header::hash_slow()` since the header excludes block_hash. We then rebuild the
+    // sequence with the LAST delta's diff.block_hash set to the recomputed hash, so
+    // that the processor's parent-hash sanity check on block 2's base (which compares
+    // against the in-flight tip's diff.block_hash) passes.
+    let placeholder = vec![
+        flash_base(1, hash("1a"), genesis_hash, ts + 2),
+        flash_delta(1, hash("placeholder"), 1),
+    ];
+    let expected_block1_hash = assembled_block_hash(&placeholder);
+
+    let block1_fbs = vec![
+        flash_base(1, hash("1a"), genesis_hash, ts + 2),
+        flash_delta(1, expected_block1_hash, 1),
+    ];
+
+    let mut events = block1_fbs;
+    events.push(flash_base(2, hash("2a"), expected_block1_hash, ts + 4));
+
+    let raw = run_flashblock_sequence(client, events);
+
+    let events: Vec<FireEvent> = parse_fire_events(&raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
+        .collect();
+
+    assert_fire_events_metadata_eq(
+        &events,
+        &[
+            FireEvent::flash_block(1, hash("1a"), 0, false),
+            FireEvent::flash_block(1, expected_block1_hash, 1, false),
+            FireEvent::flash_block(1, expected_block1_hash, 1, true),
+            FireEvent::flash_block(2, hash("2a"), 0, false),
+        ],
+    );
+}
+
+/// is_final hash mismatch on a FirstOfNextBlock transition: the processor matches
+/// geth's `controller.go:300-306` behavior — set `Skipping=true` (in our model:
+/// `state.reset()`) and drop the new base. No is_final FIRE BLOCK is emitted, and
+/// the new block N+1's base is silently discarded. Subsequent flashblocks for
+/// block N+1 are also dropped (no in-flight sequence). A later canonical
+/// notification for block N is **not** treated as a fallback trigger — the
+/// canonical FIRE BLOCK emitted on the live-block tracer is considered sufficient
+/// signal of finality.
+///
+/// Sequence:
+/// 1. Block 1 base + delta with the in-flight tip `hash("1b")`.
+/// 2. Block 2 base whose `parent_hash` is also `hash("1b")` — passes the in-flight
+///    parent-hash sanity check, so the validator returns `FirstOfNextBlock`. The
+///    new is_final attempt then compares the recomputed block-1 hash (with
+///    `state_root = ZERO` via the mock provider) against `hash("1b")` —
+///    these differ, so the processor resets and drops the new base.
+/// 3. A delta for block 2 arrives. Because state was reset, the validator's "no
+///    in-flight sequence and non-base flashblock" guard drops it.
+/// 4. `canonical_block(1, hash("wrong-1"))` is emitted to confirm that the
+///    canonical-block path no longer triggers any is_final fallback (geth doesn't
+///    either: `controller.go:268` short-circuits on `Skipping=true`).
+#[test]
+fn is_final_mismatch_resets_state_and_drops_new_block() {
+    let genesis = test_genesis();
+    let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            flash_delta(1, hash("1b"), 1),
+            // Block 2's parent_hash matches block 1's in-flight tip (`hash("1b")`)
+            // so the in-flight parent-hash sanity check passes — but it differs
+            // from the locally-recomputed block-1 hash, so the is_final attempt
+            // fails and the processor resets.
+            flash_base(2, hash("2a"), hash("1b"), ts + 4),
+            // Dropped after reset: no in-flight sequence accepts a non-base.
+            flash_delta(2, hash("2b"), 1),
+            // Confirms canonical-fallback is gone: even a canonical for block 1
+            // arriving later does not emit a deferred is_final partial.
+            canonical_block(1, hash("wrong-1")),
+        ],
+    );
+
+    let events: Vec<FireEvent> = parse_fire_events(&raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
+        .collect();
+
+    assert_fire_events_metadata_eq(
+        &events,
+        &[
+            FireEvent::flash_block(1, hash("1a"), 0, false),
+            FireEvent::flash_block(1, hash("1b"), 1, false),
+            // No FIRE BLOCK for block 2's base, no is_final for block 1, no FIRE
+            // BLOCK for block 2's delta.
+            FireEvent::canonical_block(1, hash("wrong-1")),
+        ],
     );
 }

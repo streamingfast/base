@@ -32,7 +32,7 @@ use base_execution_chainspec::BaseChainSpec;
 use base_firehose_flashblocks::{
     ClockFn, FirehoseFlashblocksProcessor, FlashblocksTracerHandle,
 };
-use base_flashblocks::FlashblocksReceiver;
+use base_flashblocks::{BlockAssembler, FlashblocksReceiver};
 use base64::Engine as _;
 use firehose_tracer::{
     InMemoryBuffer,
@@ -761,6 +761,40 @@ pub(crate) fn flash_delta_with_payload_id(
 /// header.
 pub(crate) const fn canonical_block(block_number: u64, block_hash: B256) -> TestEvent {
     TestEvent::CanonicalBlock { block_number, block_hash }
+}
+
+/// Pre-computes the canonical block hash that the processor will recompute when
+/// attempting an is_final emission, given the same sequence of flashblock events.
+///
+/// In production the processor recomputes the block hash by (a) computing the
+/// post-execution `state_root` from the EVM bundle via the state provider — this
+/// mirrors geth's `finalizedStateDB.IntermediateRoot(true)` on `processor.go:215`
+/// of the streamingfast flashblocks port — and (b) sealing the assembled header
+/// with that state_root.
+///
+/// In the test harness, `GenesisStateProvider::state_root` is a stub that returns
+/// `B256::ZERO`, so the processor's "computed" state_root is always zero — which
+/// happens to match the wire's default state_root in [`flash_delta`] /
+/// [`flash_base`] fixtures. The header that the processor seals therefore matches
+/// the header returned by [`BlockAssembler::assemble`] verbatim, so we can predict
+/// the recomputed hash by hashing the assembled header directly.
+///
+/// Filters `events` to flashblock entries (canonical-block markers are ignored),
+/// assembles them via [`BlockAssembler`], and returns
+/// `assembled.block.header.hash_slow()`. Tests use this to set the `parent_hash`
+/// of a subsequent base (or canonical block) so the recomputed-hash comparison
+/// succeeds — or deliberately pass a different value to force a mismatch.
+pub(crate) fn assembled_block_hash(events: &[TestEvent]) -> B256 {
+    let flashblocks: Vec<Flashblock> = events
+        .iter()
+        .filter_map(|event| match event {
+            TestEvent::Flashblock(fb) => Some((**fb).clone()),
+            TestEvent::CanonicalBlock { .. } => None,
+        })
+        .collect();
+    let assembled =
+        BlockAssembler::assemble(&flashblocks).expect("test fixture must assemble cleanly");
+    assembled.block.header.hash_slow()
 }
 
 // ── FireEvent ────────────────────────────────────────────────────────────────

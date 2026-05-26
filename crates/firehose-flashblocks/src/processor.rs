@@ -105,6 +105,18 @@ struct ProcessorState {
     latest_canonical: Option<(u64, B256)>,
 }
 
+/// Carries an `is_final` FIRE BLOCK ready to emit on the flashblock tracer once the
+/// caller drops the [`ProcessorState`] mutex. Constructed inside the state lock
+/// during a `FirstOfNextBlock` transition when the recomputed block hash matches
+/// the new base's `parent_hash`; consumed by the caller right after dropping state.
+#[derive(Debug)]
+struct PendingFinalEmission {
+    /// Sealed block to feed [`FirehoseBlockTracer::start_flashblock_local`].
+    sealed_block: SealedBlock<base_common_consensus::BaseBlock>,
+    /// Final delta index — stamped on the FIRE BLOCK with the `+1000` sentinel.
+    final_index: u64,
+}
+
 impl ProcessorState {
     const fn new() -> Self {
         Self {
@@ -191,17 +203,8 @@ where
 
     /// Like [`Self::new`] but accepts a custom clock used to evaluate flashblock
     /// staleness. The closure returns the current Unix timestamp in seconds.
-    pub fn with_clock(
-        client: Client,
-        tracer: FlashblocksTracerHandle,
-        clock: ClockFn,
-    ) -> Self {
-        Self {
-            client,
-            state: Mutex::new(ProcessorState::new()),
-            tracer: Mutex::new(tracer),
-            clock,
-        }
+    pub fn with_clock(client: Client, tracer: FlashblocksTracerHandle, clock: ClockFn) -> Self {
+        Self { client, state: Mutex::new(ProcessorState::new()), tracer: Mutex::new(tracer), clock }
     }
 
     /// Process a single flashblock event. Errors are logged and swallowed: the processor clears
@@ -230,9 +233,7 @@ where
         base_parent_hash: B256,
     ) -> bool {
         match latest_canonical {
-            Some((n, hash)) if n == base_block_number.saturating_sub(1) => {
-                hash == base_parent_hash
-            }
+            Some((n, hash)) if n == base_block_number.saturating_sub(1) => hash == base_parent_hash,
             _ => true,
         }
     }
@@ -240,6 +241,11 @@ where
     fn process_inner(&self, flashblock: Flashblock) -> Result<(), Error> {
         let block_number = flashblock.metadata.block_number;
         let index = flashblock.index;
+
+        // Carries the `is_final` FIRE BLOCK for the just-finished block when the new
+        // base's `parent_hash` matched the locally-recomputed hash. Emitted right
+        // after the state lock is released, before the new block's execution starts.
+        let mut pending_final_emission: Option<PendingFinalEmission> = None;
 
         let mut state = self.state.lock().expect("flashblock state mutex poisoned");
 
@@ -253,10 +259,7 @@ where
         let block_timestamp = if index == 0 {
             flashblock.base.as_ref().map(|b| b.timestamp)
         } else {
-            state
-                .stored_flashblocks
-                .first()
-                .and_then(|fb| fb.base.as_ref().map(|b| b.timestamp))
+            state.stored_flashblocks.first().and_then(|fb| fb.base.as_ref().map(|b| b.timestamp))
         };
         if let Some(ts) = block_timestamp {
             let now = (self.clock)();
@@ -390,6 +393,36 @@ where
                         let awaiting = state.awaiting_canonical_confirmation;
                         let stored_parent_hash =
                             flashblock.base.as_ref().map(|b| b.parent_hash).unwrap_or_default();
+                        // Mirror geth's `controller.go:300` flow: re-execute (here:
+                        // recompute) the previous block's last flashblock with
+                        // `isLastFlashBlock=true` and validate the resulting hash against
+                        // the new base's `parent_hash`. On mismatch, geth sets
+                        // `Skipping=true` and abandons the new base via early return; we
+                        // model that by resetting state (which leaves the processor only
+                        // accepting a fresh base, dropping subsequent deltas).
+                        if !state.stored_flashblocks.is_empty() {
+                            match Self::build_is_final_emission(
+                                latest_block,
+                                latest_idx,
+                                &state.stored_flashblocks,
+                                state.accumulated_db.as_ref(),
+                                stored_parent_hash,
+                            ) {
+                                Ok(emission) => {
+                                    pending_final_emission = Some(emission);
+                                }
+                                Err(reason) => {
+                                    warn!(
+                                        block = latest_block,
+                                        new_base_parent_hash = %stored_parent_hash,
+                                        reason = %reason,
+                                        "is_final hash mismatch on next-base transition; resetting state and dropping new base (geth equivalent: Skipping=true)"
+                                    );
+                                    state.reset();
+                                    return Ok(());
+                                }
+                            }
+                        }
                         state.start_block(flashblock);
                         if awaiting {
                             // The previous block was replayed and has not yet been confirmed
@@ -408,6 +441,8 @@ where
                                 parent_hash = %stored_parent_hash,
                                 "deferring next-block base while awaiting canonical confirmation of parent"
                             );
+                            drop(state);
+                            self.emit_final_if_pending(pending_final_emission);
                             return Ok(());
                         }
                     }
@@ -459,8 +494,7 @@ where
         if state.pending_state {
             debug!(
                 block = block_number,
-                index,
-                "parent state still unavailable; buffering flashblock for replay"
+                index, "parent state still unavailable; buffering flashblock for replay"
             );
             return Ok(());
         }
@@ -469,6 +503,12 @@ where
         let mut accumulated_db = state.accumulated_db.take();
 
         drop(state); // release the lock on the state
+
+        // If the FirstOfNextBlock transition just confirmed the previous block's
+        // recomputed hash, re-emit its final flashblock with `is_final = true`
+        // before executing the new block. Order in the wire stream stays:
+        // …, last(N) partial, is_final(N), first(N+1).
+        self.emit_final_if_pending(pending_final_emission.take());
 
         let assembled = BlockAssembler::assemble(&stored_flashblocks)
             .map_err(|e| Error::BlockAssembly(Box::new(e)))?;
@@ -561,6 +601,13 @@ where
     ///    - Mismatch → reset; subsequent flashblocks that depend on the diverged tip would
     ///      compound the error.
     ///
+    /// `is_final` re-emission is **not** retried here: matching geth's
+    /// `controller.go:268` guard, once a flashblock-tracer is_final attempt is missed
+    /// (either because the next-base's `parent_hash` didn't match the recomputed
+    /// hash or just because of race condition), the canonical FIRE BLOCK emitted by the live-block
+    /// tracer is considered sufficient — downstream consumers see finality via that canonical line
+    /// and don't need a duplicate is_final flashblock partial.
+    ///
     /// All other cases (no pending buffer, no awaiting confirmation, mismatched block
     /// numbers) are no-ops.
     pub fn on_canonical_block(&self, canonical_block_number: u64, canonical_block_hash: B256) {
@@ -569,10 +616,7 @@ where
         // Always record the latest canonical so subsequent base flashblocks can validate
         // their `parent_hash` against the canonical chain, regardless of any in-flight
         // pending or awaiting-confirmation state.
-        if state
-            .latest_canonical
-            .is_none_or(|(prev_num, _)| canonical_block_number >= prev_num)
-        {
+        if state.latest_canonical.is_none_or(|(prev_num, _)| canonical_block_number >= prev_num) {
             state.latest_canonical = Some((canonical_block_number, canonical_block_hash));
         }
 
@@ -609,9 +653,8 @@ where
         if !state.pending_state {
             return;
         }
-        let pending_block = state
-            .current_block_number
-            .expect("pending_state implies an in-flight block");
+        let pending_block =
+            state.current_block_number.expect("pending_state implies an in-flight block");
         if pending_block.saturating_sub(1) != canonical_block_number {
             return;
         }
@@ -673,9 +716,12 @@ where
             } else {
                 fb.diff.transactions.clone()
             };
-            if let Err(err) =
-                self.execute_flashblock(&assembled, fb.index, &new_transactions, &mut accumulated_db)
-            {
+            if let Err(err) = self.execute_flashblock(
+                &assembled,
+                fb.index,
+                &new_transactions,
+                &mut accumulated_db,
+            ) {
                 error!(
                     pending_block,
                     replay_index = i,
@@ -698,6 +744,94 @@ where
             canonical_block_number,
             replayed = stored.len(),
             "replayed buffered flashblocks after canonical block became available"
+        );
+    }
+
+    /// Computes the post-execution state root from the accumulated EVM bundle.
+    ///
+    /// Mirrors geth's `finalizedStateDB.IntermediateRoot(true)` at `processor.go:215`
+    /// of the streamingfast flashblocks port: the wire's `diff.state_root` is
+    /// typically null/zero for unsealed flashblocks, so the canonical state root is
+    /// derived locally from the EVM bundle accumulated across all the block's
+    /// flashblocks. Returns `B256::ZERO` (via the state provider) for an absent or
+    /// empty bundle.
+    fn compute_state_root(
+        accumulated_db: Option<&AccumulatedDb>,
+    ) -> Result<B256, Box<dyn std::error::Error + Send + Sync>> {
+        let db = accumulated_db.ok_or_else(|| {
+            Box::<dyn std::error::Error + Send + Sync>::from(
+                "no accumulated EVM bundle to derive state_root from",
+            )
+        })?;
+        let provider = &db.database.0;
+        let hashed = provider.hashed_post_state(&db.bundle_state);
+        provider.state_root(hashed).map_err(|e| Box::new(e).into())
+    }
+
+    /// Builds the [`PendingFinalEmission`] for block N's final flashblock when the
+    /// recomputed block hash matches `expected_parent_hash` (typically the new base's
+    /// `parent_hash`).
+    ///
+    /// Mirrors geth's `executeAndValidateBlock(true, &expectedBlockHash)` at
+    /// `controller.go:302`:
+    /// 1. Assemble block N's flashblocks via [`BlockAssembler`].
+    /// 2. Compute the post-execution state_root via [`Self::compute_state_root`] (the
+    ///    revm equivalent of `finalizedStateDB.IntermediateRoot(true)`).
+    /// 3. Override the header's `state_root` with the computed value and seal the
+    ///    block via [`Header::hash_slow`].
+    /// 4. Compare against `expected_parent_hash`.
+    ///
+    /// Returns `Ok(emission)` on hash match (caller emits it after dropping the state
+    /// lock). Returns `Err(reason)` on assembly failure, state_root computation
+    /// failure, or hash mismatch — the caller resets state so the new base is dropped
+    /// and the processor waits for a fresh restart, matching geth's
+    /// `Skipping = true` recovery path.
+    fn build_is_final_emission(
+        block_number: u64,
+        final_index: u64,
+        flashblocks: &[Flashblock],
+        accumulated_db: Option<&AccumulatedDb>,
+        expected_parent_hash: B256,
+    ) -> Result<PendingFinalEmission, String> {
+        let assembled = BlockAssembler::assemble(flashblocks)
+            .map_err(|err| format!("failed to assemble flashblocks: {err:?}"))?;
+        let state_root = Self::compute_state_root(accumulated_db)
+            .map_err(|err| format!("failed to compute post-execution state_root: {err}"))?;
+        let mut block = assembled.block.clone();
+        block.header.state_root = state_root;
+        let recomputed_hash = block.header.hash_slow();
+        if recomputed_hash != expected_parent_hash {
+            return Err(format!(
+                "block {block_number} recomputed hash {recomputed_hash} (state_root {state_root}) does not match expected parent_hash {expected_parent_hash}"
+            ));
+        }
+        Ok(PendingFinalEmission {
+            sealed_block: SealedBlock::new_unchecked(block, recomputed_hash),
+            final_index,
+        })
+    }
+
+    /// Emits a pre-built [`PendingFinalEmission`] on the flashblock tracer. Must be
+    /// called after the [`ProcessorState`] mutex has been released (the tracer mutex
+    /// is held for the duration of the FIRE BLOCK emission).
+    fn emit_final_if_pending(&self, pending: Option<PendingFinalEmission>) {
+        let Some(pending) = pending else { return };
+        let block_number = pending.sealed_block.header().number;
+        let block_hash = pending.sealed_block.hash();
+        let mut tracer = self.tracer.lock().expect("flashblock tracer mutex poisoned");
+        let block_tracer = FirehoseBlockTracer::start_flashblock_local::<BasePrimitives>(
+            tracer.tracer_mut(),
+            &pending.sealed_block,
+            None,
+            pending.final_index,
+            true,
+        );
+        block_tracer.mark_flashblock();
+        info!(
+            block = block_number,
+            final_index = pending.final_index,
+            block_hash = %block_hash,
+            "emitted is_final flashblock"
         );
     }
 
