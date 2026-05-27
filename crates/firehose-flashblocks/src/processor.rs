@@ -403,6 +403,13 @@ where
     ) -> Result<(), Error> {
         let block_number = flashblock.metadata.block_number;
         let index = flashblock.index;
+        debug!(
+            block = block_number,
+            index,
+            squash,
+            is_final_expected = ?is_final_expected_hash,
+            "process_inner entry"
+        );
 
         // Carries the `is_final` FIRE BLOCK for the just-finished block when the new
         // base's `parent_hash` matched the locally-recomputed hash. Emitted right
@@ -885,7 +892,7 @@ where
                     info!(
                         block = canonical_block_number,
                         canonical_block_hash = %canonical_block_hash,
-                        "canonical confirms in-flight block; emitted is_final flashblock"
+                        "canonical-driven is_final emitted"
                     );
                 }
                 Err(BuildIsFinalError::HashMismatch {
@@ -1168,7 +1175,7 @@ where
             block = block_number,
             final_index = pending.final_index,
             block_hash = %block_hash,
-            "emitted is_final flashblock"
+            "FirstOfNextBlock-fallback is_final emitted"
         );
     }
 
@@ -1324,7 +1331,7 @@ where
                             index,
                             recomputed_hash = %recomputed_hash,
                             state_root = %state_root,
-                            "peek-driven is_final: tracer hash + state_root overridden before flush"
+                            "peek-driven is_final emitted inline"
                         );
                     } else {
                         let err = std::io::Error::other(format!(

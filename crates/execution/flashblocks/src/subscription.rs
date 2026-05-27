@@ -178,6 +178,14 @@ where
                     Ok(ActorMessage::BestPayload { payload }) => Some(payload),
                     Err(_) => None,
                 };
+                debug!(
+                    target: "flashblocks_rpc::subscription",
+                    block = current.metadata.block_number,
+                    index = current.index,
+                    peek_block = peek.as_ref().map(|p| p.metadata.block_number),
+                    peek_index = peek.as_ref().map(|p| p.index),
+                    "dispatching flashblock to receiver"
+                );
                 flashblocks_state
                     .on_flashblock_received_with_peek(current, peek.as_ref());
                 peek_slot = peek;
