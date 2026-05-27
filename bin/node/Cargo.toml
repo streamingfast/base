@@ -26,7 +26,11 @@ base-reth-cli.workspace = true
 reth-cli-util.workspace = true
 reth-chainspec.workspace = true
 reth-chain-state.workspace = true
+reth-engine-primitives.workspace = true
 base-execution-cli = { workspace = true, features = ["otlp"] }
+
+# alloy
+alloy-primitives.workspace = true
 
 # cli
 url.workspace = true

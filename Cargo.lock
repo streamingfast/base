@@ -4732,6 +4732,7 @@ dependencies = [
  "futures",
  "jsonrpsee",
  "reth-db",
+ "reth-engine-primitives",
  "reth-evm",
  "reth-exex",
  "reth-ipc",
@@ -4744,6 +4745,7 @@ dependencies = [
  "reth-rpc-layer",
  "reth-rpc-server-types",
  "reth-tasks",
+ "reth-tokio-util",
  "reth-tracing",
  "reth-transaction-pool",
  "serde",
@@ -5625,6 +5627,7 @@ dependencies = [
 name = "base-reth-node"
 version = "0.9.0"
 dependencies = [
+ "alloy-primitives",
  "base-cli-utils",
  "base-execution-cli",
  "base-firehose-flashblocks",
@@ -5635,6 +5638,7 @@ dependencies = [
  "reth-chain-state",
  "reth-chainspec",
  "reth-cli-util",
+ "reth-engine-primitives",
  "reth-firehose",
  "tokio",
  "tokio-stream",
