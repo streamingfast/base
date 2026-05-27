@@ -100,6 +100,11 @@ impl TestEvent {
 struct GenesisClientInner {
     /// Block numbers that have been made available via a [`TestEvent::CanonicalBlock`] event.
     available_blocks: HashSet<u64>,
+    /// Block numbers whose canonical *header* is deliberately suppressed in
+    /// `header_by_number`. Default empty (every block returns a synthesised
+    /// header). Tests opt into the race-window scenario where state is queryable
+    /// but the canonical chain hasn't yet committed the header.
+    unavailable_headers: HashSet<u64>,
 }
 
 /// A minimal in-memory client for use in tests.
@@ -147,6 +152,31 @@ impl GenesisClient {
             .expect("genesis client inner mutex poisoned")
             .available_blocks
             .insert(block_number);
+    }
+
+    /// Suppresses `header_by_number(block_number)` so it returns `Ok(None)`.
+    ///
+    /// Simulates the brief race window between a payload insert (which makes state
+    /// queryable via `state_by_block_number_or_tag`) and the canonical-chain
+    /// commit (which makes the header readable via `header_by_number`). In that
+    /// window, a flashblock for block N+1 can find the parent's state but not the
+    /// parent's header — the processor must buffer the sequence as pending rather
+    /// than crash with "parent header missing".
+    pub(crate) fn mark_header_unavailable(&self, block_number: u64) {
+        self.inner
+            .lock()
+            .expect("genesis client inner mutex poisoned")
+            .unavailable_headers
+            .insert(block_number);
+    }
+
+    fn is_header_available(&self, block_number: u64) -> bool {
+        !self
+            .inner
+            .lock()
+            .expect("genesis client inner mutex poisoned")
+            .unavailable_headers
+            .contains(&block_number)
     }
 
     /// Returns `true` if `block_number` is the genesis block (block 0) or has been explicitly
@@ -244,9 +274,14 @@ impl HeaderProvider for GenesisClient {
     }
 
     fn header_by_number(&self, n: u64) -> ProviderResult<Option<Header>> {
-        // The processor calls this to build the EVM env for block N (looking up the parent
-        // header). Return a synthesised header with the correct block number so that
-        // `next_evm_env` computes `block_env.number = parent.number + 1` correctly.
+        // The processor calls this to build the EVM env for block N (looking up the
+        // parent header). Tests can suppress specific blocks via
+        // [`Self::mark_header_unavailable`] to simulate the race where state is
+        // queryable but the canonical-chain commit (which writes the header) hasn't
+        // happened yet. Default: return a synthesised header so existing tests pass.
+        if !self.is_header_available(n) {
+            return Ok(None);
+        }
         Ok(Some(self.header_for_block(n)))
     }
 

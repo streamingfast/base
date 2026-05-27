@@ -408,6 +408,16 @@ where
         self.state.lock().expect("flashblock state mutex poisoned").last_executed_index
     }
 
+    /// Returns `(current_block_number, pending_state, stored_flashblock_count)`.
+    /// Test-only: lets a regression test distinguish "buffered as pending" from
+    /// "state reset" — the two paths produce the same empty wire output but
+    /// differ in the processor's internal accumulation.
+    #[doc(hidden)]
+    pub fn pending_state_for_test(&self) -> (Option<u64>, bool, usize) {
+        let state = self.state.lock().expect("flashblock state mutex poisoned");
+        (state.current_block_number, state.pending_state, state.stored_flashblocks.len())
+    }
+
     /// Returns `Some((block_number, flashblock_index, revision, completed))` describing the
     /// most recent speculative state-root precompute launched by the processor, or `None`
     /// if no speculation is currently tracked. `completed` is `true` once the background
@@ -884,8 +894,9 @@ where
         // delta. Track this via `last_executed_index == None`.
         let is_first_execution_for_block = last_executed_index.is_none();
 
+        let parent_block = block_number.saturating_sub(1);
+
         if accumulated_db.is_none() {
-            let parent_block = block_number.saturating_sub(1);
             match self.try_bootstrap_provider(parent_block) {
                 Some(provider) => {
                     accumulated_db = Some(
@@ -909,6 +920,34 @@ where
                     );
                     return Ok(());
                 }
+            }
+        }
+
+        // The parent's canonical *header* must also be available — `execute_flashblock`
+        // reads it via `client.header_by_number(parent_block)` to construct the EVM env.
+        // State availability and header availability can diverge briefly when a
+        // flashblock for block N+1 arrives between the parent's payload-insert and the
+        // canonical-chain commit: the in-memory state may be queryable while
+        // `header_by_number` (which reads the canonical chain) still returns None.
+        // Treat that the same as a bootstrap failure — buffer the sequence so the
+        // canonical-block notification replays it once the header lands. Otherwise the
+        // error would bubble out of `process_inner`, the outer `process` would reset
+        // state, and subsequent flashblocks for the same block would be dropped as
+        // "no in-flight sequence" — losing the whole block on the flashblock stream.
+        match self.client.header_by_number(parent_block) {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                let mut state = self.state.lock().expect("flashblock state mutex poisoned");
+                state.pending_state = true;
+                // Drop the freshly-bootstrapped accumulated_db; the replay path
+                // re-bootstraps from the canonical-block notification.
+                state.accumulated_db = None;
+                warn!(
+                    block = block_number,
+                    parent_block,
+                    "parent header not available; buffering flashblock for replay on canonical signal"
+                );
+                return Ok(());
             }
         }
 

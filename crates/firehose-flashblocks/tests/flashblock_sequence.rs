@@ -1730,3 +1730,81 @@ fn merged_replay_emits_single_fire_block_with_all_transactions() {
         "merged FIRE BLOCK must carry all transactions across the buffered slice"
     );
 }
+
+/// Regression for the prod-observed `parent header missing` reset bug.
+///
+/// State availability and header availability can diverge briefly: a payload
+/// insert makes the parent's state queryable via `state_by_block_number_or_tag`,
+/// but the canonical-chain commit (which writes the canonical header) lands
+/// 100-150 ms later. A flashblock for block N+1 arriving in that window finds
+/// the parent's state but not the parent's header, and the EVM env
+/// construction errors out with `parent header missing`.
+///
+/// Old behavior: the outer `process` caught the error and called `state.reset()`,
+/// dropping the buffered base. Subsequent indices for the same block then hit
+/// the "no in-flight sequence" guard and were lost — the whole block disappeared
+/// from the flashblock stream until a much later restart.
+///
+/// New behavior: `process_inner` does an explicit `header_by_number` pre-check
+/// after a successful state bootstrap. On miss, mark the sequence pending so
+/// the canonical-block notification replays it once the header lands.
+///
+/// Fixture:
+/// 1. Mark canonical block 1 *state* available (via canonical event) but
+///    deliberately suppress its *header* via `mark_header_unavailable`.
+/// 2. Send base(2) + delta(2,1). The base is squashed; delta(2,1) triggers
+///    `execute_flashblock` and would normally crash on the header lookup.
+/// 3. With the fix, the new pre-check converts the miss into pending state
+///    instead. Assert: no FIRE BLOCK emitted, in-flight block still tracked
+///    (`current_block_number = Some(2)`), `pending_state = true`, and both
+///    flashblocks are buffered (`stored_flashblocks.len() == 2`).
+#[test]
+fn parent_header_missing_buffers_instead_of_resetting() {
+    let genesis = test_genesis();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    // Block 1's state is queryable (canonical signal arrived), but its header
+    // hasn't yet landed (canonical-chain commit pending).
+    client.mark_header_unavailable(1);
+
+    let result = run_flashblock_sequence_at_with_processor(
+        client,
+        vec![
+            canonical_block(1, hash("1a")),
+            flash_base(2, hash("2a"), hash("1a"), ts + 4),
+            flash_delta(2, hash("2b"), 1),
+        ],
+        ts + 4,
+    );
+
+    // No flashblock-tracer FIRE BLOCK is emitted — block 2 is pending.
+    let flash_events: Vec<FireEvent> = parse_fire_events(&result.raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::FlashBlock { .. }))
+        .collect();
+    assert!(
+        flash_events.is_empty(),
+        "no flashblock FIRE BLOCK should be emitted while the parent header is missing; got {} events",
+        flash_events.len()
+    );
+
+    // The bug manifested as a state reset → `current_block_number = None` and
+    // an empty `stored_flashblocks`. The fix keeps the in-flight block tracked
+    // and both incoming flashblocks buffered.
+    let (current_block, pending, stored_count) =
+        result.processor.pending_state_for_test();
+    assert_eq!(
+        current_block,
+        Some(2),
+        "in-flight block must still be tracked (bug would reset to None)"
+    );
+    assert!(
+        pending,
+        "sequence must be marked pending so the canonical-block signal replays it"
+    );
+    assert_eq!(
+        stored_count, 2,
+        "both base(2) and delta(2,1) must remain buffered (bug would clear to 0)"
+    );
+}
