@@ -816,6 +816,22 @@ where
             return Ok(());
         }
 
+        // Base flashblocks (wire idx 0) are never emitted standalone — the printed
+        // flash_idx would be 0, which is reserved for canonical FIRE BLOCKs in the
+        // firehose protocol. A single consumer reading the merged stream can't tell
+        // `flash_idx=0` from a canonical block, so we squash bases the same way we
+        // squash same-block deltas: stash in `stored_flashblocks`, defer execution
+        // until the next non-squashed event picks it up via the `last_executed_index`
+        // gather. The first delta then emits at flash_idx >= 1 (carrying base+delta
+        // txs); the peek-driven / canonical-driven is_final paths emit at
+        // `final_index + 1000` (>= 1001, no collision).
+        //
+        // The exception: when peek identified this base as the immediately-final
+        // partial (`is_final_expected_hash = Some(_)`), the execute path stamps the
+        // FIRE BLOCK with the `+1000` is_final marker (printed value >= 1000), so
+        // there's no canonical collision and we run execute_flashblock normally.
+        let squash = squash || (index == 0 && is_final_expected_hash.is_none());
+
         // Squash: the caller's peek showed another same-block message already queued, so
         // the EVM execution + FIRE BLOCK emission for *this* flashblock is deferred.
         // `stored_flashblocks` keeps the data; the next non-squashed flashblock will pick
@@ -825,6 +841,13 @@ where
                 block = block_number,
                 index, "squashing flashblock execution; accumulated for next non-squashed flashblock"
             );
+            // Still flush any pending is_final FIRE BLOCK queued by the
+            // FirstOfNextBlock transition (squashing the new base must not drop
+            // the previous block's finality emission). Release the state lock
+            // first — emit_final_if_pending takes the tracer lock and must not
+            // be called while holding state.
+            drop(state);
+            self.emit_final_if_pending(pending_final_emission.take());
             return Ok(());
         }
 
