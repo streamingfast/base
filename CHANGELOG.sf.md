@@ -1,3 +1,12 @@
+## v0.9.1-fh
+
+* bumped upstream to 0.9.1
+* flashblocks
+
+## v0.9.0-fh
+
+* bumped upstream to 0.9.0
+
 ## v0.8.0-fh
 
 ### Changes
