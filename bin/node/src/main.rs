@@ -13,6 +13,7 @@ use crate::firehose::{FirehoseExtension, FirehoseFlashblocksExtension};
 /// CLI arguments: upstream's standard set extended with Firehose-specific options.
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
 pub struct Args {
+    /// Standard upstream node arguments.
     #[command(flatten)]
     pub standard: StandardNodeArgs,
 
