@@ -372,19 +372,26 @@ where
             }
         }
 
-        // Parent-hash sanity check: any base (index 0) must descend from a parent block
-        // whose hash the processor has already accepted. Two cases:
+        // Parent-hash sanity check against the canonical chain: any base (index 0)
+        // whose `parent_hash` disagrees with a previously-recorded canonical hash for
+        // its parent block is dropped. This catches sequencer-reported forks once
+        // canonical has weighed in on the parent.
         //
-        // 1. If a canonical-block notification for the parent block (block_number - 1) has
-        //    already been observed, that hash is authoritative — discard on mismatch.
-        // 2. Otherwise, if an in-flight flashblock chain exists for the parent block (the
-        //    current in-flight `current_block_number == block_number - 1`), the parent
-        //    must match the latest emitted tip of that chain. Without this, a base for
-        //    block N+1 could silently extend a fork whose tip the processor has no way to
-        //    obtain canonical state for.
+        // No in-flight-tip check is performed here. A previous version compared
+        // `flashblock.base.parent_hash` against `stored_flashblocks.last().diff.block_hash`,
+        // but the sequencer-supplied `diff.block_hash` is computed with
+        // `state_root = ZERO` for unsealed flashblocks while the new base's
+        // `parent_hash` is the real canonical hash (computed with the post-execution
+        // state root) — so they always differ in normal operation and the check
+        // would reject every valid next-block base whose canonical commit hadn't
+        // yet propagated to our `latest_canonical`. The rigorous equivalent runs
+        // inside the `FirstOfNextBlock` branch via `build_is_final_emission`, which
+        // recomputes the previous block's hash via `Header::hash_slow(computed_state_root)`
+        // and compares against the new base's `parent_hash` — matching geth's
+        // `executeAndValidateBlock(true, expectedHash)` flow.
         //
-        // Non-base flashblocks (deltas) inherit the verdict via the in-flight block — they
-        // target an already-validated sequence.
+        // Non-base flashblocks (deltas) inherit the verdict via the in-flight block —
+        // they target an already-validated sequence.
         if index == 0 {
             let incoming_parent_hash =
                 flashblock.base.as_ref().map(|b| b.parent_hash).unwrap_or_default();
@@ -404,29 +411,6 @@ where
                 );
                 state.reset();
                 return Ok(());
-            }
-            let canonical_known_for_parent = matches!(
-                state.latest_canonical,
-                Some((n, _)) if n == block_number.saturating_sub(1)
-            );
-            if !canonical_known_for_parent
-                && state.current_block_number == Some(block_number.saturating_sub(1))
-            {
-                let tip_hash = state
-                    .stored_flashblocks
-                    .last()
-                    .map(|fb| fb.diff.block_hash)
-                    .unwrap_or_default();
-                if tip_hash != incoming_parent_hash {
-                    warn!(
-                        block = block_number,
-                        incoming_parent_hash = %incoming_parent_hash,
-                        in_flight_tip_hash = %tip_hash,
-                        "base flashblock parent_hash disagrees with in-flight chain tip and no canonical confirms the parent; discarding and resetting state"
-                    );
-                    state.reset();
-                    return Ok(());
-                }
             }
         }
 
@@ -710,37 +694,39 @@ where
     /// Signals that the canonical chain just committed block `canonical_block_number` with
     /// hash `canonical_block_hash`. Drives two distinct flows:
     ///
-    /// 1. **Replay or discard a pending buffer.** If the processor has buffered flashblocks
-    ///    for block `canonical_block_number + 1` (whose parent state was unavailable when
-    ///    they arrived), compare the buffered base's `parent_hash` with
-    ///    `canonical_block_hash`:
+    /// 1. **Confirm (and is_final-emit) the in-flight block.** When the processor is
+    ///    in-flight on `canonical_block_number` (its flashblocks have been executed,
+    ///    either via the real-time path or via a prior canonical-driven replay) and
+    ///    is_final hasn't already been emitted for it via the peek-driven
+    ///    `FirstOfNextBlock` path, re-run the same recompute-then-validate that
+    ///    [`Self::build_is_final_emission`] performs in the next-base path:
+    ///    - Match → emit the is_final FIRE BLOCK for the block's last flashblock,
+    ///      set `final_part_sent` so a later `FirstOfNextBlock` fallback doesn't
+    ///      double-emit, and clear any `awaiting_canonical_confirmation` flag.
+    ///    - Mismatch → reset; subsequent flashblocks that depended on the diverged
+    ///      tip would compound the error.
+    ///
+    ///    This unifies what used to be two separate handlers (the "awaiting after
+    ///    replay" check that compared the wire's `diff.block_hash` against the
+    ///    canonical hash, and a missing "confirm the real-time in-flight block"
+    ///    path). Both ordering scenarios — `FirstOfNextBlock` arrives before the
+    ///    canonical notification, or the canonical notification arrives first —
+    ///    now produce the same single is_final emission.
+    ///
+    /// 2. **Replay or discard a pending buffer.** If the processor has buffered
+    ///    flashblocks for block `canonical_block_number + 1` (whose parent state
+    ///    was unavailable when they arrived), compare the buffered base's
+    ///    `parent_hash` with `canonical_block_hash`:
     ///    - Match → bootstrap the parent state and replay every buffered flashblock,
-    ///      emitting one FIRE BLOCK line per entry. After a successful replay the in-flight
-    ///      block is itself unconfirmed, so [`awaiting_canonical_confirmation`] is set; the
-    ///      next-block base will be deferred until *its* parent is also canonically
-    ///      confirmed.
-    ///    - Mismatch → the buffered flashblocks descend from a tip that the canonical chain
-    ///      did not accept; discard them and reset the processor.
+    ///      emitting one FIRE BLOCK line per entry. After a successful replay the
+    ///      in-flight block is itself unconfirmed, so
+    ///      [`awaiting_canonical_confirmation`] is set; a later canonical(N+1) hits
+    ///      flow 1 above and emits is_final.
+    ///    - Mismatch → the buffered flashblocks descend from a tip that the
+    ///      canonical chain did not accept; discard them and reset the processor.
     ///
-    /// 2. **Confirm or contradict the current in-flight block.** When the processor's
-    ///    in-flight block IS `canonical_block_number` (its flashblocks were already emitted
-    ///    — typically via a prior replay — and we have been waiting for the canonical chain
-    ///    to weigh in), compare the canonical hash with the latest emitted flashblock's
-    ///    tip:
-    ///    - Match → clear `awaiting_canonical_confirmation`; the next-block base may now
-    ///      take the sequential fast path.
-    ///    - Mismatch → reset; subsequent flashblocks that depend on the diverged tip would
-    ///      compound the error.
-    ///
-    /// `is_final` re-emission is **not** retried here: matching geth's
-    /// `controller.go:268` guard, once a flashblock-tracer is_final attempt is missed
-    /// (either because the next-base's `parent_hash` didn't match the recomputed
-    /// hash or just because of race condition), the canonical FIRE BLOCK emitted by the live-block
-    /// tracer is considered sufficient — downstream consumers see finality via that canonical line
-    /// and don't need a duplicate is_final flashblock partial.
-    ///
-    /// All other cases (no pending buffer, no awaiting confirmation, mismatched block
-    /// numbers) are no-ops.
+    /// All other cases (no pending buffer, no in-flight match, mismatched block
+    /// numbers) just record `latest_canonical` and return.
     pub fn on_canonical_block(&self, canonical_block_number: u64, canonical_block_hash: B256) {
         let mut state = self.state.lock().expect("flashblock state mutex poisoned");
 
@@ -751,27 +737,51 @@ where
             state.latest_canonical = Some((canonical_block_number, canonical_block_hash));
         }
 
-        // Case 2: a canonical for the block we just (re)played — confirm or contradict tip.
-        if !state.pending_state && state.awaiting_canonical_confirmation {
-            if state.current_block_number == Some(canonical_block_number) {
-                let tip_hash = state
-                    .stored_flashblocks
-                    .last()
-                    .map(|fb| fb.diff.block_hash)
-                    .unwrap_or_default();
-                if tip_hash == canonical_block_hash {
-                    debug!(
+        // Flow 1: canonical confirms the in-flight block — try is_final emission.
+        // Covers both the "awaiting after replay" sub-case (which used to compare
+        // the wire's diff.block_hash and was broken when sequencers send null
+        // state_root) and the real-time-in-flight sub-case where the next-block
+        // base hasn't arrived yet but the canonical notification has.
+        if !state.pending_state && state.current_block_number == Some(canonical_block_number) {
+            if state.final_part_sent {
+                // is_final already emitted via the peek-driven `FirstOfNextBlock`
+                // path; this canonical notification is purely informational. Clear
+                // any awaiting flag and bail.
+                debug!(
+                    block = canonical_block_number,
+                    canonical_block_hash = %canonical_block_hash,
+                    "canonical confirms an already-finalized in-flight block"
+                );
+                state.awaiting_canonical_confirmation = false;
+                return;
+            }
+            let stored_clone = state.stored_flashblocks.clone();
+            let latest_idx = state.latest_flashblock_index.unwrap_or(0);
+            match Self::build_is_final_emission(
+                canonical_block_number,
+                latest_idx,
+                &stored_clone,
+                state.accumulated_db.as_ref(),
+                canonical_block_hash,
+            ) {
+                Ok(emission) => {
+                    // emit_final_if_pending locks self.tracer only; it does not
+                    // touch self.state — so holding the state mutex here is safe.
+                    self.emit_final_if_pending(Some(emission));
+                    state.final_part_sent = true;
+                    state.awaiting_canonical_confirmation = false;
+                    info!(
                         block = canonical_block_number,
                         canonical_block_hash = %canonical_block_hash,
-                        "canonical confirms in-flight tip"
+                        "canonical confirms in-flight block; emitted is_final flashblock"
                     );
-                    state.awaiting_canonical_confirmation = false;
-                } else {
+                }
+                Err(reason) => {
                     warn!(
                         block = canonical_block_number,
                         canonical_block_hash = %canonical_block_hash,
-                        flashblock_tip = %tip_hash,
-                        "canonical contradicts in-flight tip; resetting state"
+                        reason = %reason,
+                        "canonical contradicts recomputed in-flight tip; resetting state"
                     );
                     state.reset();
                 }
@@ -779,8 +789,8 @@ where
             return;
         }
 
-        // Case 1: pending buffer waiting for parent state — replay on match, discard on
-        // mismatch.
+        // Flow 2: pending buffer waiting for parent state — replay on match, discard
+        // on mismatch.
         if !state.pending_state {
             return;
         }
@@ -929,7 +939,7 @@ where
 
     /// Builds the [`PendingFinalEmission`] for block N's final flashblock when the
     /// recomputed block hash matches `expected_parent_hash` (typically the new base's
-    /// `parent_hash`).
+    /// `parent_hash`, or a canonical-block notification's hash).
     ///
     /// Mirrors geth's `executeAndValidateBlock(true, &expectedBlockHash)` at
     /// `controller.go:302`:
@@ -940,14 +950,27 @@ where
     ///    block via [`Header::hash_slow`].
     /// 4. Compare against `expected_parent_hash`.
     ///
-    /// Returns `Ok(emission)` on hash match (caller emits it after dropping the state
-    /// lock). Returns `Err(reason)` on assembly failure, state_root computation
-    /// failure, or hash mismatch — the caller resets state so the new base is dropped
-    /// and the processor waits for a fresh restart, matching geth's
-    /// `Skipping = true` recovery path.
+    /// The emission uses `final_index = latest_idx + 1` rather than `latest_idx`.
+    /// This sidesteps the tracer's "flash block index must be strictly greater than
+    /// previous" snapshot check: when the regular `execute_flashblock` already ran
+    /// for `latest_idx` it stamped `snapshot.flash_index = latest_idx`, so a
+    /// follow-up `start_flashblock_local(latest_idx, is_final=true)` would panic.
+    /// Mirrors geth's `c.state.CurrentIndex++` at `controller.go:298` before the
+    /// fallback `executeAndValidateBlock(true, …)` call. The resulting wire
+    /// emission is `(latest_idx + 1) + 1000` instead of the peek-driven path's
+    /// `latest_idx + 1000`; both indicate the same final partial via the `>=1000`
+    /// marker, and `restore_flash_block_snapshot` on the tracer side picks up the
+    /// cumulative trace from the previous iteration's snapshot so the FIRE BLOCK
+    /// still carries `0..=latest_idx` of transaction traces.
+    ///
+    /// Returns `Ok(emission)` on hash match (caller emits it after the recompute).
+    /// Returns `Err(reason)` on assembly failure, state_root computation failure,
+    /// or hash mismatch — the caller resets state so the new base is dropped and
+    /// the processor waits for a fresh restart, matching geth's `Skipping = true`
+    /// recovery path.
     fn build_is_final_emission(
         block_number: u64,
-        final_index: u64,
+        latest_idx: u64,
         flashblocks: &[Flashblock],
         accumulated_db: Option<&AccumulatedDb>,
         expected_parent_hash: B256,
@@ -966,7 +989,9 @@ where
         }
         Ok(PendingFinalEmission {
             sealed_block: SealedBlock::new_unchecked(block, recomputed_hash),
-            final_index,
+            // Step past the snapshot's `flash_index = latest_idx` so the tracer's
+            // strictly-greater check passes.
+            final_index: latest_idx + 1,
         })
     }
 

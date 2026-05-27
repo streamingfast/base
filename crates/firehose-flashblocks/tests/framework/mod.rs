@@ -1296,6 +1296,113 @@ pub(crate) fn run_flashblock_sequence(client: GenesisClient, events: Vec<TestEve
     run_flashblock_sequence_at(client, events, min_ts)
 }
 
+/// Like [`run_flashblock_sequence`] but feeds every flashblock through
+/// `on_flashblock_received` (no peek hint), bypassing the test runner's normal
+/// peek-aware path. Use this to exercise the slow-drip production scenario where
+/// flashblocks arrive one at a time with the WS subscriber's peek slot empty, so
+/// the peek-driven squash / is_final classifications never fire.
+///
+/// In that mode, block transitions are detected only by the validator's
+/// `FirstOfNextBlock` branch (which calls [`Self::build_is_final_emission`]) or
+/// by [`Self::on_canonical_block`] — letting tests verify that the fallback
+/// `is_final` paths still produce the correct wire stream.
+pub(crate) fn run_flashblock_sequence_without_peek(
+    client: GenesisClient,
+    events: Vec<TestEvent>,
+) -> Vec<u8> {
+    let min_ts = events
+        .iter()
+        .filter_map(|event| match event {
+            TestEvent::Flashblock(fb) => fb.base.as_ref().map(|b| b.timestamp),
+            TestEvent::CanonicalBlock { .. } => None,
+        })
+        .min()
+        .unwrap_or(0);
+    run_flashblock_sequence_internal_without_peek(client, events, min_ts).0
+}
+
+fn run_flashblock_sequence_internal_without_peek(
+    client: GenesisClient,
+    events: Vec<TestEvent>,
+    now_secs: u64,
+) -> (Vec<u8>, std::sync::Arc<FirehoseFlashblocksProcessor<GenesisClient>>) {
+    let flash_buffer = InMemoryBuffer::new();
+    let canonical_buffer = InMemoryBuffer::new();
+    let mut output: Vec<u8> = Vec::new();
+    let chain_id = client.chain_spec().chain().id();
+
+    let flash_writer: Box<dyn std::io::Write + Send> = Box::new(flash_buffer.clone());
+    let tracer_handle = FlashblocksTracerHandle::with_writer(
+        Config { chain_client: ChainClient::Reth, ..Default::default() },
+        ChainConfig::new(chain_id),
+        flash_writer,
+    );
+
+    let canonical_writer: Box<dyn std::io::Write + Send> = Box::new(canonical_buffer.clone());
+    let mut canonical_tracer = FlashblocksTracerHandle::with_writer(
+        Config { chain_client: ChainClient::Reth, ..Default::default() },
+        ChainConfig::new(chain_id),
+        canonical_writer,
+    );
+
+    let clock: ClockFn = std::sync::Arc::new(move || now_secs);
+    let processor = std::sync::Arc::new(FirehoseFlashblocksProcessor::with_clock(
+        client.clone(),
+        tracer_handle,
+        clock,
+    ));
+
+    let mut flash_offset = 0usize;
+    let mut canonical_offset = 0usize;
+
+    for event in events {
+        match event {
+            TestEvent::Flashblock(fb) => {
+                // No peek hint — production slow-drip case.
+                processor.on_flashblock_received(*fb);
+
+                let bytes = flash_buffer.get_bytes();
+                if bytes.len() > flash_offset {
+                    output.extend_from_slice(b"# SOURCE FLASH\n");
+                    output.extend_from_slice(&bytes[flash_offset..]);
+                    flash_offset = bytes.len();
+                }
+            }
+            TestEvent::CanonicalBlock { block_number, block_hash } => {
+                client.mark_canonical_block_available(block_number);
+
+                let header = client.header_for_block(block_number);
+                let sealed = SealedBlock::new_unchecked(
+                    alloy_consensus::Block { header, body: BlockBody::<BaseTxEnvelope>::default() },
+                    block_hash,
+                );
+                let tracer = canonical_tracer.tracer_mut();
+                let block_tracer =
+                    FirehoseBlockTracer::start_local::<BasePrimitives>(tracer, &sealed, None);
+                block_tracer.mark_verified();
+
+                let bytes = canonical_buffer.get_bytes();
+                if bytes.len() > canonical_offset {
+                    output.extend_from_slice(b"# SOURCE CANON\n");
+                    output.extend_from_slice(&bytes[canonical_offset..]);
+                    canonical_offset = bytes.len();
+                }
+
+                processor.on_canonical_block(block_number, block_hash);
+
+                let bytes = flash_buffer.get_bytes();
+                if bytes.len() > flash_offset {
+                    output.extend_from_slice(b"# SOURCE FLASH\n");
+                    output.extend_from_slice(&bytes[flash_offset..]);
+                    flash_offset = bytes.len();
+                }
+            }
+        }
+    }
+
+    (output, processor)
+}
+
 /// Output of [`run_flashblock_sequence_at_with_processor`].
 ///
 /// Bundles the merged tracer output with the underlying processor handle so tests can

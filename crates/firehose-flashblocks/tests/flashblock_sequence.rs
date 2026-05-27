@@ -22,7 +22,8 @@ use framework::{
     FireEvent, GenesisClient, assembled_block_hash, assert_fire_events_eq,
     assert_fire_events_metadata_eq, canonical_block, flash_base, flash_delta,
     flash_delta_with_payload_id, hash, parse_fire_events, run_flashblock_sequence,
-    run_flashblock_sequence_at, run_flashblock_sequence_at_with_processor, test_genesis,
+    run_flashblock_sequence_at, run_flashblock_sequence_at_with_processor,
+    run_flashblock_sequence_without_peek, test_genesis,
 };
 
 /// Simplest possible test: send a single flash-base event (block 1, no transactions) and verify
@@ -1132,5 +1133,246 @@ fn canonical_replay_stamps_last_executed_index() {
         Some(1),
         "canonical replay must stamp last_executed_index = Some(highest replayed index) \
          so the multi-delta tx-gather filter in process_inner doesn't re-execute already-applied transactions"
+    );
+}
+
+/// Regression for the prod bug where block N+1's base was rejected because the
+/// in-flight tip's `diff.block_hash` (sequencer-computed with `state_root = ZERO`)
+/// disagreed with the new base's `parent_hash` (the real canonical hash, computed
+/// with the post-execution state root). The fix removed the broken check; the
+/// rigorous version still runs inside the `FirstOfNextBlock` branch via
+/// [`build_is_final_emission`], which recomputes the previous block's hash with
+/// the locally-computed state root and compares against the new base's
+/// `parent_hash`.
+///
+/// Fixture mimics the op-rbuilder wire format: the block-1 delta's
+/// `diff.block_hash` is set to an arbitrary value DIFFERENT from the recomputed
+/// hash (simulating "sequencer reports a block_hash computed with null
+/// state_root"). Block 2's base.parent_hash is the CORRECT recomputed hash.
+///
+/// Without the fix, the in-flight-tip check would reject block 2's base because
+/// `delta.diff.block_hash != base.parent_hash`. With the fix, the test runner's
+/// peek path catches block 2's base ahead-of-time and emits block 1's delta as
+/// is_final with the recomputed hash; then block 2's base proceeds normally.
+///
+/// Asserts: block 1 base + is_final emission for block 1 delta + block 2 base
+/// all reach the wire — block 2 is NOT dropped by a broken hash comparison.
+#[test]
+fn next_base_accepted_when_delta_diff_block_hash_diverges_from_recompute() {
+    let genesis = test_genesis();
+    let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    let placeholder = vec![
+        flash_base(1, hash("1a"), genesis_hash, ts + 2),
+        flash_delta(1, hash("placeholder"), 1),
+    ];
+    let recomputed_block1_hash = assembled_block_hash(&placeholder);
+
+    // Simulates the op-rbuilder wire: the sequencer-reported `diff.block_hash`
+    // for the last delta differs from the canonical (locally-recomputed) hash.
+    let wire_block_hash = hash("wire-hash-with-null-state-root");
+    assert_ne!(
+        wire_block_hash, recomputed_block1_hash,
+        "fixture must use a wire hash that differs from the recompute, to exercise the bug"
+    );
+
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            // The delta carries the wire-reported hash (≠ recompute). The previous
+            // in-flight-tip check would have compared this against block 2's
+            // base.parent_hash and rejected block 2 outright.
+            flash_delta(1, wire_block_hash, 1),
+            // Block 2's base.parent_hash is the CANONICAL/recomputed hash. The
+            // peek-driven is_final path catches this transition and recomputes
+            // block 1's hash via state_root=ZERO from the mock provider — that
+            // matches the recompute helper's prediction, so is_final emits with
+            // the recomputed hash.
+            flash_base(2, hash("2a"), recomputed_block1_hash, ts + 4),
+        ],
+    );
+
+    let events: Vec<FireEvent> = parse_fire_events(&raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
+        .collect();
+
+    assert_fire_events_metadata_eq(
+        &events,
+        &[
+            FireEvent::flash_block(1, hash("1a"), 0, false),
+            // Single is_final emission for block 1's delta sealed with the
+            // recomputed hash (not the wire-reported one).
+            FireEvent::flash_block(1, recomputed_block1_hash, 1, true),
+            // Block 2's base reaches the wire — the bug used to drop it here.
+            FireEvent::flash_block(2, hash("2a"), 0, false),
+        ],
+    );
+}
+
+/// Regression for the prod scenario where canonical(N) arrives BEFORE the
+/// peek-driven path catches block N+1's base. With the new `on_canonical_block`
+/// Flow 1 logic, the canonical notification itself recomputes block N's hash
+/// from the EVM bundle and emits is_final on match — so finality reaches the
+/// flashblock-tracer stream regardless of whether next-base or canonical
+/// arrives first.
+///
+/// Fixture: block 1 base + delta, then `canonical_block(1, recomputed_block1_hash)`.
+/// No subsequent flashblock is queued, so the test runner's peek slot for the
+/// block-1 delta is empty — the peek-driven is_final path does NOT fire. The
+/// is_final emission must come from on_canonical_block.
+#[test]
+fn canonical_emits_is_final_when_no_subsequent_flashblock() {
+    let genesis = test_genesis();
+    let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    let placeholder = vec![
+        flash_base(1, hash("1a"), genesis_hash, ts + 2),
+        flash_delta(1, hash("any"), 1),
+    ];
+    let recomputed_block1_hash = assembled_block_hash(&placeholder);
+
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            // Wire-reported block_hash that differs from the recompute (the
+            // value the in-flight-tip check used to compare against).
+            flash_delta(1, hash("wire-hash"), 1),
+            // Canonical confirms block 1 with the locally-recomputable hash.
+            // No subsequent Flashblock event, so the runner's peek slot for
+            // the delta above is empty and the peek-driven is_final path is
+            // never triggered — finality must reach the wire via
+            // on_canonical_block's Flow 1 recompute.
+            canonical_block(1, recomputed_block1_hash),
+        ],
+    );
+
+    let events: Vec<FireEvent> = parse_fire_events(&raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
+        .collect();
+
+    assert_fire_events_metadata_eq(
+        &events,
+        &[
+            FireEvent::flash_block(1, hash("1a"), 0, false),
+            // Delta emits as non-final because the runner saw no next-block
+            // base when peeking ahead.
+            FireEvent::flash_block(1, hash("wire-hash"), 1, false),
+            // Canonical FIRE BLOCK on the canonical tracer.
+            FireEvent::canonical_block(1, recomputed_block1_hash),
+            // is_final emitted by on_canonical_block at idx = latest_idx + 1 = 2
+            // (printed as 1002): the previous execute_flashblock for the delta
+            // already stamped the tracer's snapshot at `flash_index = 1`, so the
+            // fallback emission has to step to 2 to clear the tracer's
+            // strictly-greater check (matches geth's CurrentIndex++ behavior).
+            FireEvent::flash_block(1, recomputed_block1_hash, 2, true),
+        ],
+    );
+}
+
+/// Mirror of [`canonical_emits_is_final_when_no_subsequent_flashblock`] but with
+/// a deliberately-wrong canonical hash. The new `on_canonical_block` Flow 1
+/// recomputes block 1's hash, sees a mismatch, and resets state — matching
+/// geth's `Skipping = true` behavior on hash divergence.
+#[test]
+fn canonical_with_wrong_hash_resets_state() {
+    let genesis = test_genesis();
+    let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    let placeholder = vec![
+        flash_base(1, hash("1a"), genesis_hash, ts + 2),
+        flash_delta(1, hash("any"), 1),
+    ];
+    let recomputed_block1_hash = assembled_block_hash(&placeholder);
+    let wrong_canonical_hash = hash("definitely-not-the-recompute");
+    assert_ne!(wrong_canonical_hash, recomputed_block1_hash);
+
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            flash_delta(1, hash("wire-hash"), 1),
+            // Canonical with WRONG hash → Flow 1 mismatch → reset.
+            canonical_block(1, wrong_canonical_hash),
+        ],
+    );
+
+    let events: Vec<FireEvent> = parse_fire_events(&raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
+        .collect();
+
+    assert_fire_events_metadata_eq(
+        &events,
+        &[
+            FireEvent::flash_block(1, hash("1a"), 0, false),
+            FireEvent::flash_block(1, hash("wire-hash"), 1, false),
+            FireEvent::canonical_block(1, wrong_canonical_hash),
+            // NO is_final emission. State reset.
+        ],
+    );
+}
+
+/// Verifies the no-peek production scenario (slow-drip WS arrivals: peek slot
+/// empty when each flashblock is delivered). Block 2's base.parent_hash is the
+/// recomputed block-1 hash; without peek catching the transition, the
+/// `FirstOfNextBlock` fallback inside `process_inner` runs the recompute and
+/// emits is_final for block 1. The previously-broken in-flight-tip check would
+/// have rejected block 2's base before this fallback could run.
+#[test]
+fn next_base_accepted_without_peek_when_recompute_matches() {
+    let genesis = test_genesis();
+    let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    let placeholder = vec![
+        flash_base(1, hash("1a"), genesis_hash, ts + 2),
+        flash_delta(1, hash("wire-hash"), 1),
+    ];
+    let recomputed_block1_hash = assembled_block_hash(&placeholder);
+
+    // The no-peek runner feeds flashblocks through `on_flashblock_received`
+    // (no peek hint), so the peek-driven is_final path never fires. The
+    // FirstOfNextBlock fallback inside `process_inner` is what validates the
+    // transition.
+    let raw = run_flashblock_sequence_without_peek(
+        client,
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            flash_delta(1, hash("wire-hash"), 1),
+            flash_base(2, hash("2a"), recomputed_block1_hash, ts + 4),
+        ],
+    );
+
+    let events: Vec<FireEvent> = parse_fire_events(&raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
+        .collect();
+
+    assert_fire_events_metadata_eq(
+        &events,
+        &[
+            FireEvent::flash_block(1, hash("1a"), 0, false),
+            FireEvent::flash_block(1, hash("wire-hash"), 1, false),
+            // is_final emitted by the FirstOfNextBlock fallback at idx =
+            // latest_idx + 1 = 2 (printed 1002). The increment is needed
+            // because the previous execute_flashblock for the delta stamped
+            // the tracer's snapshot at `flash_index = 1`; matches geth's
+            // CurrentIndex++ before the fallback executeAndValidateBlock call.
+            FireEvent::flash_block(1, recomputed_block1_hash, 2, true),
+            // Block 2's base reaches the wire — the broken in-flight-tip check
+            // used to drop it here because `wire-hash != recomputed`.
+            FireEvent::flash_block(2, hash("2a"), 0, false),
+        ],
     );
 }
