@@ -29,6 +29,7 @@ use reth_firehose::{FirehoseBlockTracer, FirehoseWrappedExecutor};
 use reth_primitives_traits::SealedBlock;
 use reth_provider::{BlockReaderIdExt, StateProvider, StateProviderFactory};
 use reth_revm::{State, database::StateProviderDatabase};
+use revm_database::states::bundle_state::BundleRetention;
 use tracing::{debug, error, info, warn};
 
 use crate::{Error, FlashblocksTracerHandle};
@@ -1294,6 +1295,14 @@ where
         }
 
         executor.finish().map_err(|e| Error::Execution(Box::new(e)))?;
+
+        // Promote the per-tx cache transitions accumulated by the EVM into
+        // `bundle_state`. Without this, `compute_state_root` reads an empty bundle
+        // and `StateProvider::state_root(HashedPostState)` returns the underlying
+        // provider's pre-execution state_root (i.e. the PARENT block's state_root)
+        // — every is_final recompute then disagrees with canonical. Mirrors the
+        // existing pattern in `crates/execution/flashblocks/src/processor.rs:488`.
+        accumulated_db.merge_transitions(BundleRetention::Reverts);
 
         let mut emitted_is_final = false;
         if let Some(expected_parent_hash) = is_final_expected_hash {

@@ -30,6 +30,9 @@ reth-chainspec.workspace = true
 firehose-tracer.workspace = true
 reth-primitives-traits.workspace = true
 
+# revm
+revm-database.workspace = true
+
 # alloy
 alloy-evm.workspace = true
 alloy-eips.workspace = true
