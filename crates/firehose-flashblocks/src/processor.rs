@@ -133,6 +133,73 @@ struct PendingFinalEmission {
     final_index: u64,
 }
 
+/// Failure modes for [`FirehoseFlashblocksProcessor::build_is_final_emission`].
+///
+/// The `HashMismatch` variant carries diagnostic fields that get surfaced in the
+/// caller's `warn!` so a prod log alone can pin down whether the disagreement is
+/// in state_root, in some other header field, or in delivery (missing tail
+/// flashblocks).
+#[derive(Debug)]
+enum BuildIsFinalError {
+    /// `BlockAssembler::assemble` returned an error.
+    AssembleFailed(String),
+    /// `compute_state_root` failed (no accumulated_db, or the provider's
+    /// state_root computation errored).
+    StateRootFailed(String),
+    /// Recomputed block hash did not equal `expected_parent_hash`.
+    HashMismatch {
+        /// Hash produced by hashing the assembled header with the locally-computed
+        /// post-execution state_root overridden in.
+        recomputed_hash: B256,
+        /// Locally-computed post-execution state_root.
+        computed_state_root: B256,
+        /// What we were comparing against (e.g. the new base's `parent_hash` or
+        /// the canonical hash from `on_canonical_block`).
+        expected_parent_hash: B256,
+        /// Hash of the assembled header WITHOUT our state_root override — i.e.
+        /// with the sequencer's wire `diff.state_root` (typically ZERO) left in
+        /// place. Equality of this against `expected_parent_hash` would mean the
+        /// wire's state_root was actually canonical and our compute diverged;
+        /// equality against `recomputed_hash` would mean the wire's state_root
+        /// already matched our compute and the disagreement is in another header
+        /// field.
+        assembled_header_hash_with_wire_state_root: B256,
+        /// Number of flashblocks we accumulated for the block.
+        flashblock_count: usize,
+        /// Cumulative count of transactions across all accumulated flashblocks.
+        /// Comparing against `txs=` on the canonical chain commit log surfaces
+        /// the "missing tail flashblock" case where the sequencer kept sending
+        /// after our last accepted index but the WS subscriber's mailbox dropped
+        /// them (or they arrived after canonical and were skipped as stale).
+        total_transactions: usize,
+    },
+}
+
+impl std::fmt::Display for BuildIsFinalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AssembleFailed(reason) => write!(f, "failed to assemble flashblocks: {reason}"),
+            Self::StateRootFailed(reason) => {
+                write!(f, "failed to compute post-execution state_root: {reason}")
+            }
+            Self::HashMismatch {
+                recomputed_hash,
+                computed_state_root,
+                expected_parent_hash,
+                assembled_header_hash_with_wire_state_root,
+                flashblock_count,
+                total_transactions,
+            } => write!(
+                f,
+                "recomputed_hash={recomputed_hash} state_root={computed_state_root} \
+                 expected_parent_hash={expected_parent_hash} \
+                 wire_state_root_header_hash={assembled_header_hash_with_wire_state_root} \
+                 flashblocks={flashblock_count} total_transactions={total_transactions}"
+            ),
+        }
+    }
+}
+
 impl ProcessorState {
     const fn new() -> Self {
         Self {
@@ -468,20 +535,33 @@ where
                     SequenceValidationResult::FirstOfNextBlock => {
                         // Strict successor block — keep accumulated_db so the sequential fast
                         // path can carry committed state forward without re-bootstrapping.
-                        let awaiting = state.awaiting_canonical_confirmation;
+                        let mut awaiting = state.awaiting_canonical_confirmation;
                         let stored_parent_hash =
                             flashblock.base.as_ref().map(|b| b.parent_hash).unwrap_or_default();
                         // Mirror geth's `controller.go:300` flow: re-execute (here:
                         // recompute) the previous block's last flashblock with
                         // `isLastFlashBlock=true` and validate the resulting hash against
-                        // the new base's `parent_hash`. On mismatch, geth sets
-                        // `Skipping=true` and abandons the new base via early return; we
-                        // model that by resetting state (which leaves the processor only
-                        // accepting a fresh base, dropping subsequent deltas).
+                        // the new base's `parent_hash`. Fallback only — skipped when the
+                        // peek-driven path already emitted the is_final partial for the
+                        // previous block (matching geth's `!c.state.FinalPartSent` guard
+                        // at `controller.go:284`).
                         //
-                        // Fallback only — skipped when the peek-driven path already
-                        // emitted the is_final partial for the previous block (matching
-                        // geth's `!c.state.FinalPartSent` guard at `controller.go:284`).
+                        // On mismatch we don't drop the new base. Instead we reset the
+                        // in-flight state (so the previous block's accumulated EVM bundle
+                        // — which we just proved diverged from canonical — is discarded)
+                        // and fall through to `start_block(flashblock)` so the new base
+                        // is recorded. `accumulated_db` is now `None`, so the execute
+                        // path below either bootstraps a fresh state from the parent
+                        // (when canonical for the parent is already known) or marks the
+                        // sequence pending until the canonical notification arrives —
+                        // either way the new block proceeds. Geth's `Skipping=true`
+                        // semantics would have dropped the new base outright, breaking
+                        // the wire stream until a fresh base for an even later block
+                        // arrived; recovering via re-bootstrap is the only practical
+                        // option for us because the recompute mismatch may itself be a
+                        // false positive (delivery losing tail flashblocks, header-field
+                        // divergence between our `BlockAssembler` and reth's canonical
+                        // sealing, etc. — see the diagnostic fields surfaced below).
                         if !state.final_part_sent && !state.stored_flashblocks.is_empty() {
                             match Self::build_is_final_emission(
                                 latest_block,
@@ -493,15 +573,46 @@ where
                                 Ok(emission) => {
                                     pending_final_emission = Some(emission);
                                 }
-                                Err(reason) => {
+                                Err(BuildIsFinalError::HashMismatch {
+                                    recomputed_hash,
+                                    computed_state_root,
+                                    expected_parent_hash,
+                                    assembled_header_hash_with_wire_state_root,
+                                    flashblock_count,
+                                    total_transactions,
+                                }) => {
                                     warn!(
                                         block = latest_block,
-                                        new_base_parent_hash = %stored_parent_hash,
-                                        reason = %reason,
-                                        "is_final hash mismatch on next-base transition; resetting state and dropping new base (geth equivalent: Skipping=true)"
+                                        latest_flashblock_index = latest_idx,
+                                        recomputed_hash = %recomputed_hash,
+                                        computed_state_root = %computed_state_root,
+                                        expected_parent_hash = %expected_parent_hash,
+                                        wire_state_root_header_hash = %assembled_header_hash_with_wire_state_root,
+                                        flashblock_count,
+                                        total_transactions,
+                                        "is_final hash mismatch on next-base transition; \
+                                         resetting in-flight state and re-bootstrapping for the new block \
+                                         (no is_final FIRE BLOCK emitted for the previous block)"
                                     );
                                     state.reset();
-                                    return Ok(());
+                                    // After reset, awaiting flag is cleared on state and
+                                    // we shouldn't take the awaiting-defer branch below.
+                                    awaiting = false;
+                                    // Fall through to `start_block(flashblock)`: the new
+                                    // base is recorded and the execute path below will
+                                    // re-bootstrap from canonical (or buffer pending) for
+                                    // the new block.
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        block = latest_block,
+                                        latest_flashblock_index = latest_idx,
+                                        reason = %err,
+                                        "could not build is_final emission for previous block; \
+                                         resetting in-flight state and re-bootstrapping for the new block"
+                                    );
+                                    state.reset();
+                                    awaiting = false;
                                 }
                             }
                         }
@@ -776,12 +887,34 @@ where
                         "canonical confirms in-flight block; emitted is_final flashblock"
                     );
                 }
-                Err(reason) => {
+                Err(BuildIsFinalError::HashMismatch {
+                    recomputed_hash,
+                    computed_state_root,
+                    expected_parent_hash,
+                    assembled_header_hash_with_wire_state_root,
+                    flashblock_count,
+                    total_transactions,
+                }) => {
+                    warn!(
+                        block = canonical_block_number,
+                        latest_flashblock_index = latest_idx,
+                        recomputed_hash = %recomputed_hash,
+                        computed_state_root = %computed_state_root,
+                        canonical_block_hash = %expected_parent_hash,
+                        wire_state_root_header_hash = %assembled_header_hash_with_wire_state_root,
+                        flashblock_count,
+                        total_transactions,
+                        "canonical contradicts recomputed in-flight tip; resetting state"
+                    );
+                    state.reset();
+                }
+                Err(err) => {
                     warn!(
                         block = canonical_block_number,
                         canonical_block_hash = %canonical_block_hash,
-                        reason = %reason,
-                        "canonical contradicts recomputed in-flight tip; resetting state"
+                        reason = %err,
+                        "could not build is_final emission for in-flight block on canonical \
+                         notification; resetting state"
                     );
                     state.reset();
                 }
@@ -969,23 +1102,42 @@ where
     /// the processor waits for a fresh restart, matching geth's `Skipping = true`
     /// recovery path.
     fn build_is_final_emission(
-        block_number: u64,
+        _block_number: u64,
         latest_idx: u64,
         flashblocks: &[Flashblock],
         accumulated_db: Option<&AccumulatedDb>,
         expected_parent_hash: B256,
-    ) -> Result<PendingFinalEmission, String> {
+    ) -> Result<PendingFinalEmission, BuildIsFinalError> {
         let assembled = BlockAssembler::assemble(flashblocks)
-            .map_err(|err| format!("failed to assemble flashblocks: {err:?}"))?;
+            .map_err(|err| BuildIsFinalError::AssembleFailed(format!("{err:?}")))?;
+        // Hash the assembled header AS-RECEIVED (using the sequencer's wire
+        // `diff.state_root`, which is typically ZERO). When the recompute below
+        // mismatches `expected_parent_hash`, comparing this against
+        // `expected_parent_hash` and `recomputed_hash` quickly localises the bug:
+        //   - equals `expected_parent_hash` → sequencer's wire state_root *was*
+        //     canonical and our local state_root computation diverged.
+        //   - equals `recomputed_hash` → state_root override was a no-op (wire
+        //     state_root already matched our compute) and the disagreement is in
+        //     another header field (receipts_root, gas_used, withdrawals_root, …).
+        //   - matches neither → either header construction divergence or a wire
+        //     header field disagrees with canonical.
+        let assembled_header_hash_with_wire_state_root = assembled.block.header.hash_slow();
+        let total_transactions: usize =
+            flashblocks.iter().map(|fb| fb.diff.transactions.len()).sum();
         let state_root = Self::compute_state_root(accumulated_db)
-            .map_err(|err| format!("failed to compute post-execution state_root: {err}"))?;
+            .map_err(|err| BuildIsFinalError::StateRootFailed(format!("{err}")))?;
         let mut block = assembled.block.clone();
         block.header.state_root = state_root;
         let recomputed_hash = block.header.hash_slow();
         if recomputed_hash != expected_parent_hash {
-            return Err(format!(
-                "block {block_number} recomputed hash {recomputed_hash} (state_root {state_root}) does not match expected parent_hash {expected_parent_hash}"
-            ));
+            return Err(BuildIsFinalError::HashMismatch {
+                recomputed_hash,
+                computed_state_root: state_root,
+                expected_parent_hash,
+                assembled_header_hash_with_wire_state_root,
+                flashblock_count: flashblocks.len(),
+                total_transactions,
+            });
         }
         Ok(PendingFinalEmission {
             sealed_block: SealedBlock::new_unchecked(block, recomputed_hash),

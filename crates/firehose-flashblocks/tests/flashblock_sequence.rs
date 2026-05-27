@@ -1376,3 +1376,92 @@ fn next_base_accepted_without_peek_when_recompute_matches() {
         ],
     );
 }
+
+/// Prod-observed scenario: the FirstOfNextBlock recompute mismatched canonical
+/// (block 46530249 → 46530250). Prior behavior reset state AND returned early,
+/// dropping the new base; subsequent deltas for block N+1 hit the "no in-flight
+/// sequence" guard and were also dropped — the wire stream broke for an entire
+/// block until a much later restart point.
+///
+/// New behavior: on mismatch we reset the in-flight bundle (the previous block's
+/// state proved divergent from canonical) but **fall through to `start_block`**
+/// for the new base. `accumulated_db` is now `None`, so the execute path
+/// re-bootstraps from canonical — or buffers the new block in `pending_state`
+/// until the canonical notification for the parent arrives. Either way the
+/// chain proceeds.
+///
+/// Fixture:
+/// 1. Block 1 base + delta. Delta's `diff.block_hash = hash("wire-hash")` (the
+///    sequencer's null-state-root reading, ≠ recompute).
+/// 2. Block 2 base with `parent_hash = hash("not-the-recompute")` — a value
+///    that differs from BOTH the recompute and the canonical we'll send below.
+///    With the no-peek runner, the FirstOfNextBlock fallback fires for the
+///    block-1→2 transition, recompute ≠ "not-the-recompute" → mismatch path.
+/// 3. Block 2 delta accumulates while we wait for canonical(1) bootstrap.
+/// 4. `canonical_block(1, hash("not-the-recompute"))` — canonical agrees with
+///    block 2's `parent_hash`, so the pending-buffer replay (Flow 2 of
+///    on_canonical_block) bootstraps and replays block 2's flashblocks.
+///
+/// Asserts the full recovery: block 2's flashblocks DO eventually reach the
+/// wire, via the canonical-replay path. With the old "reset + return" the
+/// output would have ended at block 1's delta with no block 2 emissions at all.
+#[test]
+fn next_base_mismatch_recovers_via_pending_and_canonical_replay() {
+    let genesis = test_genesis();
+    let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    let canonical_block1_hash = hash("not-the-recompute");
+    let placeholder = vec![
+        flash_base(1, hash("1a"), genesis_hash, ts + 2),
+        flash_delta(1, hash("wire-hash"), 1),
+    ];
+    let recomputed_block1_hash = assembled_block_hash(&placeholder);
+    // Sanity check: the canonical hash we use as parent_hash for block 2 must
+    // differ from the recompute, otherwise the fallback would actually MATCH
+    // and the test wouldn't exercise the recovery path.
+    assert_ne!(canonical_block1_hash, recomputed_block1_hash);
+
+    let raw = run_flashblock_sequence_without_peek(
+        client,
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            flash_delta(1, hash("wire-hash"), 1),
+            // Block 2's parent_hash ≠ recompute → FirstOfNextBlock fallback
+            // mismatches. With the fix, this resets in-flight state and falls
+            // through to start_block(2). Bootstrap from block 1 fails (block 1
+            // not yet canonical) → block 2 enters pending_state.
+            flash_base(2, hash("2a"), canonical_block1_hash, ts + 4),
+            // Buffered alongside the base while pending.
+            flash_delta(2, hash("2b"), 1),
+            // Canonical for block 1 (with the same hash block 2's base
+            // referenced as `parent_hash`) → on_canonical_block Flow 2 replays
+            // the buffered block-2 flashblocks.
+            canonical_block(1, canonical_block1_hash),
+        ],
+    );
+
+    let events: Vec<FireEvent> = parse_fire_events(&raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
+        .collect();
+
+    assert_fire_events_metadata_eq(
+        &events,
+        &[
+            // Block 1's flashblocks executed in real-time.
+            FireEvent::flash_block(1, hash("1a"), 0, false),
+            FireEvent::flash_block(1, hash("wire-hash"), 1, false),
+            // No is_final for block 1 — the recompute mismatched canonical.
+            // Block 2's base + delta were buffered while pending.
+            // Canonical(1) fires the live-block tracer first.
+            FireEvent::canonical_block(1, canonical_block1_hash),
+            // Then Flow 2 replays block 2's buffered flashblocks. Without the
+            // fix, neither of these would have reached the wire — the broken
+            // "reset + return" would have dropped the new base at step 3.
+            FireEvent::flash_block(2, hash("2a"), 0, false),
+            FireEvent::flash_block(2, hash("2b"), 1, false),
+        ],
+    );
+}
