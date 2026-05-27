@@ -15,14 +15,16 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use alloy_consensus::{BlockBody, Header};
-use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumberOrTag};
+use alloy_consensus::{BlockBody, Header, SignableTransaction, TxLegacy};
+use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumberOrTag, eip2718::Encodable2718};
 use alloy_genesis::Genesis;
+use alloy_network::TxSignerSync;
 use alloy_primitives::{
-    Address, B256, BlockHash, BlockNumber, Bloom, Bytes, StorageKey, TxHash, TxNumber, U256, hex,
-    keccak256,
+    Address, B256, BlockHash, BlockNumber, Bloom, Bytes, StorageKey, TxHash, TxKind, TxNumber,
+    U256, hex, keccak256,
 };
 use alloy_rpc_types_engine::PayloadId;
+use alloy_signer_local::PrivateKeySigner;
 use base_common_consensus::{BaseBlock, BasePrimitives, BaseReceipt, BaseTxEnvelope};
 use base_common_flashblocks::{
     ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, Flashblock, FlashblocksPayloadV1,
@@ -761,6 +763,116 @@ pub(crate) fn flash_delta_with_payload_id(
 /// header.
 pub(crate) const fn canonical_block(block_number: u64, block_hash: B256) -> TestEvent {
     TestEvent::CanonicalBlock { block_number, block_hash }
+}
+
+/// Private key of the well-known anvil/Hardhat test account #0
+/// (0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266) — which [`test_genesis`] funds
+/// with 1000 ETH. Use this signer for tests that need real signed transactions
+/// (e.g. to exercise the cumulative-across-block tracer offsets).
+const ANVIL_TEST_PRIVATE_KEY: &str =
+    "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+/// Returns the [`PrivateKeySigner`] for the well-known anvil account #0.
+pub(crate) fn anvil_test_signer() -> PrivateKeySigner {
+    ANVIL_TEST_PRIVATE_KEY.parse().expect("anvil test key parses")
+}
+
+/// Constructs a signed, EIP-2718-encoded legacy transfer transaction from the
+/// anvil test account.
+///
+/// `nonce` must match the sender's current account nonce. `gas_limit = 21_000`
+/// is the basic transfer cost. The recipient is fixed (`Address::repeat_byte(1)`)
+/// and `value = 0` so the test fixture stays deterministic; only the cumulative
+/// receipt fields (gas_used, transaction_index, log block_index) are exercised.
+pub(crate) fn signed_legacy_transfer(nonce: u64) -> Bytes {
+    let mut tx = TxLegacy {
+        chain_id: Some(8453),
+        nonce,
+        gas_price: 7, // matches `baseFeePerGas` from `test_genesis`
+        gas_limit: 21_000,
+        to: TxKind::Call(Address::repeat_byte(1)),
+        value: U256::ZERO,
+        input: Bytes::new(),
+    };
+    let signature = anvil_test_signer()
+        .sign_transaction_sync(&mut tx)
+        .expect("sign legacy tx");
+    let envelope = BaseTxEnvelope::Legacy(tx.into_signed(signature));
+    let mut encoded = Vec::new();
+    envelope.encode_2718(&mut encoded);
+    Bytes::from(encoded)
+}
+
+/// Like [`flash_base`] but carries a pre-built set of EIP-2718-encoded
+/// transactions on the diff. Used by tests that need real signed transactions
+/// to exercise per-tx fields (cumulative_gas_used, transaction_index, log
+/// block_index) that the cumulative-across-block tracer offsets adjust.
+pub(crate) fn flash_base_with_txs(
+    block_number: u64,
+    block_hash: B256,
+    parent_hash: B256,
+    timestamp: u64,
+    transactions: Vec<Bytes>,
+) -> TestEvent {
+    let base = ExecutionPayloadBaseV1 {
+        parent_beacon_block_root: B256::ZERO,
+        parent_hash,
+        fee_recipient: Address::ZERO,
+        prev_randao: B256::ZERO,
+        block_number,
+        gas_limit: 30_000_000,
+        timestamp,
+        extra_data: Bytes::default(),
+        base_fee_per_gas: U256::from(7u64),
+    };
+    let diff = ExecutionPayloadFlashblockDeltaV1 {
+        state_root: B256::ZERO,
+        receipts_root: B256::ZERO,
+        logs_bloom: Bloom::default(),
+        gas_used: 0,
+        block_hash,
+        transactions,
+        withdrawals: Vec::new(),
+        withdrawals_root: B256::ZERO,
+        blob_gas_used: Some(0),
+    };
+    let metadata = Metadata { block_number };
+    TestEvent::flashblock(Flashblock {
+        payload_id: PayloadId::new([0u8; 8]),
+        index: 0,
+        base: Some(base),
+        diff,
+        metadata,
+    })
+}
+
+/// Like [`flash_delta`] but carries a pre-built set of EIP-2718-encoded
+/// transactions on the diff.
+pub(crate) fn flash_delta_with_txs(
+    block_number: u64,
+    block_hash: B256,
+    index: u64,
+    transactions: Vec<Bytes>,
+) -> TestEvent {
+    let diff = ExecutionPayloadFlashblockDeltaV1 {
+        state_root: B256::ZERO,
+        receipts_root: B256::ZERO,
+        logs_bloom: Bloom::default(),
+        gas_used: 0,
+        block_hash,
+        transactions,
+        withdrawals: Vec::new(),
+        withdrawals_root: B256::ZERO,
+        blob_gas_used: Some(0),
+    };
+    let metadata = Metadata { block_number };
+    TestEvent::flashblock(Flashblock {
+        payload_id: PayloadId::new([0u8; 8]),
+        index,
+        base: None,
+        diff,
+        metadata,
+    })
 }
 
 /// Pre-computes the canonical block hash that the processor will recompute when

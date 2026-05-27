@@ -4296,8 +4296,11 @@ dependencies = [
  "alloy-eips",
  "alloy-evm",
  "alloy-genesis",
+ "alloy-network",
  "alloy-primitives",
  "alloy-rpc-types-engine",
+ "alloy-signer",
+ "alloy-signer-local",
  "base-common-chains",
  "base-common-consensus",
  "base-common-evm",
@@ -9055,8 +9058,7 @@ checksum = "9844ddc3a6e533d62bba727eb6c28b5d360921d5175e9ff0f1e621a5c590a4d5"
 [[package]]
 name = "firehose-tracer"
 version = "5.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "188965e4a04ac1653d112e9bfd31eecb4c1d58676d338f3eaa0f9b69e88e9cac"
+source = "git+https://github.com/streamingfast/evm-firehose-tracer-rs.git?branch=offset-flashblocks#e36843d3d241846fa2baec14a97f27eb03696ba7"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",

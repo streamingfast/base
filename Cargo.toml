@@ -676,6 +676,15 @@ slop-merkle-tree = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.
 slop-maybe-rayon = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
 slop-basefold-prover = { git = "https://github.com/succinctlabs/sp1.git", tag = "v6.1.0" }
 
+# Git override: pulls the in-flight cumulative-across-block tracer offsets
+# (`flashblock_tx_index_offset`, `flashblock_cumulative_gas_offset`,
+# `flashblock_log_block_index_offset`) applied in `complete_transaction`,
+# `new_receipt_from_data`, and `on_log` so per-flashblock-iteration values
+# produced by revm get rebased to canonical-across-block values. Pending an
+# upstream crates.io release; revert this patch back to the version pin
+# once the release is published.
+firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", branch = "offset-flashblocks" }
+
 [patch."https://github.com/paradigmxyz/reth"]
 reth-db = { git = "https://github.com/streamingfast/reth.git", tag = "v1.11.4-fh-2" }
 reth-cli = { git = "https://github.com/streamingfast/reth.git", tag = "v1.11.4-fh-2" }

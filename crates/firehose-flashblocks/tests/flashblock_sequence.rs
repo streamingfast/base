@@ -21,9 +21,10 @@ use base_execution_chainspec::BaseChainSpec;
 use framework::{
     FireEvent, GenesisClient, assembled_block_hash, assert_fire_events_eq,
     assert_fire_events_metadata_eq, canonical_block, flash_base, flash_delta,
-    flash_delta_with_payload_id, hash, parse_fire_events, run_flashblock_sequence,
-    run_flashblock_sequence_at, run_flashblock_sequence_at_with_processor,
-    run_flashblock_sequence_without_peek, test_genesis,
+    flash_delta_with_payload_id, flash_delta_with_txs, hash, parse_fire_events,
+    run_flashblock_sequence, run_flashblock_sequence_at,
+    run_flashblock_sequence_at_with_processor, run_flashblock_sequence_without_peek,
+    signed_legacy_transfer, test_genesis,
 };
 
 /// Simplest possible test: send a single flash-base event (block 1, no transactions) and verify
@@ -976,6 +977,128 @@ fn is_final_mismatch_resets_state_and_drops_new_block() {
             // BLOCKs for them.
             FireEvent::canonical_block(1, hash("wrong-1")),
         ],
+    );
+}
+
+/// Regression for the cumulative-across-block tracer offsets.
+///
+/// Each `execute_flashblock` call instantiates a fresh `BaseBlockExecutor`, so
+/// revm hands back per-iteration receipt fields — `cumulative_gas_used` starts
+/// at 0 again, `transaction_index` starts at 0 again, log `block_index` starts
+/// at 0 again. Geth gets the canonical cumulative-across-block values for free
+/// because its `StateProcessor` shares `usedGas`, `gp`, and `lastTxIndex`
+/// across the `Process()` calls of a single block. The firehose-tracer fix
+/// applies three offsets (`flashblock_tx_index_offset`,
+/// `flashblock_cumulative_gas_offset`, `flashblock_log_block_index_offset`),
+/// derived from the restored snapshot in `restore_flash_block_snapshot`, so
+/// the FIRE BLOCK protobuf at flash idx K carries values cumulative across
+/// the whole block through K.
+///
+/// Fixture: block 1 with three flashblocks, each emitted separately via the
+/// no-peek runner so the snapshot+restore happens between iterations:
+/// - base (idx 0): no transactions; pre-execution generates the EIP-4788
+///   beacon-roots system call.
+/// - delta (idx 1): one signed transfer (anvil account #0 → 0x010101…),
+///   `gas_limit=21_000`, expected `gas_used=21_000`.
+/// - delta (idx 2): a second signed transfer at nonce=1, same gas profile.
+///
+/// Asserts that the third FIRE BLOCK carries:
+/// - `transaction_traces[0]` from the restored snapshot:
+///   `index=0`, `gas_used=21000`, `cumulative_gas_used=21000`.
+/// - `transaction_traces[1]` from THIS iteration's EVM run:
+///   `index=1` (NOT 0, the EVM's per-iteration value),
+///   `gas_used=21000`,
+///   `cumulative_gas_used=42000` (NOT 21000, the EVM's per-iteration value).
+///
+/// Without the tracer offsets the second-delta values would be 0 and 21000.
+#[test]
+fn tracer_offsets_carry_cumulative_tx_fields_across_flashblocks() {
+    let genesis = test_genesis();
+    let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    let raw = run_flashblock_sequence_without_peek(
+        client,
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            flash_delta_with_txs(1, hash("1b"), 1, vec![signed_legacy_transfer(0)]),
+            flash_delta_with_txs(1, hash("1c"), 2, vec![signed_legacy_transfer(1)]),
+        ],
+    );
+
+    let events: Vec<FireEvent> = parse_fire_events(&raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::FlashBlock { .. }))
+        .collect();
+    assert_eq!(events.len(), 3, "expected 3 FIRE BLOCKs (base + 2 deltas)");
+
+    // Base flashblock: no transactions.
+    let FireEvent::FlashBlock { flash_idx, ref block, .. } = events[0] else {
+        panic!("expected FlashBlock");
+    };
+    assert_eq!(flash_idx, 0);
+    assert!(
+        block.transaction_traces.is_empty(),
+        "base flashblock should carry no transactions; got {} traces",
+        block.transaction_traces.len()
+    );
+
+    // First delta: one tx, freshly-executed. Offsets are 0 here because the
+    // base had no txs/receipts; the EVM's per-iteration values pass through.
+    let FireEvent::FlashBlock { flash_idx, ref block, .. } = events[1] else {
+        panic!("expected FlashBlock");
+    };
+    assert_eq!(flash_idx, 1);
+    assert_eq!(
+        block.transaction_traces.len(),
+        1,
+        "delta(1) should carry the tx executed in this iteration"
+    );
+    let trx = &block.transaction_traces[0];
+    assert_eq!(trx.index, 0, "delta(1) tx index = 0 (no prior txs in this block)");
+    assert_eq!(trx.gas_used, 21_000, "21k for the transfer");
+    let receipt = trx.receipt.as_ref().expect("receipt populated");
+    assert_eq!(
+        receipt.cumulative_gas_used, 21_000,
+        "delta(1) tx cumulative_gas_used = its own gas (no prior)"
+    );
+
+    // Second delta: two txs in the FIRE BLOCK.
+    // - traces[0] is the FIRST iteration's tx, restored from the snapshot —
+    //   its index/cumulative_gas_used are unchanged (they were already
+    //   correct when first emitted).
+    // - traces[1] is the second iteration's tx; revm gave it
+    //   `transaction_index = 0` and `cumulative_gas_used = 21_000` (its own
+    //   gas, the iteration's first tx). The tracer's offsets MUST adjust
+    //   these to canonical-across-block values.
+    let FireEvent::FlashBlock { flash_idx, ref block, .. } = events[2] else {
+        panic!("expected FlashBlock");
+    };
+    assert_eq!(flash_idx, 2);
+    assert_eq!(
+        block.transaction_traces.len(),
+        2,
+        "delta(2) FIRE BLOCK should carry both txs (one restored from the snapshot, one new)"
+    );
+
+    // Restored tx unchanged.
+    let restored = &block.transaction_traces[0];
+    assert_eq!(restored.index, 0);
+    assert_eq!(restored.receipt.as_ref().unwrap().cumulative_gas_used, 21_000);
+
+    // The regression assertions — without `flashblock_tx_index_offset` and
+    // `flashblock_cumulative_gas_offset` these would be 0 and 21_000.
+    let new_tx = &block.transaction_traces[1];
+    assert_eq!(
+        new_tx.index, 1,
+        "without flashblock_tx_index_offset this would be 0 — the EVM's per-iteration tx index"
+    );
+    assert_eq!(new_tx.gas_used, 21_000);
+    let new_receipt = new_tx.receipt.as_ref().expect("receipt populated");
+    assert_eq!(
+        new_receipt.cumulative_gas_used, 42_000,
+        "without flashblock_cumulative_gas_offset this would be 21_000 — the EVM's per-iteration cumulative"
     );
 }
 
