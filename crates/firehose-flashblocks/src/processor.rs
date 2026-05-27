@@ -44,6 +44,18 @@ use crate::{Error, FlashblocksTracerHandle};
 /// than that is almost certainly a stale message we should drop rather than execute.
 const STALE_THRESHOLD_SECS: u64 = 5;
 
+/// Minimum flashblock index at which the processor starts a background speculative
+/// state-root precompute after `execute_flashblock`.
+///
+/// Op-Base flashblocks arrive at a steady ~200 ms cadence and the block typically seals
+/// around idx ≈ 10–11. Once we are past this threshold, the next message we receive is
+/// likely either the next-block base (peek-driven is_final fires) or an empty final
+/// marker. In both common cases the bundle state at the moment is_final is computed
+/// matches the bundle state at the moment the spec was launched, so the cached
+/// state_root can be used directly — saving the ~100-150 ms trie traversal off the
+/// is_final emission latency.
+const SPECULATIVE_STATE_ROOT_MIN_INDEX: u64 = 10;
+
 /// Function that returns the current Unix timestamp in seconds, used for the staleness
 /// check. Boxed behind an `Arc` so it can be cheaply cloned and shared across threads.
 pub type ClockFn = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -61,6 +73,77 @@ type BoxedStateProvider = Box<dyn StateProvider + Send + 'static>;
 /// snapshot fetched once on bootstrap; subsequent reads are served from the `State`'s bundle
 /// cache (which holds the committed effects of all prior flashblocks).
 type AccumulatedDb = State<StateProviderDatabase<BoxedStateProvider>>;
+
+/// Result of [`FirehoseFlashblocksProcessor::execute_flashblock`].
+///
+/// Both flags are needed by callers to drive post-execution state mutations:
+/// - `emitted_is_final` gates the `final_part_sent` write that suppresses the
+///   `FirstOfNextBlock` fallback re-emission.
+/// - `bundle_changed` gates the `bundle_revision` bump that invalidates a stale
+///   speculative state-root cache. The flag is computed inside
+///   `execute_flashblock` because that's where the EVM execution decision lives,
+///   but the actual state mutation has to happen at the caller (otherwise the
+///   `on_canonical_block` merged-replay path — which holds the `state` mutex
+///   for the entire loop — would deadlock against the inner re-lock).
+#[derive(Debug, Clone, Copy)]
+struct ExecuteFlashblockOutcome {
+    /// `true` when the FIRE BLOCK was emitted as the is_final partial via the
+    /// peek-driven path (and the caller should set `final_part_sent`).
+    emitted_is_final: bool,
+    /// `true` when pre-execution changes or any transaction actually ran during
+    /// this call, mutating the underlying revm `BundleState`.
+    bundle_changed: bool,
+}
+
+/// A background speculative state-root precompute.
+///
+/// Spawned at the end of `execute_flashblock` once the flashblock index crosses
+/// [`SPECULATIVE_STATE_ROOT_MIN_INDEX`]. The task clones the post-merge `BundleState`
+/// and runs `provider.hashed_post_state` + `provider.state_root` off the synchronous
+/// processor path, writing the resulting hash into `result` when finished.
+///
+/// At is_final time, the processor compares `revision` against the current
+/// `bundle_revision`. A match means no bundle-changing work happened between spec
+/// launch and is_final, so the cached state_root is exactly the value the
+/// synchronous path would have computed. A mismatch falls back to a fresh
+/// [`FirehoseFlashblocksProcessor::compute_state_root`] call.
+///
+/// Aborts the in-flight task on drop so a stale spec doesn't keep running after
+/// the processor has moved on.
+struct SpeculativeStateRoot {
+    /// Block number the spec is for. Used to detect a spec leaking across block boundaries.
+    block_number: u64,
+    /// Flashblock index that triggered the spec launch. Recorded for diagnostics.
+    flashblock_index: u64,
+    /// Snapshot of `ProcessorState::bundle_revision` at the moment the spec was launched.
+    /// A match against the current revision at is_final time means the bundle is unchanged
+    /// and the cached state_root is valid.
+    revision: u64,
+    /// Filled by the background task on completion.
+    result: Arc<Mutex<Option<B256>>>,
+    /// Handle to the spawned task — aborted on drop.
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl std::fmt::Debug for SpeculativeStateRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpeculativeStateRoot")
+            .field("block_number", &self.block_number)
+            .field("flashblock_index", &self.flashblock_index)
+            .field("revision", &self.revision)
+            .field(
+                "result",
+                &self.result.lock().ok().and_then(|guard| *guard),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for SpeculativeStateRoot {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
 
 /// Mutable state held by the processor, guarded by a single mutex so flashblock callbacks
 /// from the WS subscriber are processed in arrival order.
@@ -120,6 +203,17 @@ struct ProcessorState {
     /// emit two is_final FIRE BLOCKs for the same block. Mirrors geth's
     /// `c.state.FinalPartSent` at `controller.go:284-300`.
     final_part_sent: bool,
+    /// Monotonic counter bumped every time `accumulated_db.merge_transitions()` actually
+    /// applies pending changes (pre-execution system calls or transactions). Reads of
+    /// this counter let [`SpeculativeStateRoot`] tell whether the bundle state it
+    /// captured is still the live bundle state: a match means the cached state_root is
+    /// safe to reuse; a difference means a follow-up flashblock has mutated the bundle
+    /// and the spec is invalid.
+    bundle_revision: u64,
+    /// In-flight or completed speculative state-root precompute for the current block.
+    /// Replaced (and the prior task aborted via [`Drop`]) every time a new flashblock
+    /// past [`SPECULATIVE_STATE_ROOT_MIN_INDEX`] is executed.
+    speculative_state_root: Option<SpeculativeStateRoot>,
 }
 
 /// Carries an `is_final` FIRE BLOCK ready to emit on the flashblock tracer once the
@@ -202,7 +296,7 @@ impl std::fmt::Display for BuildIsFinalError {
 }
 
 impl ProcessorState {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             current_block_number: None,
             latest_flashblock_index: None,
@@ -213,6 +307,8 @@ impl ProcessorState {
             awaiting_canonical_confirmation: false,
             latest_canonical: None,
             final_part_sent: false,
+            bundle_revision: 0,
+            speculative_state_root: None,
         }
     }
 
@@ -229,6 +325,10 @@ impl ProcessorState {
         self.pending_state = false;
         self.awaiting_canonical_confirmation = false;
         self.final_part_sent = false;
+        // Any reset implies the bundle state we'd been speculating against is gone;
+        // bump revision and drop the spec (its Drop aborts the spawned task).
+        self.bundle_revision = self.bundle_revision.wrapping_add(1);
+        self.speculative_state_root = None;
     }
 
     /// Begin (or restart) a sequence on a fresh base flashblock at index 0. The accumulated
@@ -306,6 +406,22 @@ where
     #[doc(hidden)]
     pub fn last_executed_index_for_test(&self) -> Option<u64> {
         self.state.lock().expect("flashblock state mutex poisoned").last_executed_index
+    }
+
+    /// Returns `Some((block_number, flashblock_index, revision, completed))` describing the
+    /// most recent speculative state-root precompute launched by the processor, or `None`
+    /// if no speculation is currently tracked. `completed` is `true` once the background
+    /// task has written its result. Test-only.
+    #[doc(hidden)]
+    pub fn speculative_state_root_status_for_test(&self) -> Option<(u64, u64, u64, bool)> {
+        let state = self.state.lock().expect("flashblock state mutex poisoned");
+        let spec = state.speculative_state_root.as_ref()?;
+        let completed = spec
+            .result
+            .lock()
+            .expect("spec result mutex poisoned")
+            .is_some();
+        Some((spec.block_number, spec.flashblock_index, spec.revision, completed))
     }
 
     /// Process a single flashblock event. Errors are logged and swallowed: the processor clears
@@ -774,22 +890,35 @@ where
         }
 
         let mut db = accumulated_db.expect("accumulated_db was populated just above");
-        let emitted_is_final = self.execute_flashblock(
-            &assembled,
-            index,
-            &new_transactions,
-            is_first_execution_for_block,
-            is_final_expected_hash,
-            &mut db,
-        )?;
+        let ExecuteFlashblockOutcome { emitted_is_final, bundle_changed } = self
+            .execute_flashblock(
+                &assembled,
+                index,
+                &new_transactions,
+                is_first_execution_for_block,
+                is_final_expected_hash,
+                &mut db,
+            )?;
 
         let mut state_guard = self.state.lock().expect("flashblock state mutex poisoned");
         state_guard.accumulated_db = Some(db);
         state_guard.last_executed_index = Some(index);
+        if bundle_changed {
+            // Invalidate any speculative state-root whose `revision` was captured
+            // before this flashblock's merge.
+            state_guard.bundle_revision = state_guard.bundle_revision.wrapping_add(1);
+        }
         if emitted_is_final {
             // Suppress the FirstOfNextBlock fallback re-emission when the new-block base
             // actually arrives — the is_final FIRE BLOCK has already been emitted inline.
             state_guard.final_part_sent = true;
+        }
+        // High-index flashblocks are likely the last partial (or one away from it).
+        // Kick off a background state-root compute so that when the next-block base
+        // (or canonical notification) arrives and triggers is_final, the slow trie
+        // traversal has already happened off the critical path.
+        if !emitted_is_final && index >= SPECULATIVE_STATE_ROOT_MIN_INDEX {
+            self.launch_speculative_state_root(&mut state_guard, block_number, index);
         }
         Ok(())
     }
@@ -808,6 +937,106 @@ where
                 None
             }
         }
+    }
+
+    /// Launches a background `tokio::spawn_blocking` task that runs
+    /// `provider.hashed_post_state` + `provider.state_root` on a clone of the current
+    /// `BundleState`. Records the bundle revision at launch so the is_final path can
+    /// validate that the cached result still corresponds to the live bundle.
+    ///
+    /// Called from `process_inner` after a flashblock at idx ≥
+    /// [`SPECULATIVE_STATE_ROOT_MIN_INDEX`] has been executed. The prior spec (if any)
+    /// is aborted via its `Drop` impl when overwritten.
+    ///
+    /// Skips silently when no tokio runtime is available (e.g. in synchronous tests):
+    /// the synchronous `compute_state_root` path inside `execute_flashblock` handles
+    /// that case unchanged.
+    fn launch_speculative_state_root(
+        &self,
+        state: &mut ProcessorState,
+        block_number: u64,
+        index: u64,
+    ) {
+        let Some(db) = state.accumulated_db.as_ref() else { return };
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            debug!(
+                block_number,
+                index,
+                "no tokio runtime in scope; skipping speculative state-root precompute"
+            );
+            return;
+        };
+
+        let bundle = db.bundle_state.clone();
+        let revision = state.bundle_revision;
+        let result: Arc<Mutex<Option<B256>>> = Arc::new(Mutex::new(None));
+        let result_for_task = Arc::clone(&result);
+        let client = self.client.clone();
+        let parent_block = block_number.saturating_sub(1);
+
+        let handle = rt.spawn_blocking(move || {
+            let provider = match client
+                .state_by_block_number_or_tag(BlockNumberOrTag::Number(parent_block))
+            {
+                Ok(p) => p,
+                Err(err) => {
+                    debug!(
+                        parent_block,
+                        error = %err,
+                        "speculative state-root: parent state unavailable"
+                    );
+                    return;
+                }
+            };
+            let hashed = provider.hashed_post_state(&bundle);
+            match provider.state_root(hashed) {
+                Ok(root) => {
+                    if let Ok(mut slot) = result_for_task.lock() {
+                        *slot = Some(root);
+                    }
+                }
+                Err(err) => {
+                    debug!(
+                        parent_block,
+                        error = %err,
+                        "speculative state-root: state_root computation failed"
+                    );
+                }
+            }
+        });
+
+        // Replacing the prior spec (if any) drops it; its `Drop` impl aborts the task.
+        state.speculative_state_root = Some(SpeculativeStateRoot {
+            block_number,
+            flashblock_index: index,
+            revision,
+            result,
+            handle,
+        });
+        debug!(
+            block_number,
+            index,
+            revision,
+            "speculative state-root precompute launched"
+        );
+    }
+
+    /// Returns the speculatively-precomputed state_root if one exists and is still
+    /// valid for the live bundle (matching block + matching revision + task has
+    /// completed). Otherwise returns `None`, signalling that the caller should fall
+    /// back to a synchronous [`Self::compute_state_root`].
+    fn try_speculative_state_root(
+        &self,
+        block_number: u64,
+        expected_revision: u64,
+    ) -> Option<B256> {
+        let state = self.state.lock().ok()?;
+        let spec = state.speculative_state_root.as_ref()?;
+        if spec.block_number != block_number || spec.revision != expected_revision {
+            return None;
+        }
+        let slot = spec.result.lock().ok()?;
+        *slot
     }
 
     /// Signals that the canonical chain just committed block `canonical_block_number` with
@@ -1045,6 +1274,12 @@ where
         // ProcessorState snapshot.
         state.pending_state = false;
         state.accumulated_db = Some(accumulated_db);
+        // The merged replay created a fresh bundle from scratch — any prior
+        // speculative state-root no longer corresponds to live state. Bump the
+        // revision and drop the spec; the next high-index flashblock will
+        // re-launch one.
+        state.bundle_revision = state.bundle_revision.wrapping_add(1);
+        state.speculative_state_root = None;
         // Mark every replayed flashblock as already-executed. Without this, the next
         // delta arriving through `process_inner` would see `last_executed_index = None`
         // and the multi-delta tx-gather filter would include every previously-replayed
@@ -1209,7 +1444,7 @@ where
         is_first_execution_for_block: bool,
         is_final_expected_hash: Option<B256>,
         accumulated_db: &mut AccumulatedDb,
-    ) -> Result<bool, Error> {
+    ) -> Result<ExecuteFlashblockOutcome, Error> {
         let block_number = assembled.base.block_number;
         let parent_hash = assembled.base.parent_hash;
 
@@ -1316,13 +1551,53 @@ where
         // existing pattern in `crates/execution/flashblocks/src/processor.rs:488`.
         accumulated_db.merge_transitions(BundleRetention::Reverts);
 
+        // The bundle changed iff pre-execution or any transaction actually ran:
+        // when both are absent, `merge_transitions` is a no-op and a prior
+        // speculative state-root (captured at the same revision) is still valid.
+        // Callers consume this flag (in process_inner / on_canonical_block) to
+        // decide whether to bump `bundle_revision` — the bump cannot happen here
+        // because on_canonical_block's merged-replay path already holds the
+        // `state` mutex for the whole loop, so re-locking from inside this
+        // function would deadlock.
+        let bundle_changed = is_first_execution_for_block || !new_transactions.is_empty();
+
         let mut emitted_is_final = false;
         if let Some(expected_parent_hash) = is_final_expected_hash {
             // Peek-driven is_final path: derive the post-execution state_root, recompute
             // the canonical block hash, and override the tracer's in-progress block so
             // the upcoming `on_block_end` flush emits a single FIRE BLOCK already
             // marked is_final and sealed with the recomputed hash.
-            let state_root_result = Self::compute_state_root(Some(&*accumulated_db));
+            //
+            // Try the speculative cache first. The revision at the moment is_final
+            // fires is `state.bundle_revision + (bundle_changed ? 1 : 0)` — the +1
+            // happens conceptually here (the caller will commit it on success) and
+            // we use that projected value as the cache key. A hit means the trie
+            // traversal already happened off the synchronous flashblock path during
+            // the previous ~200 ms inter-flashblock gap, saving 100-150 ms.
+            //
+            // Reaching this branch requires `is_final_expected_hash = Some(_)`, which
+            // is only set by `process_inner` (peek-driven). The `on_canonical_block`
+            // merged-replay path always passes `None`, so re-locking the `state`
+            // mutex inside this branch is safe — that caller doesn't hold it.
+            let projected_revision = {
+                let state = self.state.lock().expect("flashblock state mutex poisoned");
+                state.bundle_revision + if bundle_changed { 1 } else { 0 }
+            };
+            let state_root_result = match self
+                .try_speculative_state_root(block_number, projected_revision)
+            {
+                Some(root) => {
+                    debug!(
+                        block_number,
+                        index,
+                        revision = projected_revision,
+                        state_root = %root,
+                        "is_final: using speculatively-precomputed state_root"
+                    );
+                    Ok(root)
+                }
+                None => Self::compute_state_root(Some(&*accumulated_db)),
+            };
             match state_root_result {
                 Ok(state_root) => {
                     let mut recomputed_header = assembled.block.header.clone();
@@ -1399,7 +1674,7 @@ where
             "emitted flashblock partial FIRE event"
         );
 
-        Ok(emitted_is_final)
+        Ok(ExecuteFlashblockOutcome { emitted_is_final, bundle_changed })
     }
 
     fn decode_and_recover_transactions(

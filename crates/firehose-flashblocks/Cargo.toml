@@ -39,6 +39,9 @@ alloy-eips.workspace = true
 alloy-consensus.workspace = true
 alloy-primitives.workspace = true
 
+# async
+tokio = { workspace = true, features = ["rt", "sync"] }
+
 # misc
 url.workspace = true
 tracing.workspace = true

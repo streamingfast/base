@@ -1571,6 +1571,67 @@ fn next_base_mismatch_recovers_via_pending_and_canonical_replay() {
     );
 }
 
+/// Speculative state-root precompute (the latency optimisation for is_final).
+///
+/// Under a tokio runtime, the processor must spawn a background state_root
+/// computation at the end of `execute_flashblock` once the index crosses the
+/// `SPECULATIVE_STATE_ROOT_MIN_INDEX = 10` threshold. The test:
+///
+/// 1. Feeds 11 flashblocks for block 1 (base + deltas 1..=10).
+/// 2. Asserts that `speculative_state_root_status_for_test()` returns a tracked
+///    spec keyed by `(block=1, flashblock=10)`. Without the implementation, this
+///    returns `None`.
+/// 3. The runtime is held active long enough for `spawn_blocking` to complete,
+///    so the spec's `completed` flag flips to `true` (the mock provider's
+///    `state_root` is a no-op returning ZERO, but it still goes through the
+///    spawn → return path).
+#[test]
+fn speculative_state_root_launched_at_threshold() {
+    let genesis = test_genesis();
+    let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test tokio runtime");
+    let _guard = runtime.enter();
+
+    let mut events = vec![flash_base(1, hash("1a"), genesis_hash, ts + 2)];
+    for idx in 1..=10u64 {
+        events.push(flash_delta(1, hash("1a"), idx));
+    }
+
+    let result = run_flashblock_sequence_at_with_processor(client, events, ts + 2);
+
+    let status = result
+        .processor
+        .speculative_state_root_status_for_test()
+        .expect("speculative state-root must be tracked after idx >= threshold");
+    assert_eq!(status.0, 1, "spec must be keyed to block 1");
+    assert_eq!(status.1, 10, "spec must be keyed to the latest executed idx (10)");
+
+    // Drive the runtime forward until the spec_blocking task has finished. The
+    // mock provider returns ZERO immediately, so this should complete in a few
+    // poll iterations.
+    runtime.block_on(async {
+        for _ in 0..100 {
+            if result.processor.speculative_state_root_status_for_test().is_some_and(|s| s.3) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("speculative state-root task did not complete within deadline");
+    });
+
+    let status = result
+        .processor
+        .speculative_state_root_status_for_test()
+        .expect("spec still tracked");
+    assert!(status.3, "spec result must be populated by the background task");
+}
+
 /// Regression for the merged-replay optimisation: a longer buffered chain
 /// (base + 3 deltas, all signed transfers) must collapse into a single FIRE
 /// BLOCK at the highest buffered index, carrying every transaction across
