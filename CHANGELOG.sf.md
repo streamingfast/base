@@ -1,13 +1,15 @@
 ## v0.9.1-fh
 
 * bumped upstream to 0.9.1
-* flashblocks
+* initial flashblocks wiring (not to be used yet)
 
 ## v0.9.0-fh
 
 * bumped upstream to 0.9.0
 
 ## v0.8.0-fh
+
+* Parity with geth implementation, except flashblocks
 
 ### Changes
 
