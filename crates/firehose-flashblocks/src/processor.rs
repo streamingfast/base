@@ -992,47 +992,52 @@ where
             .without_state_clear()
             .build();
 
-        for (i, fb) in stored.iter().enumerate() {
-            let partial = &stored[..=i];
-            let assembled = match BlockAssembler::assemble(partial) {
-                Ok(a) => a,
-                Err(err) => {
-                    error!(
-                        pending_block,
-                        replay_index = i,
-                        error = ?err,
-                        "replay block assembly failed; resetting state"
-                    );
-                    state.reset();
-                    return;
-                }
-            };
-            let new_transactions: Vec<Bytes> = if i == 0 {
-                assembled.flashblocks[0].diff.transactions.clone()
-            } else {
-                fb.diff.transactions.clone()
-            };
-            if let Err(err) = self.execute_flashblock(
-                &assembled,
-                fb.index,
-                &new_transactions,
-                i == 0,
-                // Replay path never claims is_final — block N's flashblocks were
-                // buffered before the canonical chain was known and we don't yet know
-                // its final hash. The next-block transition (or its own peek-driven
-                // pass) will handle is_final later.
-                None,
-                &mut accumulated_db,
-            ) {
+        // Merge all buffered flashblocks into a single execute+emit. Downstream
+        // firehose consumers only need the state-correct final partial; emitting
+        // one FIRE BLOCK per buffered flashblock would re-traverse the same EVM
+        // work and stream redundant intermediate partials. Mirrors the
+        // peek-driven squash collapse done at the WS-receive path, applied here
+        // to the entire accumulated buffer.
+        let assembled = match BlockAssembler::assemble(&stored) {
+            Ok(a) => a,
+            Err(err) => {
                 error!(
                     pending_block,
-                    replay_index = i,
-                    error = %err,
-                    "replay execution failed; resetting state"
+                    flashblock_count = stored.len(),
+                    error = ?err,
+                    "replay block assembly failed; resetting state"
                 );
                 state.reset();
                 return;
             }
+        };
+        let all_transactions: Vec<Bytes> =
+            stored.iter().flat_map(|fb| fb.diff.transactions.clone()).collect();
+        let merged_index = stored
+            .last()
+            .expect("pending_state implies non-empty stored_flashblocks")
+            .index;
+        if let Err(err) = self.execute_flashblock(
+            &assembled,
+            merged_index,
+            &all_transactions,
+            true,
+            // Replay path never claims is_final — block N's flashblocks were
+            // buffered before the canonical chain was known and we don't yet know
+            // its final hash. The next-block transition (or its own peek-driven
+            // pass) will handle is_final later.
+            None,
+            &mut accumulated_db,
+        ) {
+            error!(
+                pending_block,
+                flashblock_count = stored.len(),
+                merged_index,
+                error = %err,
+                "merged replay execution failed; resetting state"
+            );
+            state.reset();
+            return;
         }
 
         // We still hold the state lock here — no concurrent `process_inner` call

@@ -648,8 +648,10 @@ fn base_canonical_after_flashblock_flushes_buffer() {
             FireEvent::flash_block(1, hash("1a"), 0, false), // Flash1 — flashblock tracer, block 1, flash_idx=0
             FireEvent::canonical_block(1, hash("1a")), // Canonical1 — canonical tracer, block 1
             FireEvent::canonical_block(2, hash("2a")), // Canonical2 — canonical tracer, block 2
-            FireEvent::flash_block(3, hash("3a"), 0, false), // Flash3 — flashblock tracer, block 3, flash_idx=0
-            FireEvent::flash_block(3, hash("3b"), 1, false), // Flash3 — flashblock tracer, block 3, flash_idx=1
+            // canonical(2) triggers the merged replay of block 3's buffered
+            // flashblocks: ONE FIRE BLOCK stamped at the highest buffered index
+            // (idx 1) carrying the merged transactions from base + delta.
+            FireEvent::flash_block(3, hash("3b"), 1, false),
             FireEvent::canonical_block(3, hash("3a")), // Canonical3 — canonical tracer, block 3
         ],
     );
@@ -1102,32 +1104,28 @@ fn tracer_offsets_carry_cumulative_tx_fields_across_flashblocks() {
     );
 }
 
-/// Asserts that the firehose tracer's flashblock snapshot mechanism is wired up:
-/// each emitted FIRE BLOCK at index K must carry the **cumulative** trace from
-/// indices `0..=K`, not just the contributions new to iteration K. Mirrors geth's
-/// `firehoseTracer.SnapshotFlashBlockForNextIteration()` call before the early
-/// return on `!isLastFlashBlock` at `eth/tracers/firehose.go:180`.
+/// Verifies the merged-replay path collapses a multi-flashblock buffered sequence
+/// into a single FIRE BLOCK that still carries every required trace component
+/// (transactions AND pre-execution system calls).
 ///
 /// Sequence + reasoning:
 /// 1. `flash_base(2, …)` and `flash_delta(2, 1)` arrive before block 1 is
-///    canonical → buffered.
-/// 2. `canonical_block(1, …)` triggers the replay path, which calls
-///    `execute_flashblock` **once per buffered flashblock** in separate EVM
-///    invocations. This is the codepath where the snapshot mechanism matters
-///    most: each iteration's `on_block_start` clears the in-progress block, so
-///    without the snapshot the second emission would lose the first's tracer
-///    contributions entirely.
-/// 3. The base flashblock executes pre-execution changes (EIP-4788 beacon-roots
-///    write) which the firehose tracer records as a `system_call`. The delta
-///    has no further pre-execution changes (only the first execution per block
-///    fires them), so any `system_calls` count > 0 on the delta's FIRE BLOCK
-///    can only have come from the snapshot/restore round-trip.
+///    canonical → buffered (`pending_state = true`), no FIRE BLOCK lines.
+/// 2. `canonical_block(1, …)` triggers the merged-replay path. Instead of one
+///    `execute_flashblock` call per buffered flashblock (which would emit a
+///    FIRE BLOCK per entry), the processor assembles the buffered slice once,
+///    gathers all transactions across base+delta into one list, and runs a
+///    single EVM execution that emits ONE FIRE BLOCK stamped with the highest
+///    buffered index.
+/// 3. Pre-execution changes (EIP-4788 beacon-roots write) still run because the
+///    merged call sets `is_first_execution_for_block = true` — the resulting
+///    `system_call` lands on the merged FIRE BLOCK directly (no snapshot/restore
+///    round-trip needed since there is only one emission).
 ///
 /// Asserts:
-/// - The base's FIRE BLOCK carries `system_calls.len() == 1` (the EIP-4788 write).
-/// - The delta's FIRE BLOCK also carries `system_calls.len() == 1` (the base's
-///   system_call, restored via `snapshot_flash_block_for_next_iteration` →
-///   `restore_flash_block_snapshot`). Without the snapshot call, this would be 0.
+/// - Exactly ONE FIRE BLOCK is emitted for block 2 (the merged one).
+/// - It is stamped at the highest buffered index (1).
+/// - It carries `system_calls.len() == 1` (the EIP-4788 write).
 #[test]
 fn snapshot_carries_cumulative_traces_across_replay() {
     let genesis = test_genesis();
@@ -1142,10 +1140,8 @@ fn snapshot_carries_cumulative_traces_across_replay() {
             // pending buffer with no FIRE BLOCK emission.
             flash_base(2, hash("2a"), hash("1a"), ts + 4),
             flash_delta(2, hash("2b"), 1),
-            // canonical(1) triggers the replay path — base and delta execute
-            // through `execute_flashblock` in separate iterations (NOT squashed
-            // into one EVM call), which is the case where the snapshot mechanism
-            // is required to preserve cumulative trace state.
+            // canonical(1) triggers the merged-replay path: one FIRE BLOCK with
+            // all buffered transactions and the highest buffered index (1).
             canonical_block(1, hash("1a")),
         ],
     );
@@ -1155,36 +1151,20 @@ fn snapshot_carries_cumulative_traces_across_replay() {
         .filter(|e| matches!(e, FireEvent::FlashBlock { .. }))
         .collect();
 
-    assert_eq!(flash_events.len(), 2, "expected 2 FIRE BLOCK lines for block 2 (base + delta)");
-
-    let FireEvent::FlashBlock { flash_idx: base_idx, block: ref base_block, .. } = flash_events[0]
-    else {
-        panic!("expected FlashBlock");
-    };
-    assert_eq!(base_idx, 0, "first replayed flashblock is the base (idx 0)");
     assert_eq!(
-        base_block.system_calls.len(),
+        flash_events.len(),
         1,
-        "base flashblock must carry the EIP-4788 beacon-roots pre-execution system call"
+        "expected exactly 1 FIRE BLOCK line for block 2 (merged base+delta replay)"
     );
 
-    let FireEvent::FlashBlock { flash_idx: delta_idx, block: ref delta_block, .. } =
-        flash_events[1]
-    else {
+    let FireEvent::FlashBlock { flash_idx, block: ref merged_block, .. } = flash_events[0] else {
         panic!("expected FlashBlock");
     };
-    assert_eq!(delta_idx, 1, "second replayed flashblock is the delta (idx 1)");
-    // This is the regression assertion. Without
-    // `snapshot_flash_block_for_next_iteration` between iterations, the delta's
-    // FIRE BLOCK would carry `system_calls.len() == 0` because `on_block_start`
-    // clears the in-progress block at the start of each iteration. The snapshot
-    // is what restores the base's system_call into the delta's emission.
+    assert_eq!(flash_idx, 1, "merged replay stamps the highest buffered index");
     assert_eq!(
-        delta_block.system_calls.len(),
+        merged_block.system_calls.len(),
         1,
-        "delta FIRE BLOCK must carry the cumulative system_calls from base — \
-         without snapshot_flash_block_for_next_iteration this is 0 and the wire \
-         stream diverges from the geth flashblock contract"
+        "merged FIRE BLOCK must carry the EIP-4788 beacon-roots pre-execution system call"
     );
 }
 
@@ -1238,12 +1218,12 @@ fn canonical_replay_stamps_last_executed_index() {
         .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
         .collect();
 
-    // Replay emitted the buffered base and delta.
+    // Merged replay: ONE FIRE BLOCK stamped at the highest buffered index (1)
+    // carrying all transactions from base + delta in a single EVM pass.
     assert_fire_events_metadata_eq(
         &events,
         &[
             FireEvent::canonical_block(1, hash("1a")),
-            FireEvent::flash_block(2, hash("2a"), 0, false),
             FireEvent::flash_block(2, hash("2b"), 1, false),
         ],
     );
@@ -1580,11 +1560,69 @@ fn next_base_mismatch_recovers_via_pending_and_canonical_replay() {
             // Block 2's base + delta were buffered while pending.
             // Canonical(1) fires the live-block tracer first.
             FireEvent::canonical_block(1, canonical_block1_hash),
-            // Then Flow 2 replays block 2's buffered flashblocks. Without the
-            // fix, neither of these would have reached the wire — the broken
-            // "reset + return" would have dropped the new base at step 3.
-            FireEvent::flash_block(2, hash("2a"), 0, false),
+            // Then Flow 2 replays block 2's buffered flashblocks via the merged
+            // replay: ONE FIRE BLOCK stamped at the highest buffered index (1)
+            // carrying all transactions from base + delta. Without the recovery
+            // fix, neither this nor the per-flashblock emissions would have
+            // reached the wire — the broken "reset + return" would have dropped
+            // the new base at step 3.
             FireEvent::flash_block(2, hash("2b"), 1, false),
         ],
+    );
+}
+
+/// Regression for the merged-replay optimisation: a longer buffered chain
+/// (base + 3 deltas, all signed transfers) must collapse into a single FIRE
+/// BLOCK at the highest buffered index, carrying every transaction across
+/// the buffered slice.
+///
+/// Sequence:
+/// 1. base(2) + delta(2,1) + delta(2,2) + delta(2,3) — each delta carries one
+///    signed transfer at nonces 0, 1, 2. Block 1 is not yet canonical, so all
+///    four buffer in `pending_state = true`.
+/// 2. `canonical_block(1, …)` triggers the merged replay: ONE FIRE BLOCK
+///    stamped at idx 3 with `transaction_traces.len() == 3` (one per delta).
+///
+/// Without the merge, the canonical-replay path would emit 4 FIRE BLOCKs
+/// (one per buffered flashblock).
+#[test]
+fn merged_replay_emits_single_fire_block_with_all_transactions() {
+    let genesis = test_genesis();
+    let _genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            flash_base(2, hash("2a"), hash("1a"), ts + 4),
+            flash_delta_with_txs(2, hash("2b"), 1, vec![signed_legacy_transfer(0)]),
+            flash_delta_with_txs(2, hash("2c"), 2, vec![signed_legacy_transfer(1)]),
+            flash_delta_with_txs(2, hash("2d"), 3, vec![signed_legacy_transfer(2)]),
+            canonical_block(1, hash("1a")),
+        ],
+    );
+
+    let flash_events: Vec<FireEvent> = parse_fire_events(&raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::FlashBlock { .. }))
+        .collect();
+
+    assert_eq!(
+        flash_events.len(),
+        1,
+        "merged replay must emit ONE FIRE BLOCK regardless of buffered count; \
+         got {} (probably reverted to per-flashblock replay)",
+        flash_events.len()
+    );
+
+    let FireEvent::FlashBlock { flash_idx, ref block, .. } = flash_events[0] else {
+        panic!("expected FlashBlock");
+    };
+    assert_eq!(flash_idx, 3, "merged replay stamps the highest buffered index");
+    assert_eq!(
+        block.transaction_traces.len(),
+        3,
+        "merged FIRE BLOCK must carry all transactions across the buffered slice"
     );
 }
