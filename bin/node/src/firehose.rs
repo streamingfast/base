@@ -73,26 +73,46 @@ impl BaseNodeExtension for FirehoseFlashblocksExtension {
 
         // Both hooks need to push canonical blocks into the processor, but the processor is only
         // available in the node-started hook. Use an unbounded mpsc so the engine-event hook can
-        // forward `CanonicalBlockAdded` (fires inside the engine before canonical-state
-        // notification, ~100-150 ms earlier) without knowing the processor's concrete type.
+        // forward early signals (`BlockReceived` at newPayload arrival, `CanonicalBlockAdded`
+        // after validation+insertion) without knowing the processor's concrete type. The
+        // `final_part_sent` guard inside the processor prevents double-emission when both
+        // variants deliver the same (block_number, hash).
         let (canonical_tx, mut canonical_rx) = mpsc::unbounded_channel::<(u64, B256)>();
 
         let hooks = hooks.add_engine_event_listener_hook(move |mut events| {
             tokio::spawn(async move {
                 while let Some(event) = events.next().await {
-                    if let ConsensusEngineEvent::CanonicalBlockAdded(block, elapsed) = event {
-                        let number = block.recovered_block.number;
-                        let hash = block.recovered_block.hash();
-                        debug!(
-                            target: "firehose::flashblocks",
-                            block_number = number,
-                            block_hash = %hash,
-                            elapsed_ms = elapsed.as_millis() as u64,
-                            "engine CanonicalBlockAdded signal",
-                        );
-                        if canonical_tx.send((number, hash)).is_err() {
-                            return;
+                    let (number, hash, source) = match event {
+                        // Fires the moment the engine receives a payload from the consensus
+                        // layer, before validation and insertion. Mirrors geth's
+                        // `SendNotification` call at the top of `newPayload`
+                        // (`eth/catalyst/api.go:730`), letting the processor trigger is_final
+                        // ~175 ms earlier than the post-commit path. If the payload is later
+                        // rejected, the hash-mismatch branch on the subsequent
+                        // `CanonicalBlockAdded` / canonical-state notification reconciles.
+                        ConsensusEngineEvent::BlockReceived(num_hash) => {
+                            (num_hash.number, num_hash.hash, "BlockReceived")
                         }
+                        // Fallback: fires after the engine has validated and added the block
+                        // to the canonical chain. Carries the same (number, hash) — racing
+                        // with BlockReceived; whichever arrives first triggers the
+                        // is_final emission, the other is a no-op via `final_part_sent`.
+                        ConsensusEngineEvent::CanonicalBlockAdded(block, _elapsed) => (
+                            block.recovered_block.number,
+                            block.recovered_block.hash(),
+                            "CanonicalBlockAdded",
+                        ),
+                        _ => continue,
+                    };
+                    debug!(
+                        target: "firehose::flashblocks",
+                        block_number = number,
+                        block_hash = %hash,
+                        source,
+                        "engine canonical signal",
+                    );
+                    if canonical_tx.send((number, hash)).is_err() {
+                        return;
                     }
                 }
             });
