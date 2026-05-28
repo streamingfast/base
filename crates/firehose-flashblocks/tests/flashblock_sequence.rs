@@ -1731,6 +1731,54 @@ fn merged_replay_emits_single_fire_block_with_all_transactions() {
     );
 }
 
+/// Regression for the prod-observed `flash_idx=0` emission on merged-replay
+/// when only the base flashblock was buffered.
+///
+/// Sequence:
+/// 1. base(2) arrives before canonical(1) → pending_state = true, stored = [base].
+/// 2. canonical(1) arrives → Flow 2 (pending replay) fires. With the fix, the
+///    "only base buffered" edge case is detected and skipped: no FIRE BLOCK is
+///    emitted at flash_idx=0 (which would collide with canonical FIRE BLOCKs).
+///    pending_state is cleared so subsequent events aren't deferred.
+/// 3. delta(2,1) arrives. accumulated_db is None, so process_inner bootstraps
+///    fresh from the now-canonical parent, gathers base+delta txs, and emits at
+///    flash_idx=1 — proving the base's txs were preserved through the skip.
+#[test]
+fn merged_replay_skips_emission_when_only_base_buffered() {
+    let genesis = test_genesis();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            flash_base(2, hash("2a"), hash("1a"), ts + 4),
+            // canonical(1) triggers merged-replay flow 2. Only the base is buffered
+            // — the fix must skip emission here to avoid flash_idx=0.
+            canonical_block(1, hash("1a")),
+            // The delta arrives after the canonical replay; process_inner now
+            // bootstraps fresh and emits at flash_idx=1 carrying base+delta txs.
+            flash_delta(2, hash("2b"), 1),
+        ],
+    );
+
+    let events: Vec<FireEvent> = parse_fire_events(&raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
+        .collect();
+
+    assert_fire_events_metadata_eq(
+        &events,
+        &[
+            // Canonical FIRE BLOCK for block 1 (from the canonical tracer).
+            FireEvent::canonical_block(1, hash("1a")),
+            // No flash_idx=0 emission (the regression check).
+            // delta(2,1) emits at flash_idx=1 carrying base+delta txs.
+            FireEvent::flash_block(2, hash("2b"), 1, false),
+        ],
+    );
+}
+
 /// Regression for the prod-observed `parent header missing` reset bug.
 ///
 /// State availability and header availability can diverge briefly: a payload

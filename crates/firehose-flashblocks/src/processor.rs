@@ -1249,6 +1249,34 @@ where
             return;
         }
 
+        // Edge case: when only the base is buffered, running merged-replay
+        // would emit a FIRE BLOCK at flash_idx=0 — which collides with canonical
+        // FIRE BLOCKs on the shared firehose stream. There is no
+        // "execute through the tracer, take snapshot, but suppress wire output"
+        // affordance (mark_failed discards the snapshot), so the cleanest fix
+        // is to skip the merged-replay entirely. Clear the pending flag so the
+        // next event isn't deferred; the next delta arriving via process_inner
+        // will bootstrap a fresh EVM state from the now-canonical parent,
+        // gather base+delta txs, and emit at flash_idx >= 1. If no delta
+        // arrives and the next-block-base / canonical(N) signal comes directly,
+        // the canonical-tracer FIRE BLOCK for block N still reaches downstream
+        // consumers — the flashblock-stream just drops the "base-only" partial
+        // for this block, which carries no user transactions anyway.
+        if state.stored_flashblocks.last().is_some_and(|fb| fb.index == 0) {
+            state.pending_state = false;
+            // accumulated_db stays None so the next delta re-bootstraps cleanly.
+            // last_executed_index stays None so the next delta's execution
+            // gathers the base's txs (and fires pre-execution changes).
+            info!(
+                pending_block,
+                canonical_block_number,
+                "skipping merged-replay of base-only buffer to avoid flash_idx=0 \
+                 collision with canonical FIRE BLOCKs; next delta or canonical \
+                 signal will surface the data"
+            );
+            return;
+        }
+
         let Some(provider) = self.try_bootstrap_provider(canonical_block_number) else {
             debug!(
                 pending_block,
