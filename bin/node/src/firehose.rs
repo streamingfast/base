@@ -7,12 +7,17 @@
 //!   flashblock WebSocket feed and emits per-flashblock partial-block FIRE
 //!   events via a separate, dedicated tracer.
 
+use alloy_primitives::B256;
 use base_firehose_flashblocks::{
     FirehoseFlashblocksProcessor, FirehoseFlashblocksStreamer, FlashblocksTracerHandle,
 };
 use base_node_runner::{BaseNodeExtension, FromExtensionConfig, NodeHooks};
+use reth_chain_state::CanonStateSubscriptions;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
-use tracing::{info, warn};
+use reth_engine_primitives::ConsensusEngineEvent;
+use tokio::sync::mpsc;
+use tokio_stream::{StreamExt, wrappers::BroadcastStream};
+use tracing::{debug, info, warn};
 use url::Url;
 
 /// Runner-level extension that installs the Firehose `ExEx`.
@@ -65,10 +70,59 @@ impl FirehoseFlashblocksExtension {
 impl BaseNodeExtension for FirehoseFlashblocksExtension {
     fn apply(self: Box<Self>, hooks: NodeHooks) -> NodeHooks {
         let ws_url = self.ws_url;
+
+        // Both hooks need to push canonical blocks into the processor, but the processor is only
+        // available in the node-started hook. Use an unbounded mpsc so the engine-event hook can
+        // forward early signals (`BlockReceived` at newPayload arrival, `CanonicalBlockAdded`
+        // after validation+insertion) without knowing the processor's concrete type. The
+        // `final_part_sent` guard inside the processor prevents double-emission when both
+        // variants deliver the same (block_number, hash).
+        let (canonical_tx, mut canonical_rx) = mpsc::unbounded_channel::<(u64, B256)>();
+
+        let hooks = hooks.add_engine_event_listener_hook(move |mut events| {
+            tokio::spawn(async move {
+                while let Some(event) = events.next().await {
+                    let (number, hash, source) = match event {
+                        // Fires the moment the engine receives a payload from the consensus
+                        // layer, before validation and insertion. Mirrors geth's
+                        // `SendNotification` call at the top of `newPayload`
+                        // (`eth/catalyst/api.go:730`), letting the processor trigger is_final
+                        // ~175 ms earlier than the post-commit path. If the payload is later
+                        // rejected, the hash-mismatch branch on the subsequent
+                        // `CanonicalBlockAdded` / canonical-state notification reconciles.
+                        ConsensusEngineEvent::BlockReceived(num_hash) => {
+                            (num_hash.number, num_hash.hash, "BlockReceived")
+                        }
+                        // Fallback: fires after the engine has validated and added the block
+                        // to the canonical chain. Carries the same (number, hash) — racing
+                        // with BlockReceived; whichever arrives first triggers the
+                        // is_final emission, the other is a no-op via `final_part_sent`.
+                        ConsensusEngineEvent::CanonicalBlockAdded(block, _elapsed) => (
+                            block.recovered_block.number,
+                            block.recovered_block.hash(),
+                            "CanonicalBlockAdded",
+                        ),
+                        _ => continue,
+                    };
+                    debug!(
+                        target: "firehose::flashblocks",
+                        block_number = number,
+                        block_hash = %hash,
+                        source,
+                        "engine canonical signal",
+                    );
+                    if canonical_tx.send((number, hash)).is_err() {
+                        return;
+                    }
+                }
+            });
+        });
+
+        let ws_url_for_node = ws_url.clone();
         hooks.add_node_started_hook(move |full_node| {
             if !reth_firehose::is_tracer_initialized() {
                 warn!(
-                    url = %ws_url,
+                    url = %ws_url_for_node,
                     "skipping Firehose flashblocks streamer: Firehose tracer is not initialized"
                 );
                 return Ok(());
@@ -80,9 +134,41 @@ impl BaseNodeExtension for FirehoseFlashblocksExtension {
                 ..Default::default()
             };
             let tracer = FlashblocksTracerHandle::new(tracer_config, chain_config);
-            let processor = FirehoseFlashblocksProcessor::new(full_node.provider, tracer);
-            info!(url = %ws_url, "starting Firehose flashblocks streamer");
-            FirehoseFlashblocksStreamer::new(processor, ws_url).start();
+            let processor =
+                FirehoseFlashblocksProcessor::new(full_node.provider.clone(), tracer);
+            info!(url = %ws_url_for_node, "starting Firehose flashblocks streamer");
+            let streamer = FirehoseFlashblocksStreamer::new(processor, ws_url_for_node);
+            let processor_for_canonical = streamer.processor();
+            streamer.start();
+
+            // Earliest in-engine signal: drain canonical blocks forwarded by the engine-event
+            // listener installed above.
+            let processor_for_engine_events = processor_for_canonical.clone();
+            tokio::spawn(async move {
+                while let Some((number, hash)) = canonical_rx.recv().await {
+                    processor_for_engine_events.on_canonical_block(number, hash);
+                }
+            });
+
+            // Fallback path: canonical-state notification fires after the canonical chain has
+            // been committed. `final_part_sent` inside the processor prevents double-emission
+            // when both signals deliver the same block.
+            let mut canonical_stream =
+                BroadcastStream::new(full_node.provider.subscribe_to_canonical_state());
+            tokio::spawn(async move {
+                while let Some(notification) = canonical_stream.next().await {
+                    let notification = match notification {
+                        Ok(n) => n,
+                        Err(err) => {
+                            warn!(error = %err, "canonical-state broadcast lagged; continuing");
+                            continue;
+                        }
+                    };
+                    for block in notification.committed().blocks_iter() {
+                        processor_for_canonical.on_canonical_block(block.number, block.hash());
+                    }
+                }
+            });
             Ok(())
         })
     }

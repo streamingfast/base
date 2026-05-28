@@ -25,7 +25,12 @@ base-firehose-flashblocks.workspace = true
 base-reth-cli.workspace = true
 reth-cli-util.workspace = true
 reth-chainspec.workspace = true
+reth-chain-state.workspace = true
+reth-engine-primitives.workspace = true
 base-execution-cli = { workspace = true, features = ["otlp"] }
+
+# alloy
+alloy-primitives.workspace = true
 
 # cli
 url.workspace = true
@@ -34,6 +39,10 @@ clap.workspace = true
 # firehose
 reth-firehose.workspace = true
 firehose-tracer.workspace = true
+
+# async
+tokio.workspace = true
+tokio-stream.workspace = true
 
 # tracing
 tracing.workspace = true

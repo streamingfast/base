@@ -5,14 +5,17 @@
 
 use std::fmt;
 
+use base_common_consensus::BasePrimitives;
 use eyre::Result;
 use futures::future::BoxFuture;
+use reth_engine_primitives::ConsensusEngineEvent;
 use reth_exex::ExExContext;
 use reth_node_builder::{
     NodeAdapter, NodeBuilderWithComponents, NodeComponentsBuilder, WithLaunchContext,
     node::FullNode,
     rpc::{RethRpcAddOns, RpcContext},
 };
+use reth_tokio_util::EventStream;
 
 use crate::types::{BaseComponentsBuilder, BaseNodeTypes, ConcreteBaseAddOns};
 
@@ -144,6 +147,19 @@ impl NodeHooks {
     {
         self.add_ons_hooks.push(Box::new(hook));
         self
+    }
+
+    /// Adds a hook that subscribes to the consensus engine's
+    /// [`ConsensusEngineEvent`] broadcast at add-on launch time.
+    ///
+    /// The hook receives a fresh [`EventStream`] subscribed to the same broadcast channel the
+    /// engine itself notifies. Useful for reacting to the earliest in-engine signal (e.g.
+    /// `CanonicalBlockAdded` fires before the canonical-state notification).
+    pub fn add_engine_event_listener_hook<F>(self, hook: F) -> Self
+    where
+        F: FnOnce(EventStream<ConsensusEngineEvent<BasePrimitives>>) + Send + 'static,
+    {
+        self.add_add_ons_hook(move |add_ons| add_ons.on_engine_events(hook))
     }
 
     /// Adds a node-started hook that will run after the node has started.

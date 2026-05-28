@@ -85,6 +85,10 @@ jobs:
           provenance: false
           build-args: |
             FIREHOSE_ETHEREUM=${{ inputs.firehose_ethereum || 'latest' }}
+          cache-from: |
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.platform_suffix }}
+          cache-to: |
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.platform_suffix }},mode=max,compression=zstd,image-manifest=true,oci-mediatypes=true
 
   push:
     needs: build

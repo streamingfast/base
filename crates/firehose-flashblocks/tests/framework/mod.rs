@@ -3,37 +3,38 @@
 //! This module provides:
 //! - [`GenesisClient`]: a minimal in-memory reth provider mock backed by a genesis allocation.
 //! - [`GenesisStateProvider`]: a thin [`StateProvider`] wrapper around [`StateProviderTest`].
-//! - [`flash_base`] / [`flash_delta`]: helpers to build [`Flashblock`] fixtures.
-//! - [`ws_server_once`]: a transient WebSocket server that sends a sequence of messages once.
+//! - [`flash_base`] / [`flash_delta`] / [`canonical_block`]: helpers to build [`TestEvent`] fixtures.
+//! - [`TestEvent`]: discriminated event type for test sequences (flashblock or canonical block).
 //! - [`FireEvent`]: structured representation of a single FIRE output line (INIT or BLOCK).
 //! - [`parse_fire_events`]: parses all FIRE lines from raw tracer output.
-//! - [`run_flashblock_sequence`]: end-to-end harness — starts server, runs processor, returns output.
+//! - [`run_flashblock_sequence`]: end-to-end harness — drives the processor directly, returns output.
 
 use std::{
-    net::SocketAddr,
+    collections::HashSet,
     ops::RangeInclusive,
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, Mutex},
 };
 
-use alloy_consensus::Header;
-use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumberOrTag};
+use alloy_consensus::{BlockBody, Header, SignableTransaction, TxLegacy};
+use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumberOrTag, eip2718::Encodable2718};
 use alloy_genesis::Genesis;
+use alloy_network::TxSignerSync;
 use alloy_primitives::{
-    Address, BlockHash, BlockNumber, Bloom, Bytes, StorageKey, TxHash, TxNumber, B256, U256,
+    Address, B256, BlockHash, BlockNumber, Bloom, Bytes, StorageKey, TxHash, TxKind, TxNumber,
+    U256, hex, keccak256,
 };
 use alloy_rpc_types_engine::PayloadId;
-use base_common_consensus::{
-    BaseBlock, BasePrimitives, BaseReceipt, BaseTxEnvelope,
-};
+use alloy_signer_local::PrivateKeySigner;
+use base_common_consensus::{BaseBlock, BasePrimitives, BaseReceipt, BaseTxEnvelope};
 use base_common_flashblocks::{
     ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, Flashblock, FlashblocksPayloadV1,
     Metadata,
 };
 use base_execution_chainspec::BaseChainSpec;
 use base_firehose_flashblocks::{
-    FirehoseFlashblocksProcessor, FlashblocksTracerHandle,
+    ClockFn, FirehoseFlashblocksProcessor, FlashblocksTracerHandle,
 };
+use base_flashblocks::{BlockAssembler, FlashblocksReceiver};
 use base64::Engine as _;
 use firehose_tracer::{
     InMemoryBuffer,
@@ -41,10 +42,10 @@ use firehose_tracer::{
     pb::Block as EthBlock,
 };
 use prost::Message as _;
-use futures::SinkExt as _;
 use reth_chainspec::{ChainInfo, ChainSpecProvider, EthChainSpec};
 use reth_db_models::StoredBlockBodyIndices;
-use reth_primitives_traits::{Account, RecoveredBlock, SealedHeader};
+use reth_firehose::FirehoseBlockTracer;
+use reth_primitives_traits::{Account, RecoveredBlock, SealedBlock, SealedHeader};
 use reth_provider::{
     AccountReader, BlockBodyIndicesProvider, BlockHashReader, BlockIdReader, BlockNumReader,
     BlockReader, BlockReaderIdExt, BlockSource, BytecodeReader, HashedPostStateProvider,
@@ -59,20 +60,62 @@ use reth_trie::{
     StorageProof, TrieInput, updates::TrieUpdates,
 };
 use serde_json::json;
-use tokio::net::TcpListener;
-use tokio_tungstenite::{
-    accept_async,
-    tungstenite::{Message, Utf8Bytes},
-};
-use url::Url;
+
+// ── TestEvent ─────────────────────────────────────────────────────────────────
+
+/// A discriminated event for test sequences fed into [`run_flashblock_sequence`].
+///
+/// The runner processes events in order:
+/// - [`TestEvent::Flashblock`] is serialised and sent over the WS connection (same as today).
+/// - [`TestEvent::CanonicalBlock`] updates [`GenesisClient`]'s internal state to mark block N as
+///   available; no WS message is emitted. This unblocks the processor's bootstrap path when it
+///   calls `state_by_block_number_or_tag(BlockNumberOrTag::Number(N))`.
+#[derive(Clone)]
+pub(crate) enum TestEvent {
+    /// A flashblock to be sent over the WebSocket connection.
+    ///
+    /// Boxed to avoid a large-variant size imbalance with [`TestEvent::CanonicalBlock`].
+    Flashblock(Box<Flashblock>),
+    /// Signals that canonical block N (with the given block hash) is now available from the
+    /// chain provider, and triggers an accompanying canonical FIRE BLOCK emission.
+    CanonicalBlock {
+        /// Block number.
+        block_number: u64,
+        /// Block hash to seal the emitted canonical FIRE BLOCK with.
+        block_hash: B256,
+    },
+}
+
+impl TestEvent {
+    /// Wraps a [`Flashblock`] as a [`TestEvent::Flashblock`].
+    pub(crate) fn flashblock(fb: Flashblock) -> Self {
+        Self::Flashblock(Box::new(fb))
+    }
+}
 
 // ── Mock client ──────────────────────────────────────────────────────────────
+
+/// Inner mutable state for [`GenesisClient`], shared via `Arc<Mutex<...>>`.
+#[derive(Debug, Default)]
+struct GenesisClientInner {
+    /// Block numbers that have been made available via a [`TestEvent::CanonicalBlock`] event.
+    available_blocks: HashSet<u64>,
+    /// Block numbers whose canonical *header* is deliberately suppressed in
+    /// `header_by_number`. Default empty (every block returns a synthesised
+    /// header). Tests opt into the race-window scenario where state is queryable
+    /// but the canonical chain hasn't yet committed the header.
+    unavailable_headers: HashSet<u64>,
+}
 
 /// A minimal in-memory client for use in tests.
 ///
 /// Holds a genesis (used to seed account state and chain spec) and a pre-built genesis header.
 /// Only the three methods called by [`FirehoseFlashblocksProcessor`] are implemented; all others
 /// return `Ok(None)` / `Ok(Vec::new())` or delegate to [`StateProviderTest`].
+///
+/// [`GenesisClient`] tracks which canonical blocks are "available" so that the processor's
+/// bootstrap path (via `state_by_block_number_or_tag`) can be unblocked by a
+/// [`TestEvent::CanonicalBlock`] event without sending anything over the WebSocket connection.
 #[derive(Clone, Debug)]
 pub(crate) struct GenesisClient {
     /// The chain spec derived from the genesis.
@@ -81,6 +124,8 @@ pub(crate) struct GenesisClient {
     pub(crate) genesis: Genesis,
     /// The genesis block header computed from the genesis.
     pub(crate) genesis_header: Header,
+    /// Shared inner state tracking which canonical blocks are available.
+    inner: Arc<Mutex<GenesisClientInner>>,
 }
 
 impl GenesisClient {
@@ -89,7 +134,77 @@ impl GenesisClient {
         let chain_spec = Arc::new(BaseChainSpec::from_genesis(genesis.clone()));
         let genesis_header =
             reth_chainspec::make_genesis_header(&genesis, &chain_spec.inner.hardforks);
-        Self { chain_spec, genesis, genesis_header }
+        Self {
+            chain_spec,
+            genesis,
+            genesis_header,
+            inner: Arc::new(Mutex::new(GenesisClientInner::default())),
+        }
+    }
+
+    /// Marks canonical block `block_number` as available to the provider.
+    ///
+    /// After this call, `state_by_block_number_or_tag(BlockNumberOrTag::Number(block_number))`
+    /// will succeed and return a genesis-seeded state provider for that block number.
+    pub(crate) fn mark_canonical_block_available(&self, block_number: u64) {
+        self.inner
+            .lock()
+            .expect("genesis client inner mutex poisoned")
+            .available_blocks
+            .insert(block_number);
+    }
+
+    /// Suppresses `header_by_number(block_number)` so it returns `Ok(None)`.
+    ///
+    /// Simulates the brief race window between a payload insert (which makes state
+    /// queryable via `state_by_block_number_or_tag`) and the canonical-chain
+    /// commit (which makes the header readable via `header_by_number`). In that
+    /// window, a flashblock for block N+1 can find the parent's state but not the
+    /// parent's header — the processor must buffer the sequence as pending rather
+    /// than crash with "parent header missing".
+    pub(crate) fn mark_header_unavailable(&self, block_number: u64) {
+        self.inner
+            .lock()
+            .expect("genesis client inner mutex poisoned")
+            .unavailable_headers
+            .insert(block_number);
+    }
+
+    fn is_header_available(&self, block_number: u64) -> bool {
+        !self
+            .inner
+            .lock()
+            .expect("genesis client inner mutex poisoned")
+            .unavailable_headers
+            .contains(&block_number)
+    }
+
+    /// Returns `true` if `block_number` is the genesis block (block 0) or has been explicitly
+    /// marked as available via [`mark_canonical_block_available`].
+    fn is_block_available(&self, block_number: u64) -> bool {
+        if block_number == 0 {
+            return true;
+        }
+        self.inner
+            .lock()
+            .expect("genesis client inner mutex poisoned")
+            .available_blocks
+            .contains(&block_number)
+    }
+
+    /// Synthesises a [`Header`] for the given block number.
+    ///
+    /// The genesis header is used as a template. `number` is set to `block_number` and
+    /// `timestamp` is advanced by 2 seconds per block from the genesis timestamp. All other
+    /// fields are inherited from genesis so that EVM environment construction produces a
+    /// consistent result regardless of which parent block the processor looks up.
+    pub(crate) fn header_for_block(&self, block_number: u64) -> Header {
+        Header {
+            number: block_number,
+            timestamp: self.genesis_header.timestamp + block_number * 2,
+            parent_hash: B256::ZERO,
+            ..self.genesis_header.clone()
+        }
     }
 }
 
@@ -158,9 +273,16 @@ impl HeaderProvider for GenesisClient {
         Ok(Some(self.genesis_header.clone()))
     }
 
-    fn header_by_number(&self, _n: u64) -> ProviderResult<Option<Header>> {
-        // The processor uses this to build the EVM env for block N; always return genesis.
-        Ok(Some(self.genesis_header.clone()))
+    fn header_by_number(&self, n: u64) -> ProviderResult<Option<Header>> {
+        // The processor calls this to build the EVM env for block N (looking up the
+        // parent header). Tests can suppress specific blocks via
+        // [`Self::mark_header_unavailable`] to simulate the race where state is
+        // queryable but the canonical-chain commit (which writes the header) hasn't
+        // happened yet. Default: return a synthesised header so existing tests pass.
+        if !self.is_header_available(n) {
+            return Ok(None);
+        }
+        Ok(Some(self.header_for_block(n)))
     }
 
     fn headers_range(
@@ -214,10 +336,7 @@ impl TransactionsProvider for GenesisClient {
         Ok(None)
     }
 
-    fn transaction_by_id_unhashed(
-        &self,
-        _id: TxNumber,
-    ) -> ProviderResult<Option<BaseTxEnvelope>> {
+    fn transaction_by_id_unhashed(&self, _id: TxNumber) -> ProviderResult<Option<BaseTxEnvelope>> {
         Ok(None)
     }
 
@@ -228,9 +347,8 @@ impl TransactionsProvider for GenesisClient {
     fn transaction_by_hash_with_meta(
         &self,
         _h: TxHash,
-    ) -> ProviderResult<
-        Option<(BaseTxEnvelope, alloy_consensus::transaction::TransactionMeta)>,
-    > {
+    ) -> ProviderResult<Option<(BaseTxEnvelope, alloy_consensus::transaction::TransactionMeta)>>
+    {
         Ok(None)
     }
 
@@ -278,10 +396,7 @@ impl ReceiptProvider for GenesisClient {
         Ok(None)
     }
 
-    fn receipts_by_block(
-        &self,
-        _b: BlockHashOrNumber,
-    ) -> ProviderResult<Option<Vec<BaseReceipt>>> {
+    fn receipts_by_block(&self, _b: BlockHashOrNumber) -> ProviderResult<Option<Vec<BaseReceipt>>> {
         Ok(None)
     }
 
@@ -367,10 +482,7 @@ impl BlockReaderIdExt for GenesisClient {
         Ok(None)
     }
 
-    fn sealed_header_by_id(
-        &self,
-        _id: BlockId,
-    ) -> ProviderResult<Option<SealedHeader<Header>>> {
+    fn sealed_header_by_id(&self, _id: BlockId) -> ProviderResult<Option<SealedHeader<Header>>> {
         Ok(None)
     }
 
@@ -422,11 +534,7 @@ impl BlockHashReader for GenesisStateProvider {
         self.0.block_hash(n)
     }
 
-    fn canonical_hashes_range(
-        &self,
-        s: BlockNumber,
-        e: BlockNumber,
-    ) -> ProviderResult<Vec<B256>> {
+    fn canonical_hashes_range(&self, s: BlockNumber, e: BlockNumber) -> ProviderResult<Vec<B256>> {
         self.0.canonical_hashes_range(s, e)
     }
 }
@@ -440,10 +548,7 @@ impl StateRootProvider for GenesisStateProvider {
         Ok(B256::ZERO)
     }
 
-    fn state_root_with_updates(
-        &self,
-        _hs: HashedPostState,
-    ) -> ProviderResult<(B256, TrieUpdates)> {
+    fn state_root_with_updates(&self, _hs: HashedPostState) -> ProviderResult<(B256, TrieUpdates)> {
         Ok((B256::ZERO, TrieUpdates::default()))
     }
 
@@ -456,11 +561,7 @@ impl StateRootProvider for GenesisStateProvider {
 }
 
 impl StorageRootProvider for GenesisStateProvider {
-    fn storage_root(
-        &self,
-        _addr: Address,
-        _hs: HashedStorage,
-    ) -> ProviderResult<B256> {
+    fn storage_root(&self, _addr: Address, _hs: HashedStorage) -> ProviderResult<B256> {
         Ok(B256::ZERO)
     }
 
@@ -527,7 +628,10 @@ impl StateProvider for GenesisStateProvider {
 }
 
 impl BytecodeReader for GenesisStateProvider {
-    fn bytecode_by_hash(&self, h: &B256) -> ProviderResult<Option<reth_primitives_traits::Bytecode>> {
+    fn bytecode_by_hash(
+        &self,
+        h: &B256,
+    ) -> ProviderResult<Option<reth_primitives_traits::Bytecode>> {
         self.0.bytecode_by_hash(h)
     }
 }
@@ -539,9 +643,14 @@ impl StateProviderFactory for GenesisClient {
 
     fn state_by_block_number_or_tag(
         &self,
-        _n: BlockNumberOrTag,
+        number_or_tag: BlockNumberOrTag,
     ) -> ProviderResult<StateProviderBox> {
-        Ok(Box::new(GenesisStateProvider::new(&self.genesis)))
+        match number_or_tag {
+            BlockNumberOrTag::Number(n) if !self.is_block_available(n) => {
+                Err(ProviderError::BlockBodyIndicesNotFound(n))
+            }
+            _ => Ok(Box::new(GenesisStateProvider::new(&self.genesis))),
+        }
     }
 
     fn history_by_block_number(&self, _n: BlockNumber) -> ProviderResult<StateProviderBox> {
@@ -560,10 +669,7 @@ impl StateProviderFactory for GenesisClient {
         Ok(Box::new(GenesisStateProvider::new(&self.genesis)))
     }
 
-    fn pending_state_by_hash(
-        &self,
-        _h: B256,
-    ) -> ProviderResult<Option<StateProviderBox>> {
+    fn pending_state_by_hash(&self, _h: B256) -> ProviderResult<Option<StateProviderBox>> {
         Ok(Some(Box::new(GenesisStateProvider::new(&self.genesis))))
     }
 
@@ -572,16 +678,30 @@ impl StateProviderFactory for GenesisClient {
     }
 }
 
+// ── Hash helper ──────────────────────────────────────────────────────────────
+
+/// Returns a deterministic [`B256`] derived from a short label.
+///
+/// Used by test builders to assign readable, distinct block hashes to flashblocks and
+/// canonical blocks. Tests typically use labels like `"1a"`, `"2a"`, `"3a"` for the
+/// canonical fork and `"3b"`, `"3c"` for siblings/alternates.
+pub(crate) fn hash(label: &str) -> B256 {
+    keccak256(label.as_bytes())
+}
+
 // ── Flashblock builders ──────────────────────────────────────────────────────
 
-/// Constructs a base flashblock (index 0) for the given block number.
+/// Constructs a base flashblock (index 0) for the given block number, wrapped as a [`TestEvent`].
 ///
-/// All optional fields use sensible defaults. The base flashblock carries no transactions.
+/// `block_hash` is the resulting block's hash (carried on the diff). `parent_hash` is the
+/// hash of the parent block referenced by this base. All optional fields use sensible
+/// defaults; the base flashblock carries no transactions.
 pub(crate) fn flash_base(
     block_number: u64,
+    block_hash: B256,
     parent_hash: B256,
     timestamp: u64,
-) -> Flashblock {
+) -> TestEvent {
     let base = ExecutionPayloadBaseV1 {
         parent_beacon_block_root: B256::ZERO,
         parent_hash,
@@ -599,7 +719,7 @@ pub(crate) fn flash_base(
         receipts_root: B256::ZERO,
         logs_bloom: Bloom::default(),
         gas_used: 0,
-        block_hash: B256::ZERO,
+        block_hash,
         transactions: Vec::new(),
         withdrawals: Vec::new(),
         withdrawals_root: B256::ZERO,
@@ -616,25 +736,45 @@ pub(crate) fn flash_base(
 
     let metadata = Metadata { block_number };
 
-    Flashblock {
+    TestEvent::flashblock(Flashblock {
         payload_id: payload.payload_id,
         index: payload.index,
         base: payload.base,
         diff: payload.diff,
         metadata,
-    }
+    })
 }
 
-/// Constructs a delta flashblock (index > 0) for the given block number.
+/// Constructs a delta flashblock (index > 0) for the given block number, wrapped as a [`TestEvent`].
 ///
+/// `block_hash` is the candidate-tip hash carried on this delta's diff. The parent hash
+/// is implicit — it lives on the base flashblock that started the sequence. The
+/// `payload_id` defaults to all-zeros, matching what [`flash_base`] produces, so deltas
+/// built with this helper always pair correctly with bases built by [`flash_base`].
 /// Carries no new transactions; used to test sequence progression.
-pub(crate) fn flash_delta(block_number: u64, index: u64) -> Flashblock {
+pub(crate) fn flash_delta(block_number: u64, block_hash: B256, index: u64) -> TestEvent {
+    flash_delta_with_payload_id(block_number, block_hash, index, 0)
+}
+
+/// Like [`flash_delta`] but stamps the delta with a caller-supplied `payload_id` (the
+/// `u64` is encoded big-endian into [`PayloadId`]'s 8 bytes).
+///
+/// Useful for exercising the processor's "delta belongs to the same payload as the base"
+/// validation: a delta whose `payload_id` differs from the in-flight base's is treated
+/// as if it were out of sequence — discarded, with the processor waiting for a fresh base
+/// flashblock before resuming.
+pub(crate) fn flash_delta_with_payload_id(
+    block_number: u64,
+    block_hash: B256,
+    index: u64,
+    payload_id: u64,
+) -> TestEvent {
     let diff = ExecutionPayloadFlashblockDeltaV1 {
         state_root: B256::ZERO,
         receipts_root: B256::ZERO,
         logs_bloom: Bloom::default(),
         gas_used: 0,
-        block_hash: B256::ZERO,
+        block_hash,
         transactions: Vec::new(),
         withdrawals: Vec::new(),
         withdrawals_root: B256::ZERO,
@@ -643,46 +783,165 @@ pub(crate) fn flash_delta(block_number: u64, index: u64) -> Flashblock {
 
     let metadata = Metadata { block_number };
 
-    Flashblock {
+    TestEvent::flashblock(Flashblock {
+        payload_id: PayloadId::new(payload_id.to_be_bytes()),
+        index,
+        base: None,
+        diff,
+        metadata,
+    })
+}
+
+/// Signals that canonical block `block_number` (with the given `block_hash`) is now
+/// available from the provider, and triggers a canonical FIRE BLOCK emission with that
+/// hash. The parent hash is implicit — the canonical tracer seals from a synthesised
+/// header.
+pub(crate) const fn canonical_block(block_number: u64, block_hash: B256) -> TestEvent {
+    TestEvent::CanonicalBlock { block_number, block_hash }
+}
+
+/// Private key of the well-known anvil/Hardhat test account #0
+/// (0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266) — which [`test_genesis`] funds
+/// with 1000 ETH. Use this signer for tests that need real signed transactions
+/// (e.g. to exercise the cumulative-across-block tracer offsets).
+const ANVIL_TEST_PRIVATE_KEY: &str =
+    "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+/// Returns the [`PrivateKeySigner`] for the well-known anvil account #0.
+pub(crate) fn anvil_test_signer() -> PrivateKeySigner {
+    ANVIL_TEST_PRIVATE_KEY.parse().expect("anvil test key parses")
+}
+
+/// Constructs a signed, EIP-2718-encoded legacy transfer transaction from the
+/// anvil test account.
+///
+/// `nonce` must match the sender's current account nonce. `gas_limit = 21_000`
+/// is the basic transfer cost. The recipient is fixed (`Address::repeat_byte(1)`)
+/// and `value = 0` so the test fixture stays deterministic; only the cumulative
+/// receipt fields (gas_used, transaction_index, log block_index) are exercised.
+pub(crate) fn signed_legacy_transfer(nonce: u64) -> Bytes {
+    let mut tx = TxLegacy {
+        chain_id: Some(8453),
+        nonce,
+        gas_price: 7, // matches `baseFeePerGas` from `test_genesis`
+        gas_limit: 21_000,
+        to: TxKind::Call(Address::repeat_byte(1)),
+        value: U256::ZERO,
+        input: Bytes::new(),
+    };
+    let signature = anvil_test_signer()
+        .sign_transaction_sync(&mut tx)
+        .expect("sign legacy tx");
+    let envelope = BaseTxEnvelope::Legacy(tx.into_signed(signature));
+    let mut encoded = Vec::new();
+    envelope.encode_2718(&mut encoded);
+    Bytes::from(encoded)
+}
+
+/// Like [`flash_base`] but carries a pre-built set of EIP-2718-encoded
+/// transactions on the diff. Used by tests that need real signed transactions
+/// to exercise per-tx fields (cumulative_gas_used, transaction_index, log
+/// block_index) that the cumulative-across-block tracer offsets adjust.
+pub(crate) fn flash_base_with_txs(
+    block_number: u64,
+    block_hash: B256,
+    parent_hash: B256,
+    timestamp: u64,
+    transactions: Vec<Bytes>,
+) -> TestEvent {
+    let base = ExecutionPayloadBaseV1 {
+        parent_beacon_block_root: B256::ZERO,
+        parent_hash,
+        fee_recipient: Address::ZERO,
+        prev_randao: B256::ZERO,
+        block_number,
+        gas_limit: 30_000_000,
+        timestamp,
+        extra_data: Bytes::default(),
+        base_fee_per_gas: U256::from(7u64),
+    };
+    let diff = ExecutionPayloadFlashblockDeltaV1 {
+        state_root: B256::ZERO,
+        receipts_root: B256::ZERO,
+        logs_bloom: Bloom::default(),
+        gas_used: 0,
+        block_hash,
+        transactions,
+        withdrawals: Vec::new(),
+        withdrawals_root: B256::ZERO,
+        blob_gas_used: Some(0),
+    };
+    let metadata = Metadata { block_number };
+    TestEvent::flashblock(Flashblock {
+        payload_id: PayloadId::new([0u8; 8]),
+        index: 0,
+        base: Some(base),
+        diff,
+        metadata,
+    })
+}
+
+/// Like [`flash_delta`] but carries a pre-built set of EIP-2718-encoded
+/// transactions on the diff.
+pub(crate) fn flash_delta_with_txs(
+    block_number: u64,
+    block_hash: B256,
+    index: u64,
+    transactions: Vec<Bytes>,
+) -> TestEvent {
+    let diff = ExecutionPayloadFlashblockDeltaV1 {
+        state_root: B256::ZERO,
+        receipts_root: B256::ZERO,
+        logs_bloom: Bloom::default(),
+        gas_used: 0,
+        block_hash,
+        transactions,
+        withdrawals: Vec::new(),
+        withdrawals_root: B256::ZERO,
+        blob_gas_used: Some(0),
+    };
+    let metadata = Metadata { block_number };
+    TestEvent::flashblock(Flashblock {
         payload_id: PayloadId::new([0u8; 8]),
         index,
         base: None,
         diff,
         metadata,
-    }
+    })
 }
 
-// ── WS server ────────────────────────────────────────────────────────────────
-
-/// Spins up a transient WebSocket server that sends each flashblock from `sequence` to the
-/// first client that connects, then closes the connection.
+/// Pre-computes the canonical block hash that the processor will recompute when
+/// attempting an is_final emission, given the same sequence of flashblock events.
 ///
-/// Returns the server's [`SocketAddr`] so the test can pass it to the subscriber.
-pub(crate) async fn ws_server_once(sequence: Vec<Flashblock>) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut ws = accept_async(stream).await.unwrap();
-
-        for fb in &sequence {
-            let payload = FlashblocksPayloadV1 {
-                payload_id: fb.payload_id,
-                index: fb.index,
-                base: fb.base.clone(),
-                diff: fb.diff.clone(),
-                metadata: json!({ "block_number": fb.metadata.block_number }),
-            };
-            let json = serde_json::to_string(&payload).unwrap();
-            ws.send(Message::Text(Utf8Bytes::from(json))).await.unwrap();
-        }
-
-        // Close gracefully after all messages are sent.
-        let _ = ws.send(Message::Close(None)).await;
-    });
-
-    addr
+/// In production the processor recomputes the block hash by (a) computing the
+/// post-execution `state_root` from the EVM bundle via the state provider — this
+/// mirrors geth's `finalizedStateDB.IntermediateRoot(true)` on `processor.go:215`
+/// of the streamingfast flashblocks port — and (b) sealing the assembled header
+/// with that state_root.
+///
+/// In the test harness, `GenesisStateProvider::state_root` is a stub that returns
+/// `B256::ZERO`, so the processor's "computed" state_root is always zero — which
+/// happens to match the wire's default state_root in [`flash_delta`] /
+/// [`flash_base`] fixtures. The header that the processor seals therefore matches
+/// the header returned by [`BlockAssembler::assemble`] verbatim, so we can predict
+/// the recomputed hash by hashing the assembled header directly.
+///
+/// Filters `events` to flashblock entries (canonical-block markers are ignored),
+/// assembles them via [`BlockAssembler`], and returns
+/// `assembled.block.header.hash_slow()`. Tests use this to set the `parent_hash`
+/// of a subsequent base (or canonical block) so the recomputed-hash comparison
+/// succeeds — or deliberately pass a different value to force a mismatch.
+pub(crate) fn assembled_block_hash(events: &[TestEvent]) -> B256 {
+    let flashblocks: Vec<Flashblock> = events
+        .iter()
+        .filter_map(|event| match event {
+            TestEvent::Flashblock(fb) => Some((**fb).clone()),
+            TestEvent::CanonicalBlock { .. } => None,
+        })
+        .collect();
+    let assembled =
+        BlockAssembler::assemble(&flashblocks).expect("test fixture must assemble cleanly");
+    assembled.block.header.hash_slow()
 }
 
 // ── FireEvent ────────────────────────────────────────────────────────────────
@@ -720,6 +979,8 @@ pub(crate) enum FireEvent {
     Block {
         /// Block number.
         block_number: u64,
+        /// Block hash parsed from the FIRE BLOCK line.
+        block_hash: B256,
         /// Previous block number.
         prev_block_number: u64,
         /// Last irreversible block number.
@@ -733,6 +994,8 @@ pub(crate) enum FireEvent {
     FlashBlock {
         /// Block number.
         block_number: u64,
+        /// Block hash parsed from the FIRE BLOCK line.
+        block_hash: B256,
         /// Logical flash block index (with the `+1000` sentinel stripped for `is_final`).
         flash_idx: u64,
         /// Whether this is the final partial for the block (`printed_flash_idx >= 1000`).
@@ -754,11 +1017,12 @@ impl FireEvent {
     /// Sets `block` to `EthBlock::default()`. Use with [`assert_fire_events_metadata_eq`]
     /// to compare only protocol metadata fields without inspecting the payload.
     ///
-    /// `lib_num` and `timestamp_ns` default to `0` — treated as wildcards by the
-    /// metadata comparison helper.
-    pub(crate) fn canonical_block(block_number: u64) -> Self {
+    /// `block_hash` is compared exactly. `lib_num` and `timestamp_ns` default to `0` —
+    /// treated as wildcards by the metadata comparison helper.
+    pub(crate) fn canonical_block(block_number: u64, block_hash: B256) -> Self {
         Self::Block {
             block_number,
+            block_hash,
             prev_block_number: if block_number > 0 { block_number - 1 } else { 0 },
             lib_num: 0,
             timestamp_ns: 0,
@@ -769,9 +1033,16 @@ impl FireEvent {
     /// Constructs an expected [`FireEvent::FlashBlock`] for metadata-only assertions.
     ///
     /// Sets `block` to `EthBlock::default()`. Use with [`assert_fire_events_metadata_eq`].
-    pub(crate) fn flash_block(block_number: u64, flash_idx: u64, is_final: bool) -> Self {
+    /// `block_hash` is compared exactly.
+    pub(crate) fn flash_block(
+        block_number: u64,
+        block_hash: B256,
+        flash_idx: u64,
+        is_final: bool,
+    ) -> Self {
         Self::FlashBlock {
             block_number,
+            block_hash,
             flash_idx,
             is_final,
             prev_block_number: if block_number > 0 { block_number - 1 } else { 0 },
@@ -792,6 +1063,7 @@ impl FireEvent {
 pub(crate) fn assert_fire_events_metadata_eq(actual: &[FireEvent], expected: &[FireEvent]) {
     let sentinel = FireEvent::Block {
         block_number: 0,
+        block_hash: B256::ZERO,
         prev_block_number: 0,
         lib_num: 0,
         timestamp_ns: 0,
@@ -816,6 +1088,7 @@ pub(crate) fn assert_fire_events_metadata_eq(actual: &[FireEvent], expected: &[F
 pub(crate) fn assert_fire_events_eq(actual: &[FireEvent], expected: &[FireEvent]) {
     let sentinel = FireEvent::Block {
         block_number: 0,
+        block_hash: B256::ZERO,
         prev_block_number: 0,
         lib_num: 0,
         timestamp_ns: 0,
@@ -838,10 +1111,18 @@ pub(crate) fn assert_fire_events_eq(actual: &[FireEvent], expected: &[FireEvent]
 fn normalize_metadata(actual: &FireEvent, expected: &FireEvent) -> FireEvent {
     match (actual, expected) {
         (
-            FireEvent::Block { block_number, prev_block_number, lib_num, timestamp_ns, .. },
+            FireEvent::Block {
+                block_number,
+                block_hash,
+                prev_block_number,
+                lib_num,
+                timestamp_ns,
+                ..
+            },
             FireEvent::Block { lib_num: el, timestamp_ns: et, block: eb, .. },
         ) => FireEvent::Block {
             block_number: *block_number,
+            block_hash: *block_hash,
             prev_block_number: *prev_block_number,
             lib_num: if *el == 0 { 0 } else { *lib_num },
             timestamp_ns: if *et == 0 { 0 } else { *timestamp_ns },
@@ -849,11 +1130,19 @@ fn normalize_metadata(actual: &FireEvent, expected: &FireEvent) -> FireEvent {
         },
         (
             FireEvent::FlashBlock {
-                block_number, flash_idx, is_final, prev_block_number, lib_num, timestamp_ns, ..
+                block_number,
+                block_hash,
+                flash_idx,
+                is_final,
+                prev_block_number,
+                lib_num,
+                timestamp_ns,
+                ..
             },
             FireEvent::FlashBlock { lib_num: el, timestamp_ns: et, block: eb, .. },
         ) => FireEvent::FlashBlock {
             block_number: *block_number,
+            block_hash: *block_hash,
             flash_idx: *flash_idx,
             is_final: *is_final,
             prev_block_number: *prev_block_number,
@@ -872,10 +1161,18 @@ fn normalize_metadata(actual: &FireEvent, expected: &FireEvent) -> FireEvent {
 fn normalize_full(actual: &FireEvent, expected: &FireEvent) -> FireEvent {
     match (actual, expected) {
         (
-            FireEvent::Block { block_number, prev_block_number, lib_num, timestamp_ns, block },
+            FireEvent::Block {
+                block_number,
+                block_hash,
+                prev_block_number,
+                lib_num,
+                timestamp_ns,
+                block,
+            },
             FireEvent::Block { lib_num: el, timestamp_ns: et, .. },
         ) => FireEvent::Block {
             block_number: *block_number,
+            block_hash: *block_hash,
             prev_block_number: *prev_block_number,
             lib_num: if *el == 0 { 0 } else { *lib_num },
             timestamp_ns: if *et == 0 { 0 } else { *timestamp_ns },
@@ -883,11 +1180,19 @@ fn normalize_full(actual: &FireEvent, expected: &FireEvent) -> FireEvent {
         },
         (
             FireEvent::FlashBlock {
-                block_number, flash_idx, is_final, prev_block_number, lib_num, timestamp_ns, block,
+                block_number,
+                block_hash,
+                flash_idx,
+                is_final,
+                prev_block_number,
+                lib_num,
+                timestamp_ns,
+                block,
             },
             FireEvent::FlashBlock { lib_num: el, timestamp_ns: et, .. },
         ) => FireEvent::FlashBlock {
             block_number: *block_number,
+            block_hash: *block_hash,
             flash_idx: *flash_idx,
             is_final: *is_final,
             prev_block_number: *prev_block_number,
@@ -900,6 +1205,26 @@ fn normalize_full(actual: &FireEvent, expected: &FireEvent) -> FireEvent {
 }
 
 // ── FIRE line parsing ─────────────────────────────────────────────────────────
+
+/// Identifies which tracer emitted the FIRE BLOCK line currently being parsed. Set by
+/// `# SOURCE FLASH` / `# SOURCE CANON` marker lines in the merged output produced by
+/// [`run_flashblock_sequence`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceTag {
+    Canonical,
+    Flash,
+}
+
+/// Parses a `0x`-optional hex string into a [`B256`], returning [`B256::ZERO`] on any
+/// decode failure (so parsing never panics on malformed input).
+fn parse_hex_b256(s: &str) -> B256 {
+    let trimmed = s.strip_prefix("0x").unwrap_or(s);
+    let mut buf = [0u8; 32];
+    match hex::decode_to_slice(trimmed, &mut buf) {
+        Ok(()) => B256::from(buf),
+        Err(_) => B256::ZERO,
+    }
+}
 
 /// Decodes a base64-encoded, prost-serialised `sf.ethereum.type.v2.Block` from the
 /// `payload_base64` field of a `FIRE BLOCK` line.
@@ -917,6 +1242,12 @@ fn decode_eth_block(payload_base64: &str) -> EthBlock {
 /// Parses all FIRE lines from raw tracer output and returns structured [`FireEvent`] values.
 ///
 /// Recognised line prefixes:
+/// - `# SOURCE FLASH` / `# SOURCE CANON` — synthetic marker emitted by
+///   [`run_flashblock_sequence`] before each event's tracer output. The parser tracks the
+///   current source and uses it to assign each subsequent `FIRE BLOCK` line to the right
+///   [`FireEvent`] variant: flashblock-tracer lines (any `flash_idx`) become
+///   [`FireEvent::FlashBlock`] (the base flashblock keeps `flash_idx == 0` rather than being
+///   reinterpreted as a canonical block); canonical-tracer lines become [`FireEvent::Block`].
 /// - `FIRE INIT <version> <node_name> <node_version>`
 /// - `FIRE BLOCK <block_num> <flash_idx> <block_hash> <prev_num> <prev_hash> <lib_num>
 ///   <timestamp_ns> <payload_base64>`
@@ -924,12 +1255,24 @@ fn decode_eth_block(payload_base64: &str) -> EthBlock {
 /// The `payload_base64` field is decoded from base64 and deserialised via prost into an
 /// [`EthBlock`] and stored on the returned [`FireEvent`] variants.
 ///
-/// Lines that do not start with `FIRE` or that have malformed fields are silently skipped.
+/// Lines that do not start with `FIRE` or `# SOURCE`, or that have malformed fields, are
+/// silently skipped. If a `FIRE BLOCK` arrives before any source marker, it defaults to
+/// canonical (so output from non-runner callers still parses sensibly).
 pub(crate) fn parse_fire_events(raw: &[u8]) -> Vec<FireEvent> {
     let text = std::str::from_utf8(raw).unwrap_or("");
     let mut results = Vec::new();
+    let mut source = SourceTag::Canonical;
 
     for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("# SOURCE ") {
+            source = match rest.trim() {
+                "FLASH" => SourceTag::Flash,
+                "CANON" => SourceTag::Canonical,
+                _ => source,
+            };
+            continue;
+        }
+
         let mut parts = line.split(' ');
 
         let (Some(p0), Some(p1)) = (parts.next(), parts.next()) else { continue };
@@ -954,7 +1297,7 @@ pub(crate) fn parse_fire_events(raw: &[u8]) -> Vec<FireEvent> {
                 //            <lib_num> <timestamp_ns> <payload_base64>
                 let Some(block_num_s) = parts.next() else { continue };
                 let Some(flash_idx_s) = parts.next() else { continue };
-                let Some(_block_hash_s) = parts.next() else { continue };
+                let Some(block_hash_s) = parts.next() else { continue };
                 let Some(prev_num_s) = parts.next() else { continue };
                 let Some(_prev_hash_s) = parts.next() else { continue };
                 let Some(lib_num_s) = parts.next() else { continue };
@@ -966,32 +1309,39 @@ pub(crate) fn parse_fire_events(raw: &[u8]) -> Vec<FireEvent> {
                 let Ok(prev_block_number) = prev_num_s.parse::<u64>() else { continue };
                 let Ok(lib_num) = lib_num_s.parse::<u64>() else { continue };
                 let Ok(timestamp_ns) = timestamp_s.parse::<u64>() else { continue };
+                let block_hash = parse_hex_b256(block_hash_s);
 
                 let block = decode_eth_block(payload_b64);
 
-                if printed_flash_idx == 0 {
-                    results.push(FireEvent::Block {
-                        block_number,
-                        prev_block_number,
-                        lib_num,
-                        timestamp_ns,
-                        block,
-                    });
+                let (flash_idx, is_final) = if printed_flash_idx >= 1000 {
+                    (printed_flash_idx - 1000, true)
                 } else {
-                    let (flash_idx, is_final) = if printed_flash_idx >= 1000 {
-                        (printed_flash_idx - 1000, true)
-                    } else {
-                        (printed_flash_idx, false)
-                    };
-                    results.push(FireEvent::FlashBlock {
-                        block_number,
-                        flash_idx,
-                        is_final,
-                        prev_block_number,
-                        lib_num,
-                        timestamp_ns,
-                        block,
-                    });
+                    (printed_flash_idx, false)
+                };
+
+                match source {
+                    SourceTag::Canonical => {
+                        results.push(FireEvent::Block {
+                            block_number,
+                            block_hash,
+                            prev_block_number,
+                            lib_num,
+                            timestamp_ns,
+                            block,
+                        });
+                    }
+                    SourceTag::Flash => {
+                        results.push(FireEvent::FlashBlock {
+                            block_number,
+                            block_hash,
+                            flash_idx,
+                            is_final,
+                            prev_block_number,
+                            lib_num,
+                            timestamp_ns,
+                            block,
+                        });
+                    }
                 }
             }
             _ => {} // skip unknown FIRE sub-commands
@@ -1051,35 +1401,291 @@ pub(crate) fn test_genesis() -> Genesis {
 
 // ── Test runner ──────────────────────────────────────────────────────────────
 
-/// Builds a [`FirehoseFlashblocksProcessor`] with a buffer-backed tracer, connects it to a
-/// one-shot WebSocket server serving `sequence`, waits briefly for processing, and returns
-/// the captured raw tracer output.
-pub(crate) async fn run_flashblock_sequence(
-    client: GenesisClient,
-    sequence: Vec<Flashblock>,
-) -> Vec<u8> {
-    let addr = ws_server_once(sequence).await;
-    let ws_url = Url::parse(&format!("ws://127.0.0.1:{}", addr.port())).unwrap();
+/// Drives a [`FirehoseFlashblocksProcessor`] with a buffer-backed tracer through `events` in
+/// strict order, and returns the captured raw tracer output.
+///
+/// Events are processed sequentially without any WebSocket indirection:
+///
+/// - [`TestEvent::Flashblock`] — calls `processor.on_flashblock_received` directly so that
+///   FIRE BLOCK lines are emitted by the **flashblock tracer**.
+/// - [`TestEvent::CanonicalBlock`] — marks the block available in [`GenesisClient`] *and*
+///   emits a canonical (non-flash) FIRE BLOCK line through a dedicated **canonical tracer**.
+///   This simulates the live-node behaviour where the global `FirehoseExtension` `ExEx` emits
+///   a canonical FIRE BLOCK whenever a block is finalised by the engine, independent of the
+///   flashblock tracer.
+///
+/// In live operation the two tracers are distinct Firehose streams, each with its own
+/// `FIRE INIT` header, so `flash_idx=0` is unambiguous downstream — it means "canonical" on
+/// the canonical stream and "base flashblock" on the flashblock stream. In tests, both tracers
+/// share an output sink, so we tag each event's output with a `# SOURCE FLASH` or
+/// `# SOURCE CANON` marker line. [`parse_fire_events`] consumes these markers to assign each
+/// emitted FIRE BLOCK to the correct [`FireEvent`] variant:
+///
+/// - Flashblock-tracer line (any `flash_idx`) → [`FireEvent::FlashBlock`]
+///   (including the base flashblock at `flash_idx == 0`).
+/// - Canonical-tracer line → [`FireEvent::Block`].
+///
+/// The processor's staleness clock is set to the *minimum* flashblock timestamp in
+/// `events`. Combined with the processor's saturating-subtraction age calculation, this
+/// makes every flashblock appear at age 0 (later events are "in the future" relative to
+/// the clock and saturate to 0) — so no fixture is rejected as stale regardless of how
+/// widely its `ts + N` offsets span. Use [`run_flashblock_sequence_at`] to drive the
+/// clock to an arbitrary moment and exercise the staleness check.
+pub(crate) fn run_flashblock_sequence(client: GenesisClient, events: Vec<TestEvent>) -> Vec<u8> {
+    let min_ts = events
+        .iter()
+        .filter_map(|event| match event {
+            TestEvent::Flashblock(fb) => fb.base.as_ref().map(|b| b.timestamp),
+            TestEvent::CanonicalBlock { .. } => None,
+        })
+        .min()
+        .unwrap_or(0);
+    run_flashblock_sequence_at(client, events, min_ts)
+}
 
-    let buffer = InMemoryBuffer::new();
-    let writer: Box<dyn std::io::Write + Send> = Box::new(buffer.clone());
+/// Like [`run_flashblock_sequence`] but feeds every flashblock through
+/// `on_flashblock_received` (no peek hint), bypassing the test runner's normal
+/// peek-aware path. Use this to exercise the slow-drip production scenario where
+/// flashblocks arrive one at a time with the WS subscriber's peek slot empty, so
+/// the peek-driven squash / is_final classifications never fire.
+///
+/// In that mode, block transitions are detected only by the validator's
+/// `FirstOfNextBlock` branch (which calls [`Self::build_is_final_emission`]) or
+/// by [`Self::on_canonical_block`] — letting tests verify that the fallback
+/// `is_final` paths still produce the correct wire stream.
+pub(crate) fn run_flashblock_sequence_without_peek(
+    client: GenesisClient,
+    events: Vec<TestEvent>,
+) -> Vec<u8> {
+    let min_ts = events
+        .iter()
+        .filter_map(|event| match event {
+            TestEvent::Flashblock(fb) => fb.base.as_ref().map(|b| b.timestamp),
+            TestEvent::CanonicalBlock { .. } => None,
+        })
+        .min()
+        .unwrap_or(0);
+    run_flashblock_sequence_internal_without_peek(client, events, min_ts).0
+}
+
+fn run_flashblock_sequence_internal_without_peek(
+    client: GenesisClient,
+    events: Vec<TestEvent>,
+    now_secs: u64,
+) -> (Vec<u8>, std::sync::Arc<FirehoseFlashblocksProcessor<GenesisClient>>) {
+    let flash_buffer = InMemoryBuffer::new();
+    let canonical_buffer = InMemoryBuffer::new();
+    let mut output: Vec<u8> = Vec::new();
     let chain_id = client.chain_spec().chain().id();
 
+    let flash_writer: Box<dyn std::io::Write + Send> = Box::new(flash_buffer.clone());
     let tracer_handle = FlashblocksTracerHandle::with_writer(
         Config { chain_client: ChainClient::Reth, ..Default::default() },
         ChainConfig::new(chain_id),
-        writer,
+        flash_writer,
     );
 
-    let processor = Arc::new(FirehoseFlashblocksProcessor::new(client, tracer_handle));
+    let canonical_writer: Box<dyn std::io::Write + Send> = Box::new(canonical_buffer.clone());
+    let mut canonical_tracer = FlashblocksTracerHandle::with_writer(
+        Config { chain_client: ChainClient::Reth, ..Default::default() },
+        ChainConfig::new(chain_id),
+        canonical_writer,
+    );
 
-    // Use the subscriber to drive the processor via the live WS path.
-    let mut subscriber =
-        base_flashblocks::FlashblocksSubscriber::new(Arc::clone(&processor), ws_url);
-    subscriber.start();
+    let clock: ClockFn = std::sync::Arc::new(move || now_secs);
+    let processor = std::sync::Arc::new(FirehoseFlashblocksProcessor::with_clock(
+        client.clone(),
+        tracer_handle,
+        clock,
+    ));
 
-    // Allow time for the WS server to send all messages and the processor to handle them.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut flash_offset = 0usize;
+    let mut canonical_offset = 0usize;
 
-    buffer.get_bytes()
+    for event in events {
+        match event {
+            TestEvent::Flashblock(fb) => {
+                // No peek hint — production slow-drip case.
+                processor.on_flashblock_received(*fb);
+
+                let bytes = flash_buffer.get_bytes();
+                if bytes.len() > flash_offset {
+                    output.extend_from_slice(b"# SOURCE FLASH\n");
+                    output.extend_from_slice(&bytes[flash_offset..]);
+                    flash_offset = bytes.len();
+                }
+            }
+            TestEvent::CanonicalBlock { block_number, block_hash } => {
+                client.mark_canonical_block_available(block_number);
+
+                let header = client.header_for_block(block_number);
+                let sealed = SealedBlock::new_unchecked(
+                    alloy_consensus::Block { header, body: BlockBody::<BaseTxEnvelope>::default() },
+                    block_hash,
+                );
+                let tracer = canonical_tracer.tracer_mut();
+                let block_tracer =
+                    FirehoseBlockTracer::start_local::<BasePrimitives>(tracer, &sealed, None);
+                block_tracer.mark_verified();
+
+                let bytes = canonical_buffer.get_bytes();
+                if bytes.len() > canonical_offset {
+                    output.extend_from_slice(b"# SOURCE CANON\n");
+                    output.extend_from_slice(&bytes[canonical_offset..]);
+                    canonical_offset = bytes.len();
+                }
+
+                processor.on_canonical_block(block_number, block_hash);
+
+                let bytes = flash_buffer.get_bytes();
+                if bytes.len() > flash_offset {
+                    output.extend_from_slice(b"# SOURCE FLASH\n");
+                    output.extend_from_slice(&bytes[flash_offset..]);
+                    flash_offset = bytes.len();
+                }
+            }
+        }
+    }
+
+    (output, processor)
+}
+
+/// Output of [`run_flashblock_sequence_at_with_processor`].
+///
+/// Bundles the merged tracer output with the underlying processor handle so tests can
+/// inspect internal state (e.g. `last_executed_index`) at the end of the sequence.
+pub(crate) struct RunResult {
+    /// Merged FIRE BLOCK stream from both the flashblock tracer and the canonical
+    /// tracer, with `# SOURCE FLASH` / `# SOURCE CANON` markers separating per-event
+    /// emissions.
+    pub raw: Vec<u8>,
+    /// The processor used to drive the sequence; consume with
+    /// `processor.last_executed_index_for_test()` to verify internal state.
+    pub processor: std::sync::Arc<FirehoseFlashblocksProcessor<GenesisClient>>,
+}
+
+/// Like [`run_flashblock_sequence_at`] but also returns a handle to the underlying
+/// [`FirehoseFlashblocksProcessor`] so tests can assert against its internal state
+/// (e.g. that the canonical-driven replay path correctly stamped
+/// `last_executed_index` to suppress double-execution of replayed deltas).
+pub(crate) fn run_flashblock_sequence_at_with_processor(
+    client: GenesisClient,
+    events: Vec<TestEvent>,
+    now_secs: u64,
+) -> RunResult {
+    let (raw, processor) = run_flashblock_sequence_internal(client, events, now_secs);
+    RunResult { raw, processor }
+}
+
+/// Like [`run_flashblock_sequence`] but pins the processor's clock to `now_secs`. Use
+/// this to test the staleness check by configuring `now_secs` far ahead of the
+/// flashblocks' timestamps.
+pub(crate) fn run_flashblock_sequence_at(
+    client: GenesisClient,
+    events: Vec<TestEvent>,
+    now_secs: u64,
+) -> Vec<u8> {
+    run_flashblock_sequence_internal(client, events, now_secs).0
+}
+
+fn run_flashblock_sequence_internal(
+    client: GenesisClient,
+    events: Vec<TestEvent>,
+    now_secs: u64,
+) -> (Vec<u8>, std::sync::Arc<FirehoseFlashblocksProcessor<GenesisClient>>) {
+    let flash_buffer = InMemoryBuffer::new();
+    let canonical_buffer = InMemoryBuffer::new();
+    let mut output: Vec<u8> = Vec::new();
+    let chain_id = client.chain_spec().chain().id();
+
+    // Flashblock tracer — drives `FirehoseFlashblocksProcessor`.
+    let flash_writer: Box<dyn std::io::Write + Send> = Box::new(flash_buffer.clone());
+    let tracer_handle = FlashblocksTracerHandle::with_writer(
+        Config { chain_client: ChainClient::Reth, ..Default::default() },
+        ChainConfig::new(chain_id),
+        flash_writer,
+    );
+
+    // Canonical tracer — emits non-flash FIRE BLOCK lines for `CanonicalBlock` events.
+    let canonical_writer: Box<dyn std::io::Write + Send> = Box::new(canonical_buffer.clone());
+    let mut canonical_tracer = FlashblocksTracerHandle::with_writer(
+        Config { chain_client: ChainClient::Reth, ..Default::default() },
+        ChainConfig::new(chain_id),
+        canonical_writer,
+    );
+
+    let clock: ClockFn = std::sync::Arc::new(move || now_secs);
+    let processor = std::sync::Arc::new(FirehoseFlashblocksProcessor::with_clock(
+        client.clone(),
+        tracer_handle,
+        clock,
+    ));
+
+    // Track how much of each per-tracer buffer we've already flushed to `output`, so that
+    // each event's emissions are tagged with its source marker in the merged stream.
+    let mut flash_offset = 0usize;
+    let mut canonical_offset = 0usize;
+
+    for (idx, event) in events.iter().enumerate() {
+        let event = event.clone();
+        match event {
+            TestEvent::Flashblock(fb) => {
+                // Find the next queued Flashblock in the event list — that's the value
+                // the production subscriber's 1-element peek slot would surface, after
+                // skipping any intervening CanonicalBlock markers (which don't live on
+                // the flashblock WebSocket channel in production).
+                let peek = events.iter().skip(idx + 1).find_map(|e| match e {
+                    TestEvent::Flashblock(next) => Some(next.as_ref()),
+                    TestEvent::CanonicalBlock { .. } => None,
+                });
+                processor.on_flashblock_received_with_peek(*fb, peek);
+
+                let bytes = flash_buffer.get_bytes();
+                if bytes.len() > flash_offset {
+                    output.extend_from_slice(b"# SOURCE FLASH\n");
+                    output.extend_from_slice(&bytes[flash_offset..]);
+                    flash_offset = bytes.len();
+                }
+            }
+            TestEvent::CanonicalBlock { block_number, block_hash } => {
+                // Make the block available to the provider so that subsequent flashblocks
+                // that need to bootstrap from block N can find it.
+                client.mark_canonical_block_available(block_number);
+
+                // Emit a canonical FIRE BLOCK to simulate the global ExEx tracer emitting the
+                // finalised block. A minimal block with the correct number is sufficient; the
+                // test assertions use metadata-only comparisons.
+                let header = client.header_for_block(block_number);
+                let sealed = SealedBlock::new_unchecked(
+                    alloy_consensus::Block { header, body: BlockBody::<BaseTxEnvelope>::default() },
+                    block_hash,
+                );
+                let tracer = canonical_tracer.tracer_mut();
+                let block_tracer =
+                    FirehoseBlockTracer::start_local::<BasePrimitives>(tracer, &sealed, None);
+                block_tracer.mark_verified();
+
+                let bytes = canonical_buffer.get_bytes();
+                if bytes.len() > canonical_offset {
+                    output.extend_from_slice(b"# SOURCE CANON\n");
+                    output.extend_from_slice(&bytes[canonical_offset..]);
+                    canonical_offset = bytes.len();
+                }
+
+                // Notify the processor that this canonical block is now available, which
+                // triggers replay of any buffered flashblocks waiting on it as their parent.
+                // Replay writes to the flashblock tracer's buffer, so drain it again below.
+                processor.on_canonical_block(block_number, block_hash);
+
+                let bytes = flash_buffer.get_bytes();
+                if bytes.len() > flash_offset {
+                    output.extend_from_slice(b"# SOURCE FLASH\n");
+                    output.extend_from_slice(&bytes[flash_offset..]);
+                    flash_offset = bytes.len();
+                }
+            }
+        }
+    }
+
+    (output, processor)
 }

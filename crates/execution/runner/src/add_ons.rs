@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{fmt, marker::PhantomData};
 
 use base_execution_payload_builder::{
     Attributes, PayloadPrimitives,
@@ -13,8 +13,11 @@ use base_execution_rpc::{
 };
 use base_execution_txpool::BasePooledTx;
 use base_node_core::{BaseEngineApiBuilder, BaseNodeTypes, BasePayloadValidatorBuilder};
+use reth_engine_primitives::ConsensusEngineEvent;
 use reth_evm::ConfigureEvm;
-use reth_node_api::{BuildNextEnv, FullNodeComponents, HeaderTy, NodeAddOns, PayloadTypes, TxTy};
+use reth_node_api::{
+    BuildNextEnv, FullNodeComponents, FullNodeTypes, HeaderTy, NodeAddOns, PayloadTypes, TxTy,
+};
 use reth_node_builder::{
     node::NodeTypes,
     rpc::{
@@ -26,15 +29,23 @@ use reth_node_builder::{
 use reth_primitives_traits::header::HeaderMut;
 use reth_rpc_api::{DebugApiServer, DebugExecutionWitnessApiServer};
 use reth_rpc_server_types::RethRpcModule;
+use reth_tokio_util::EventStream;
 use reth_tracing::tracing::debug;
 use reth_transaction_pool::TransactionPool;
 use serde::de::DeserializeOwned;
+
+/// Hook type that receives a fresh listener subscribed to the consensus engine's
+/// [`ConsensusEngineEvent`] broadcast at add-on launch time.
+pub type EngineEventListenerHook<N> = Box<
+    dyn FnOnce(EventStream<ConsensusEngineEvent<<<N as FullNodeTypes>::Types as NodeTypes>::Primitives>>)
+        + Send
+        + 'static,
+>;
 
 /// Add-ons w.r.t. Base.
 ///
 /// This type provides Base-specific addons to the node and exposes the RPC server and engine
 /// API.
-#[derive(Debug)]
 pub struct BaseAddOns<
     N: FullNodeComponents,
     EthB: EthApiBuilder<N>,
@@ -50,6 +61,28 @@ pub struct BaseAddOns<
     pub da_config: BaseDAConfig,
     /// Gas limit configuration for the payload builder.
     pub gas_limit_config: GasLimitConfig,
+    /// Hooks invoked at [`NodeAddOns::launch_add_ons`] time, each handed a fresh listener
+    /// subscribed to the consensus engine's event broadcast. Used to drive subscribers that
+    /// need the engine's earliest signal (e.g. `CanonicalBlockAdded` fires inside the engine
+    /// before the canonical-state notification).
+    pub engine_event_listeners: Vec<EngineEventListenerHook<N>>,
+}
+
+impl<N, EthB, PVB, EB, EVB, RpcMiddleware> fmt::Debug
+    for BaseAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>
+where
+    N: FullNodeComponents,
+    EthB: EthApiBuilder<N>,
+    RpcAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BaseAddOns")
+            .field("rpc_add_ons", &self.rpc_add_ons)
+            .field("da_config", &self.da_config)
+            .field("gas_limit_config", &self.gas_limit_config)
+            .field("engine_event_listeners", &self.engine_event_listeners.len())
+            .finish()
+    }
 }
 
 impl<N, EthB, PVB, EB, EVB, RpcMiddleware> BaseAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>
@@ -64,7 +97,24 @@ where
         da_config: BaseDAConfig,
         gas_limit_config: GasLimitConfig,
     ) -> Self {
-        Self { rpc_add_ons, da_config, gas_limit_config }
+        Self {
+            rpc_add_ons,
+            da_config,
+            gas_limit_config,
+            engine_event_listeners: Vec::new(),
+        }
+    }
+
+    /// Registers a hook that will be handed a fresh listener on the consensus engine's
+    /// [`ConsensusEngineEvent`] broadcast at add-on launch time.
+    pub fn on_engine_events<F>(mut self, hook: F) -> Self
+    where
+        F: FnOnce(EventStream<ConsensusEngineEvent<<N::Types as NodeTypes>::Primitives>>)
+            + Send
+            + 'static,
+    {
+        self.engine_event_listeners.push(Box::new(hook));
+        self
     }
 }
 
@@ -106,12 +156,13 @@ where
         self,
         engine_api_builder: T,
     ) -> BaseAddOns<N, EthB, PVB, T, EVB, RpcMiddleware> {
-        let Self { rpc_add_ons, da_config, gas_limit_config, .. } = self;
-        BaseAddOns::new(
-            rpc_add_ons.with_engine_api(engine_api_builder),
+        let Self { rpc_add_ons, da_config, gas_limit_config, engine_event_listeners, .. } = self;
+        BaseAddOns {
+            rpc_add_ons: rpc_add_ons.with_engine_api(engine_api_builder),
             da_config,
             gas_limit_config,
-        )
+            engine_event_listeners,
+        }
     }
 
     /// Maps the [`PayloadValidatorBuilder`] builder type.
@@ -119,12 +170,13 @@ where
         self,
         payload_validator_builder: T,
     ) -> BaseAddOns<N, EthB, T, EB, EVB, RpcMiddleware> {
-        let Self { rpc_add_ons, da_config, gas_limit_config, .. } = self;
-        BaseAddOns::new(
-            rpc_add_ons.with_payload_validator(payload_validator_builder),
+        let Self { rpc_add_ons, da_config, gas_limit_config, engine_event_listeners, .. } = self;
+        BaseAddOns {
+            rpc_add_ons: rpc_add_ons.with_payload_validator(payload_validator_builder),
             da_config,
             gas_limit_config,
-        )
+            engine_event_listeners,
+        }
     }
 
     /// Maps the [`EngineValidatorBuilder`] builder type.
@@ -132,12 +184,13 @@ where
         self,
         engine_validator_builder: T,
     ) -> BaseAddOns<N, EthB, PVB, EB, T, RpcMiddleware> {
-        let Self { rpc_add_ons, da_config, gas_limit_config, .. } = self;
-        BaseAddOns::new(
-            rpc_add_ons.with_engine_validator(engine_validator_builder),
+        let Self { rpc_add_ons, da_config, gas_limit_config, engine_event_listeners, .. } = self;
+        BaseAddOns {
+            rpc_add_ons: rpc_add_ons.with_engine_validator(engine_validator_builder),
             da_config,
             gas_limit_config,
-        )
+            engine_event_listeners,
+        }
     }
 
     /// Sets the RPC middleware stack for processing RPC requests.
@@ -148,12 +201,13 @@ where
     ///
     /// See also [`RpcAddOns::with_rpc_middleware`].
     pub fn with_rpc_middleware<T>(self, rpc_middleware: T) -> BaseAddOns<N, EthB, PVB, EB, EVB, T> {
-        let Self { rpc_add_ons, da_config, gas_limit_config, .. } = self;
-        BaseAddOns::new(
-            rpc_add_ons.with_rpc_middleware(rpc_middleware),
+        let Self { rpc_add_ons, da_config, gas_limit_config, engine_event_listeners, .. } = self;
+        BaseAddOns {
+            rpc_add_ons: rpc_add_ons.with_rpc_middleware(rpc_middleware),
             da_config,
             gas_limit_config,
-        )
+            engine_event_listeners,
+        }
     }
 
     /// Sets the hook that is run once the rpc server is started.
@@ -206,7 +260,18 @@ where
         self,
         ctx: reth_node_api::AddOnsContext<'_, N>,
     ) -> eyre::Result<Self::Handle> {
-        let Self { rpc_add_ons, da_config, gas_limit_config, .. } = self;
+        let Self {
+            rpc_add_ons,
+            da_config,
+            gas_limit_config,
+            engine_event_listeners,
+            ..
+        } = self;
+
+        for listener in engine_event_listeners {
+            listener(ctx.engine_events.new_listener());
+        }
+
         let eth_config =
             BaseEthConfigHandler::new(ctx.node.provider().clone(), ctx.node.evm_config().clone());
 

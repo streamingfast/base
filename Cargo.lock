@@ -4298,8 +4298,11 @@ dependencies = [
  "alloy-eips",
  "alloy-evm",
  "alloy-genesis",
+ "alloy-network",
  "alloy-primitives",
  "alloy-rpc-types-engine",
+ "alloy-signer",
+ "alloy-signer-local",
  "base-common-chains",
  "base-common-consensus",
  "base-common-evm",
@@ -4323,6 +4326,7 @@ dependencies = [
  "reth-storage-errors",
  "reth-trie",
  "revm",
+ "revm-database",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -4730,6 +4734,7 @@ dependencies = [
  "futures",
  "jsonrpsee",
  "reth-db",
+ "reth-engine-primitives",
  "reth-evm",
  "reth-exex",
  "reth-ipc",
@@ -4742,6 +4747,7 @@ dependencies = [
  "reth-rpc-layer",
  "reth-rpc-server-types",
  "reth-tasks",
+ "reth-tokio-util",
  "reth-tracing",
  "reth-transaction-pool",
  "serde",
@@ -5623,6 +5629,7 @@ dependencies = [
 name = "base-reth-node"
 version = "0.9.1"
 dependencies = [
+ "alloy-primitives",
  "base-cli-utils",
  "base-execution-cli",
  "base-firehose-flashblocks",
@@ -5630,9 +5637,13 @@ dependencies = [
  "base-reth-cli",
  "clap",
  "firehose-tracer",
+ "reth-chain-state",
  "reth-chainspec",
  "reth-cli-util",
+ "reth-engine-primitives",
  "reth-firehose",
+ "tokio",
+ "tokio-stream",
  "tracing",
  "url",
 ]
@@ -9052,9 +9063,8 @@ checksum = "9844ddc3a6e533d62bba727eb6c28b5d360921d5175e9ff0f1e621a5c590a4d5"
 
 [[package]]
 name = "firehose-tracer"
-version = "5.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31cba6984a9c8246604055d93b0ce721c9e21effb931fb94e21f692a33c78491"
+version = "5.2.0"
+source = "git+https://github.com/streamingfast/evm-firehose-tracer-rs.git?branch=offset-flashblocks#e36843d3d241846fa2baec14a97f27eb03696ba7"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",

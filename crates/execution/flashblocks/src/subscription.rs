@@ -156,12 +156,39 @@ where
 
         let flashblocks_state = Arc::clone(&self.flashblocks_state);
         tokio::spawn(async move {
-            while let Some(message) = mailbox.recv().await {
-                match message {
-                    ActorMessage::BestPayload { payload } => {
-                        flashblocks_state.on_flashblock_received(payload);
-                    }
-                }
+            // Maintains a 1-element peek window into the mailbox so receivers can
+            // see the immediately-next queued flashblock (if any) before deciding
+            // whether to execute or squash the current one. Mirrors geth's
+            // `PeekChan` (Go channel + 1-element peek buffer) at
+            // `node/flashblock/controller.go:62-104`.
+            let mut peek_slot: Option<Flashblock> = None;
+            loop {
+                let current = match peek_slot.take() {
+                    Some(p) => p,
+                    None => match mailbox.recv().await {
+                        Some(ActorMessage::BestPayload { payload }) => payload,
+                        None => return,
+                    },
+                };
+                // Non-blocking peek: only see what's already buffered. If the
+                // producer is faster than the consumer this will surface the
+                // next message; otherwise the consumer falls back to executing
+                // without look-ahead.
+                let peek = match mailbox.try_recv() {
+                    Ok(ActorMessage::BestPayload { payload }) => Some(payload),
+                    Err(_) => None,
+                };
+                debug!(
+                    target: "flashblocks_rpc::subscription",
+                    block = current.metadata.block_number,
+                    index = current.index,
+                    peek_block = peek.as_ref().map(|p| p.metadata.block_number),
+                    peek_index = peek.as_ref().map(|p| p.index),
+                    "dispatching flashblock to receiver"
+                );
+                flashblocks_state
+                    .on_flashblock_received_with_peek(current, peek.as_ref());
+                peek_slot = peek;
             }
         });
     }

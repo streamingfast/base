@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 ARG FIREHOSE_ETHEREUM="latest"
 ARG RUST_VERSION=1.93
 
@@ -6,10 +7,13 @@ WORKDIR /app
 ARG MOLD_VERSION=2.40.4
 ARG MOLD_SHA256_AARCH64=c799b9ccae8728793da2186718fbe53b76400a9da396184fac0c64aa3298ec37
 ARG MOLD_SHA256_X86_64=4c999e19ffa31afa5aa429c679b665d5e2ca5a6b6832ad4b79668e8dcf3d8ec1
-RUN apt-get update && \
+ARG TARGETARCH
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
-      git libclang-dev pkg-config curl build-essential cmake && \
-    rm -rf /var/lib/apt/lists/*
+      git libclang-dev pkg-config curl build-essential cmake
 RUN set -eux; \
     case "$(uname -m)" in \
       x86_64) MOLD_ARCH=x86_64; MOLD_SHA256="${MOLD_SHA256_X86_64}" ;; \
@@ -24,7 +28,10 @@ RUN set -eux; \
 
 COPY . .
 
-RUN cargo build --release --package base-reth-node --bin base-reth-node && \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/app/target,id=base-reth-target-${TARGETARCH} \
+    cargo build --release --package base-reth-node --bin base-reth-node && \
     cp /app/target/release/base-reth-node /app/base-reth-node
 
 FROM ghcr.io/streamingfast/firehose-ethereum:${FIREHOSE_ETHEREUM}
