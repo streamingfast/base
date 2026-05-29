@@ -1,3 +1,7 @@
+## v0.9.1-fh-1
+
+* Fixed flash blocks to arrive in the right order and be 100% identical to the canonical blocks
+
 ## v0.9.1-fh
 
 * bumped upstream to 0.9.1
