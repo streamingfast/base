@@ -697,12 +697,30 @@ where
                         // divergence between our `BlockAssembler` and reth's canonical
                         // sealing, etc. — see the diagnostic fields surfaced below).
                         if !state.final_part_sent && !state.stored_flashblocks.is_empty() {
+                            // Same optimization as `on_canonical_block`: the live
+                            // revision still matches what the speculative precompute
+                            // captured (no flashblock has executed for the previous
+                            // block since the spec was launched), so a hit avoids
+                            // the synchronous trie traversal.
+                            let cached_state_root = Self::cached_state_root_for(
+                                &state,
+                                latest_block,
+                                state.bundle_revision,
+                            );
+                            if cached_state_root.is_some() {
+                                debug!(
+                                    block = latest_block,
+                                    revision = state.bundle_revision,
+                                    "FirstOfNextBlock-fallback: using speculatively-precomputed state_root"
+                                );
+                            }
                             match Self::build_is_final_emission(
                                 latest_block,
                                 latest_idx,
                                 &state.stored_flashblocks,
                                 state.accumulated_db.as_ref(),
                                 stored_parent_hash,
+                                cached_state_root,
                             ) {
                                 Ok(emission) => {
                                     pending_final_emission = Some(emission);
@@ -1093,6 +1111,19 @@ where
         expected_revision: u64,
     ) -> Option<B256> {
         let state = self.state.lock().ok()?;
+        Self::cached_state_root_for(&state, block_number, expected_revision)
+    }
+
+    /// Same as [`Self::try_speculative_state_root`] but reads from a `ProcessorState`
+    /// guard the caller already holds — used by [`Self::on_canonical_block`] and the
+    /// `FirstOfNextBlock` fallback in [`Self::process_inner`], both of which lock
+    /// `self.state` for the duration of the is_final-emission decision and would
+    /// deadlock against re-locking inside [`Self::try_speculative_state_root`].
+    fn cached_state_root_for(
+        state: &ProcessorState,
+        block_number: u64,
+        expected_revision: u64,
+    ) -> Option<B256> {
         let spec = state.speculative_state_root.as_ref()?;
         if spec.block_number != block_number || spec.revision != expected_revision {
             return None;
@@ -1167,12 +1198,30 @@ where
             }
             let stored_clone = state.stored_flashblocks.clone();
             let latest_idx = state.latest_flashblock_index.unwrap_or(0);
+            // No bundle-changing work has happened since the last flashblock
+            // execution, so the live revision is the one the speculative
+            // precompute (if any) was launched against. A hit skips the slow
+            // synchronous state_root and is the key to beating reth's full-block
+            // FIRE BLOCK out the door.
+            let cached_state_root = Self::cached_state_root_for(
+                &state,
+                canonical_block_number,
+                state.bundle_revision,
+            );
+            if cached_state_root.is_some() {
+                debug!(
+                    block = canonical_block_number,
+                    revision = state.bundle_revision,
+                    "canonical-driven is_final: using speculatively-precomputed state_root"
+                );
+            }
             match Self::build_is_final_emission(
                 canonical_block_number,
                 latest_idx,
                 &stored_clone,
                 state.accumulated_db.as_ref(),
                 canonical_block_hash,
+                cached_state_root,
             ) {
                 Ok(emission) => {
                     // emit_final_if_pending locks self.tracer only; it does not
@@ -1445,6 +1494,7 @@ where
         flashblocks: &[Flashblock],
         accumulated_db: Option<&AccumulatedDb>,
         expected_parent_hash: B256,
+        precomputed_state_root: Option<B256>,
     ) -> Result<PendingFinalEmission, BuildIsFinalError> {
         let assembled = BlockAssembler::assemble(flashblocks)
             .map_err(|err| BuildIsFinalError::AssembleFailed(format!("{err:?}")))?;
@@ -1462,8 +1512,17 @@ where
         let assembled_header_hash_with_wire_state_root = assembled.block.header.hash_slow();
         let total_transactions: usize =
             flashblocks.iter().map(|fb| fb.diff.transactions.len()).sum();
-        let state_root = Self::compute_state_root(accumulated_db)
-            .map_err(|err| BuildIsFinalError::StateRootFailed(format!("{err}")))?;
+        // When the caller supplies a precomputed state_root (typically from the
+        // speculative cache that fires at index ≥ 10), skip the synchronous
+        // 100-150 ms trie traversal — this is the entire point of the cache,
+        // and it's what lets the canonical-driven is_final FIRE BLOCK win the
+        // race against reth's full-block FIRE BLOCK emitted from `mark_verified`
+        // after its own state-root validation.
+        let state_root = match precomputed_state_root {
+            Some(root) => root,
+            None => Self::compute_state_root(accumulated_db)
+                .map_err(|err| BuildIsFinalError::StateRootFailed(format!("{err}")))?,
+        };
         let mut block = assembled.block.clone();
         block.header.state_root = state_root;
         let recomputed_hash = block.header.hash_slow();
