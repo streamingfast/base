@@ -5,12 +5,72 @@
 
 extern crate alloc;
 
+mod macros;
+
 mod provider;
 pub use provider::BasePrecompiles;
+
+mod lookup;
+pub use lookup::{BerylLookup, BerylLookupWithObserver};
 
 mod spec;
 pub use spec::BasePrecompileSpec;
 
+mod activation;
+pub use activation::{
+    ActivationFeature, ActivationRegistry, ActivationRegistryStorage, IActivationRegistry,
+};
+
 mod bn254_pair;
+pub use bn254_pair::{
+    GRANITE, GRANITE_MAX_INPUT_SIZE, JOVIAN, JOVIAN_MAX_INPUT_SIZE, run_pair_granite,
+    run_pair_jovian,
+};
 
 mod bls12_381;
+pub use bls12_381::{
+    ISTHMUS_G1_MSM, ISTHMUS_G1_MSM_MAX_INPUT_SIZE, ISTHMUS_G2_MSM, ISTHMUS_G2_MSM_MAX_INPUT_SIZE,
+    ISTHMUS_PAIRING, ISTHMUS_PAIRING_MAX_INPUT_SIZE, JOVIAN_G1_MSM, JOVIAN_G1_MSM_MAX_INPUT_SIZE,
+    JOVIAN_G2_MSM, JOVIAN_G2_MSM_MAX_INPUT_SIZE, JOVIAN_PAIRING, JOVIAN_PAIRING_MAX_INPUT_SIZE,
+    run_isthmus_g1_msm, run_isthmus_g2_msm, run_isthmus_pairing, run_jovian_g1_msm,
+    run_jovian_g2_msm, run_jovian_pairing,
+};
+
+mod common;
+pub use common::{
+    B20Guards, B20TokenRole, Burnable, Configurable, Eip712Domain, Mintable, Pausable, PermitArgs,
+    Permittable, Policy, PolicyRegistry, RoleManaged, Token, TokenAccounting, Transferable,
+};
+#[cfg(any(test, feature = "test-utils"))]
+pub use common::{InMemoryPolicy, InMemoryTokenAccounting, TestStablecoinToken, TestToken};
+
+mod observer;
+pub use observer::{EndGuard, NoopPrecompileCallObserver, PrecompileCallObserver};
+
+mod b20;
+pub use b20::{
+    B20CoreStorage, B20PausableFeature, B20PolicyType, B20Token, B20TokenInit, B20TokenPrecompile,
+    B20TokenStorage, IB20,
+};
+
+mod b20_security;
+pub use b20_security::{
+    B20RedeemStorage, B20SecurityExtensionStorage, B20SecurityInit, B20SecurityPrecompile,
+    B20SecurityStorage, B20SecurityToken, IB20Security, SecurityAccounting,
+};
+
+mod b20_stablecoin;
+pub use b20_stablecoin::{
+    B20StablecoinExtensionStorage, B20StablecoinInit, B20StablecoinPrecompile,
+    B20StablecoinStorage, B20StablecoinToken, IB20Stablecoin, StablecoinAccounting,
+};
+
+mod b20_factory;
+pub use b20_factory::{
+    B20Factory, B20FactoryStorage, B20Variant, CommonParams, IB20Factory, TokenCreateParams,
+};
+
+mod policy;
+pub use policy::{
+    IPolicyRegistry, PackedPolicy, PolicyHandle, PolicyRegistryPrecompile, PolicyRegistryStorage,
+};

@@ -7,7 +7,9 @@ mod core;
 pub use core::App;
 
 mod resources;
-pub use resources::{ConductorState, DaState, FlashState, ProofsState, Resources, ValidatorState};
+pub use resources::{
+    ConductorState, DaState, FlashState, ProofsState, Resources, SourceLabel, ValidatorState,
+};
 
 mod router;
 pub use router::{Router, ViewId};
@@ -21,6 +23,7 @@ pub use view::View;
 /// TUI view implementations.
 mod views;
 pub use views::{
-    CommandCenterView, ConductorView, ConfigView, DaMonitorView, FlashblocksView, HomeView,
-    ProofsView, TransactionPane, UpgradesView, create_view,
+    ActionMenuItem, CommandCenterView, ConductorView, ConfigView, ConfirmButton, DaMonitorView,
+    FlashblocksView, HomeView, Overlay, PendingAction, ProofsView, TransactionPane, UpgradesView,
+    create_view,
 };

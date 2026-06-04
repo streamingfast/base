@@ -95,6 +95,8 @@ pub struct ChainConfig {
     // Roles
     /// Unsafe block signer address.
     pub unsafe_block_signer: Option<Address>,
+    /// Activation registry admin address.
+    pub activation_admin_address: Option<Address>,
 
     // Gas limits
     /// Maximum gas limit for L2 blocks.
@@ -157,6 +159,15 @@ impl ChainConfig {
     ];
 
     /// Base Mainnet chain configuration.
+    pub const MAINNET: &'static Self = Self::mainnet();
+    /// Base Sepolia chain configuration.
+    pub const SEPOLIA: &'static Self = Self::sepolia();
+    /// Local dev chain configuration (all forks active at genesis).
+    pub const DEVNET: &'static Self = Self::devnet();
+    /// Base Zeronet chain configuration.
+    pub const ZERONET: &'static Self = Self::zeronet();
+
+    /// Base Mainnet chain configuration.
     pub const fn mainnet() -> &'static Self {
         &MAINNET
     }
@@ -197,9 +208,20 @@ impl ChainConfig {
         match id {
             8453 => Some(&MAINNET),
             84532 => Some(&SEPOLIA),
+            1337 => Some(&DEVNET),
             763360 => Some(&ZERONET),
             _ => None,
         }
+    }
+
+    /// Returns the full [`RollupConfig`] for the given L2 chain ID.
+    pub fn rollup_config_by_chain_id(id: u64) -> Option<RollupConfig> {
+        Self::by_chain_id(id).map(Self::rollup_config)
+    }
+
+    /// Returns the full [`RollupConfig`] for the given [`Chain`] identifier.
+    pub fn rollup_config_by_chain(chain: &Chain) -> Option<RollupConfig> {
+        Self::rollup_config_by_chain_id(chain.id())
     }
 
     /// Returns the EIP-1559 [`FeeConfig`] for this chain.
@@ -340,6 +362,7 @@ const MAINNET: ChainConfig = ChainConfig {
     protocol_versions_address: address!("8062abc286f5e7d9428a0ccb9abd71e50d93b935"),
 
     unsafe_block_signer: Some(address!("Af6E19BE0F9cE7f8afd49a1824851023A8249e8a")),
+    activation_admin_address: Some(address!("331C9d37BbcebBC9dfAf98FBE3C5B8A39Dd6E771")),
 
     max_gas_limit: 105_000_000,
     prune_delete_limit: 20_000,
@@ -412,6 +435,7 @@ const SEPOLIA: ChainConfig = ChainConfig {
     protocol_versions_address: address!("79add5713b383daa0a138d3c4780c7a1804a8090"),
 
     unsafe_block_signer: Some(address!("b830b99c95Ea32300039624Cb567d324D4b1D83C")),
+    activation_admin_address: Some(address!("5Be7Dd3678e999D5F7bC508c413db239F7D4Ac59")),
 
     max_gas_limit: 45_000_000,
     prune_delete_limit: 10_000,
@@ -475,6 +499,7 @@ const DEVNET: ChainConfig = ChainConfig {
     protocol_versions_address: Address::ZERO,
 
     unsafe_block_signer: None,
+    activation_admin_address: Some(address!("9965507D1a55bcC2695C58ba16FB37d819B0A4dc")),
 
     max_gas_limit: 30_000_000,
     prune_delete_limit: 20_000,
@@ -527,6 +552,7 @@ const ZERONET: ChainConfig = ChainConfig {
     protocol_versions_address: address!("646c8604cf62b23e0cf094f2e790c6c75547ff85"),
 
     unsafe_block_signer: Some(address!("cf17274338d3128f6C96d9af54511a17e8b38a08")),
+    activation_admin_address: Some(address!("F5969A85a555671EeD766C4ff0C61426AA626b11")),
 
     max_gas_limit: 25_000_000,
     prune_delete_limit: 10_000,
@@ -564,5 +590,24 @@ mod tests {
             assert!(ChainConfig::by_name(name).is_some(), "{name} should resolve");
         }
         assert_eq!(ChainConfig::by_name(ChainConfig::SEPOLIA_ALIAS), Some(ChainConfig::sepolia()));
+        assert_eq!(
+            ChainConfig::by_chain_id(ChainConfig::devnet().chain_id),
+            Some(ChainConfig::devnet())
+        );
+        assert_eq!(
+            ChainConfig::rollup_config_by_chain_id(ChainConfig::devnet().chain_id)
+                .map(|cfg| cfg.l2_chain_id.id()),
+            Some(ChainConfig::devnet().chain_id)
+        );
+        assert_eq!(ChainConfig::MAINNET, ChainConfig::mainnet());
+        assert_eq!(ChainConfig::SEPOLIA, ChainConfig::sepolia());
+        assert_eq!(ChainConfig::DEVNET, ChainConfig::devnet());
+        assert_eq!(ChainConfig::ZERONET, ChainConfig::zeronet());
+    }
+
+    #[test]
+    fn zeronet_beryl_is_unscheduled() {
+        assert_eq!(ChainConfig::zeronet().beryl_timestamp, None);
+        assert_eq!(ChainConfig::zeronet().hardfork_config().base.beryl, None);
     }
 }

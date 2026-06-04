@@ -299,11 +299,19 @@ impl RollupNode {
     /// finalizes `safe` blocks that it has derived when L1 finalized block updates are
     /// received.
     pub async fn start(&self) -> Result<(), String> {
+        self.start_with_cancellation(CancellationToken::new()).await
+    }
+
+    /// Starts the rollup node service with a caller-provided cancellation token.
+    pub async fn start_with_cancellation(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<(), String> {
         let l1_head_number: base_consensus_providers::L1HeadNumber = Arc::new(AtomicU64::new(0));
         let pipeline = self.create_pipeline(Arc::clone(&l1_head_number)).await;
         let engine_client =
             Arc::new(self.engine_config().build_engine_client().await.map_err(|e| e.to_string())?);
-        self.start_inner(engine_client, pipeline, l1_head_number).await
+        self.start_inner(engine_client, pipeline, l1_head_number, cancellation).await
     }
 
     /// Starts the rollup node service with a pre-built derivation pipeline.
@@ -328,7 +336,7 @@ impl RollupNode {
         let l1_head_number: base_consensus_providers::L1HeadNumber = Arc::new(AtomicU64::new(0));
         let engine_client =
             Arc::new(self.engine_config().build_engine_client().await.map_err(|e| e.to_string())?);
-        self.start_inner(engine_client, pipeline, l1_head_number).await
+        self.start_inner(engine_client, pipeline, l1_head_number, CancellationToken::new()).await
     }
 
     /// Starts the rollup node with a pre-built engine client.
@@ -342,7 +350,7 @@ impl RollupNode {
     ) -> Result<(), String> {
         let l1_head_number: base_consensus_providers::L1HeadNumber = Arc::new(AtomicU64::new(0));
         let pipeline = self.create_pipeline(Arc::clone(&l1_head_number)).await;
-        self.start_inner(engine_client, pipeline, l1_head_number).await
+        self.start_inner(engine_client, pipeline, l1_head_number, CancellationToken::new()).await
     }
 
     async fn start_inner<E, P>(
@@ -350,6 +358,7 @@ impl RollupNode {
         engine_client: Arc<E>,
         pipeline: P,
         l1_head_number: base_consensus_providers::L1HeadNumber,
+        cancellation: CancellationToken,
     ) -> Result<(), String>
     where
         E: EngineClient + 'static,
@@ -357,8 +366,6 @@ impl RollupNode {
         DerivationActor<QueuedDerivationEngineClient, P>:
             NodeActor<StartData = (), Error = DerivationError>,
     {
-        let cancellation = CancellationToken::new();
-
         // Build the safe head DB pair. Both actors share the same underlying DB via Arc.
         //
         // In delegate mode the local derivation actor is replaced by a `DelegateDerivationActor`
@@ -397,11 +404,22 @@ impl RollupNode {
 
         // Create the conductor client early — the engine processor needs it for the
         // bootstrap leadership check and the sequencer actor needs it for block building.
+        // When `conductor_binary_commit` is set, commit_unsafe_payload uses the
+        // SSZ-binary endpoint; the other RPCs (leader, active, override_leader)
+        // continue to use JSON-RPC.
+        let binary_commit = self.sequencer_config.conductor_binary_commit;
+        let conductor_timeout = self.sequencer_config.conductor_rpc_timeout;
         let conductor: Option<ConductorClient> = self
             .sequencer_config
             .conductor_rpc_url
             .clone()
-            .map(ConductorClient::new_http)
+            .map(|url| {
+                if binary_commit {
+                    ConductorClient::new_http_with_binary_commit(url, conductor_timeout)
+                } else {
+                    ConductorClient::new_http(url, conductor_timeout)
+                }
+            })
             .transpose()
             .map_err(|e| format!("Failed to create conductor client: {e}"))?;
 
@@ -546,7 +564,6 @@ impl RollupNode {
                     unsafe_payload_gossip_client: queued_gossip_client,
                     sealer: None,
                     pending_stop: None,
-                    next_build_parent: None,
                 }),
                 Some(QueuedSequencerAdminAPIClient::new(sequencer_admin_api_tx)),
             )

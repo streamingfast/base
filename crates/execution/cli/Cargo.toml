@@ -30,6 +30,7 @@ reth-cli-commands.workspace = true
 reth-node-metrics.workspace = true
 reth-network-peers.workspace = true
 reth-rpc-server-types.workspace = true
+reth-tasks.workspace = true
 reth-db = { workspace = true, features = ["mdbx"] }
 
 # op-reth
@@ -103,10 +104,9 @@ dev = [
 
 serde = [
 	"alloy-eips/serde",
+	"base-common-chains/serde",
 	"base-common-consensus/serde",
 	"base-execution-chainspec/serde",
 	"reth-network/serde",
 	"secp256k1/serde",
 ]
-
-edge = [ "reth-cli-commands/edge", "reth-node-core/edge" ]

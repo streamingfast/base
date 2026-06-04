@@ -912,7 +912,6 @@ where
                         State::builder()
                             .with_database(StateProviderDatabase::new(provider))
                             .with_bundle_update()
-                            .without_state_clear()
                             .build(),
                     );
                 }
@@ -1338,7 +1337,6 @@ where
         let mut accumulated_db = State::builder()
             .with_database(StateProviderDatabase::new(provider))
             .with_bundle_update()
-            .without_state_clear()
             .build();
 
         // Merge all buffered flashblocks into a single execute+emit. Downstream

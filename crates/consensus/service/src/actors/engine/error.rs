@@ -4,8 +4,6 @@
 
 use base_consensus_engine::{EngineResetError, EngineTaskErrors};
 
-use crate::CheckpointError;
-
 /// An error from the [`EngineActor`].
 ///
 /// [`EngineActor`]: super::EngineActor
@@ -20,7 +18,7 @@ pub enum EngineError {
     /// Engine task error.
     #[error(transparent)]
     EngineTask(#[from] EngineTaskErrors),
-    /// Checkpoint error.
-    #[error(transparent)]
-    Checkpoint(#[from] CheckpointError),
+    /// A critical engine task error was already forwarded to the request caller.
+    #[error("critical engine task error: {0}")]
+    CriticalEngineTask(String),
 }

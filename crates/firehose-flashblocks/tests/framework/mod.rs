@@ -598,7 +598,12 @@ impl StateProofProvider for GenesisStateProvider {
         Err(ProviderError::UnsupportedProvider)
     }
 
-    fn witness(&self, _i: TrieInput, _t: HashedPostState) -> ProviderResult<Vec<Bytes>> {
+    fn witness(
+        &self,
+        _i: TrieInput,
+        _t: HashedPostState,
+        _mode: reth_trie::ExecutionWitnessMode,
+    ) -> ProviderResult<Vec<Bytes>> {
         Err(ProviderError::UnsupportedProvider)
     }
 }
@@ -616,14 +621,6 @@ impl StateProvider for GenesisStateProvider {
         key: StorageKey,
     ) -> ProviderResult<Option<alloy_primitives::StorageValue>> {
         self.0.storage(addr, key)
-    }
-
-    fn storage_by_hashed_key(
-        &self,
-        addr: Address,
-        hk: StorageKey,
-    ) -> ProviderResult<Option<alloy_primitives::StorageValue>> {
-        self.0.storage_by_hashed_key(addr, hk)
     }
 }
 

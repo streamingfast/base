@@ -3,18 +3,18 @@
 use base_common_genesis::RollupConfig;
 use base_protocol::L2BlockInfo;
 
-mod checkpoint;
-pub use checkpoint::{
-    ForkchoiceCheckpointError, ForkchoiceCheckpointLabel, ForkchoiceCheckpointReader,
-    NoopForkchoiceCheckpointReader,
-};
-
 mod forkchoice;
 pub use forkchoice::L2ForkchoiceState;
 
 mod error;
 pub use error::SyncStartError;
 use tracing::info;
+
+mod checkpoint;
+pub use checkpoint::{
+    ForkchoiceCheckpointError, ForkchoiceCheckpointLabel, ForkchoiceCheckpointReader,
+    NoopForkchoiceCheckpointReader,
+};
 
 use crate::EngineClient;
 
@@ -42,9 +42,8 @@ pub async fn find_starting_forkchoice<EngineClient_: EngineClient>(
     .await
 }
 
-/// Searches for the latest [`L2ForkchoiceState`] that we can use to start the sync process with,
-/// using the supplied checkpoint reader only when reth returns a labeled safe/finalized block whose
-/// body is pruned.
+/// Like [`find_starting_forkchoice`], but consults `checkpoint_reader` when reth-labeled blocks
+/// cannot be hydrated because their bodies have been pruned (see [`ForkchoiceCheckpointReader`]).
 pub async fn find_starting_forkchoice_with_checkpoint_reader<
     EngineClient_: EngineClient,
     CheckpointReader: ForkchoiceCheckpointReader + ?Sized,

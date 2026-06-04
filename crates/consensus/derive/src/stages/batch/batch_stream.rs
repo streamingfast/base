@@ -260,12 +260,11 @@ mod tests {
     use base_common_consensus::BaseBlock;
     use base_common_genesis::{ChainGenesis, HardForkConfig, SystemConfig};
     use base_protocol::{SingleBatch, SpanBatchElement};
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     use super::*;
     use crate::{
         StageReset,
-        test_utils::{CollectingLayer, TestBatchStreamProvider, TestL2ChainProvider, TraceStorage},
+        test_utils::{TestBatchStreamProvider, TestL2ChainProvider},
     };
 
     #[tokio::test]
@@ -323,9 +322,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_stream_inactive() {
-        let trace_store: TraceStorage = Default::default();
-        let layer = CollectingLayer::new(trace_store.clone());
-        tracing_subscriber::Registry::default().with(layer).init();
+        let (trace_store, _guard) = base_protocol::capture_traces!();
 
         let data = vec![Ok(Batch::Single(SingleBatch::default()))];
         let config = Arc::new(RollupConfig {
@@ -426,9 +423,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_span_batch_extraction_error_flushes_stage() {
-        let trace_store: TraceStorage = Default::default();
-        let layer = CollectingLayer::new(trace_store.clone());
-        tracing_subscriber::Registry::default().with(layer).init();
+        let (trace_store, _guard) = base_protocol::capture_traces!();
 
         let parent_hash = b256!("1111111111111111111111111111111111111111000000000000000000000000");
         let l1_block_hash =

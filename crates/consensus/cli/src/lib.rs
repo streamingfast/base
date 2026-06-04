@@ -22,14 +22,13 @@ pub use config::{ConfigError, L1ConfigFile, L2ConfigFile};
 mod follow;
 pub use follow::{
     ConsensusFollowNodeArgs, ConsensusFollowNodeCommand, ConsensusFollowNodeConfigArgs,
-    ConsensusFollowNodeOverrides,
 };
 
 mod l1;
 pub use l1::L1ClientArgs;
 
 mod l2;
-pub use l2::L2ClientArgs;
+pub use l2::{EmbeddedL2ClientArgs, L2ClientArgs};
 
 mod metrics;
 pub use metrics::CliMetrics;
@@ -37,10 +36,11 @@ pub use metrics::CliMetrics;
 mod node;
 pub use node::{
     ConsensusNodeArgs, ConsensusNodeCommand, ConsensusNodeConfigArgs, ConsensusNodeOverrides,
+    EmbeddedConsensusNodeConfigArgs,
 };
 
 mod rpc;
-pub use rpc::RpcArgs;
+pub use rpc::{EmbeddedRpcArgs, RpcArgs};
 
 mod sequencer;
 pub use sequencer::SequencerArgs;
@@ -49,4 +49,4 @@ pub mod signer;
 pub use signer::{SignerArgs, SignerArgsParseError};
 
 pub mod p2p;
-pub use p2p::{P2PArgs, P2PConfigError};
+pub use p2p::{EmbeddedP2PArgs, P2PArgs, P2PConfigError};

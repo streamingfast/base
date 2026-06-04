@@ -1,4 +1,11 @@
-use std::{path::PathBuf, process::Command, time::Duration};
+use std::{
+    fs,
+    io::ErrorKind,
+    path::PathBuf,
+    process::Command,
+    thread,
+    time::{Duration, Instant},
+};
 
 use eyre::{Result, WrapErr, ensure};
 use testcontainers::{
@@ -13,6 +20,9 @@ use crate::{
 };
 
 const SETUP_IMAGE_TAG: &str = "devnet-setup:local";
+const SETUP_IMAGE_BUILD_LOCK_DIR: &str = "base-devnet-setup-image-build.lock";
+const SETUP_IMAGE_BUILD_LOCK_TIMEOUT: Duration = Duration::from_secs(600);
+const SETUP_IMAGE_BUILD_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DEPLOY_TIMEOUT_SECS: u64 = 300;
 
 /// Builder enode ID
@@ -118,6 +128,8 @@ pub struct SetupContainer {
     chain_id: u64,
     l2_chain_id: u64,
     slot_duration: u64,
+    base_azul_activation_block: Option<u64>,
+    base_beryl_activation_block: Option<u64>,
     network_name: Option<String>,
 }
 
@@ -129,6 +141,8 @@ impl SetupContainer {
             chain_id: 1337,
             l2_chain_id: 84538453,
             slot_duration: 2,
+            base_azul_activation_block: None,
+            base_beryl_activation_block: None,
             network_name: None,
         }
     }
@@ -148,6 +162,18 @@ impl SetupContainer {
     /// Sets the slot duration.
     pub const fn with_slot_duration(mut self, slot_duration: u64) -> Self {
         self.slot_duration = slot_duration;
+        self
+    }
+
+    /// Sets the L2 block number at which Base Azul activates.
+    pub const fn with_base_azul_activation_block(mut self, block: u64) -> Self {
+        self.base_azul_activation_block = Some(block);
+        self
+    }
+
+    /// Sets the L2 block number at which Base Beryl activates.
+    pub const fn with_base_beryl_activation_block(mut self, block: u64) -> Self {
+        self.base_beryl_activation_block = Some(block);
         self
     }
 
@@ -213,7 +239,7 @@ impl SetupContainer {
         let image = GenericImage::new("devnet-setup", "local")
             .with_wait_for(WaitFor::exit(ExitWaitStrategy::default().with_exit_code(0)));
 
-        let _container = image
+        let mut container = image
             .with_network(net)
             .with_startup_timeout(Duration::from_secs(DEPLOY_TIMEOUT_SECS))
             .with_env_var("OUTPUT_DIR", "/output/l2")
@@ -234,7 +260,17 @@ impl SetupContainer {
             .with_env_var("L2_EL_BOOTNODE_ENODE_ID", EL_BOOTNODE_ENODE_ID)
             .with_env_var("L2_EL_BOOTNODE_ENODE", EL_BOOTNODE_ENODE)
             .with_env_var("L2_CL_BOOTNODE_P2P_KEY", CL_BOOTNODE_P2P_KEY)
-            .with_env_var("L2_CL_BOOTNODE_ENR_PATH", CL_BOOTNODE_ENR_PATH)
+            .with_env_var("L2_CL_BOOTNODE_ENR_PATH", CL_BOOTNODE_ENR_PATH);
+
+        if let Some(block) = self.base_azul_activation_block {
+            container = container.with_env_var("L2_BASE_AZUL_BLOCK", block.to_string());
+        }
+
+        if let Some(block) = self.base_beryl_activation_block {
+            container = container.with_env_var("L2_BASE_BERYL_BLOCK", block.to_string());
+        }
+
+        let _container = container
             .with_mount(Mount::bind_mount(l2_output_mount, "/output/l2"))
             .with_mount(Mount::bind_mount(shared_mount, "/shared"))
             .with_cmd(["setup-l2.sh"])
@@ -250,30 +286,71 @@ impl SetupContainer {
     }
 
     fn ensure_setup_image_built(&self) -> Result<()> {
-        let image_exists = Command::new("docker")
-            .args(["image", "inspect", SETUP_IMAGE_TAG])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let setup_image_exists = || {
+            Command::new("docker")
+                .args(["image", "inspect", SETUP_IMAGE_TAG])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
 
-        if image_exists {
+        if setup_image_exists() {
             return Ok(());
         }
 
-        let repo_root = self.find_repo_root()?;
-        let dockerfile_path = repo_root.join("etc/docker/Dockerfile.devnet");
+        let lock_dir = std::env::temp_dir().join(SETUP_IMAGE_BUILD_LOCK_DIR);
+        let lock_started = Instant::now();
+        loop {
+            match fs::create_dir(&lock_dir) {
+                Ok(()) => break,
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    if setup_image_exists() {
+                        return Ok(());
+                    }
+                    ensure!(
+                        lock_started.elapsed() < SETUP_IMAGE_BUILD_LOCK_TIMEOUT,
+                        "timed out waiting for devnet setup image build lock at {}",
+                        lock_dir.display(),
+                    );
+                    thread::sleep(SETUP_IMAGE_BUILD_LOCK_POLL_INTERVAL);
+                }
+                Err(error) => {
+                    return Err(error).wrap_err("Failed to acquire devnet setup image build lock");
+                }
+            }
+        }
 
-        ensure!(dockerfile_path.exists(), "etc/docker/Dockerfile.devnet not found");
+        let build_result = (|| {
+            if setup_image_exists() {
+                return Ok(());
+            }
 
-        let status = Command::new("docker")
-            .args(["build", "-t", SETUP_IMAGE_TAG, "-f", "etc/docker/Dockerfile.devnet", "."])
-            .current_dir(&repo_root)
-            .status()
-            .wrap_err("Failed to run docker build")?;
+            let repo_root = self.find_repo_root()?;
+            let dockerfile_path = repo_root.join("etc/docker/Dockerfile.devnet");
 
-        ensure!(status.success(), "docker build failed");
+            ensure!(dockerfile_path.exists(), "etc/docker/Dockerfile.devnet not found");
 
-        Ok(())
+            let status = Command::new("docker")
+                .args(["build", "-t", SETUP_IMAGE_TAG, "-f", "etc/docker/Dockerfile.devnet", "."])
+                .current_dir(&repo_root)
+                .status()
+                .wrap_err("Failed to run docker build")?;
+
+            ensure!(status.success(), "docker build failed");
+
+            Ok(())
+        })();
+
+        let cleanup_result =
+            fs::remove_dir(&lock_dir).wrap_err("Failed to release devnet setup image build lock");
+
+        match build_result {
+            Ok(()) => cleanup_result,
+            Err(error) => {
+                let _ = cleanup_result;
+                Err(error)
+            }
+        }
     }
 
     fn find_repo_root(&self) -> Result<PathBuf> {

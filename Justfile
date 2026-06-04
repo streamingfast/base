@@ -2,6 +2,8 @@
 # The kernels require Xcode (Metal) on macOS but are only needed for linking
 # (cargo build), not for type-checking (cargo check/clippy). CI builds run
 # on Linux where CPU kernels compile without issue.
+
+[private]
 _skip_kernels := if os() == "macos" { "RISC0_SKIP_BUILD_KERNELS=1" } else { "" }
 
 set positional-arguments := true
@@ -18,6 +20,8 @@ mod check 'etc/just/check.just'
 mod build 'etc/just/build.just'
 # SP1 / succinct ELF builds and proving helpers
 mod succinct 'etc/just/succinct.just'
+# ZK prover gRPC request helpers
+mod zk-prover 'etc/just/zk-prover.just'
 
 alias t := test
 alias f := fix
@@ -26,19 +30,15 @@ alias c := clean
 alias h := hack
 alias wt := watch-test
 alias wc := watch-check
-alias ldc := load-test-devnet-continuous
+alias ldc := load-test-continuous
 
 # Default to display help menu
 default:
     @just --list
 
-# Load test devnet in continuous mode (Ctrl-C to stop)
-load-test-devnet-continuous:
-    just load-test devnet-continuous
-
-# Runs the specs docs locally
-specs:
-    cd docs/specs && bun ci && bun dev
+# Load test a network in continuous mode (Ctrl-C to stop)
+load-test-continuous network='devnet':
+    just load-test continuous {{ network }}
 
 # One-time project setup: installs tooling and builds test contracts
 setup:
@@ -131,11 +131,11 @@ test-affected base="main": install-nextest build::contracts build::elfs
     cargo nextest run --all-features "${pkg_args[@]}"
 
 # Runs tests with ci profile for minimal disk usage
-test-ci: install-nextest build::contracts build::elfs
+test-ci: install-nextest build::contracts
     cargo nextest run -P ci --locked --workspace --all-features --exclude devnet --cargo-profile ci
 
 # Runs tests only for affected crates with ci profile (for PRs)
-test-affected-ci base="main": install-nextest build::contracts build::elfs
+test-affected-ci base="main": install-nextest build::contracts
     #!/usr/bin/env bash
     set -euo pipefail
     pkg_args_output="$(python3 etc/scripts/local/affected-crates.py {{ base }} --exclude devnet --cargo-args)"
@@ -163,12 +163,12 @@ hack:
 
 # Fixes any formatting issues
 format-fix:
-    {{_skip_kernels}} BASE_SUCCINCT_ELF_STUB=1 cargo fix --allow-dirty --allow-staged --workspace
+    {{ _skip_kernels }} BASE_SUCCINCT_ELF_STUB=1 cargo fix --allow-dirty --allow-staged --workspace
     cargo +nightly fmt --all
 
 # Fixes any clippy issues
 clippy-fix:
-    {{_skip_kernels}} BASE_SUCCINCT_ELF_STUB=1 cargo clippy --workspace --all-features --all-targets --fix --allow-dirty --allow-staged
+    {{ _skip_kernels }} BASE_SUCCINCT_ELF_STUB=1 cargo clippy --workspace --all-features --all-targets --fix --allow-dirty --allow-staged
 
 # Cleans the workspace
 clean:

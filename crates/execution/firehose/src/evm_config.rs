@@ -19,7 +19,7 @@ use base_common_consensus::BasePrimitives;
 use base_common_evm::{BaseEvmFactory, BaseTransaction};
 use reth_errors::BlockExecutionError;
 use reth_evm::{
-    ConfigureEngineEvm, ConfigureEvm, EvmEnvFor, ExecutionCtxFor, TransactionEnv,
+    ConfigureEngineEvm, ConfigureEvm, EvmEnvFor, ExecutionCtxFor, TransactionEnvMut,
     execute::Executor,
 };
 use reth_firehose::{
@@ -53,7 +53,7 @@ where
             >,
         > + Unpin
         + 'static,
-    BaseTransaction<TxEnv>: TransactionEnv,
+    BaseTransaction<TxEnv>: TransactionEnvMut,
     BlockTy<F::Primitives>: BlockTrait,
     <BlockTy<F::Primitives> as BlockTrait>::Header: BlockHeader + Sealable,
     <BlockTy<F::Primitives> as BlockTrait>::Body: BlockBody,
@@ -121,7 +121,7 @@ where
             >,
         > + Unpin
         + 'static,
-    BaseTransaction<TxEnv>: TransactionEnv,
+    BaseTransaction<TxEnv>: TransactionEnvMut,
     BlockTy<F::Primitives>: BlockTrait,
     <BlockTy<F::Primitives> as BlockTrait>::Header: BlockHeader + Sealable,
     <BlockTy<F::Primitives> as BlockTrait>::Body: BlockBody,

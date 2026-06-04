@@ -12,7 +12,10 @@ use base_common_rpc_types::Transaction;
 use base_protocol::{BlockInfo, FromBlockError, L2BlockInfo};
 use tracing::warn;
 
-use crate::{EngineClient, ForkchoiceCheckpointLabel, ForkchoiceCheckpointReader, SyncStartError};
+use crate::{
+    EngineClient, ForkchoiceCheckpointLabel, ForkchoiceCheckpointReader,
+    NoopForkchoiceCheckpointReader, SyncStartError,
+};
 
 /// An unsafe, safe, and finalized [`L2BlockInfo`] returned by the [`crate::find_starting_forkchoice`]
 /// function.
@@ -52,16 +55,12 @@ impl L2ForkchoiceState {
         cfg: &RollupConfig,
         engine_client: &EngineClient_,
     ) -> Result<Self, SyncStartError> {
-        Self::current_with_checkpoint_reader(
-            cfg,
-            engine_client,
-            &crate::NoopForkchoiceCheckpointReader,
-        )
-        .await
+        Self::current_with_checkpoint_reader(cfg, engine_client, &NoopForkchoiceCheckpointReader)
+            .await
     }
 
-    /// Fetches the current forkchoice state of the L2 execution layer, using checkpoints only when
-    /// reth reports a safe or finalized block whose body has been pruned.
+    /// Like [`Self::current`], but falls back to `checkpoint_reader` for safe / finalized labels
+    /// when reth has pruned the L1 info deposit transaction body.
     pub async fn current_with_checkpoint_reader<
         EngineClient_: EngineClient,
         CheckpointReader: ForkchoiceCheckpointReader + ?Sized,
@@ -161,7 +160,6 @@ async fn block_info_from_reth_or_checkpoint<
             let Some(checkpoint) = checkpoint_reader.checkpoint(label).await? else {
                 return Err(err.into());
             };
-
             if checkpoint.block_info != header {
                 warn!(
                     target: "sync_start",
@@ -176,9 +174,14 @@ async fn block_info_from_reth_or_checkpoint<
                     checkpoint_timestamp = checkpoint.block_info.timestamp,
                     "forkchoice checkpoint does not match reth labeled block header"
                 );
-                return Err(err.into());
+                return Err(SyncStartError::CheckpointMismatch {
+                    label,
+                    reth_number: header.number,
+                    reth_hash: header.hash,
+                    checkpoint_number: checkpoint.block_info.number,
+                    checkpoint_hash: checkpoint.block_info.hash,
+                });
             }
-
             warn!(
                 target: "sync_start",
                 label = label.as_str(),
