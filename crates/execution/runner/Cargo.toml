@@ -78,6 +78,10 @@ tracing-subscriber = { workspace = true, optional = true }
 [dev-dependencies]
 base-node-runner = { path = ".", features = ["test-utils"] }
 criterion = { workspace = true, features = ["async_tokio", "html_reports"] }
+reth-firehose.workspace = true
+reth-chainspec.workspace = true
+base-test-utils.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [[bench]]
 name = "fcu_unsafe"
