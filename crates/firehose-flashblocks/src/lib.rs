@@ -9,7 +9,12 @@ mod tracer;
 pub use tracer::{FLASHBLOCK_TRACER_ID, FlashblocksTracerHandle};
 
 mod processor;
-pub use processor::{ClockFn, FirehoseFlashblocksProcessor};
+pub use processor::{ClockFn, FirehoseFlashblocksProcessor, FlashblockPeekClassifier};
+
+mod dispatcher;
+pub use dispatcher::{
+    CanonicalBlockSender, FirehoseFlashblocksDispatcher, FlashblockEnqueuer, ProcessorCommand,
+};
 
 mod streamer;
 pub use streamer::FirehoseFlashblocksStreamer;

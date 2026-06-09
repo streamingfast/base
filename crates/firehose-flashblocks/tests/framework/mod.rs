@@ -32,7 +32,8 @@ use base_common_flashblocks::{
 };
 use base_execution_chainspec::BaseChainSpec;
 use base_firehose_flashblocks::{
-    ClockFn, FirehoseFlashblocksProcessor, FlashblocksTracerHandle,
+    CanonicalBlockSender, ClockFn, FirehoseFlashblocksDispatcher, FirehoseFlashblocksProcessor,
+    FlashblockEnqueuer, FlashblocksTracerHandle,
 };
 use base_flashblocks::{BlockAssembler, FlashblocksReceiver};
 use base64::Engine as _;
@@ -1685,4 +1686,85 @@ fn run_flashblock_sequence_internal(
     }
 
     (output, processor)
+}
+
+/// Drives a [`FirehoseFlashblocksProcessor`] through `events` using the **production** serialized
+/// command queue (the [`FirehoseFlashblocksDispatcher`] + [`FlashblockEnqueuer`] +
+/// [`CanonicalBlockSender`] path) rather than calling the processor's methods directly.
+///
+/// Every canonical block in `events` is marked available up front, then a single consumer task is
+/// spawned and every event is enqueued in list order from one producer. Because enqueueing
+/// touches no shared state, the consumer observes the commands in exactly the enqueued order, so
+/// the run is deterministic. This mirrors the real wiring where flashblocks and the two canonical
+/// signal sources funnel into one queue and are applied strictly in arrival order — never
+/// concurrently. (It deliberately does not model the pending/replay availability-timing path;
+/// fixtures should keep each block's parent available, i.e. exercise the fast/bootstrap path.)
+///
+/// Returns the raw flashblock-tracer output, prefixed with a single `# SOURCE FLASH` marker so
+/// [`parse_fire_events`] classifies every line as a [`FireEvent::FlashBlock`].
+pub(crate) async fn run_flashblock_sequence_via_dispatcher(
+    client: GenesisClient,
+    events: Vec<TestEvent>,
+    now_secs: u64,
+) -> Vec<u8> {
+    let flash_buffer = InMemoryBuffer::new();
+    let chain_id = client.chain_spec().chain().id();
+
+    let flash_writer: Box<dyn std::io::Write + Send> = Box::new(flash_buffer.clone());
+    let tracer_handle = FlashblocksTracerHandle::with_writer(
+        Config { chain_client: ChainClient::Reth, ..Default::default() },
+        ChainConfig::new(chain_id),
+        flash_writer,
+    );
+
+    let clock: ClockFn = std::sync::Arc::new(move || now_secs);
+    let processor = std::sync::Arc::new(FirehoseFlashblocksProcessor::with_clock(
+        client.clone(),
+        tracer_handle,
+        clock,
+    ));
+
+    // Pre-mark every canonical block available so the consumer never hits the pending/replay
+    // availability race; enqueueing then mutates no shared state and the FIFO order is exact.
+    for event in &events {
+        if let TestEvent::CanonicalBlock { block_number, .. } = event {
+            client.mark_canonical_block_available(*block_number);
+        }
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let dispatcher = FirehoseFlashblocksDispatcher::new(std::sync::Arc::clone(&processor));
+    let consumer = tokio::spawn(dispatcher.run(rx));
+
+    let enqueuer = FlashblockEnqueuer::new(tx.clone());
+    let canonical_block_sender = CanonicalBlockSender::new(tx.clone());
+    // Only `enqueuer` / `canonical_block_sender` keep the channel open from here on.
+    drop(tx);
+
+    for (idx, event) in events.iter().enumerate() {
+        match event.clone() {
+            TestEvent::Flashblock(fb) => {
+                // The value the production subscriber's 1-element peek slot would surface: the
+                // next queued flashblock, skipping canonical markers (which don't live on the
+                // flashblock WS channel).
+                let peek = events.iter().skip(idx + 1).find_map(|e| match e {
+                    TestEvent::Flashblock(next) => Some(next.as_ref()),
+                    TestEvent::CanonicalBlock { .. } => None,
+                });
+                enqueuer.on_flashblock_received_with_peek(*fb, peek);
+            }
+            TestEvent::CanonicalBlock { block_number, block_hash } => {
+                canonical_block_sender.send(block_number, block_hash);
+            }
+        }
+    }
+
+    // Close the channel so the consumer drains the backlog and exits, then wait for it.
+    drop(enqueuer);
+    drop(canonical_block_sender);
+    consumer.await.expect("dispatcher consumer task panicked");
+
+    let mut output = b"# SOURCE FLASH\n".to_vec();
+    output.extend_from_slice(&flash_buffer.get_bytes());
+    output
 }

@@ -74,6 +74,58 @@ type BoxedStateProvider = Box<dyn StateProvider + Send + 'static>;
 /// cache (which holds the committed effects of all prior flashblocks).
 type AccumulatedDb = State<StateProviderDatabase<BoxedStateProvider>>;
 
+/// Classifies a freshly-received flashblock against the WS subscriber's 1-element peek window,
+/// producing `(squash, is_final_expected_hash)` for [`FirehoseFlashblocksProcessor::process`].
+///
+/// Lives outside the processor (and is free of the `Client` type parameter) so the ingress
+/// layer can classify at the moment the peek reference is still live — before the owned
+/// flashblock is handed to the serialized command queue — without depending on the processor's
+/// provider bounds.
+#[derive(Debug)]
+pub struct FlashblockPeekClassifier;
+
+impl FlashblockPeekClassifier {
+    /// Classifies the peeked next message and produces `(squash, is_final_expected_hash)`.
+    ///
+    /// Exactly one of the two values is "active" (or neither, if the peek is empty or
+    /// unrelated):
+    ///
+    /// - **Squash** — `(true, None)`: the current flashblock is a delta (`index > 0`) and
+    ///   the peek shows another message for the same block (a higher-index delta or a
+    ///   same-block restart base). The current flashblock's data is accumulated into
+    ///   `stored_flashblocks`, but EVM execution and FIRE BLOCK emission are deferred to
+    ///   the next non-squashed flashblock. Geth's strict version at `controller.go:394-396`
+    ///   only squashes on a same-block restart base; this implementation extends to also
+    ///   squash same-block higher-index deltas.
+    ///
+    /// - **is_final** — `(false, Some(expected_parent_hash))`: the peek shows the base of
+    ///   the immediately next block (`peek.block_number == current.block_number + 1` and
+    ///   `peek.index == 0`). The current flashblock will execute through the EVM, and just
+    ///   before the FIRE BLOCK is flushed the processor will recompute the canonical block
+    ///   hash from the post-execution state and override it on the tracer via
+    ///   `set_final_flash_block`. The wire emission becomes a single FIRE BLOCK stamped
+    ///   `idx + 1000` and sealed with the recomputed hash — matching geth's peek path at
+    ///   `controller.go:398-405`.
+    ///
+    /// - **None** — `(false, None)`: peek is absent or unrelated; the current flashblock
+    ///   executes and emits as a non-final partial.
+    pub fn classify(current: &Flashblock, peek: Option<&Flashblock>) -> (bool, Option<B256>) {
+        let Some(peek) = peek else { return (false, None) };
+        let cur_block = current.metadata.block_number;
+        let peek_block = peek.metadata.block_number;
+        if peek_block == cur_block && current.index > 0 {
+            return (true, None);
+        }
+        if peek_block == cur_block + 1
+            && peek.index == 0
+            && let Some(base) = peek.base.as_ref()
+        {
+            return (false, Some(base.parent_hash));
+        }
+        (false, None)
+    }
+}
+
 /// Result of [`FirehoseFlashblocksProcessor::execute_flashblock`].
 ///
 /// Both flags are needed by callers to drive post-execution state mutations:
@@ -430,7 +482,19 @@ where
     /// Process a single flashblock event. Errors are logged and swallowed: the processor clears
     /// its in-flight state and accumulated DB so the next base flashblock restarts tracking.
     ///
-    /// `squash` carries the verdict of [`Self::classify_peek`]: when `true`, the validator
+    /// # Serialization invariant
+    ///
+    /// This must only ever be driven from a single thread, interleaved with no other call to
+    /// `process` or [`Self::on_canonical_block`]. In production that is guaranteed by routing
+    /// every event through the single-consumer
+    /// [`FirehoseFlashblocksDispatcher`](crate::FirehoseFlashblocksDispatcher) command queue.
+    /// `process_inner` deliberately releases the `state` mutex across EVM execution, so calling
+    /// this concurrently from multiple producers reintroduces the data race it was built to
+    /// prevent (a canonical signal mutating/resetting the in-flight state mid-execution, yielding
+    /// wrong state roots and duplicate is_final emissions). Do not call it directly outside that
+    /// serialized path.
+    ///
+    /// `squash` carries the verdict of [`FlashblockPeekClassifier::classify`]: when `true`, the validator
     /// still accepts the message into `stored_flashblocks` (so its transactions are not
     /// lost) but EVM execution and FIRE BLOCK emission are deferred to the next
     /// non-squashed flashblock — which will gather and execute all the held-back
@@ -442,52 +506,17 @@ where
     /// [`firehose_tracer::Tracer::set_final_flash_block`] with the locally-recomputed hash
     /// and state_root before the FIRE BLOCK is flushed, matching geth's
     /// `Firehose.SetFinalFlashBlock` + `OnBlockEnd` pattern.
-    fn process(&self, flashblock: Flashblock, squash: bool, is_final_expected_hash: Option<B256>) {
+    pub fn process(
+        &self,
+        flashblock: Flashblock,
+        squash: bool,
+        is_final_expected_hash: Option<B256>,
+    ) {
         if let Err(err) = self.process_inner(flashblock, squash, is_final_expected_hash) {
             error!(error = %err, "flashblock processing failed; resetting state and waiting for next base");
             let mut state = self.state.lock().expect("flashblock state mutex poisoned");
             state.reset();
         }
-    }
-
-    /// Classifies the peeked next message and produces `(squash, is_final_expected_hash)`.
-    ///
-    /// Exactly one of the two values is "active" (or neither, if the peek is empty or
-    /// unrelated):
-    ///
-    /// - **Squash** — `(true, None)`: the current flashblock is a delta (`index > 0`) and
-    ///   the peek shows another message for the same block (a higher-index delta or a
-    ///   same-block restart base). The current flashblock's data is accumulated into
-    ///   `stored_flashblocks`, but EVM execution and FIRE BLOCK emission are deferred to
-    ///   the next non-squashed flashblock. Geth's strict version at `controller.go:394-396`
-    ///   only squashes on a same-block restart base; this implementation extends to also
-    ///   squash same-block higher-index deltas.
-    ///
-    /// - **is_final** — `(false, Some(expected_parent_hash))`: the peek shows the base of
-    ///   the immediately next block (`peek.block_number == current.block_number + 1` and
-    ///   `peek.index == 0`). The current flashblock will execute through the EVM, and just
-    ///   before the FIRE BLOCK is flushed the processor will recompute the canonical block
-    ///   hash from the post-execution state and override it on the tracer via
-    ///   `set_final_flash_block`. The wire emission becomes a single FIRE BLOCK stamped
-    ///   `idx + 1000` and sealed with the recomputed hash — matching geth's peek path at
-    ///   `controller.go:398-405`.
-    ///
-    /// - **None** — `(false, None)`: peek is absent or unrelated; the current flashblock
-    ///   executes and emits as a non-final partial.
-    fn classify_peek(current: &Flashblock, peek: Option<&Flashblock>) -> (bool, Option<B256>) {
-        let Some(peek) = peek else { return (false, None) };
-        let cur_block = current.metadata.block_number;
-        let peek_block = peek.metadata.block_number;
-        if peek_block == cur_block && current.index > 0 {
-            return (true, None);
-        }
-        if peek_block == cur_block + 1
-            && peek.index == 0
-            && let Some(base) = peek.base.as_ref()
-        {
-            return (false, Some(base.parent_hash));
-        }
-        (false, None)
     }
 
     /// Returns `true` if a new-block base's `parent_hash` is consistent with the most
@@ -1846,7 +1875,7 @@ where
     }
 
     fn on_flashblock_received_with_peek(&self, flashblock: Flashblock, peek: Option<&Flashblock>) {
-        let (squash, is_final_expected_hash) = Self::classify_peek(&flashblock, peek);
+        let (squash, is_final_expected_hash) = FlashblockPeekClassifier::classify(&flashblock, peek);
         self.process(flashblock, squash, is_final_expected_hash);
     }
 }
