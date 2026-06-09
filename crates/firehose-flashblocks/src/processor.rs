@@ -482,6 +482,18 @@ where
     /// Process a single flashblock event. Errors are logged and swallowed: the processor clears
     /// its in-flight state and accumulated DB so the next base flashblock restarts tracking.
     ///
+    /// # Serialization invariant
+    ///
+    /// This must only ever be driven from a single thread, interleaved with no other call to
+    /// `process` or [`Self::on_canonical_block`]. In production that is guaranteed by routing
+    /// every event through the single-consumer
+    /// [`FirehoseFlashblocksDispatcher`](crate::FirehoseFlashblocksDispatcher) command queue.
+    /// `process_inner` deliberately releases the `state` mutex across EVM execution, so calling
+    /// this concurrently from multiple producers reintroduces the data race it was built to
+    /// prevent (a canonical signal mutating/resetting the in-flight state mid-execution, yielding
+    /// wrong state roots and duplicate is_final emissions). Do not call it directly outside that
+    /// serialized path.
+    ///
     /// `squash` carries the verdict of [`FlashblockPeekClassifier::classify`]: when `true`, the validator
     /// still accepts the message into `stored_flashblocks` (so its transactions are not
     /// lost) but EVM execution and FIRE BLOCK emission are deferred to the next

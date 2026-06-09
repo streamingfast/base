@@ -167,7 +167,12 @@ where
             })
             .await;
             if let Err(err) = outcome {
-                error!(error = %err, "firehose flashblocks command handler panicked; continuing");
+                // A handler panic means the processor's state mutex is almost certainly
+                // poisoned, so every subsequent command would panic too — continuing would
+                // just spin logging errors. Stop draining instead: dropping `rx` makes the
+                // ingress handles' sends fail fast (warn-and-drop) rather than pile up.
+                error!(error = %err, "firehose flashblocks command handler panicked; stopping dispatcher");
+                break;
             }
         }
         debug!("firehose flashblocks command queue closed; dispatcher consumer exiting");
