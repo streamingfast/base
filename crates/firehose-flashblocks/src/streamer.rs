@@ -13,7 +13,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use url::Url;
 
 use crate::{
-    CanonicalSender, FirehoseFlashblocksDispatcher, FirehoseFlashblocksProcessor,
+    CanonicalBlockSender, FirehoseFlashblocksDispatcher, FirehoseFlashblocksProcessor,
     FlashblockEnqueuer, ProcessorCommand,
 };
 
@@ -22,7 +22,7 @@ use crate::{
 ///
 /// All mutating events — WebSocket flashblocks and every canonical-block signal — are funnelled
 /// through a single command queue drained by one consumer task, so the processor's state is
-/// only ever mutated serially. Callers obtain a [`CanonicalSender`] via [`Self::canonical_sender`]
+/// only ever mutated serially. Callers obtain a [`CanonicalBlockSender`] via [`Self::canonical_block_sender`]
 /// to feed canonical-block notifications into that same queue.
 #[derive(Debug)]
 pub struct FirehoseFlashblocksStreamer<Client> {
@@ -44,7 +44,7 @@ where
 {
     /// Constructs the streamer with a pre-built processor (which already carries its dedicated
     /// tracer) and the WebSocket URL to subscribe to. The command queue is created here so
-    /// [`Self::canonical_sender`] is available before [`Self::start`] is called.
+    /// [`Self::canonical_block_sender`] is available before [`Self::start`] is called.
     pub fn new(processor: FirehoseFlashblocksProcessor<Client>, ws_url: Url) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         Self { processor: Arc::new(processor), ws_url, command_tx, command_rx: Some(command_rx) }
@@ -53,8 +53,8 @@ where
     /// Returns a sender that feeds canonical-block notifications into the shared command queue.
     /// Clone it once per signal source (e.g. the early in-engine notification and the
     /// post-commit canonical-state broadcast).
-    pub fn canonical_sender(&self) -> CanonicalSender {
-        CanonicalSender::new(self.command_tx.clone())
+    pub fn canonical_block_sender(&self) -> CanonicalBlockSender {
+        CanonicalBlockSender::new(self.command_tx.clone())
     }
 
     /// Spawns the command-queue consumer and the WebSocket subscriber. The subscriber owns its

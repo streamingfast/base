@@ -141,15 +141,15 @@ impl BaseNodeExtension for FirehoseFlashblocksExtension {
             // Both canonical signals feed the processor's single serialized command queue, so
             // they are applied in strict arrival order relative to each other and to the
             // WebSocket flashblock stream — never concurrently.
-            let canonical_sender = streamer.canonical_sender();
+            let canonical_block_sender = streamer.canonical_block_sender();
             streamer.start();
 
             // Earliest in-engine signal: drain canonical blocks forwarded by the engine-event
             // listener installed above.
-            let canonical_sender_for_engine = canonical_sender.clone();
+            let canonical_block_sender_for_engine = canonical_block_sender.clone();
             tokio::spawn(async move {
                 while let Some((number, hash)) = canonical_rx.recv().await {
-                    canonical_sender_for_engine.send(number, hash);
+                    canonical_block_sender_for_engine.send(number, hash);
                 }
             });
 
@@ -168,7 +168,7 @@ impl BaseNodeExtension for FirehoseFlashblocksExtension {
                         }
                     };
                     for block in notification.committed().blocks_iter() {
-                        canonical_sender.send(block.number, block.hash());
+                        canonical_block_sender.send(block.number, block.hash());
                     }
                 }
             });

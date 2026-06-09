@@ -13,7 +13,7 @@ pub use processor::{ClockFn, FirehoseFlashblocksProcessor, FlashblockPeekClassif
 
 mod dispatcher;
 pub use dispatcher::{
-    CanonicalSender, FirehoseFlashblocksDispatcher, FlashblockEnqueuer, ProcessorCommand,
+    CanonicalBlockSender, FirehoseFlashblocksDispatcher, FlashblockEnqueuer, ProcessorCommand,
 };
 
 mod streamer;

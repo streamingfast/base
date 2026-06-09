@@ -32,7 +32,7 @@ use base_common_flashblocks::{
 };
 use base_execution_chainspec::BaseChainSpec;
 use base_firehose_flashblocks::{
-    CanonicalSender, ClockFn, FirehoseFlashblocksDispatcher, FirehoseFlashblocksProcessor,
+    CanonicalBlockSender, ClockFn, FirehoseFlashblocksDispatcher, FirehoseFlashblocksProcessor,
     FlashblockEnqueuer, FlashblocksTracerHandle,
 };
 use base_flashblocks::{BlockAssembler, FlashblocksReceiver};
@@ -1690,7 +1690,7 @@ fn run_flashblock_sequence_internal(
 
 /// Drives a [`FirehoseFlashblocksProcessor`] through `events` using the **production** serialized
 /// command queue (the [`FirehoseFlashblocksDispatcher`] + [`FlashblockEnqueuer`] +
-/// [`CanonicalSender`] path) rather than calling the processor's methods directly.
+/// [`CanonicalBlockSender`] path) rather than calling the processor's methods directly.
 ///
 /// Every canonical block in `events` is marked available up front, then a single consumer task is
 /// spawned and every event is enqueued in list order from one producer. Because enqueueing
@@ -1737,8 +1737,8 @@ pub(crate) async fn run_flashblock_sequence_via_dispatcher(
     let consumer = tokio::spawn(dispatcher.run(rx));
 
     let enqueuer = FlashblockEnqueuer::new(tx.clone());
-    let canonical_sender = CanonicalSender::new(tx.clone());
-    // Only `enqueuer` / `canonical_sender` keep the channel open from here on.
+    let canonical_block_sender = CanonicalBlockSender::new(tx.clone());
+    // Only `enqueuer` / `canonical_block_sender` keep the channel open from here on.
     drop(tx);
 
     for (idx, event) in events.iter().enumerate() {
@@ -1754,14 +1754,14 @@ pub(crate) async fn run_flashblock_sequence_via_dispatcher(
                 enqueuer.on_flashblock_received_with_peek(*fb, peek);
             }
             TestEvent::CanonicalBlock { block_number, block_hash } => {
-                canonical_sender.send(block_number, block_hash);
+                canonical_block_sender.send(block_number, block_hash);
             }
         }
     }
 
     // Close the channel so the consumer drains the backlog and exits, then wait for it.
     drop(enqueuer);
-    drop(canonical_sender);
+    drop(canonical_block_sender);
     consumer.await.expect("dispatcher consumer task panicked");
 
     let mut output = b"# SOURCE FLASH\n".to_vec();

@@ -74,16 +74,9 @@ impl FlashblockEnqueuer {
 
 impl FlashblocksReceiver for FlashblockEnqueuer {
     fn on_flashblock_received(&self, flashblock: Flashblock) {
-        let block = flashblock.metadata.block_number;
-        let index = flashblock.index;
-        let command = ProcessorCommand::Flashblock {
-            flashblock: Box::new(flashblock),
-            squash: false,
-            is_final_expected_hash: None,
-        };
-        if self.tx.send(command).is_err() {
-            warn!(block, index, "firehose flashblocks command queue closed; dropping flashblock");
-        }
+        // Equivalent to the peek path with an empty peek: `classify(_, None)` yields
+        // `(squash = false, is_final_expected_hash = None)`.
+        self.on_flashblock_received_with_peek(flashblock, None);
     }
 
     fn on_flashblock_received_with_peek(&self, flashblock: Flashblock, peek: Option<&Flashblock>) {
@@ -104,11 +97,11 @@ impl FlashblocksReceiver for FlashblockEnqueuer {
 /// Ingress handle for canonical-block signals. Cloned once per signal source (the early
 /// in-engine notification and the post-commit canonical-state broadcast both hold a clone).
 #[derive(Debug, Clone)]
-pub struct CanonicalSender {
+pub struct CanonicalBlockSender {
     tx: UnboundedSender<ProcessorCommand>,
 }
 
-impl CanonicalSender {
+impl CanonicalBlockSender {
     /// Wraps a command-queue sender as a canonical-signal ingress handle.
     pub const fn new(tx: UnboundedSender<ProcessorCommand>) -> Self {
         Self { tx }
