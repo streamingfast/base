@@ -27,7 +27,7 @@ use base_flashblocks::FlashblocksReceiver;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::{FirehoseFlashblocksProcessor, FlashblockPeekClassifier};
 
@@ -144,20 +144,30 @@ where
         Self { processor }
     }
 
-    /// Consumes commands from `rx` until every sender has dropped, applying each synchronously.
+    /// Consumes commands from `rx` until every sender has dropped, applying each to completion
+    /// before the next is dequeued.
     ///
-    /// The handlers run inline (not via `spawn_blocking`) so the per-block speculative
-    /// state-root precompute — which spawns through [`tokio::runtime::Handle::try_current`] —
-    /// still sees a runtime. This must therefore be driven on a tokio task.
+    /// Each command's synchronous handler runs on the blocking pool via
+    /// [`tokio::task::spawn_blocking`], and the consumer `await`s it before pulling the next
+    /// command. This keeps the (~100 ms) state-root trie traversal off the runtime's worker
+    /// threads — so it never starves other tasks — while still applying commands strictly in
+    /// arrival order. `spawn_blocking` closures run within the runtime context, so the
+    /// processor's per-block speculative state-root precompute (which spawns through
+    /// [`tokio::runtime::Handle::try_current`]) keeps working.
     pub async fn run(self, mut rx: UnboundedReceiver<ProcessorCommand>) {
         while let Some(command) = rx.recv().await {
-            match command {
+            let processor = Arc::clone(&self.processor);
+            let outcome = tokio::task::spawn_blocking(move || match command {
                 ProcessorCommand::Flashblock { flashblock, squash, is_final_expected_hash } => {
-                    self.processor.process(*flashblock, squash, is_final_expected_hash);
+                    processor.process(*flashblock, squash, is_final_expected_hash);
                 }
                 ProcessorCommand::CanonicalBlock { number, hash } => {
-                    self.processor.on_canonical_block(number, hash);
+                    processor.on_canonical_block(number, hash);
                 }
+            })
+            .await;
+            if let Err(err) = outcome {
+                error!(error = %err, "firehose flashblocks command handler panicked; continuing");
             }
         }
         debug!("firehose flashblocks command queue closed; dispatcher consumer exiting");
