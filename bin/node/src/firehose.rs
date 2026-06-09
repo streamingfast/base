@@ -138,21 +138,24 @@ impl BaseNodeExtension for FirehoseFlashblocksExtension {
                 FirehoseFlashblocksProcessor::new(full_node.provider.clone(), tracer);
             info!(url = %ws_url_for_node, "starting Firehose flashblocks streamer");
             let streamer = FirehoseFlashblocksStreamer::new(processor, ws_url_for_node);
-            let processor_for_canonical = streamer.processor();
+            // Both canonical signals feed the processor's single serialized command queue, so
+            // they are applied in strict arrival order relative to each other and to the
+            // WebSocket flashblock stream — never concurrently.
+            let canonical_sender = streamer.canonical_sender();
             streamer.start();
 
             // Earliest in-engine signal: drain canonical blocks forwarded by the engine-event
             // listener installed above.
-            let processor_for_engine_events = processor_for_canonical.clone();
+            let canonical_sender_for_engine = canonical_sender.clone();
             tokio::spawn(async move {
                 while let Some((number, hash)) = canonical_rx.recv().await {
-                    processor_for_engine_events.on_canonical_block(number, hash);
+                    canonical_sender_for_engine.send(number, hash);
                 }
             });
 
             // Fallback path: canonical-state notification fires after the canonical chain has
-            // been committed. `final_part_sent` inside the processor prevents double-emission
-            // when both signals deliver the same block.
+            // been committed. The serialized queue applies it after the early signal (when both
+            // deliver the same block), so `final_part_sent` reliably suppresses double-emission.
             let mut canonical_stream =
                 BroadcastStream::new(full_node.provider.subscribe_to_canonical_state());
             tokio::spawn(async move {
@@ -165,7 +168,7 @@ impl BaseNodeExtension for FirehoseFlashblocksExtension {
                         }
                     };
                     for block in notification.committed().blocks_iter() {
-                        processor_for_canonical.on_canonical_block(block.number, block.hash());
+                        canonical_sender.send(block.number, block.hash());
                     }
                 }
             });
