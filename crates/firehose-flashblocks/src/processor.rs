@@ -788,6 +788,13 @@ where
                             }
                         }
                         state.start_block(flashblock);
+                        // Do not carry the EVM `State` across block boundaries. The next block
+                        // re-bootstraps a fresh `State` from the canonical parent on its first
+                        // execution (or buffers pending → replays if the parent isn't committed
+                        // yet). Reusing the carried `State` let its read cache drift from the
+                        // validated bundle and corrupt subsequent blocks — the divergence was
+                        // confined entirely to carried, incrementally-executed blocks.
+                        state.accumulated_db = None;
                         if awaiting {
                             // The previous block was replayed and has not yet been confirmed
                             // by a canonical-block notification. Defer this transition: the
@@ -934,6 +941,9 @@ where
 
         let parent_block = block_number.saturating_sub(1);
 
+        // The carried `State` is dropped at every block boundary (see the `FirstOfNextBlock`
+        // transition), so this bootstraps a fresh `State` from the canonical parent on every
+        // block's first execution.
         if accumulated_db.is_none() {
             match self.try_bootstrap_provider(parent_block) {
                 Some(provider) => {
@@ -967,10 +977,7 @@ where
         // canonical-chain commit: the in-memory state may be queryable while
         // `header_by_number` (which reads the canonical chain) still returns None.
         // Treat that the same as a bootstrap failure — buffer the sequence so the
-        // canonical-block notification replays it once the header lands. Otherwise the
-        // error would bubble out of `process_inner`, the outer `process` would reset
-        // state, and subsequent flashblocks for the same block would be dropped as
-        // "no in-flight sequence" — losing the whole block on the flashblock stream.
+        // canonical-block notification replays it once the header lands.
         match self.client.header_by_number(parent_block) {
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => {
@@ -1696,6 +1703,12 @@ where
             }
         }
 
+        // The returned `BlockExecutionResult` is intentionally dropped. A fresh
+        // `BaseBlockExecutor` is created per `execute_flashblock` call, so its receipts'
+        // `cumulative_gas_used` restarts at 0 each pass (per-flashblock, not block-cumulative).
+        // That is harmless here: the FIRE BLOCK is built from the tracer's own per-tx accounting
+        // (not these receipts), the state root is derived from the bundle, and fee-vault credits
+        // use per-tx gas — nothing consumes this value.
         executor.finish().map_err(|e| Error::Execution(Box::new(e)))?;
 
         // Promote the per-tx cache transitions accumulated by the EVM into

@@ -388,6 +388,9 @@ fn two_blocks_with_deltas() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
     let client = GenesisClient::new(genesis);
+    // The processor re-bootstraps each block's state from its (committed) parent rather than
+    // carrying the in-flight `State` forward, so block 2's parent (block 1) must be available.
+    client.mark_canonical_block_available(1);
     let ts = 0x67d00000u64;
 
     // Block 2's `parent_hash` must equal block 1's locally-recomputed hash so the
@@ -821,6 +824,8 @@ fn is_final_emitted_on_next_base_match() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
     let client = GenesisClient::new(genesis);
+    // Re-bootstrap per block: block 2's parent (block 1) must be available.
+    client.mark_canonical_block_available(1);
     let ts = 0x67d00000u64;
 
     // First, build a placeholder block-1 sequence to extract the recomputed hash via
@@ -932,6 +937,8 @@ fn squash_does_not_apply_across_block_boundaries() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
     let client = GenesisClient::new(genesis);
+    // Re-bootstrap per block: block 2's parent (block 1) must be available.
+    client.mark_canonical_block_available(1);
     let ts = 0x67d00000u64;
 
     let placeholder =
@@ -1310,6 +1317,8 @@ fn next_base_accepted_when_delta_diff_block_hash_diverges_from_recompute() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
     let client = GenesisClient::new(genesis);
+    // Re-bootstrap per block: block 2's parent (block 1) must be available.
+    client.mark_canonical_block_available(1);
     let ts = 0x67d00000u64;
 
     let placeholder = vec![
@@ -1481,6 +1490,8 @@ fn next_base_accepted_without_peek_when_recompute_matches() {
     let genesis = test_genesis();
     let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
     let client = GenesisClient::new(genesis);
+    // Re-bootstrap per block: block 2's parent (block 1) must be available.
+    client.mark_canonical_block_available(1);
     let ts = 0x67d00000u64;
 
     let placeholder =
