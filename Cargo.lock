@@ -4503,7 +4503,7 @@ dependencies = [
 
 [[package]]
 name = "base-execution-firehose"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "alloy-consensus 2.0.5",
  "alloy-evm",
@@ -4712,7 +4712,7 @@ dependencies = [
 
 [[package]]
 name = "base-firehose-flashblocks"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "alloy-consensus 2.0.5",
  "alloy-eips 2.0.5",
@@ -4757,7 +4757,7 @@ dependencies = [
 
 [[package]]
 name = "base-firehose-tests"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "alloy-consensus 2.0.5",
  "alloy-eips 2.0.5",

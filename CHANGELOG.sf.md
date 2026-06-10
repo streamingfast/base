@@ -1,3 +1,12 @@
+## v1.0.1-fh
+
+* Bumped base to `v1.0.1`
+* Fixes on flash blocks: fetch fresh state on every block to avoid mismatches that cause UNDOs
+
+## v1.0.0-fh
+
+* Bumped base to `v1.0.0`
+
 ## v0.9.1-fh-1
 
 * Fixed flash blocks to arrive in the right order and be 100% identical to the canonical blocks
