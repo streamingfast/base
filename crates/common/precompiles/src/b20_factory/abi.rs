@@ -8,19 +8,10 @@ sol! {
         // ── Structs ─────────────────────────────────────────────────────────
 
         enum B20Variant {
-            /// Default B-20 token variant.
-            DEFAULT,
+            /// Asset B-20 token variant.
+            ASSET,
             /// Stablecoin B-20 token variant.
-            STABLECOIN,
-            /// Security B-20 token variant.
-            SECURITY
-        }
-
-        struct B20CreateParams {
-            uint8 version;
-            string name;
-            string symbol;
-            address initialAdmin;
+            STABLECOIN
         }
 
         struct B20StablecoinCreateParams {
@@ -31,16 +22,18 @@ sol! {
             string currency;
         }
 
-        struct B20SecurityCreateParams {
+        struct B20AssetCreateParams {
             uint8 version;
             string name;
             string symbol;
             address initialAdmin;
-            string isin;
-            uint256 minimumRedeemable;
+            uint8 decimals;
         }
 
         // ── Errors ───────────────────────────────────────────────────────────
+
+        /// ETH was sent to a nonpayable factory function.
+        error NonPayable();
 
         /// A token already exists at the address derived from `(variant, msg.sender, salt)`.
         error TokenAlreadyExists(address token);
@@ -52,10 +45,14 @@ sol! {
         error UnsupportedVersion(uint8 version, B20Variant variant);
 
         /// A required string argument was empty.
-        error MissingRequiredField();
+        /// @param field  Name of the missing field (e.g. `"currency"`).
+        error MissingRequiredField(string field);
 
         /// The stablecoin `currency` field was not on the ISO 4217 fiat allowlist.
         error InvalidCurrency(string code);
+
+        /// The asset `decimals` field was outside the allowed range.
+        error InvalidDecimals(uint8 decimals);
 
         /// One of the post-creation init calls failed.
         error InitCallFailed(uint256 index);
@@ -67,8 +64,16 @@ sol! {
             B20Variant indexed variant,
             string name,
             string symbol,
-            uint8 decimals
+            uint8 decimals,
+            bytes variantParams
         );
+
+        /// ABI-encoded payload for the `variantParams` field of `B20Created`
+        /// when variant is `STABLECOIN`.
+        struct B20StablecoinEventParams {
+            uint8 version;
+            string currency;
+        }
 
         // ── Functions ────────────────────────────────────────────────────────
 
@@ -93,5 +98,37 @@ sol! {
 
         /// Returns `true` if `token` has been initialized by this factory.
         function isB20Initialized(address token) external view returns (bool);
+    }
+}
+
+impl IB20Factory::IB20FactoryCalls {
+    /// Returns the stable metric label for this decoded factory call.
+    pub const fn as_label(&self) -> &'static str {
+        match self {
+            Self::createB20(_) => "factory.createB20",
+            Self::getB20Address(_) => "factory.getB20Address",
+            Self::isB20(_) => "factory.isB20",
+            Self::isB20Initialized(_) => "factory.isB20Initialized",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::{Address, B256};
+
+    use crate::IB20Factory;
+
+    #[test]
+    fn factory_call_labels_are_stable() {
+        assert_eq!(
+            IB20Factory::IB20FactoryCalls::getB20Address(IB20Factory::getB20AddressCall {
+                variant: IB20Factory::B20Variant::ASSET,
+                sender: Address::ZERO,
+                salt: B256::ZERO,
+            })
+            .as_label(),
+            "factory.getB20Address"
+        );
     }
 }

@@ -7,7 +7,7 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolEvent, SolValue};
 use base_action_harness::TEST_ACCOUNT_KEY;
 use base_common_consensus::{BaseBlock, BaseTxEnvelope};
-use base_common_precompiles::{B20TokenRole, IB20};
+use base_common_precompiles::{B20_MAX_SUPPLY_CAP, B20TokenRole, IB20};
 
 use crate::env::BerylTestEnv;
 
@@ -216,37 +216,21 @@ async fn b20_staticcall_abi_returns_storage_values() {
 }
 
 #[tokio::test]
-async fn b20_transfer_reverts_while_token_feature_is_deactivated() {
+async fn b20_transfer_succeeds_while_token_feature_is_deactivated() {
     let mut scenario = B20TokenScenario::new().await;
 
-    let deactivate_b20 = scenario.env.deactivate_feature_tx(BerylTestEnv::b20_token_feature());
+    let deactivate_b20 = scenario.env.deactivate_feature_tx(BerylTestEnv::b20_asset_feature());
     let block = scenario.build_block_with_transactions(vec![deactivate_b20]).await;
 
-    assert!(scenario.env.user_tx_succeeded(&block, 0), "B20_TOKEN deactivation must succeed");
+    assert!(scenario.env.user_tx_succeeded(&block, 0), "B20_ASSET deactivation must succeed");
 
     let transfer_while_deactivated =
         scenario.env.transfer_b20_tx(scenario.token, BerylTestEnv::bob(), U256::from(1));
     let block = scenario.build_block_with_transactions(vec![transfer_while_deactivated]).await;
 
     assert!(
-        !scenario.env.user_tx_succeeded(&block, 0),
-        "token transfer must revert when B20_TOKEN is deactivated"
-    );
-    scenario.assert_balances(BerylTestEnv::B20_INITIAL_SUPPLY, 0, 0);
-    scenario.assert_total_supply(BerylTestEnv::B20_INITIAL_SUPPLY);
-
-    let reactivate_b20 = scenario.env.activate_feature_tx(BerylTestEnv::b20_token_feature());
-    let block = scenario.build_block_with_transactions(vec![reactivate_b20]).await;
-
-    assert!(scenario.env.user_tx_succeeded(&block, 0), "B20_TOKEN re-activation must succeed");
-
-    let transfer_after_reactivate =
-        scenario.env.transfer_b20_tx(scenario.token, BerylTestEnv::bob(), U256::from(1));
-    let block = scenario.build_block_with_transactions(vec![transfer_after_reactivate]).await;
-
-    assert!(
         scenario.env.user_tx_succeeded(&block, 0),
-        "token transfer must succeed after B20_TOKEN is re-activated"
+        "existing token transfer must succeed even when B20_ASSET is deactivated"
     );
     scenario.assert_transfer_log(&block, BerylTestEnv::alice(), BerylTestEnv::bob(), 1);
     scenario.assert_balances(BerylTestEnv::B20_INITIAL_SUPPLY - 1, 1, 0);
@@ -313,7 +297,11 @@ async fn b20_staticcall_abi_covers_all_read_methods() {
                 IB20::isPausedCall { feature: IB20::PausableFeature::TRANSFER }.abi_encode(),
                 U256::ZERO,
             ),
-            StaticcallCase::word("supplyCap", IB20::supplyCapCall {}.abi_encode(), U256::MAX),
+            StaticcallCase::word(
+                "supplyCap",
+                IB20::supplyCapCall {}.abi_encode(),
+                B20_MAX_SUPPLY_CAP,
+            ),
             StaticcallCase::word(
                 "DOMAIN_SEPARATOR",
                 IB20::DOMAIN_SEPARATORCall {}.abi_encode(),
@@ -448,7 +436,7 @@ async fn b20_extended_mutations_update_state_and_emit_events() {
         3,
         IB20::SupplyCapUpdated {
             updater: BerylTestEnv::alice(),
-            oldSupplyCap: U256::MAX,
+            oldSupplyCap: B20_MAX_SUPPLY_CAP,
             newSupplyCap: new_cap,
         }
         .encode_log_data(),
@@ -614,14 +602,10 @@ impl B20TokenScenario {
 
         scenario.build_block_with_transactions(Vec::new()).await;
 
-        let activate_factory =
-            scenario.env.activate_feature_tx(BerylTestEnv::b20_factory_feature());
-        let activate_b20 = scenario.env.activate_feature_tx(BerylTestEnv::b20_token_feature());
-        let block =
-            scenario.build_block_with_transactions(vec![activate_factory, activate_b20]).await;
+        let activate_b20 = scenario.env.activate_feature_tx(BerylTestEnv::b20_asset_feature());
+        let block = scenario.build_block_with_transactions(vec![activate_b20]).await;
 
-        assert!(scenario.env.user_tx_succeeded(&block, 0), "TOKEN_FACTORY activation must succeed");
-        assert!(scenario.env.user_tx_succeeded(&block, 1), "B20_TOKEN activation must succeed");
+        assert!(scenario.env.user_tx_succeeded(&block, 0), "B20_ASSET activation must succeed");
 
         let create = scenario.env.create_b20_token_tx();
         let block = scenario.build_block_with_transactions(vec![create]).await;
