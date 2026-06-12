@@ -391,11 +391,7 @@ where
         contract: Address,
         data: Bytes,
     ) -> Result<ResultAndState<Self::HaltReason>, Self::Error> {
-        if self.inspect {
-            InspectSystemCallEvm::inspect_system_call_with_caller(self, caller, contract, data)
-        } else {
-            SystemCallEvm::system_call_with_caller(self, caller, contract, data)
-        }
+        SystemCallEvm::system_call_with_caller(self, caller, contract, data)
     }
 
     fn finish(self) -> (Self::DB, EvmEnv<Self::Spec>) {
@@ -435,11 +431,7 @@ mod tests {
         JOVIAN_G2_MSM_MAX_INPUT_SIZE, JOVIAN_MAX_INPUT_SIZE, JOVIAN_PAIRING,
         JOVIAN_PAIRING_MAX_INPUT_SIZE,
     };
-    use revm::{
-        context::CfgEnv,
-        database::EmptyDB,
-        precompile::{PrecompileHalt, PrecompileStatus},
-    };
+    use revm::{context::CfgEnv, database::EmptyDB};
     use rstest::rstest;
 
     use super::*;
@@ -475,31 +467,11 @@ mod tests {
     }
 
     #[rstest]
-    #[case::bn254_pair(
-        *JOVIAN.address(),
-        JOVIAN_MAX_INPUT_SIZE,
-        PrecompileHalt::Bn254PairLength,
-    )]
-    #[case::bls12_g1_msm(
-        *JOVIAN_G1_MSM.address(),
-        JOVIAN_G1_MSM_MAX_INPUT_SIZE,
-        PrecompileHalt::Bls12381G1MsmInputLength,
-    )]
-    #[case::bls12_g2_msm(
-        *JOVIAN_G2_MSM.address(),
-        JOVIAN_G2_MSM_MAX_INPUT_SIZE,
-        PrecompileHalt::Bls12381G2MsmInputLength,
-    )]
-    #[case::bls12_pairing(
-        *JOVIAN_PAIRING.address(),
-        JOVIAN_PAIRING_MAX_INPUT_SIZE,
-        PrecompileHalt::Bls12381PairingInputLength,
-    )]
-    fn precompile_jovian_over_max_input(
-        #[case] address: Address,
-        #[case] max_size: usize,
-        #[case] expected_halt: PrecompileHalt,
-    ) {
+    #[case::bn254_pair(*JOVIAN.address(), JOVIAN_MAX_INPUT_SIZE)]
+    #[case::bls12_g1_msm(*JOVIAN_G1_MSM.address(), JOVIAN_G1_MSM_MAX_INPUT_SIZE)]
+    #[case::bls12_g2_msm(*JOVIAN_G2_MSM.address(), JOVIAN_G2_MSM_MAX_INPUT_SIZE)]
+    #[case::bls12_pairing(*JOVIAN_PAIRING.address(), JOVIAN_PAIRING_MAX_INPUT_SIZE)]
+    fn precompile_jovian_over_max_input(#[case] address: Address, #[case] max_size: usize) {
         let mut evm = BaseEvmFactory::default().create_evm(
             EmptyDB::default(),
             EvmEnv::new(
@@ -521,7 +493,7 @@ mod tests {
             internals: EvmInternals::from_context(ctx),
         });
         assert!(
-            matches!(result, Ok(ref output) if output.status == PrecompileStatus::Halt(expected_halt)),
+            result.is_err(),
             "precompile {address} should fail over max input size, got {result:?}"
         );
     }

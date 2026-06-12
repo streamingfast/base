@@ -2,7 +2,7 @@
 //! [`base_flashblocks::FlashblocksSubscriber`] so a single `start()` call spawns the WebSocket
 //! reader, the serialized command-queue consumer, and per-flashblock Firehose emission.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use alloy_consensus::Header;
 use base_common_chains::Upgrades;
@@ -72,7 +72,8 @@ where
 
         // WebSocket flashblocks enqueue into the same serialized queue.
         let enqueuer = Arc::new(FlashblockEnqueuer::new(self.command_tx.clone()));
-        let mut subscriber = FlashblocksSubscriber::new(enqueuer, self.ws_url.clone());
+        let mut subscriber =
+            FlashblocksSubscriber::new(enqueuer, self.ws_url.clone(), Duration::from_millis(500));
         subscriber.start();
     }
 }

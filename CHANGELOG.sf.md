@@ -1,3 +1,10 @@
+## v1.1.0-fh
+
+* Bumped base to `v1.1.0`
+* Maintained reth at v2.2.0 (firehose/2.x branch) pending reth-firehose v2.3.0 compatibility
+* Added Beryl hardfork activation timestamps (Sepolia: 1_781_805_600, Zeronet: 1_780_678_800)
+* Added Cobalt hardfork plumbing
+
 ## v1.0.1-fh
 
 * Bumped base to `v1.0.1`

@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 
 use alloy_consensus::{Block, BlockHeader, Sealable, Transaction};
 use alloy_eips::{Encodable2718, eip4895::Withdrawal, eip7685::Requests};
-use alloy_primitives::{B256, Bytes, Signature, keccak256};
+use alloy_primitives::{B256, Signature, keccak256};
 use alloy_rpc_types_engine::{
     CancunPayloadFields, ExecutionPayloadInputV2, ExecutionPayloadV3, PraguePayloadFields,
 };
@@ -124,19 +124,12 @@ pub struct ExecutionData {
     pub payload: BaseExecutionPayload,
     /// Additional fork-specific fields.
     pub sidecar: BaseExecutionPayloadSidecar,
-    /// Optional Amsterdam block access list RLP bytes.
-    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
-    pub block_access_list: Option<Bytes>,
 }
 
 impl ExecutionData {
     /// Creates new instance of [`ExecutionData`].
-    pub const fn new(
-        payload: BaseExecutionPayload,
-        sidecar: BaseExecutionPayloadSidecar,
-        block_access_list: Option<Bytes>,
-    ) -> Self {
-        Self { payload, sidecar, block_access_list }
+    pub const fn new(payload: BaseExecutionPayload, sidecar: BaseExecutionPayloadSidecar) -> Self {
+        Self { payload, sidecar }
     }
 
     /// Conversion from [`alloy_consensus::Block`]. Also returns the [`BaseExecutionPayloadSidecar`]
@@ -152,7 +145,7 @@ impl ExecutionData {
     {
         let (payload, sidecar) = BaseExecutionPayload::from_block_slow(block);
 
-        Self::new(payload, sidecar, None)
+        Self::new(payload, sidecar)
     }
 
     /// Conversion from [`alloy_consensus::Block`]. Also returns the [`BaseExecutionPayloadSidecar`]
@@ -164,30 +157,16 @@ impl ExecutionData {
         T: Encodable2718 + Transaction,
         H: BlockHeader,
     {
-        Self::from_block_unchecked_with_extras(block_hash, block, None)
-    }
-
-    /// Conversion from [`alloy_consensus::Block`] with optional Amsterdam block access list RLP
-    /// bytes.
-    pub fn from_block_unchecked_with_extras<T, H>(
-        block_hash: B256,
-        block: &Block<T, H>,
-        block_access_list: Option<Bytes>,
-    ) -> Self
-    where
-        T: Encodable2718 + Transaction,
-        H: BlockHeader,
-    {
         let (payload, sidecar) = BaseExecutionPayload::from_block_unchecked(block_hash, block);
 
-        Self::new(payload, sidecar, block_access_list)
+        Self::new(payload, sidecar)
     }
 
     /// Creates a new instance from args to engine API method `newPayloadV2`.
     ///
     /// Spec: <https://specs.base.org/protocol/execution#engine_newpayloadv2>
     pub fn v2(payload: ExecutionPayloadInputV2) -> Self {
-        Self::new(BaseExecutionPayload::v2(payload), BaseExecutionPayloadSidecar::default(), None)
+        Self::new(BaseExecutionPayload::v2(payload), BaseExecutionPayloadSidecar::default())
     }
 
     /// Creates a new instance from args to engine API method `newPayloadV3`.
@@ -204,7 +183,6 @@ impl ExecutionData {
                 parent_beacon_block_root,
                 versioned_hashes,
             )),
-            None,
         )
     }
 
@@ -223,7 +201,6 @@ impl ExecutionData {
                 CancunPayloadFields::new(parent_beacon_block_root, versioned_hashes),
                 PraguePayloadFields::new(execution_requests),
             ),
-            None,
         )
     }
 

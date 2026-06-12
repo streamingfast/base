@@ -1,6 +1,6 @@
 //! Contains the block executor for base.
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{borrow::Cow, boxed::Box, vec::Vec};
 
 use alloy_consensus::{Eip658Value, Header, Transaction, TransactionEnvelope, TxReceipt};
 use alloy_eips::{Encodable2718, Typed2718};
@@ -8,8 +8,9 @@ use alloy_evm::{
     Database, Evm, FromRecoveredTx, FromTxWithEncoded, RecoveredTx,
     block::{
         BlockExecutionError, BlockExecutionResult, BlockExecutor, BlockValidationError,
-        ExecutableTx, GasOutput, StateDB, SystemCaller,
-        state_changes::post_block_balance_increments,
+        ExecutableTx, GasOutput, OnStateHook, StateChangePostBlockSource, StateChangeSource,
+        StateDB, SystemCaller,
+        state_changes::{balance_increment_state, post_block_balance_increments},
     },
     eth::{EthTxResult, receipt_builder::ReceiptBuilderCtx},
 };
@@ -222,6 +223,8 @@ where
             depositor,
         } = output;
 
+        self.system_caller.on_state(StateChangeSource::Transaction(self.receipts.len()), &state);
+
         let tx_gas_used = result.tx_gas_used();
         let state_gas_used = result.gas().block_state_gas_used();
 
@@ -272,11 +275,20 @@ where
     ) -> Result<(Self::Evm, BlockExecutionResult<R::Receipt>), BlockExecutionError> {
         let balance_increments =
             post_block_balance_increments::<Header>(&self.spec, self.evm.block(), &[], None);
-
+        // increment balances
         self.evm
             .db_mut()
-            .increment_balances(balance_increments)
+            .increment_balances(balance_increments.clone())
             .map_err(|_| BlockValidationError::IncrementBalanceFailed)?;
+        // call state hook with changes due to balance increments.
+        self.system_caller.try_on_state_with(|| {
+            balance_increment_state(&balance_increments, self.evm.db_mut()).map(|state| {
+                (
+                    StateChangeSource::PostBlock(StateChangePostBlockSource::BalanceIncrements),
+                    Cow::Owned(state),
+                )
+            })
+        })?;
 
         let legacy_gas_used =
             self.receipts.last().map(|r| r.cumulative_gas_used()).unwrap_or_default();
@@ -290,6 +302,10 @@ where
                 blob_gas_used: self.da_footprint_used,
             },
         ))
+    }
+
+    fn set_state_hook(&mut self, hook: Option<Box<dyn OnStateHook>>) {
+        self.system_caller.with_state_hook(hook);
     }
 
     fn evm_mut(&mut self) -> &mut Self::Evm {

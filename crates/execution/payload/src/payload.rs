@@ -27,7 +27,7 @@ use reth_chainspec::EthChainSpec;
 use reth_payload_builder::PayloadBuilderError;
 use reth_payload_primitives::{BuildNextEnv, BuiltPayload, BuiltPayloadExecutedBlock};
 use reth_primitives_traits::{
-    Block as _, NodePrimitives, SealedBlock, SealedHeader, SignedTransaction, WithEncoded,
+    NodePrimitives, SealedBlock, SealedHeader, SignedTransaction, WithEncoded,
 };
 
 /// Minimal Ethereum payload builder attributes retained for Base payload construction.
@@ -265,8 +265,6 @@ pub struct BaseBuiltPayload<N: NodePrimitives = BasePrimitives> {
     pub(crate) block: Arc<SealedBlock<N::Block>>,
     /// Block execution data for the payload, if any.
     pub(crate) executed_block: Option<BuiltPayloadExecutedBlock<N>>,
-    /// Amsterdam block access list RLP bytes, if any.
-    pub(crate) block_access_list: Option<Bytes>,
     /// The fees of the block
     pub(crate) fees: U256,
 }
@@ -280,9 +278,8 @@ impl<N: NodePrimitives> BaseBuiltPayload<N> {
         block: Arc<SealedBlock<N::Block>>,
         fees: U256,
         executed_block: Option<BuiltPayloadExecutedBlock<N>>,
-        block_access_list: Option<Bytes>,
     ) -> Self {
-        Self { id, block, fees, executed_block, block_access_list }
+        Self { id, block, fees, executed_block }
     }
 
     /// Returns the identifier of the payload.
@@ -321,29 +318,8 @@ impl<N: NodePrimitives> BuiltPayload for BaseBuiltPayload<N> {
         self.executed_block.clone()
     }
 
-    fn block_access_list(&self) -> Option<&Bytes> {
-        self.block_access_list.as_ref()
-    }
-
     fn requests(&self) -> Option<Requests> {
         None
-    }
-}
-
-impl<N: NodePrimitives> From<BaseBuiltPayload<N>> for base_common_rpc_types_engine::ExecutionData
-where
-    N::SignedTx: SignedTransaction,
-{
-    fn from(value: BaseBuiltPayload<N>) -> Self {
-        let BaseBuiltPayload { block, block_access_list, .. } = value;
-        let block_hash = block.hash();
-        let block = Arc::unwrap_or_clone(block).into_block();
-
-        Self::from_block_unchecked_with_extras(
-            block_hash,
-            &block.into_ethereum_block(),
-            block_access_list,
-        )
     }
 }
 
