@@ -1,7 +1,8 @@
 ## v1.1.0-fh
 
 * Bumped base to `v1.1.0`
-* Maintained reth at v2.2.0 (firehose/2.x branch) pending reth-firehose v2.3.0 compatibility
+* Bumped `streamingfast/reth` dependencies to `tag = "v2.3.0-fh"` (reth v2.3.0, revm 40, alloy-evm 0.36)
+* Patched `alloy-evm` to the StreamingFast fork (`streamingfast/evm` branch `sf/v0.36.0`), which routes EVM system calls (EIP-4788, EIP-2935, etc.) through the Inspector so Firehose traces them — fixes the missing EIP-4788 beacon-roots pre-execution system call
 * Added Beryl hardfork activation timestamps (Sepolia: 1_781_805_600, Zeronet: 1_780_678_800)
 * Added Cobalt hardfork plumbing
 

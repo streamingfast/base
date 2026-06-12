@@ -72,8 +72,9 @@ where
 
         // WebSocket flashblocks enqueue into the same serialized queue.
         let enqueuer = Arc::new(FlashblockEnqueuer::new(self.command_tx.clone()));
+        // Matches the non-firehose subscription default (FlashblocksConfig).
         let mut subscriber =
-            FlashblocksSubscriber::new(enqueuer, self.ws_url.clone(), Duration::from_millis(500));
+            FlashblocksSubscriber::new(enqueuer, self.ws_url.clone(), Duration::from_secs(30));
         subscriber.start();
     }
 }
