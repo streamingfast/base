@@ -53,6 +53,8 @@ pub struct ChainConfig {
     pub azul_timestamp: Option<u64>,
     /// Beryl activation timestamp (optional).
     pub beryl_timestamp: Option<u64>,
+    /// Cobalt activation timestamp (optional).
+    pub cobalt_timestamp: Option<u64>,
 
     // Genesis
     /// L1 genesis block hash.
@@ -96,7 +98,11 @@ pub struct ChainConfig {
     /// Unsafe block signer address.
     pub unsafe_block_signer: Option<Address>,
     /// Activation registry admin address.
-    pub activation_admin_address: Option<Address>,
+    ///
+    /// Required and non-zero for all Base chains: every Base chain has Beryl scheduled, and
+    /// Beryl's activation registry precompile needs an admin at genesis. `Address::ZERO` is
+    /// rejected by chainspec validation.
+    pub activation_admin_address: Address,
 
     // Gas limits
     /// Maximum gas limit for L2 blocks.
@@ -246,7 +252,11 @@ impl ChainConfig {
             pectra_blob_schedule_time: self.pectra_blob_schedule_timestamp,
             isthmus_time: Some(self.isthmus_timestamp),
             jovian_time: Some(self.jovian_timestamp),
-            base: HardforkConfig { azul: self.azul_timestamp, beryl: self.beryl_timestamp },
+            base: HardforkConfig {
+                azul: self.azul_timestamp,
+                beryl: self.beryl_timestamp,
+                cobalt: self.cobalt_timestamp,
+            },
         }
     }
 
@@ -341,6 +351,7 @@ const MAINNET: ChainConfig = ChainConfig {
     jovian_timestamp: 1_764_691_201,
     azul_timestamp: Some(1_779_991_200),
     beryl_timestamp: None,
+    cobalt_timestamp: None,
 
     genesis_l1_hash: b256!("5c13d307623a926cd31415036c8b7fa14572f9dac64528e857a470511fc30771"),
     genesis_l1_number: 17_481_768,
@@ -362,7 +373,7 @@ const MAINNET: ChainConfig = ChainConfig {
     protocol_versions_address: address!("8062abc286f5e7d9428a0ccb9abd71e50d93b935"),
 
     unsafe_block_signer: Some(address!("Af6E19BE0F9cE7f8afd49a1824851023A8249e8a")),
-    activation_admin_address: Some(address!("331C9d37BbcebBC9dfAf98FBE3C5B8A39Dd6E771")),
+    activation_admin_address: address!("cE3a3bEE7E72E2A24079f3c0Cb3b97740ED425A9"),
 
     max_gas_limit: 105_000_000,
     prune_delete_limit: 20_000,
@@ -413,7 +424,8 @@ const SEPOLIA: ChainConfig = ChainConfig {
     isthmus_timestamp: 1_744_905_600,
     jovian_timestamp: 1_763_568_001,
     azul_timestamp: Some(1_776_708_000),
-    beryl_timestamp: None,
+    beryl_timestamp: Some(1_781_805_600),
+    cobalt_timestamp: None,
 
     genesis_l1_hash: b256!("cac9a83291d4dec146d6f7f69ab2304f23f5be87b1789119a0c5b1e4482444ed"),
     genesis_l1_number: 4_370_868,
@@ -435,7 +447,7 @@ const SEPOLIA: ChainConfig = ChainConfig {
     protocol_versions_address: address!("79add5713b383daa0a138d3c4780c7a1804a8090"),
 
     unsafe_block_signer: Some(address!("b830b99c95Ea32300039624Cb567d324D4b1D83C")),
-    activation_admin_address: Some(address!("5Be7Dd3678e999D5F7bC508c413db239F7D4Ac59")),
+    activation_admin_address: address!("5F43072722f59964d886CBb507F6a85ca0759D42"),
 
     max_gas_limit: 45_000_000,
     prune_delete_limit: 10_000,
@@ -478,6 +490,7 @@ const DEVNET: ChainConfig = ChainConfig {
     jovian_timestamp: 0,
     azul_timestamp: Some(0),
     beryl_timestamp: None,
+    cobalt_timestamp: None,
 
     genesis_l1_hash: B256::ZERO,
     genesis_l1_number: 0,
@@ -499,7 +512,7 @@ const DEVNET: ChainConfig = ChainConfig {
     protocol_versions_address: Address::ZERO,
 
     unsafe_block_signer: None,
-    activation_admin_address: Some(address!("9965507D1a55bcC2695C58ba16FB37d819B0A4dc")),
+    activation_admin_address: address!("9965507D1a55bcC2695C58ba16FB37d819B0A4dc"),
 
     max_gas_limit: 30_000_000,
     prune_delete_limit: 20_000,
@@ -530,7 +543,8 @@ const ZERONET: ChainConfig = ChainConfig {
     isthmus_timestamp: 0,
     jovian_timestamp: 0,
     azul_timestamp: Some(1_775_152_800),
-    beryl_timestamp: None,
+    beryl_timestamp: Some(1_780_678_800),
+    cobalt_timestamp: None,
 
     genesis_l1_hash: b256!("b7d4b69971ff31d5179be5e1b83f5a4f438f4cd1db886a6630623b7047f32cfd"),
     genesis_l1_number: 2_450_277,
@@ -552,7 +566,7 @@ const ZERONET: ChainConfig = ChainConfig {
     protocol_versions_address: address!("646c8604cf62b23e0cf094f2e790c6c75547ff85"),
 
     unsafe_block_signer: Some(address!("cf17274338d3128f6C96d9af54511a17e8b38a08")),
-    activation_admin_address: Some(address!("F5969A85a555671EeD766C4ff0C61426AA626b11")),
+    activation_admin_address: address!("F5969A85a555671EeD766C4ff0C61426AA626b11"),
 
     max_gas_limit: 25_000_000,
     prune_delete_limit: 10_000,
@@ -606,8 +620,10 @@ mod tests {
     }
 
     #[test]
-    fn zeronet_beryl_is_unscheduled() {
-        assert_eq!(ChainConfig::zeronet().beryl_timestamp, None);
-        assert_eq!(ChainConfig::zeronet().hardfork_config().base.beryl, None);
+    fn zeronet_beryl_is_scheduled() {
+        assert_eq!(ChainConfig::zeronet().beryl_timestamp, Some(1_780_678_800));
+        assert_eq!(ChainConfig::zeronet().hardfork_config().base.beryl, Some(1_780_678_800));
+        assert_eq!(ChainConfig::zeronet().cobalt_timestamp, None);
+        assert_eq!(ChainConfig::zeronet().hardfork_config().base.cobalt, None);
     }
 }

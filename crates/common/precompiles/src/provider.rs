@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, string::String};
+use alloc::string::String;
 
 use alloy_evm::precompiles::PrecompilesMap;
 use alloy_primitives::Address;
@@ -9,7 +9,7 @@ use revm::{
     handler::{EthPrecompiles, PrecompileProvider},
     interpreter::{CallInputs, InterpreterResult},
     precompile::{self, Precompiles, bn254, modexp, secp256r1},
-    primitives::{OnceLock, hardfork::SpecId},
+    primitives::{AddressSet, OnceLock, hardfork::SpecId},
 };
 
 use crate::{
@@ -41,7 +41,9 @@ impl<S: BasePrecompileSpec> BasePrecompiles<S> {
             BaseUpgrade::Granite | BaseUpgrade::Holocene => Self::granite(),
             BaseUpgrade::Isthmus => Self::isthmus(),
             BaseUpgrade::Jovian => Self::jovian(),
-            BaseUpgrade::Azul | BaseUpgrade::Beryl => Self::azul(),
+            BaseUpgrade::Azul => Self::azul(),
+            BaseUpgrade::Beryl => Self::beryl(),
+            BaseUpgrade::Cobalt => Self::cobalt(),
             upgrade => panic!("unsupported Base precompile upgrade: {upgrade}"),
         };
 
@@ -53,6 +55,7 @@ impl<S: BasePrecompileSpec> BasePrecompiles<S> {
     }
 
     /// Sets the activation registry admin address.
+    #[must_use = "with_activation_admin_address returns a new BasePrecompiles value"]
     pub const fn with_activation_admin_address(
         mut self,
         activation_admin_address: Option<Address>,
@@ -164,6 +167,13 @@ impl<S: BasePrecompileSpec> BasePrecompiles<S> {
         Self::azul()
     }
 
+    /// Returns precompiles for the Base Cobalt spec.
+    ///
+    /// Static precompiles are the same as Beryl; Cobalt adds dynamic precompiles at install time.
+    pub fn cobalt() -> &'static Precompiles {
+        Self::beryl()
+    }
+
     /// Builds a [`PrecompilesMap`] with all Base precompiles for this spec installed.
     ///
     /// For Beryl and later, this also installs the dynamic token and registry precompiles.
@@ -182,10 +192,14 @@ impl<S: BasePrecompileSpec> BasePrecompiles<S> {
     {
         let mut precompiles = PrecompilesMap::from_static(self.precompiles());
         if self.spec.upgrade() >= BaseUpgrade::Beryl {
-            B20Factory::install(&mut precompiles);
-            BerylLookup::install_with_observer(&mut precompiles, observer);
-            PolicyRegistryPrecompile::install(&mut precompiles);
-            ActivationRegistry::install(&mut precompiles, self.activation_admin_address);
+            B20Factory::install_with_observer(&mut precompiles, observer.clone());
+            BerylLookup::install_with_observer(&mut precompiles, observer.clone());
+            PolicyRegistryPrecompile::install_with_observer(&mut precompiles, observer.clone());
+            ActivationRegistry::install_with_observer(
+                &mut precompiles,
+                self.activation_admin_address,
+                observer,
+            );
         }
         precompiles
     }
@@ -218,7 +232,7 @@ where
     }
 
     #[inline]
-    fn warm_addresses(&self) -> Box<impl Iterator<Item = Address>> {
+    fn warm_addresses(&self) -> &AddressSet {
         self.inner.warm_addresses()
     }
 
@@ -321,25 +335,49 @@ mod tests {
         let mut bad_input_len = bn254_pair::JOVIAN_MAX_INPUT_SIZE + 1;
         assert!(bad_input_len < bn254_pair::GRANITE_MAX_INPUT_SIZE);
         let input = vec![0u8; bad_input_len];
-        assert!(bn254_pair_precompile.execute(&input, u64::MAX, 0).is_err());
+        assert!(
+            matches!(
+                bn254_pair_precompile.execute(&input, u64::MAX, 0),
+                Ok(output) if output.halt_reason().is_some()
+            ),
+            "expected halt for oversized bn254 pair input"
+        );
 
         let g1_msm = precompiles.precompiles().get(&bls12_381_const::G1_MSM_ADDRESS).unwrap();
         bad_input_len = bls12_381::JOVIAN_G1_MSM_MAX_INPUT_SIZE + 1;
         assert!(bad_input_len < bls12_381::ISTHMUS_G1_MSM_MAX_INPUT_SIZE);
         let input = vec![0u8; bad_input_len];
-        assert!(g1_msm.execute(&input, u64::MAX, 0).is_err());
+        assert!(
+            matches!(
+                g1_msm.execute(&input, u64::MAX, 0),
+                Ok(output) if output.halt_reason().is_some()
+            ),
+            "expected halt for oversized BLS12-381 G1 MSM input"
+        );
 
         let g2_msm = precompiles.precompiles().get(&bls12_381_const::G2_MSM_ADDRESS).unwrap();
         bad_input_len = bls12_381::JOVIAN_G2_MSM_MAX_INPUT_SIZE + 1;
         assert!(bad_input_len < bls12_381::ISTHMUS_G2_MSM_MAX_INPUT_SIZE);
         let input = vec![0u8; bad_input_len];
-        assert!(g2_msm.execute(&input, u64::MAX, 0).is_err());
+        assert!(
+            matches!(
+                g2_msm.execute(&input, u64::MAX, 0),
+                Ok(output) if output.halt_reason().is_some()
+            ),
+            "expected halt for oversized BLS12-381 G2 MSM input"
+        );
 
         let pairing = precompiles.precompiles().get(&bls12_381_const::PAIRING_ADDRESS).unwrap();
         bad_input_len = bls12_381::JOVIAN_PAIRING_MAX_INPUT_SIZE + 1;
         assert!(bad_input_len < bls12_381::ISTHMUS_PAIRING_MAX_INPUT_SIZE);
         let input = vec![0u8; bad_input_len];
-        assert!(pairing.execute(&input, u64::MAX, 0).is_err());
+        assert!(
+            matches!(
+                pairing.execute(&input, u64::MAX, 0),
+                Ok(output) if output.halt_reason().is_some()
+            ),
+            "expected halt for oversized BLS12-381 pairing input"
+        );
     }
 
     #[test]
@@ -513,10 +551,11 @@ mod tests {
     #[rstest]
     #[case::azul(BaseUpgrade::Azul, false)]
     #[case::beryl(BaseUpgrade::Beryl, true)]
+    #[case::cobalt(BaseUpgrade::Cobalt, true)]
     fn install_routes_b20_precompiles_by_fork(#[case] spec: BaseUpgrade, #[case] expected: bool) {
         let precompiles = BasePrecompiles::new_with_spec(spec).install();
         let (token, _) =
-            B20Variant::B20.compute_address(Address::repeat_byte(0x11), B256::repeat_byte(0x22));
+            B20Variant::Asset.compute_address(Address::repeat_byte(0x11), B256::repeat_byte(0x22));
 
         assert_eq!(precompiles.get(&B20FactoryStorage::ADDRESS).is_some(), expected);
         assert_eq!(precompiles.get(&token).is_some(), expected);
