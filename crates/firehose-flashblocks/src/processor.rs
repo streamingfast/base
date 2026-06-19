@@ -656,6 +656,7 @@ where
                     latest_idx,
                     block_number,
                     index,
+                    flashblock.metadata.prev_flashblock_id,
                 ) {
                     SequenceValidationResult::NextInSequence => {
                         // A delta must belong to the same payload as the in-flight base —
@@ -851,6 +852,19 @@ where
                             expected,
                             actual,
                             "non-sequential flashblock gap; resetting state and waiting for next base"
+                        );
+                        state.reset();
+                        return Ok(());
+                    }
+                    SequenceValidationResult::NonSequentialPredecessor { expected, actual } => {
+                        warn!(
+                            block = block_number,
+                            index,
+                            expected_prev_block = expected.block_number,
+                            expected_prev_index = expected.index,
+                            actual_prev_block = actual.block_number,
+                            actual_prev_index = actual.index,
+                            "flashblock predecessor link mismatch; resetting state and waiting for next base"
                         );
                         state.reset();
                         return Ok(());

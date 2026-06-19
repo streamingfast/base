@@ -732,7 +732,7 @@ pub(crate) fn flash_base(
         metadata: json!({ "block_number": block_number }),
     };
 
-    let metadata = Metadata { block_number };
+    let metadata = Metadata { block_number, ..Default::default() };
 
     TestEvent::flashblock(Flashblock {
         payload_id: payload.payload_id,
@@ -779,7 +779,7 @@ pub(crate) fn flash_delta_with_payload_id(
         blob_gas_used: Some(0),
     };
 
-    let metadata = Metadata { block_number };
+    let metadata = Metadata { block_number, ..Default::default() };
 
     TestEvent::flashblock(Flashblock {
         payload_id: PayloadId::new(payload_id.to_be_bytes()),
@@ -869,7 +869,7 @@ pub(crate) fn flash_base_with_txs(
         withdrawals_root: B256::ZERO,
         blob_gas_used: Some(0),
     };
-    let metadata = Metadata { block_number };
+    let metadata = Metadata { block_number, ..Default::default() };
     TestEvent::flashblock(Flashblock {
         payload_id: PayloadId::new([0u8; 8]),
         index: 0,
@@ -898,7 +898,7 @@ pub(crate) fn flash_delta_with_txs(
         withdrawals_root: B256::ZERO,
         blob_gas_used: Some(0),
     };
-    let metadata = Metadata { block_number };
+    let metadata = Metadata { block_number, ..Default::default() };
     TestEvent::flashblock(Flashblock {
         payload_id: PayloadId::new([0u8; 8]),
         index,
