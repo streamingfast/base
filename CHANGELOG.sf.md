@@ -1,3 +1,9 @@
+## v1.1.1-fh
+
+* Bumped base to `v1.1.1`
+* Fixed issue seen on base-sepolia with new B20 native token: 
+  logs and state changes are correctly output from precompiled contract calls
+
 ## v1.1.0-fh
 
 * Bumped base to `v1.1.0`
