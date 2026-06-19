@@ -16,14 +16,16 @@
 
 mod framework;
 
+use base_common_flashblocks::FlashblockId;
 use base_execution_chainspec::BaseChainSpec;
 
 use framework::{
     FireEvent, GenesisClient, assembled_block_hash, assert_fire_events_eq,
     assert_fire_events_metadata_eq, canonical_block, flash_base, flash_delta,
-    flash_delta_with_payload_id, flash_delta_with_txs, hash, parse_fire_events,
-    run_flashblock_sequence, run_flashblock_sequence_at, run_flashblock_sequence_at_with_processor,
-    run_flashblock_sequence_without_peek, signed_legacy_transfer, test_genesis,
+    flash_delta_with_payload_id, flash_delta_with_prev_id, flash_delta_with_txs, hash,
+    parse_fire_events, run_flashblock_sequence, run_flashblock_sequence_at,
+    run_flashblock_sequence_at_with_processor, run_flashblock_sequence_without_peek,
+    signed_legacy_transfer, test_genesis,
 };
 
 /// A lone base flashblock (wire idx 0) never emits a standalone FIRE BLOCK: its
@@ -1866,4 +1868,110 @@ fn parent_header_missing_buffers_instead_of_resetting() {
         stored_count, 2,
         "both base(2) and delta(2,1) must remain buffered (bug would clear to 0)"
     );
+}
+
+/// v1.1.1 (PR #3603) added a predecessor-link check to the sequence validator: a delta
+/// carries `metadata.prev_flashblock_id` naming the flashblock it claims to follow. When
+/// that id is non-default and disagrees with the latest accepted flashblock, the validator
+/// returns `NonSequentialPredecessor`.
+///
+/// Here base(1,0) establishes latest id `{block:1, index:0}`, then delta(1,1) claims to
+/// follow `{block:9, index:9}` — a fork/misorder. The processor must treat it like a gap:
+/// drop the delta, reset state, and wait for the next base. The base was squashed (idx 0
+/// never emits standalone), so nothing is emitted and the in-flight sequence is cleared.
+#[test]
+fn delta_with_mismatched_prev_id_resets() {
+    let genesis = test_genesis();
+    let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    let result = run_flashblock_sequence_at_with_processor(
+        client,
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            // Sequentially next index (1), but the predecessor link points at an
+            // unrelated flashblock — predecessor mismatch, not an index gap.
+            flash_delta_with_prev_id(
+                1,
+                hash("1a"),
+                1,
+                FlashblockId { block_number: 9, index: 9 },
+            ),
+        ],
+        ts + 2,
+    );
+
+    let events: Vec<FireEvent> = parse_fire_events(&result.raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
+        .collect();
+
+    // Base squashed, predecessor-mismatched delta → reset. Nothing emitted.
+    assert_fire_events_metadata_eq(&events, &[]);
+
+    // The reset must clear the in-flight sequence entirely.
+    let (current_block, pending, stored_count) = result.processor.pending_state_for_test();
+    assert_eq!(current_block, None, "predecessor mismatch must reset current block to None");
+    assert!(!pending, "a reset sequence is not pending");
+    assert_eq!(stored_count, 0, "reset must clear all buffered flashblocks");
+}
+
+/// Counterpart to [`delta_with_mismatched_prev_id_resets`]: a delta whose
+/// `prev_flashblock_id` correctly names the latest accepted flashblock (`{block:1,
+/// index:0}`) links cleanly and is accepted, emitting the consolidated flashblock at
+/// idx=1. Confirms the new check does not reject valid predecessor links.
+#[test]
+fn delta_with_matching_prev_id_is_accepted() {
+    let genesis = test_genesis();
+    let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            flash_delta_with_prev_id(
+                1,
+                hash("1a"),
+                1,
+                FlashblockId { block_number: 1, index: 0 },
+            ),
+        ],
+    );
+
+    let events: Vec<FireEvent> = parse_fire_events(&raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
+        .collect();
+
+    // Base squashed; delta(1,1) with a matching predecessor link is accepted and emits.
+    assert_fire_events_metadata_eq(&events, &[FireEvent::flash_block(1, hash("1a"), 1, false)]);
+}
+
+/// Backward compatibility: a delta with a default (all-zero) `prev_flashblock_id` — what a
+/// builder that does not yet emit the field produces — skips the predecessor check and is
+/// accepted on index ordering alone, exactly as before v1.1.1.
+#[test]
+fn delta_with_default_prev_id_is_accepted() {
+    let genesis = test_genesis();
+    let genesis_hash = BaseChainSpec::from_genesis(genesis.clone()).inner.genesis_hash();
+    let client = GenesisClient::new(genesis);
+    let ts = 0x67d00000u64;
+
+    let raw = run_flashblock_sequence(
+        client,
+        vec![
+            flash_base(1, hash("1a"), genesis_hash, ts + 2),
+            flash_delta_with_prev_id(1, hash("1a"), 1, FlashblockId::default()),
+        ],
+    );
+
+    let events: Vec<FireEvent> = parse_fire_events(&raw)
+        .into_iter()
+        .filter(|e| matches!(e, FireEvent::Block { .. } | FireEvent::FlashBlock { .. }))
+        .collect();
+
+    assert_fire_events_metadata_eq(&events, &[FireEvent::flash_block(1, hash("1a"), 1, false)]);
 }

@@ -27,8 +27,8 @@ use alloy_rpc_types_engine::PayloadId;
 use alloy_signer_local::PrivateKeySigner;
 use base_common_consensus::{BaseBlock, BasePrimitives, BaseReceipt, BaseTxEnvelope};
 use base_common_flashblocks::{
-    ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, Flashblock, FlashblocksPayloadV1,
-    Metadata,
+    ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, Flashblock, FlashblockId,
+    FlashblocksPayloadV1, Metadata,
 };
 use base_execution_chainspec::BaseChainSpec;
 use base_firehose_flashblocks::{
@@ -783,6 +783,44 @@ pub(crate) fn flash_delta_with_payload_id(
 
     TestEvent::flashblock(Flashblock {
         payload_id: PayloadId::new(payload_id.to_be_bytes()),
+        index,
+        base: None,
+        diff,
+        metadata,
+    })
+}
+
+/// Like [`flash_delta`] but stamps the delta's metadata with an explicit
+/// `prev_flashblock_id` (the link to the flashblock this delta claims to follow).
+///
+/// Used to exercise the predecessor-link validation added in v1.1.1: the sequence
+/// validator rejects a delta whose `prev_flashblock_id` is non-default and does not
+/// match the latest accepted flashblock id, returning `NonSequentialPredecessor` and
+/// causing the processor to reset and wait for the next base. A default (all-zero)
+/// `prev_flashblock_id` is treated as "unset" and skips the check for backward
+/// compatibility with builders that do not emit the field yet.
+pub(crate) fn flash_delta_with_prev_id(
+    block_number: u64,
+    block_hash: B256,
+    index: u64,
+    prev_flashblock_id: FlashblockId,
+) -> TestEvent {
+    let diff = ExecutionPayloadFlashblockDeltaV1 {
+        state_root: B256::ZERO,
+        receipts_root: B256::ZERO,
+        logs_bloom: Bloom::default(),
+        gas_used: 0,
+        block_hash,
+        transactions: Vec::new(),
+        withdrawals: Vec::new(),
+        withdrawals_root: B256::ZERO,
+        blob_gas_used: Some(0),
+    };
+
+    let metadata = Metadata { block_number, prev_flashblock_id };
+
+    TestEvent::flashblock(Flashblock {
+        payload_id: PayloadId::new([0u8; 8]),
         index,
         base: None,
         diff,
