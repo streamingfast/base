@@ -1,3 +1,8 @@
+## v1.1.1-fh-1
+
+* Bumped `streamingfast/reth` dependencies to `tag = "v2.3.0-fh-5"`, which fixes a call/receipt log-count mismatch panic (`N call logs but N+1 receipt logs`) when a native-precompile log (B-20 token event) is emitted at a journal index freed by a reverted opcode `LOG` — seen on Base mainnet block 48387796 (Uniswap V4 revert-based quote). Also pulls in fh-2 (post-tx balance resolver), fh-3 (keccak OOM cap), fh-4 (Docker release CI).
+* Added a `FIREHOSE_TRACER_IGNORE_LOG_MISMATCH` env-var safety net (patched `firehose-tracer` to `v5.2.2`): when set, log-count / BlockIndex mismatches are logged and skipped instead of panicking.
+
 ## v1.1.1-fh
 
 * Bumped base to `v1.1.1`
