@@ -641,6 +641,10 @@ reth-firehose-tests = { git = "https://github.com/streamingfast/reth.git", tag =
 firehose-tracer = "5.2.1"
 
 [patch.crates-io]
+# Hotfix: gate the "mismatch between call logs and receipt logs" panic behind the
+# FIREHOSE_TRACER_IGNORE_LOG_MISMATCH env var so it logs and skips instead of crashing.
+firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", tag = "v5.2.2" }
+
 # SF fork of alloy-evm that routes system calls (EIP-4788, EIP-2935, etc.) through the
 # Inspector, so Firehose tracing observes them. Matches the patch in streamingfast/reth
 # v2.3.0-fh. See https://github.com/alloy-rs/evm/pull/323 for the upstream PR.
