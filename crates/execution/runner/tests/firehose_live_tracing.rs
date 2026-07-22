@@ -137,6 +137,8 @@ async fn live_payload_validation_emits_firehose_blocks() -> Result<()> {
                 no_tx_pool: Some(true),
                 min_base_fee: Some(min_base_fee),
                 eip_1559_params: Some(B64::from(eip_1559_params)),
+                // Pre-`BaseTime` activation, so no millisecond component.
+                timestamp_millis_part: None,
             },
             3,
         )?;
