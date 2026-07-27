@@ -1,3 +1,33 @@
+## v1.2.0-fh
+
+### Changed
+
+* Bumped base to `v1.2.0`.
+* Kept `streamingfast/reth` at `tag = "v2.3.0-fh-5"` — upstream `v1.2.0` did not move off reth
+  `v2.3.0`, revm `40.0.3` or alloy-evm `0.36.0`, so no new Firehose reth release is required.
+* Added `reth-eth-wire-types` to the `[patch."https://github.com/paradigmxyz/reth"]` table.
+  Upstream `v1.2.0` began depending on it directly; without the patch entry it would resolve to a
+  second copy from `paradigmxyz/reth` alongside the Firehose fork's copy.
+* Stopped tracking the `.dev/` scratch directory and added it to `.gitignore`.
+
+### Fixed
+
+* Regenerated the stale `base-firehose-tests` `nop_transfer` golden block. It had not been refreshed
+  since it was created against reth `v1.11.4-fh`, so it still recorded `gas_limit: 30000000` for the
+  EIP-4788 beacon-roots system call; the current tracer reports `31566720`. The mismatch was already
+  present in `v1.1.1-fh-1` and is unrelated to the `v1.2.0` bump — verified by re-running the test
+  on the pre-merge tree. No other field of the captured block changed.
+
+### Notes
+
+* Upstream `v1.2.0` lands EIP-8130 (account abstraction) with *phased* transaction execution and a
+  Cobalt irregular state transition. Firehose tracing is unaffected on real networks for now:
+  EIP-8130 is gated behind the Cobalt upgrade, and `cobalt_timestamp` is `None` for mainnet,
+  sepolia, devnet and zeronet in `crates/common/chains/src/config.rs`. Note that the local Docker
+  devnet *does* schedule it (`L2_BASE_COBALT_BLOCK=22` in `etc/docker/devnet-env`), so tracing a
+  local devnet past block 22 will exercise the unsupported path. Tracing support for multi-phase
+  transactions must be added before Cobalt activates anywhere real.
+
 ## v1.1.1-fh-1
 
 * Bumped `streamingfast/reth` dependencies to `tag = "v2.3.0-fh-5"`, which fixes a call/receipt log-count mismatch panic (`N call logs but N+1 receipt logs`) when a native-precompile log (B-20 token event) is emitted at a journal index freed by a reverted opcode `LOG` — seen on Base mainnet block 48387796 (Uniswap V4 revert-based quote). Also pulls in fh-2 (post-tx balance resolver), fh-3 (keccak OOM cap), fh-4 (Docker release CI).

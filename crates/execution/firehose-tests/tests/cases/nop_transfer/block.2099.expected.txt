@@ -1558,7 +1558,7 @@ Block {
             ],
             address_delegates_to: None,
             value: None,
-            gas_limit: 30000000,
+            gas_limit: 31566720,
             gas_consumed: 0,
             return_data: [],
             input: [
