@@ -34,8 +34,8 @@ use revm::database::{CacheDB, EmptyDB};
 ///
 /// `case_folder` must contain `prestate.json` (Base/OP-style genesis + block context + EIP-2718
 /// encoded signed transaction). The captured `Block` is the protobuf parsed from the single
-/// `FIRE BLOCK` line emitted for the executed block; assert against a `.binpb` golden via
-/// [`assert_block_equals_golden`].
+/// `FIRE BLOCK` line emitted for the executed block; assert against it with `BlockInvariants` and a
+/// `BlockProjection` golden (see `tests/prestate.rs`).
 pub fn run_prestate(case_folder: &Path) -> eyre::Result<RunOutcome> {
     use alloy_consensus::Block;
     use base_common_consensus::BaseBlockBody;
@@ -148,5 +148,3 @@ fn build_op_header(
         ..Default::default()
     }
 }
-
-pub use reth_firehose_tests::assert_block_equals_golden;

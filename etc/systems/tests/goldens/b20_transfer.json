@@ -1,0 +1,81 @@
+{
+  "calls": [
+    {
+      "address": "@b20-token",
+      "balance_changes": [
+        {
+          "address": "@admin",
+          "reason": "REASON_GAS_BUY"
+        },
+        {
+          "address": "@admin",
+          "reason": "REASON_GAS_REFUND"
+        },
+        {
+          "address": "0x4200000000000000000000000000000000000019",
+          "reason": "REASON_REWARD_TRANSACTION_FEE"
+        },
+        {
+          "address": "0x420000000000000000000000000000000000001a",
+          "reason": "REASON_REWARD_TRANSACTION_FEE"
+        }
+      ],
+      "call_type": "CALL",
+      "caller": "@admin",
+      "index": 1,
+      "input": "0xa9059cbb000000000000000000000000976ea74026e726554db657fa54763abd0c3a0aa90000000000000000000000000000000000000000000000000000000005f5e100",
+      "logs": [
+        {
+          "address": "@b20-token",
+          "data": "0x0000000000000000000000000000000000000000000000000000000005f5e100",
+          "topics": [
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+            "0x0000000000000000000000009965507d1a55bcc2695c58ba16fb37d819b0a4dc",
+            "0x000000000000000000000000976ea74026e726554db657fa54763abd0c3a0aa9"
+          ]
+        }
+      ],
+      "nonce_changes": [
+        {
+          "address": "@admin",
+          "delta": "+1"
+        }
+      ],
+      "return_data": "0x0000000000000000000000000000000000000000000000000000000000000001",
+      "storage_changes": [
+        {
+          "address": "@b20-token",
+          "key": "0xa14eb246d421839fa53a0bb3113dd730a7c59dd0d6c9f6ee0274cb69fde27d03",
+          "new_value": "0x0000000000000000000000000000000000000000000000000000000035a4e900",
+          "old_value": "0x000000000000000000000000000000000000000000000000000000003b9aca00"
+        },
+        {
+          "address": "@b20-token",
+          "key": "0xfb9e2669d4ad56e6cd9cd11cf03d0045e632f60ef6a978d4f18dad7d94c3c6a0",
+          "new_value": "0x0000000000000000000000000000000000000000000000000000000005f5e100",
+          "old_value": "0x0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ]
+    }
+  ],
+  "from": "@admin",
+  "index": 1,
+  "input": "0xa9059cbb000000000000000000000000976ea74026e726554db657fa54763abd0c3a0aa90000000000000000000000000000000000000000000000000000000005f5e100",
+  "receipt": {
+    "logs": [
+      {
+        "address": "@b20-token",
+        "data": "0x0000000000000000000000000000000000000000000000000000000005f5e100",
+        "topics": [
+          "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+          "0x0000000000000000000000009965507d1a55bcc2695c58ba16fb37d819b0a4dc",
+          "0x000000000000000000000000976ea74026e726554db657fa54763abd0c3a0aa9"
+        ]
+      }
+    ]
+  },
+  "return_data": "0x0000000000000000000000000000000000000000000000000000000000000001",
+  "status": "SUCCEEDED",
+  "to": "@b20-token",
+  "type": "TRX_TYPE_DYNAMIC_FEE"
+}

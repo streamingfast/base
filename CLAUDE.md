@@ -19,3 +19,7 @@ Use structured tracing instead of interpolated strings. Always use key=value fie
 Keep unit tests colocated with their implementation. Do not introduce standalone `tests.rs` modules for unit tests; define tests in the same `.rs` implementation file/module inside a `#[cfg(test)] mod tests { ... }` block.
 
 `#[cfg(test)] mod tests { ... }` must always be placed at the end of the file, after all non-test code.
+
+## Firehose tracing tests
+
+The tracing-regression framework (capture, invariants, JSON projection, golden) is chain-agnostic and lives in the `firehose-tracer-test` crate of `evm-firehose-tracer-rs`; `base-firehose-tests` re-exports it and adds the Base bindings (`BaseFirehoseCapture::install`, `run_prestate`). Regenerate any golden with `GOLDEN_UPDATE=1`. The Docker-backed `base-system-tests --test firehose_b20` must run with `RUSTFLAGS="-C debug-assertions=off"` (reth's `deferred_trie::wait_cloned` debug-asserts from a Rayon worker).

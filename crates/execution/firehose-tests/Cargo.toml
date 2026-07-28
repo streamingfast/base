@@ -22,6 +22,7 @@ base-execution-chainspec.workspace = true
 reth-firehose.workspace = true
 reth-revm.workspace = true
 firehose-tracer.workspace = true
+firehose-tracer-test.workspace = true
 reth-firehose-tests.workspace = true
 reth-primitives-traits.workspace = true
 
@@ -36,8 +37,6 @@ revm.workspace = true
 
 # encoding & errors
 eyre.workspace = true
-prost.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 
 [[test]]

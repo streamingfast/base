@@ -1,0 +1,74 @@
+{
+  "begin_ordinal": 3,
+  "calls": [
+    {
+      "address": "@recipient",
+      "balance_changes": [
+        {
+          "address": "@sender",
+          "new_value": "0x3635c9911fb44e49c8",
+          "old_value": "0x3635c9adc5dea00000",
+          "ordinal": 4,
+          "reason": "REASON_GAS_BUY"
+        },
+        {
+          "address": "@sender",
+          "new_value": "0x3627e8da6c0cea49c8",
+          "old_value": "0x3635c9911fb44e49c8",
+          "ordinal": 7,
+          "reason": "REASON_TRANSFER"
+        },
+        {
+          "address": "@recipient",
+          "new_value": "0x0de0b6b3a7640000",
+          "ordinal": 8,
+          "reason": "REASON_TRANSFER"
+        },
+        {
+          "address": "@coinbase",
+          "new_value": "0x3a7bcdfde65b0d9156",
+          "old_value": "0x3a7bcde14030be1956",
+          "ordinal": 10,
+          "reason": "REASON_REWARD_TRANSACTION_FEE"
+        },
+        {
+          "address": "0x4200000000000000000000000000000000000019",
+          "new_value": "0x023e38",
+          "ordinal": 11,
+          "reason": "REASON_REWARD_TRANSACTION_FEE"
+        }
+      ],
+      "begin_ordinal": 6,
+      "call_type": "CALL",
+      "caller": "@sender",
+      "end_ordinal": 9,
+      "index": 1,
+      "nonce_changes": [
+        {
+          "address": "@sender",
+          "new_value": 1,
+          "ordinal": 5
+        }
+      ],
+      "value": "0x0de0b6b3a7640000"
+    }
+  ],
+  "end_ordinal": 12,
+  "from": "@sender",
+  "gas_limit": 21000,
+  "gas_price": "0x59682f07",
+  "gas_used": 21000,
+  "hash": "0xabd066c3571c11180b979955c236cc3b1c5b32d7e766ec4140fd18e015302d20",
+  "max_fee_per_gas": "0x03b9aca007",
+  "max_priority_fee_per_gas": "0x59682f00",
+  "r": "0x8e6655159657c43f515a92389e191ecf4a6b9d1f988939d796fe0bcee880d280",
+  "receipt": {
+    "cumulative_gas_used": 21000,
+    "logs_bloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "s": "0x26e09ccf7a29466b1a67cbf139df1e01e07b9229e21440e01fa243621f6d69ba",
+  "status": "SUCCEEDED",
+  "to": "@recipient",
+  "type": "TRX_TYPE_DYNAMIC_FEE",
+  "value": "0x0de0b6b3a7640000"
+}

@@ -1,5 +1,12 @@
 ## v1.2.0-fh
 
+### Added
+
+* Added Firehose tracing-regression coverage for Base transactions: a prestate-driven test (block
+  invariants + JSON projection golden) plus an end-to-end `base-system-tests` integration test
+  tracing a B-20 precompile transfer. The chain-agnostic capture / invariants / projection / golden
+  framework lives in the shared `firehose-tracer-test` crate (`evm-firehose-tracer-rs` `5.3.0`).
+
 ### Changed
 
 * Bumped base to `v1.2.0`.
@@ -12,11 +19,10 @@
 
 ### Fixed
 
-* Regenerated the stale `base-firehose-tests` `nop_transfer` golden block. It had not been refreshed
-  since it was created against reth `v1.11.4-fh`, so it still recorded `gas_limit: 30000000` for the
-  EIP-4788 beacon-roots system call; the current tracer reports `31566720`. The mismatch was already
-  present in `v1.1.1-fh-1` and is unrelated to the `v1.2.0` bump — verified by re-running the test
-  on the pre-merge tree. No other field of the captured block changed.
+* Replaced the stale `base-firehose-tests` `nop_transfer` full-protobuf golden with a JSON
+  projection plus property invariants. The full-block golden recorded `gas_limit: 30000000` for the
+  EIP-4788 beacon-roots system call while the current tracer reports `31566720`; the projection
+  excludes volatile fields like gas, so it no longer rots on such changes.
 
 ### Notes
 
