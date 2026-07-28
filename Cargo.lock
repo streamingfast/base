@@ -4803,14 +4803,13 @@ dependencies = [
  "base-execution-firehose",
  "eyre",
  "firehose-tracer",
+ "firehose-tracer-test",
  "k256",
- "prost 0.14.4",
  "reth-firehose",
  "reth-firehose-tests",
  "reth-primitives-traits",
  "reth-revm",
  "revm",
- "serde",
  "serde_json",
 ]
 
@@ -6348,6 +6347,7 @@ dependencies = [
  "base-execution-chainspec",
  "base-execution-rpc",
  "base-execution-txpool",
+ "base-firehose-tests",
  "base-flashblocks",
  "base-flashblocks-node",
  "base-node-core",
@@ -6803,7 +6803,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.12.1",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -6823,7 +6823,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.12.1",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "regex",
@@ -9711,8 +9711,9 @@ checksum = "9844ddc3a6e533d62bba727eb6c28b5d360921d5175e9ff0f1e621a5c590a4d5"
 
 [[package]]
 name = "firehose-tracer"
-version = "5.2.2"
-source = "git+https://github.com/streamingfast/evm-firehose-tracer-rs.git?tag=v5.2.2#8cbc6f9fc175455ddd285fd3dcfdaa44433a76f0"
+version = "5.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12f116192c9a01744168c80024324eb8d25fa94917f644a84236da685041eb8b"
 dependencies = [
  "alloy-consensus 2.0.5",
  "alloy-eips 2.0.5",
@@ -9729,6 +9730,26 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "firehose-tracer-test"
+version = "5.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23840e080c438da1ff6feb80b7bfcc6474f330c2e49579651c8d5bb7de0be325"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
+ "base64-simd",
+ "eyre",
+ "firehose-tracer",
+ "hex",
+ "k256",
+ "prost 0.14.4",
+ "prost-reflect",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -15582,7 +15603,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck",
- "itertools 0.12.1",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "once_cell",
@@ -15602,7 +15623,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.12.1",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -15636,7 +15657,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -15649,10 +15670,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "prost-reflect"
+version = "0.16.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01b80ea363c31af2de2b92e3c07ed1156628f7838c4afb4df75ee78a37fedbd1"
+dependencies = [
+ "prost 0.14.4",
+ "prost-types 0.14.4",
 ]
 
 [[package]]

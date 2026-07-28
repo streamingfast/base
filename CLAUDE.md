@@ -17,3 +17,7 @@ All `use` imports must be at the top of the file or the top of a `mod` block. Ne
 Use structured tracing instead of interpolated strings. Always use key=value fields for any dynamic data: `info!(block = %block_number, "processed block")` rather than `info!("processed block {block_number}")`. Use `%` for Display, `?` for Debug. The message string should be a static description; all variable data goes in fields. Correct: `error!(error = %e, peer = %peer_id, "connection failed")`. Incorrect: `error!("connection to {peer_id} failed: {e}")`.
 
 `#[cfg(test)] mod tests { ... }` must always be placed at the end of the file, after all non-test code.
+
+## Firehose tracing tests
+
+The tracing-regression framework (capture, invariants, JSON projection, golden) is chain-agnostic and lives in the `firehose-tracer-test` crate of `evm-firehose-tracer-rs`; `base-firehose-tests` re-exports it and adds the Base bindings (`BaseFirehoseCapture::install`, `run_prestate`). Regenerate any golden with `GOLDEN_UPDATE=1`. The Docker-backed `base-system-tests --test firehose_b20` must run with `RUSTFLAGS="-C debug-assertions=off"` (reth's `deferred_trie::wait_cloned` debug-asserts from a Rayon worker).

@@ -26,6 +26,7 @@ use base_consensus_rpc::{AdminApiClient, BaseP2PApiClient, RollupNodeApiClient, 
 use base_consensus_sources::BlockSigner;
 use eyre::{Result, WrapErr};
 use jsonrpsee::http_client::HttpClientBuilder;
+use tempfile::TempDir;
 use tokio::task::JoinHandle;
 use tracing::info;
 use url::Url;
@@ -73,6 +74,9 @@ pub struct InProcessConsensus {
     p2p_tcp_port: u16,
     peer_id: String,
     _handle: JoinHandle<()>,
+    /// Kept alive so the node's checkpoint database survives for the node's lifetime and is
+    /// removed on drop.
+    _checkpoint_dir: TempDir,
 }
 
 impl std::fmt::Debug for InProcessConsensus {
@@ -167,6 +171,13 @@ impl InProcessConsensus {
             max_concurrent_requests: NonZeroUsize::new(1024).expect("nonzero"),
         };
 
+        // Every consensus node needs its own checkpoint database. The default path is derived from
+        // the L2 chain id alone (`$HOME/.base/<chain id>/checkpoint.redb`), so the sequencer and
+        // the validator — which run in the same test process on the same chain — would both try to
+        // open it and the second one would fail with "Database already open".
+        let checkpoint_dir =
+            TempDir::new().wrap_err("Failed to create consensus checkpoint directory")?;
+
         let mut builder = RollupNodeBuilder::new(
             rollup_config,
             l1_config,
@@ -174,7 +185,8 @@ impl InProcessConsensus {
             engine_config,
             net_config,
             Some(rpc_config),
-        );
+        )
+        .with_checkpoint_path(checkpoint_dir.path().join("checkpoint.redb"));
 
         if config.mode == NodeMode::Sequencer {
             builder = builder.with_sequencer_config(SequencerConfig {
@@ -207,7 +219,13 @@ impl InProcessConsensus {
             }
         }
 
-        Ok(Self { rpc_addr, p2p_tcp_port, peer_id, _handle: handle })
+        Ok(Self {
+            rpc_addr,
+            p2p_tcp_port,
+            peer_id,
+            _handle: handle,
+            _checkpoint_dir: checkpoint_dir,
+        })
     }
 
     /// Connects this node to a peer at the given libp2p multiaddr via the `opp2p_connectPeer` RPC.

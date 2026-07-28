@@ -92,6 +92,9 @@ testcontainers = { workspace = true, features = ["blocking", "host-port-exposure
 # cli
 clap = { workspace = true, features = ["derive"] }
 
+# firehose
+base-firehose-tests.workspace = true
+
 # proof
 base-zk-client.workspace = true
 base-proof-rpc.workspace = true

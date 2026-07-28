@@ -1,3 +1,15 @@
+## Unreleased
+
+### Added
+
+* Added Firehose tracing-regression coverage for Base transactions: a prestate-driven test plus an
+  end-to-end `base-system-tests` integration test tracing a B-20 precompile transfer.
+
+### Fixed
+
+* Fixed `base-system-tests` failing to start because the in-process sequencer and validator shared
+  one consensus checkpoint database.
+
 ## v1.1.1-fh-1
 
 * Bumped `streamingfast/reth` dependencies to `tag = "v2.3.0-fh-5"`, which fixes a call/receipt log-count mismatch panic (`N call logs but N+1 receipt logs`) when a native-precompile log (B-20 token event) is emitted at a journal index freed by a reverted opcode `LOG` — seen on Base mainnet block 48387796 (Uniswap V4 revert-based quote). Also pulls in fh-2 (post-tx balance resolver), fh-3 (keccak OOM cap), fh-4 (Docker release CI).
