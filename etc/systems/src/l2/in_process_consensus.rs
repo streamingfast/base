@@ -27,9 +27,15 @@ use base_consensus_sources::BlockSigner;
 use eyre::{Result, WrapErr};
 use jsonrpsee::http_client::HttpClientBuilder;
 use tempfile::TempDir;
-use tokio::task::JoinHandle;
+use tokio::{
+    task::JoinHandle,
+    time::{sleep, timeout},
+};
 use tracing::info;
 use url::Url;
+
+const SEQUENCER_UNSAFE_HEAD_TIMEOUT: Duration = Duration::from_secs(60);
+const SEQUENCER_UNSAFE_HEAD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Configuration for starting an in-process consensus node.
 #[derive(Debug)]
@@ -73,10 +79,8 @@ pub struct InProcessConsensus {
     rpc_addr: SocketAddr,
     p2p_tcp_port: u16,
     peer_id: String,
-    _handle: JoinHandle<()>,
-    /// Kept alive so the node's checkpoint database survives for the node's lifetime and is
-    /// removed on drop.
     _checkpoint_dir: TempDir,
+    _handle: JoinHandle<()>,
 }
 
 impl std::fmt::Debug for InProcessConsensus {
@@ -171,13 +175,12 @@ impl InProcessConsensus {
             max_concurrent_requests: NonZeroUsize::new(1024).expect("nonzero"),
         };
 
-        // Every consensus node needs its own checkpoint database. The default path is derived from
-        // the L2 chain id alone (`$HOME/.base/<chain id>/checkpoint.redb`), so the sequencer and
-        // the validator — which run in the same test process on the same chain — would both try to
-        // open it and the second one would fail with "Database already open".
-        let checkpoint_dir =
-            TempDir::new().wrap_err("Failed to create consensus checkpoint directory")?;
+        let checkpoint_dir = tempfile::tempdir()
+            .wrap_err("Failed to create temporary checkpoint database directory")?;
+        let checkpoint_path = checkpoint_dir.path().join("checkpoint.redb");
 
+        // In-process devnets can run multiple consensus nodes with the same chain ID.
+        // Give each node isolated checkpoint storage so redb writer locks do not collide.
         let mut builder = RollupNodeBuilder::new(
             rollup_config,
             l1_config,
@@ -186,7 +189,7 @@ impl InProcessConsensus {
             net_config,
             Some(rpc_config),
         )
-        .with_checkpoint_path(checkpoint_dir.path().join("checkpoint.redb"));
+        .with_checkpoint_path(checkpoint_path);
 
         if config.mode == NodeMode::Sequencer {
             builder = builder.with_sequencer_config(SequencerConfig {
@@ -214,7 +217,7 @@ impl InProcessConsensus {
                 result.wrap_err("startup channel closed")?
                       .wrap_err("consensus node failed during startup")?;
             }
-            result = wait_for_rpc(rpc_addr) => {
+            result = wait_for_rpc(rpc_addr, "consensus RPC") => {
                 result?;
             }
         }
@@ -223,8 +226,8 @@ impl InProcessConsensus {
             rpc_addr,
             p2p_tcp_port,
             peer_id,
-            _handle: handle,
             _checkpoint_dir: checkpoint_dir,
+            _handle: handle,
         })
     }
 
@@ -246,7 +249,7 @@ impl InProcessConsensus {
                 }
                 Err(e) => {
                     last_err = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    sleep(Duration::from_millis(500)).await;
                 }
             }
         }
@@ -266,19 +269,28 @@ impl InProcessConsensus {
         // The consensus node validates that the provided hash matches the engine's actual unsafe
         // head before activating the sequencer. Poll sync status until the engine is initialized
         // (non-zero unsafe head hash), then pass the real value.
-        let mut unsafe_head = B256::ZERO;
-        for _ in 0..40 {
-            match client.sync_status().await {
-                Ok(status) if status.unsafe_l2.block_info.hash != B256::ZERO => {
-                    unsafe_head = status.unsafe_l2.block_info.hash;
-                    break;
+        let mut last_sync_error = None;
+        let unsafe_head = timeout(SEQUENCER_UNSAFE_HEAD_TIMEOUT, async {
+            loop {
+                match client.sync_status().await {
+                    Ok(status) if status.unsafe_l2.block_info.hash != B256::ZERO => {
+                        return status.unsafe_l2.block_info.hash;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        last_sync_error = Some(e.to_string());
+                    }
                 }
-                _ => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+                sleep(SEQUENCER_UNSAFE_HEAD_POLL_INTERVAL).await;
             }
-        }
-        if unsafe_head == B256::ZERO {
-            return Err(eyre::eyre!("Engine unsafe head did not initialize within 10s"));
-        }
+        })
+        .await
+        .map_err(|_| {
+            let suffix = last_sync_error
+                .map(|e| format!("; last sync_status error: {e}"))
+                .unwrap_or_default();
+            eyre::eyre!("Engine unsafe head did not initialize within 60s{suffix}")
+        })?;
 
         client
             .admin_start_sequencer(unsafe_head)
@@ -338,7 +350,7 @@ fn extract_signing_key(keypair: &libp2p::identity::Keypair) -> Result<k256::ecds
 }
 
 /// Polls the RPC endpoint until it responds or times out.
-async fn wait_for_rpc(addr: SocketAddr) -> Result<()> {
+pub(super) async fn wait_for_rpc(addr: SocketAddr, description: &str) -> Result<()> {
     let url = format!("http://{}:{}", addr.ip(), addr.port());
     let client = reqwest::Client::new();
 
@@ -346,18 +358,21 @@ async fn wait_for_rpc(addr: SocketAddr) -> Result<()> {
     for i in 0..60 {
         match client.get(&url).send().await {
             Ok(_) => {
-                info!(attempts = i + 1, "consensus RPC is ready");
+                info!(attempts = i + 1, description = %description, "RPC endpoint is ready");
                 return Ok(());
             }
             Err(e) => {
                 last_err = Some(e);
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                sleep(Duration::from_millis(500)).await;
             }
         }
     }
 
-    Err(eyre::eyre!(
-        "Consensus RPC at {url} did not become ready within 30s: {}",
-        last_err.unwrap()
-    ))
+    let Some(last_err) = last_err else {
+        return Err(eyre::eyre!(
+            "{description} at {url} did not become ready within 30s: no readiness attempts were made"
+        ));
+    };
+
+    Err(eyre::eyre!("{description} at {url} did not become ready within 30s: {last_err}"))
 }

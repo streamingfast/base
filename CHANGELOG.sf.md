@@ -1,14 +1,38 @@
-## Unreleased
+## v1.2.0-fh
 
 ### Added
 
-* Added Firehose tracing-regression coverage for Base transactions: a prestate-driven test plus an
-  end-to-end `base-system-tests` integration test tracing a B-20 precompile transfer.
+* Added Firehose tracing-regression coverage for Base transactions: a prestate-driven test (block
+  invariants + JSON projection golden) plus an end-to-end `base-system-tests` integration test
+  tracing a B-20 precompile transfer. The chain-agnostic capture / invariants / projection / golden
+  framework lives in the shared `firehose-tracer-test` crate (`evm-firehose-tracer-rs` `5.3.0`).
+
+### Changed
+
+* Bumped base to `v1.2.0`.
+* Kept `streamingfast/reth` at `tag = "v2.3.0-fh-5"` — upstream `v1.2.0` did not move off reth
+  `v2.3.0`, revm `40.0.3` or alloy-evm `0.36.0`, so no new Firehose reth release is required.
+* Added `reth-eth-wire-types` to the `[patch."https://github.com/paradigmxyz/reth"]` table.
+  Upstream `v1.2.0` began depending on it directly; without the patch entry it would resolve to a
+  second copy from `paradigmxyz/reth` alongside the Firehose fork's copy.
+* Stopped tracking the `.dev/` scratch directory and added it to `.gitignore`.
 
 ### Fixed
 
-* Fixed `base-system-tests` failing to start because the in-process sequencer and validator shared
-  one consensus checkpoint database.
+* Replaced the stale `base-firehose-tests` `nop_transfer` full-protobuf golden with a JSON
+  projection plus property invariants. The full-block golden recorded `gas_limit: 30000000` for the
+  EIP-4788 beacon-roots system call while the current tracer reports `31566720`; the projection
+  excludes volatile fields like gas, so it no longer rots on such changes.
+
+### Notes
+
+* Upstream `v1.2.0` lands EIP-8130 (account abstraction) with *phased* transaction execution and a
+  Cobalt irregular state transition. Firehose tracing is unaffected on real networks for now:
+  EIP-8130 is gated behind the Cobalt upgrade, and `cobalt_timestamp` is `None` for mainnet,
+  sepolia, devnet and zeronet in `crates/common/chains/src/config.rs`. Note that the local Docker
+  devnet *does* schedule it (`L2_BASE_COBALT_BLOCK=22` in `etc/docker/devnet-env`), so tracing a
+  local devnet past block 22 will exercise the unsupported path. Tracing support for multi-phase
+  transactions must be added before Cobalt activates anywhere real.
 
 ## v1.1.1-fh-1
 
