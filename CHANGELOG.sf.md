@@ -10,8 +10,10 @@
 ### Changed
 
 * Bumped base to `v1.2.0`.
-* Kept `streamingfast/reth` at `tag = "v2.3.0-fh-5"` — upstream `v1.2.0` did not move off reth
-  `v2.3.0`, revm `40.0.3` or alloy-evm `0.36.0`, so no new Firehose reth release is required.
+* Bumped `streamingfast/reth` dependencies from `tag = "v2.3.0-fh-5"` to `tag = "v2.3.0-fh-7"`.
+  Upstream `v1.2.0` did not move off reth `v2.3.0`, revm `40.0.3` or alloy-evm `0.36.0`; the two new
+  Firehose tags carry balance-change fixes only (see below), so the `Cargo.lock` diff is purely the
+  git tag/rev of the `streamingfast/reth` source.
 * Added `reth-eth-wire-types` to the `[patch."https://github.com/paradigmxyz/reth"]` table.
   Upstream `v1.2.0` began depending on it directly; without the patch entry it would resolve to a
   second copy from `paradigmxyz/reth` alongside the Firehose fork's copy.
@@ -19,6 +21,15 @@
 
 ### Fixed
 
+* The SELFDESTRUCT refund is now included when resolving an account's post-transaction balance
+  (`streamingfast/reth` fh-7). revm credits the beneficiary in place and records the move only
+  inside its `AccountDestroyed` journal entry on the truly-destroyed path (EIP-6780), so a coinbase,
+  sender or fee vault that received a suicide refund reported a `RewardTransactionFee` /
+  `GasRefund` `old_balance` contradicting the `SuicideRefund` event emitted moments earlier. The
+  same resolver backs the OP fee-vault credits.
+* Value-transfer balance changes are now emitted when a transaction sends value to a precompile and
+  then fails (`streamingfast/reth` fh-6); the reverted callee had its `BalanceTransfer` journal
+  entry truncated before the journal walk ran, dropping both balance changes.
 * Replaced the stale `base-firehose-tests` `nop_transfer` full-protobuf golden with a JSON
   projection plus property invariants. The full-block golden recorded `gas_limit: 30000000` for the
   EIP-4788 beacon-roots system call while the current tracer reports `31566720`; the projection
