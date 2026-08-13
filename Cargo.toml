@@ -650,10 +650,13 @@ ark-bls12-381 = { version = "0.5.0", default-features = false }
 # Firehose tracer (defined by the streamingfast reth fork, firehose/2.x branch).
 reth-firehose = { git = "https://github.com/streamingfast/reth.git", tag = "v2.3.0-fh-7" }
 reth-firehose-tests = { git = "https://github.com/streamingfast/reth.git", tag = "v2.3.0-fh-7" }
-firehose-tracer = "5.3.0"
+firehose-tracer = "5.4.1"
 
 # Shared tracing-regression framework (capture / invariants / projection / golden).
-firehose-tracer-test = "5.3.0"
+firehose-tracer-test = "5.4.1"
+
+# Chain-agnostic generator for replayable Firehose prestate fixtures.
+firehose-tracer-prestate = "5.4.1"
 
 [patch.crates-io]
 # SF fork of alloy-evm that routes system calls (EIP-4788, EIP-2935, etc.) through the

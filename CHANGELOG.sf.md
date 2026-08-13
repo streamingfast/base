@@ -5,7 +5,28 @@
 * Added Firehose tracing-regression coverage for Base transactions: a prestate-driven test (block
   invariants + JSON projection golden) plus an end-to-end `base-system-tests` integration test
   tracing a B-20 precompile transfer. The chain-agnostic capture / invariants / projection / golden
-  framework lives in the shared `firehose-tracer-test` crate (`evm-firehose-tracer-rs` `5.3.0`).
+  framework lives in the shared `firehose-tracer-test` crate (`evm-firehose-tracer-rs` `5.4.1`).
+
+* Added `base-firehose-prestate` (`etc/tools/firehose-prestate`), a thin Base wrapper around
+  `firehose-tracer-prestate` `5.4.1`, the chain-agnostic Rust port of
+  `streamingfast/go-ethereum`'s `generate-prestate`. `generate` turns any mined Base mainnet or
+  Sepolia transaction into a self-contained `prestate.json` that `run_prestate` replays through the
+  tracer with no node and no Docker. Base supplies the chain-specific seam: the `BaseTxEnvelope`
+  type, the genesis config re-projected from `ChainConfig` (the chain spec's own genesis drops
+  every timestamped fork), the `L1Block` predeploy slots the OP L1-cost function reads outside the
+  EVM journal, and the chain id. Without those L1 slots a replay computes a zero L1 fee.
+
+* Added a `base_mainnet_replay` prestate case replaying Base mainnet transaction
+  `0x32ecdb4e72df6ec331edb81256b58a768ba49d1e3e89a1a071b980a85d6b72c0` (block `49663794`, index
+  `159`). Its golden was seeded from StreamingFast's production Firehose by the tool's `reference`
+  subcommand (`sf.firehose.v2.Fetch/Block`), so the first run of the test compared the replay
+  directly against production — and matched. That validation is a one-off proving the generator and
+  the tracer agree with production; the golden is an ordinary `GOLDEN_UPDATE=1` one from then on,
+  and further cases only need `generate`. Both sides share the
+  `ProductionReplay` projection (`firehose-tracer-test`, re-exported from `base-firehose-tests`),
+  which excludes only block-wide positional fields (ordinals, transaction index, log block index,
+  cumulative gas used) and keeps gas accounting, the call tree, logs and absolute balance, nonce
+  and storage values verbatim.
 
 ### Changed
 
