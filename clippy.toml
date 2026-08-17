@@ -24,4 +24,5 @@ doc-valid-idents = [
     "MEV",
     "OP",
     "Optimism",
+    "StreamingFast",
 ]

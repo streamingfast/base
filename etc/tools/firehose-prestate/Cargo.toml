@@ -1,0 +1,33 @@
+[package]
+name = "base-firehose-prestate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# base
+base-common-evm.workspace = true
+base-common-chains.workspace = true
+base-common-rpc-types.workspace = true
+base-execution-chainspec.workspace = true
+base-common-consensus = { workspace = true, features = ["serde"] }
+
+# alloy
+alloy-genesis.workspace = true
+
+# firehose
+firehose-tracer-prestate = { workspace = true, features = ["cli"] }
+
+# misc
+eyre.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+clap = { workspace = true, features = ["derive", "env"] }

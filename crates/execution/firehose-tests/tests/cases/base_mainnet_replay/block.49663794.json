@@ -1,0 +1,74 @@
+{
+  "calls": [
+    {
+      "address": "0xec0e36a6060339694c618ffffcc9ec7da21cb0cc",
+      "balance_changes": [
+        {
+          "address": "0xabbac9becc5b171842ae47703dfa6640b23c9710",
+          "new_value": "0x054f62c0f2f516dc",
+          "old_value": "0x054f634d28dc754b",
+          "reason": "REASON_GAS_BUY"
+        },
+        {
+          "address": "0xabbac9becc5b171842ae47703dfa6640b23c9710",
+          "new_value": "0x054f632dc29791dc",
+          "old_value": "0x054f62c0f2f516dc",
+          "reason": "REASON_GAS_REFUND"
+        },
+        {
+          "address": "0x4200000000000000000000000000000000000019",
+          "new_value": "0x01e52f91908dcdaac0",
+          "old_value": "0x01e52f9171aaa6b5c0",
+          "reason": "REASON_REWARD_TRANSACTION_FEE"
+        },
+        {
+          "address": "0x420000000000000000000000000000000000001a",
+          "new_value": "0x16d824463b189260",
+          "old_value": "0x16d82445b7faa3f1",
+          "reason": "REASON_REWARD_TRANSACTION_FEE"
+        }
+      ],
+      "call_type": "CALL",
+      "caller": "0xabbac9becc5b171842ae47703dfa6640b23c9710",
+      "executed_code": true,
+      "gas_consumed": 5280,
+      "gas_limit": 98748,
+      "index": 1,
+      "input": "0xd67704ad000000000000000000000000000000000000000000000000000000036948f05a",
+      "keccak_preimages": {
+        "String(\"647538f573622c2dc5ad534d3157795075362ce71b9944e2a4e56b07eac973fc\")": "000000000000000000000000abbac9becc5b171842ae47703dfa6640b23c97100000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "nonce_changes": [
+        {
+          "address": "0xabbac9becc5b171842ae47703dfa6640b23c9710",
+          "new_value": 6989526,
+          "old_value": 6989525
+        }
+      ],
+      "storage_changes": [
+        {
+          "address": "0xec0e36a6060339694c618ffffcc9ec7da21cb0cc",
+          "key": "0x647538f573622c2dc5ad534d3157795075362ce71b9944e2a4e56b07eac973fc",
+          "new_value": "0x000000000000000000000000000000000000000000000000000000036948f05a",
+          "old_value": "0x0000000000000000000000000000000000000000000000000000000367c0ba09"
+        }
+      ]
+    }
+  ],
+  "from": "0xabbac9becc5b171842ae47703dfa6640b23c9710",
+  "gas_limit": 120000,
+  "gas_price": "0x4c4b40",
+  "gas_used": 26532,
+  "hash": "0x32ecdb4e72df6ec331edb81256b58a768ba49d1e3e89a1a071b980a85d6b72c0",
+  "input": "0xd67704ad000000000000000000000000000000000000000000000000000000036948f05a",
+  "max_fee_per_gas": "0x1dcf2781",
+  "nonce": 6989525,
+  "r": "0x02f41d76d4d32a48ed9dc1cf0ea08e40ac40fabb2e5ec3be3d6906a296a7fc66",
+  "receipt": {
+    "logs_bloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "s": "0x42f0f6ce0005056cea2f280e60d032efa10afa2dfb9928215a971d5269771812",
+  "status": "SUCCEEDED",
+  "to": "0xec0e36a6060339694c618ffffcc9ec7da21cb0cc",
+  "type": "TRX_TYPE_DYNAMIC_FEE"
+}
