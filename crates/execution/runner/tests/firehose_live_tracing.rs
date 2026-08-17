@@ -45,8 +45,9 @@ use reth_chainspec::EthChainSpec;
 use reth_provider::ChainSpecProvider;
 use tokio::time::sleep;
 
-/// Number of blocks to advance. Block 1 is the Firehose genesis marker (emitted via
-/// `on_genesis_block`); blocks 2.. exercise the live `execute_and_trace_block` path on the follower.
+/// Number of blocks to advance. All of them (block 1 included — the genesis block itself is
+/// emitted separately at node startup by the Firehose ExEx, not through this path) exercise the
+/// live `execute_and_trace_block` path on the follower.
 const PRODUCED_BLOCKS: u64 = 3;
 
 /// Base EIP-1559 base-fee params (`eip1559Denominator` / `eip1559Elasticity`) matching the
@@ -198,9 +199,9 @@ async fn live_payload_validation_emits_firehose_blocks() -> Result<()> {
          traced.\nCaptured tracer output:\n{text}"
     );
 
-    // Blocks 2..=PRODUCED_BLOCKS go through the live `execute_and_trace_block` path (block 1 is the
-    // genesis marker, emitted separately via `on_genesis_block`). Require each to have been traced.
-    for number in 2..=PRODUCED_BLOCKS {
+    // Every produced block goes through the live `execute_and_trace_block` path. Require each to
+    // have been traced.
+    for number in 1..=PRODUCED_BLOCKS {
         assert!(
             traced.contains(&number),
             "expected a FIRE BLOCK line for live block #{number}, got traced blocks {traced:?}"
