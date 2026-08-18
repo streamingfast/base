@@ -490,9 +490,9 @@ where
         }
 
         // Firehose: when the tracer is active, resolve the sealed block synchronously so we can
-        // start the block-level tracer guard before execution. The guard emits
-        // `on_block_start`/`on_genesis_block` now and defers `on_block_end(None)` until
-        // `mark_verified()` runs after post-execution validation.
+        // start the block-level tracer guard before execution. The guard emits `on_block_start`
+        // now and defers `on_block_end(None)` until `mark_verified()` runs after post-execution
+        // validation.
         //
         // If any early return is taken between here and `mark_verified()`, the guard's Drop
         // emits `on_block_end(Some(err))` so invalid blocks are never flushed downstream.
@@ -505,24 +505,16 @@ where
         // `Block` variant — this way the downstream `self.convert_to_block(input)?` site becomes
         // a no-op (it just unwraps the already-sealed block) without needing to thread a separate
         // resolved-block cache through the code.
-        //
-        // Block 1 is the genesis marker: `start` emits `on_genesis_block` as a standalone event
-        // and does NOT leave the tracer in "block state", so wrapping the executor would panic
-        // in `on_system_call_start`. Let the guard drop (no-op for genesis) and fall through to
-        // the non-Firehose execution path.
         let (mut fh_tracer, input): (Option<reth_firehose::FirehoseBlockTracer>, _) =
             if reth_firehose::is_tracer_initialized() {
                 let sealed = self.convert_to_block(input)?;
                 let tracer =
                     reth_firehose::FirehoseBlockTracer::start::<BasePrimitives>(&sealed, None);
-                let is_genesis = tracer.is_genesis();
                 firehose_tracer::firehose_debug!(
-                    "validator: firehose tracer initialized (block={}, is_genesis={})",
+                    "validator: firehose tracer initialized (block={})",
                     sealed.header().number(),
-                    is_genesis
                 );
-                let fh_tracer = (!is_genesis).then_some(tracer);
-                (fh_tracer, BlockOrPayload::Block(sealed))
+                (Some(tracer), BlockOrPayload::Block(sealed))
             } else {
                 firehose_tracer::firehose_debug!(
                     "validator: firehose tracer NOT initialized — non-traced execution path"
@@ -537,8 +529,8 @@ where
         // Two entry points exist for the same work: `execute_block` is the non-traced path and
         // `execute_and_trace_block` is its Firehose-enabled twin (no CachedExecutor wrapper —
         // traced runs always re-execute every tx so the inspector observes full EVM state).
-        // We pick based on whether a live tracer guard is available for this block (see Firehose
-        // preamble above for when the guard is `None` — notably the block-1 genesis marker).
+        // We pick based on whether a live tracer guard is available for this block (i.e. whether
+        // the tracer is initialized).
         let (output, senders, receipt_root_rx) = match fh_tracer.as_mut() {
             Some(tracer) => {
                 match self.execute_and_trace_block(state_provider, env, &input, tracer, &mut handle)
