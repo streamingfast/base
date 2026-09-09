@@ -1,4 +1,4 @@
-## Unreleased
+## v1.2.0-fh3.2
 
 ### Fixed
 
