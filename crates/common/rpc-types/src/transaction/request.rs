@@ -4,7 +4,7 @@ use alloy_consensus::{
     Sealed, SignableTransaction, Signed, TxEip1559, TxEip4844, TypedTransaction,
 };
 use alloy_eips::eip7702::SignedAuthorization;
-#[cfg(feature = "reth")]
+#[cfg(feature = "network")]
 use alloy_network::TransactionBuilder;
 use alloy_network_primitives::TransactionBuilder7702;
 use alloy_primitives::{Address, B256, Bytes, ChainId, Signature, TxKind, U256};
@@ -115,9 +115,15 @@ pub struct Eip8130RequestFields {
     /// The phased call batches dispatched by the sender account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calls: Option<Vec<Vec<Call>>>,
-    /// Optional expiring-nonce expiry (Unix seconds).
+    /// Optional lower bound of the validity window (Unix milliseconds; `0` or
+    /// absent means no lower bound). Checked as `block.timestamp * 1000 >=
+    /// valid_after`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expiry: Option<u64>,
+    pub valid_after: Option<u64>,
+    /// Optional upper bound of the validity window (Unix milliseconds; `0` or
+    /// absent means no expiry). Required (non-zero) for nonce-free transactions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_before: Option<u64>,
     /// Opaque, non-executed transaction metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Bytes>,
@@ -189,7 +195,8 @@ impl Eip8130RequestFields {
         self.nonce_key.is_some()
             || self.account_changes.is_some()
             || self.calls.is_some()
-            || self.expiry.is_some()
+            || self.valid_after.is_some()
+            || self.valid_before.is_some()
             || self.metadata.is_some()
             || self.sender.is_some()
             || self.sender_auth.is_some()
@@ -451,7 +458,7 @@ impl TransactionBuilder7702 for BaseTransactionRequest {
     }
 }
 
-#[cfg(feature = "reth")]
+#[cfg(feature = "network")]
 impl TransactionBuilder for BaseTransactionRequest {
     fn chain_id(&self) -> Option<ChainId> {
         self.as_ref().chain_id()

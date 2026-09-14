@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use base_builder_cli::Args as BuilderArgs;
-use base_builder_core::{BuilderApiExtension, FlashblocksServiceBuilder};
+use base_builder_core::{
+    BuilderApiExtension, BuilderApiExtensionConfig, FlashblocksServiceBuilder,
+};
 use base_builder_metering::MeteringStoreExtension;
 use base_consensus_cli::{
     CliMetrics, ConsensusNodeArgs, ConsensusNodeConfigArgs, ConsensusNodeOverrides,
@@ -15,7 +17,7 @@ use base_execution_cli::{
 };
 use base_node_runner::BaseNodeRunner;
 use base_txpool_rpc::{TxPoolRpcConfig, TxPoolRpcExtension};
-use base_upgrade_signal::{UpgradeSignalRuntimeValidation, UpgradeSignalStartupMode};
+use base_upgrade_signal::UpgradeSignalStartupMode;
 use clap::Args;
 use reth_cli_runner::CliRunner;
 use tokio_util::sync::CancellationToken;
@@ -68,21 +70,19 @@ impl SequencerCommand {
         let sequencer_rpc = rollup_args.sequencer.clone();
         let metering_provider: base_builder_core::SharedMeteringProvider =
             Arc::new(builder.build_metering_store());
+        let accept_validity_transactions = builder.enable_experimental_validity_transactions;
+        let max_validity_predicates = builder.experimental_validity_max_predicates;
         let builder_config = builder.into_builder_config(Arc::clone(&metering_provider))?;
         let da_config = builder_config.da_config.clone();
         let gas_limit_config = builder_config.gas_limit_config.clone();
+        let manifest_precheck_enabled = builder_config.manifest_precheck_enabled;
 
         CliRunner::try_default_runtime()?.run_command_until_exit(|ctx| async move {
-            let upgrade_signal_runtime_validation =
-                UpgradeSignalRuntimeValidation::with_activation_admin_address(
-                    execution_chain.activation_admin_address,
-                );
             rollup_args
                 .upgrade_signal
                 .apply_startup_to_sinks(
                     &rollup_args.upgrade_signal_l1_rpc,
                     "integrated sequencer startup",
-                    upgrade_signal_runtime_validation,
                     execution_chain.chain().id(),
                     Arc::make_mut(&mut execution_chain),
                     &mut rollup_config,
@@ -106,10 +106,14 @@ impl SequencerCommand {
             let mut runner = BaseNodeRunner::new(rollup_args.clone())
                 .with_da_config(da_config)
                 .with_gas_limit_config(gas_limit_config)
-                .with_service_builder(FlashblocksServiceBuilder(builder_config));
+                .with_manifest_precheck_enabled(manifest_precheck_enabled)
+                .with_service_builder(FlashblocksServiceBuilder::new(builder_config));
             runner.install_ext::<MeteringStoreExtension>(metering_provider);
             runner.install_ext::<TxPoolRpcExtension>(TxPoolRpcConfig { sequencer_rpc });
-            runner.install_ext::<BuilderApiExtension>(());
+            runner.install_ext::<BuilderApiExtension>(BuilderApiExtensionConfig::new(
+                accept_validity_transactions,
+                max_validity_predicates,
+            ));
             StandardBaseRethNode::install_upgrade_signal_runtime_extension(
                 &mut runner,
                 &rollup_args,
@@ -126,7 +130,6 @@ impl SequencerCommand {
                 ConsensusNodeStartOptions::new(rollup_config)
                     .with_overrides(ConsensusNodeOverrides::embedded_execution(
                         l2_engine_rpc,
-                        upgrade_signal_runtime_validation,
                         upgrade_signal_l1_rpc,
                     ))
                     .with_cancellation(consensus_cancellation.clone())
@@ -247,8 +250,6 @@ mod tests {
             SEQUENCER_KEY,
             "--upgrade-signal.contract",
             "0x0000000000000000000000000000000000000001",
-            "--upgrade-signal.upgrade-id",
-            "azul",
         ]));
 
         let BaseCommand::Sequencer(sequencer) = cli.command else {
@@ -264,7 +265,6 @@ mod tests {
                 .map(|address| address.to_string()),
             Some("0x0000000000000000000000000000000000000001".to_string())
         );
-        assert_eq!(sequencer.builder.rollup_args.upgrade_signal.upgrade_ids, ["azul"]);
     }
 
     #[test]

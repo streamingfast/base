@@ -3,12 +3,15 @@
 use alloy_consensus::Header;
 use base_common_consensus::{BasePrimitives, BaseTransactionSigned};
 use base_execution_chainspec::BaseChainSpec;
-use base_execution_txpool::{BasePooledTx, BundleTransaction, TimestampedTransaction};
+use base_execution_txpool::{
+    BasePooledTx, BundleTransaction, StateDiffInvalidation, TimestampedTransaction,
+};
 use base_node_core::BaseEngineTypes;
 use reth_node_api::{FullNodeTypes, NodeTypes};
-use reth_payload_util::PayloadTransactions;
 use reth_provider::{BlockReaderIdExt, ChainSpecProvider, StateProviderFactory};
 use reth_transaction_pool::{TransactionPool, TransactionPoolExt};
+
+use crate::ParkablePayloadTransactions;
 
 /// Composite trait bound for a full node type compatible with the Base builder.
 pub trait NodeBounds:
@@ -40,6 +43,8 @@ pub trait PoolBounds:
                          + BundleTransaction
                          + TimestampedTransaction,
     > + TransactionPoolExt
+    + base_execution_txpool::ParkableTransactionPool
+    + StateDiffInvalidation
     + Unpin
     + 'static
 where
@@ -55,6 +60,8 @@ where
                              + BundleTransaction
                              + TimestampedTransaction,
         > + TransactionPoolExt
+        + base_execution_txpool::ParkableTransactionPool
+        + StateDiffInvalidation
         + Unpin
         + 'static,
     <Self as TransactionPool>::Transaction:
@@ -81,7 +88,7 @@ impl<T> ClientBounds for T where
 
 /// Composite trait bound for payload transaction iterators used by the Base builder.
 pub trait PayloadTxsBounds:
-    PayloadTransactions<
+    ParkablePayloadTransactions<
     Transaction: BasePooledTx<Consensus = BaseTransactionSigned>
                      + BundleTransaction
                      + TimestampedTransaction,
@@ -90,7 +97,7 @@ pub trait PayloadTxsBounds:
 }
 
 impl<T> PayloadTxsBounds for T where
-    T: PayloadTransactions<
+    T: ParkablePayloadTransactions<
         Transaction: BasePooledTx<Consensus = BaseTransactionSigned>
                          + BundleTransaction
                          + TimestampedTransaction,

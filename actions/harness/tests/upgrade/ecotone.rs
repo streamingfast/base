@@ -1,8 +1,7 @@
 //! Action tests for the Ecotone upgrade activation boundary.
 
 use base_action_harness::{
-    ActionL2Source, ActionTestHarness, Batcher, BatcherConfig, L1MinerConfig, SharedL1Chain,
-    TestRollupConfigBuilder,
+    ActionTestHarness, BatcherConfig, L1MinerConfig, SharedL1Chain, TestRollupConfigBuilder,
 };
 use base_batcher_encoder::{DaType, EncoderConfig};
 use base_common_genesis::UpgradeConfig;
@@ -110,14 +109,11 @@ async fn ecotone_activation_block_user_txs_accepted_at_batch_layer() {
     };
 
     // Canyon and Delta active at genesis; Ecotone at ts=6 (block 3).
-    // Fjord must be active so the batcher's brotli-compressed frames are
-    // accepted by the pipeline's BatchReader.
     let ecotone_time = 6u64;
     let upgrades = UpgradeConfig {
         canyon_time: Some(0),
         delta_time: Some(0),
         ecotone_time: Some(ecotone_time),
-        fjord_time: Some(0),
         ..Default::default()
     };
     let rollup_cfg =
@@ -127,12 +123,11 @@ async fn ecotone_activation_block_user_txs_accepted_at_batch_layer() {
     let l1_chain = SharedL1Chain::from_blocks(h.l1.chain().to_vec());
     let mut builder = h.create_l2_sequencer(l1_chain);
 
-    let mut batcher = Batcher::new(ActionL2Source::new(), &h.rollup_config, batcher_cfg.clone());
-
     // Blocks 1 and 2: pre-Ecotone, user txs OK.
-    for _ in 1..=2u64 {
-        batcher.push_block(builder.build_next_block_with_single_transaction().await);
-        batcher.advance(&mut h.l1).await;
+    for nonce in 0..2 {
+        let block = builder.build_next_block_with_single_transaction().await;
+        h.submit_single_batch_zlib_calldata(&batcher_cfg, &block, nonce)
+            .expect("valid pre-Ecotone zlib batch");
     }
 
     // Block 3 at ts=6 (first Ecotone): build WITH a user tx. Unlike Jovian,
@@ -143,12 +138,13 @@ async fn ecotone_activation_block_user_txs_accepted_at_batch_layer() {
         block3_with_user_tx.header.timestamp, ecotone_time,
         "block 3 must land exactly at ecotone_time"
     );
-    batcher.push_block(block3_with_user_tx);
-    batcher.advance(&mut h.l1).await;
+    h.submit_single_batch_zlib_calldata(&batcher_cfg, &block3_with_user_tx, 2)
+        .expect("valid Ecotone activation zlib batch");
 
     // Block 4: post-Ecotone, user txs OK.
-    batcher.push_block(builder.build_next_block_with_single_transaction().await);
-    batcher.advance(&mut h.l1).await;
+    let block4 = builder.build_next_block_with_single_transaction().await;
+    h.submit_single_batch_zlib_calldata(&batcher_cfg, &block4, 3)
+        .expect("valid post-Ecotone zlib batch");
 
     let (mut node, _chain) = h.create_test_rollup_node_from_sequencer(
         &mut builder,
@@ -179,8 +175,7 @@ async fn ecotone_activation_block_user_txs_accepted_at_batch_layer() {
 /// following the same pattern as `jovian_derivation_crosses_activation_boundary`
 /// in `upgrade/activation.rs`.
 ///
-/// - Canyon and Delta active at genesis (via Fjord cascade ensures brotli is
-///   accepted by the verifier's `BatchReader`).
+/// - Canyon and Delta active at genesis.
 /// - Ecotone activates at ts=6 (L2 block 3, `block_time=2`).
 /// - Blocks 1–2: pre-Ecotone, submitted with user transactions.
 /// - Block 3: first Ecotone block — submitted **empty** (no user txs) because
@@ -195,15 +190,12 @@ async fn ecotone_derivation_crosses_activation_boundary() {
         ..BatcherConfig::default()
     };
 
-    // All forks through Delta active at genesis so that at ts=6 only Ecotone
-    // is "new". Fjord must be active so the batcher's brotli compression is
-    // accepted. Ecotone activates at ts=6 (block 3).
+    // All forks through Delta active at genesis so that Ecotone activates alone at ts=6.
     let ecotone_time = 6u64;
     let upgrades = UpgradeConfig {
         canyon_time: Some(0),
         delta_time: Some(0),
         ecotone_time: Some(ecotone_time),
-        fjord_time: Some(0),
         ..Default::default()
     };
     let rollup_cfg =
@@ -214,7 +206,6 @@ async fn ecotone_derivation_crosses_activation_boundary() {
     let mut builder = h.create_l2_sequencer(l1_chain);
 
     // Build and submit 4 L2 blocks individually (one batch per L1 block).
-    let mut batcher = Batcher::new(ActionL2Source::new(), &h.rollup_config, batcher_cfg.clone());
     for i in 1..=4u64 {
         let block = if i == 3 {
             // First Ecotone block: must be deposit-only (no user txs) because
@@ -223,8 +214,8 @@ async fn ecotone_derivation_crosses_activation_boundary() {
         } else {
             builder.build_next_block_with_single_transaction().await
         };
-        batcher.push_block(block);
-        batcher.advance(&mut h.l1).await;
+        h.submit_single_batch_zlib_calldata(&batcher_cfg, &block, i - 1)
+            .expect("valid zlib batch across Ecotone activation");
     }
 
     let (mut node, _chain) = h.create_test_rollup_node_from_sequencer(

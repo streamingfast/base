@@ -17,13 +17,16 @@ use base_proof_contracts::{
     GameStatus,
 };
 use base_proof_primitives::Proposal;
-use base_proof_rpc::{BaseBlock, L1Provider, L2Provider, RollupProvider, RpcError, RpcResult};
+use base_proof_rpc::{
+    BaseBlock, BaseHeader, L1Provider, L2Provider, RollupProvider, RpcError, RpcResult,
+};
 use base_prover_service_client::{ProofRequesterProvider, ProverServiceClientError};
 use base_prover_service_protocol::{
-    DeleteProofRequest, GetProofRequest, GetProofResponse, ListProofsRequest, ListProofsResponse,
-    PROOF_REQUEST_NOT_FOUND_MESSAGE, ProofRequestIdCollisionMessage,
-    ProofRequestKind as ApiProofRequestKind, ProofResult as ApiProofResult, ProofStatus,
-    ProveBlockRangeRequest, ProveBlockRangeResponse, TeeKind, TeeProofResult,
+    DeleteProofRequest, DeleteProofsByTeeSignerRequest, GetProofRequest, GetProofResponse,
+    ListProofsRequest, ListProofsResponse, PROOF_REQUEST_NOT_FOUND_MESSAGE,
+    ProofRequestIdCollisionMessage, ProofRequestKind as ApiProofRequestKind,
+    ProofResult as ApiProofResult, ProofStatus, ProveBlockRangeRequest, ProveBlockRangeResponse,
+    TeeKind, TeeProofResult,
 };
 use jsonrpsee::{core::client::Error as JsonRpcClientError, types::ErrorObjectOwned};
 
@@ -100,11 +103,12 @@ impl L2Provider for MockL2 {
     async fn get_proof(&self, _: Address, _: B256) -> RpcResult<EIP1186AccountProofResponse> {
         unimplemented!()
     }
-    async fn header_by_number(
-        &self,
-        _: BlockNumberOrTag,
-    ) -> RpcResult<alloy_rpc_types_eth::Header> {
-        Ok(alloy_rpc_types_eth::Header { hash: B256::repeat_byte(0x30), ..Default::default() })
+    async fn header_by_number(&self, _: BlockNumberOrTag) -> RpcResult<BaseHeader> {
+        Ok(Header::<alloy_consensus::Header> {
+            hash: B256::repeat_byte(0x30),
+            ..Default::default()
+        }
+        .into())
     }
     async fn block_by_number(&self, _: BlockNumberOrTag) -> RpcResult<BaseBlock> {
         unimplemented!()
@@ -246,6 +250,9 @@ impl AggregateVerifierClient for MockAggregateVerifier {
     async fn game_info(&self, _: Address) -> Result<GameInfo, ContractError> {
         unimplemented!("unused in proposer tests")
     }
+    async fn game_type(&self, _: Address) -> Result<u32, ContractError> {
+        unimplemented!("unused in proposer tests")
+    }
     async fn status(&self, _: Address) -> Result<GameStatus, ContractError> {
         unimplemented!("unused in proposer tests")
     }
@@ -379,6 +386,7 @@ pub fn test_proposal(block_number: u64) -> Proposal {
         l2_block_number: block_number,
         prev_output_root: B256::repeat_byte(0x03),
         config_hash: B256::repeat_byte(0x04),
+        schedule_id: B256::repeat_byte(0x05),
     }
 }
 
@@ -389,6 +397,8 @@ pub struct MockProofRequester {
     pub requests: Mutex<HashMap<String, ProveBlockRangeRequest>>,
     /// Sessions that should return a terminal failed status from `get_proof`.
     pub failed_sessions: Mutex<HashMap<String, String>>,
+    /// TEE signers passed to batch deletion.
+    pub deleted_tee_signers: Mutex<Vec<Address>>,
     /// Reject every `prove_block_range` call with an L1 head conflict.
     pub reject_l1_head_conflict: bool,
     /// Return a mismatched session id from `prove_block_range`.
@@ -472,6 +482,7 @@ impl ProofRequesterProvider for MockProofRequester {
                 aggregate_proposal,
                 proposals,
                 tee_kind: TeeKind::AwsNitro,
+                tee_signer: Address::repeat_byte(0x11),
             })),
         })
     }
@@ -487,6 +498,19 @@ impl ProofRequesterProvider for MockProofRequester {
         self.requests.lock().unwrap().remove(&request.session_id);
         self.failed_sessions.lock().unwrap().remove(&request.session_id);
         Ok(())
+    }
+
+    async fn delete_proofs_by_tee_signer(
+        &self,
+        request: DeleteProofsByTeeSignerRequest,
+    ) -> Result<u64, ProverServiceClientError> {
+        if self.reject_delete {
+            return Err(ProverServiceClientError::Timeout("simulated delete failure".into()));
+        }
+
+        self.deleted_tee_signers.lock().unwrap().push(request.tee_signer);
+        let deleted_count = self.requests.lock().unwrap().drain().count() as u64;
+        Ok(deleted_count)
     }
 
     async fn list_proofs(

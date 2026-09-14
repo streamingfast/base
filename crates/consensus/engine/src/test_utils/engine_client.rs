@@ -26,6 +26,12 @@ use tokio::sync::RwLock;
 
 use crate::{EngineClient, EngineClientError};
 
+type L2RpcBlock = <Base as Network>::BlockResponse;
+
+fn l2_rpc_block(block: Block<BaseTransaction>) -> L2RpcBlock {
+    block.map_header(Into::into)
+}
+
 /// Builder for creating test `MockEngineClient` instances with sensible defaults
 pub fn test_engine_client_builder() -> MockEngineClientBuilder {
     MockEngineClientBuilder::new().with_config(Arc::new(RollupConfig::default()))
@@ -47,9 +53,11 @@ pub enum MockL2BlockError {
 #[derive(Debug, Clone, Default)]
 pub struct MockEngineStorage {
     /// Storage for block responses by tag.
-    pub l2_blocks_by_label: HashMap<BlockNumberOrTag, Block<BaseTransaction>>,
+    pub l2_blocks_by_label: HashMap<BlockNumberOrTag, L2RpcBlock>,
     /// Storage for block info responses by tag.
     pub block_info_by_tag: HashMap<BlockNumberOrTag, L2BlockInfo>,
+    /// Whether the EL is actively syncing.
+    pub el_syncing: bool,
 
     // Version-specific new_payload responses
     /// Storage for `new_payload_v2` responses.
@@ -64,8 +72,12 @@ pub struct MockEngineStorage {
     // Version-specific fork_choice_updated responses
     /// Storage for `fork_choice_updated_v2` responses.
     pub fork_choice_updated_v2_response: Option<ForkchoiceUpdated>,
+    /// Storage for `fork_choice_updated_v2` requests and whether they included payload attributes.
+    pub fork_choice_updated_v2_requests: Vec<(ForkchoiceState, bool)>,
     /// Storage for `fork_choice_updated_v3` responses.
     pub fork_choice_updated_v3_response: Option<ForkchoiceUpdated>,
+    /// Storage for `fork_choice_updated_v3` requests and whether they included payload attributes.
+    pub fork_choice_updated_v3_requests: Vec<(ForkchoiceState, bool)>,
 
     // Version-specific fork_choice_updated error overrides
     /// Error to return for `fork_choice_updated_v2` instead of a response.
@@ -99,9 +111,11 @@ pub struct MockEngineStorage {
     /// Storage for L1 blocks by stringified `BlockId`.
     /// L1 blocks use standard Ethereum transactions.
     pub l1_blocks_by_id: HashMap<String, Block<EthTransaction>>,
+    /// Number of executed L1 block requests by stringified `BlockId`.
+    pub l1_block_calls_by_id: HashMap<String, u64>,
     /// Storage for L2 blocks by stringified `BlockId`.
     /// L2 blocks use Base transactions.
-    pub l2_blocks_by_id: HashMap<String, Block<BaseTransaction>>,
+    pub l2_blocks_by_id: HashMap<String, L2RpcBlock>,
     /// Errors returned for L2 block requests by stringified `BlockId`.
     pub l2_block_errors_by_id: HashMap<String, MockL2BlockError>,
     /// Storage for proofs by (address, stringified `BlockId`) key.
@@ -154,13 +168,19 @@ impl MockEngineClientBuilder {
         tag: BlockNumberOrTag,
         block: Block<BaseTransaction>,
     ) -> Self {
-        self.storage.l2_blocks_by_label.insert(tag, block);
+        self.storage.l2_blocks_by_label.insert(tag, l2_rpc_block(block));
         self
     }
 
     /// Sets a block info response for a specific tag.
     pub fn with_block_info_by_tag(mut self, tag: BlockNumberOrTag, info: L2BlockInfo) -> Self {
         self.storage.block_info_by_tag.insert(tag, info);
+        self
+    }
+
+    /// Sets the `eth_syncing` response.
+    pub const fn with_el_syncing(mut self, syncing: bool) -> Self {
+        self.storage.el_syncing = syncing;
         self
     }
 
@@ -270,7 +290,7 @@ impl MockEngineClientBuilder {
     /// Sets an L2 block response for a specific `BlockId`.
     pub fn with_l2_block(mut self, block_id: BlockId, block: Block<BaseTransaction>) -> Self {
         let key = block_id_to_key(&block_id);
-        self.storage.l2_blocks_by_id.insert(key, block);
+        self.storage.l2_blocks_by_id.insert(key, l2_rpc_block(block));
         self
     }
 
@@ -346,7 +366,7 @@ impl MockEngineClient {
         tag: BlockNumberOrTag,
         block: Block<BaseTransaction>,
     ) {
-        self.storage.write().await.l2_blocks_by_label.insert(tag, block);
+        self.storage.write().await.l2_blocks_by_label.insert(tag, l2_rpc_block(block));
     }
 
     /// Sets a block info response for a specific tag.
@@ -433,7 +453,7 @@ impl MockEngineClient {
     /// Sets an L2 block response for a specific `BlockId`.
     pub async fn set_l2_block(&self, block_id: BlockId, block: Block<BaseTransaction>) {
         let key = block_id_to_key(&block_id);
-        self.storage.write().await.l2_blocks_by_id.insert(key, block);
+        self.storage.write().await.l2_blocks_by_id.insert(key, l2_rpc_block(block));
     }
 
     /// Sets a proof response for a specific address and `BlockId`.
@@ -471,7 +491,8 @@ impl EngineClient for MockEngineClient {
                 let block_key = block_key.clone();
 
                 ProviderCall::BoxedFuture(Box::pin(async move {
-                    let storage_guard = storage.read().await;
+                    let mut storage_guard = storage.write().await;
+                    *storage_guard.l1_block_calls_by_id.entry(block_key.clone()).or_default() += 1;
                     Ok(storage_guard.l1_blocks_by_id.get(&block_key).cloned())
                 }))
             }),
@@ -536,7 +557,7 @@ impl EngineClient for MockEngineClient {
     async fn l2_block_by_label(
         &self,
         numtag: BlockNumberOrTag,
-    ) -> Result<Option<Block<BaseTransaction>>, EngineClientError> {
+    ) -> Result<Option<L2RpcBlock>, EngineClientError> {
         let storage = self.storage.read().await;
         Ok(storage.l2_blocks_by_label.get(&numtag).cloned())
     }
@@ -547,6 +568,10 @@ impl EngineClient for MockEngineClient {
     ) -> Result<Option<L2BlockInfo>, EngineClientError> {
         let storage = self.storage.read().await;
         Ok(storage.block_info_by_tag.get(&numtag).copied())
+    }
+
+    async fn el_syncing(&self) -> Result<bool, EngineClientError> {
+        Ok(self.storage.read().await.el_syncing)
     }
 }
 
@@ -596,10 +621,13 @@ impl BaseEngineApi for MockEngineClient {
 
     async fn fork_choice_updated_v2(
         &self,
-        _fork_choice_state: ForkchoiceState,
-        _payload_attributes: Option<BasePayloadAttributes>,
+        fork_choice_state: ForkchoiceState,
+        payload_attributes: Option<BasePayloadAttributes>,
     ) -> TransportResult<ForkchoiceUpdated> {
-        let storage = self.storage.read().await;
+        let mut storage = self.storage.write().await;
+        storage
+            .fork_choice_updated_v2_requests
+            .push((fork_choice_state, payload_attributes.is_some()));
         if let Some(error) = storage.fork_choice_updated_v2_error.clone() {
             return Err(TransportError::ErrorResp(error));
         }
@@ -613,10 +641,13 @@ impl BaseEngineApi for MockEngineClient {
 
     async fn fork_choice_updated_v3(
         &self,
-        _fork_choice_state: ForkchoiceState,
-        _payload_attributes: Option<BasePayloadAttributes>,
+        fork_choice_state: ForkchoiceState,
+        payload_attributes: Option<BasePayloadAttributes>,
     ) -> TransportResult<ForkchoiceUpdated> {
-        let storage = self.storage.read().await;
+        let mut storage = self.storage.write().await;
+        storage
+            .fork_choice_updated_v3_requests
+            .push((fork_choice_state, payload_attributes.is_some()));
         if let Some(error) = storage.fork_choice_updated_v3_error.clone() {
             return Err(TransportError::ErrorResp(error));
         }

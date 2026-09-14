@@ -10,7 +10,7 @@ use base_optimism_rpc::OptimismRollupProviderExt;
 use base_prover_service_client::{ProofRequesterClient, ProverServiceClientConfig};
 use base_prover_service_protocol::{
     ExecutionStats, GetProofRequest, GetProofResponse, ProofRequest, ProofRequestKind, ProofResult,
-    ProofStatus, ProveBlockRangeRequest, ZkProofRequest, ZkVm,
+    ProofStatus, ProveBlockRangeRequest, ZkBackend, ZkProofRequest, ZkVm,
 };
 use eyre::{Result, WrapErr, ensure};
 use nanoid::nanoid;
@@ -125,9 +125,12 @@ impl ZkProofBench {
                         sequence_window: None,
                         l1_head: Some(l1_head),
                         intermediate_root_interval: None,
+                        schedule_l2_block_number: None,
                         zk_vm: ZkVm::Sp1,
+                        zk_backend: ZkBackend::DryRun,
                     }),
                 },
+                retry_failed: true,
             })
             .await?;
 
@@ -193,8 +196,8 @@ impl ZkProofBench {
                     "dry-run prover response for request {session_id} did not include execution_stats"
                 )
             }),
-            Some(ProofResult::SnarkGroth16(_)) => Err(eyre::eyre!(
-                "dry-run prover response for request {session_id} returned snark_groth16 result"
+            Some(ProofResult::SnarkPlonk(_)) => Err(eyre::eyre!(
+                "dry-run prover response for request {session_id} returned snark_plonk result"
             )),
             Some(ProofResult::Tee(_)) => Err(eyre::eyre!(
                 "dry-run prover response for request {session_id} returned tee result"

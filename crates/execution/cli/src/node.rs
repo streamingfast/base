@@ -22,7 +22,7 @@ use reth_rpc_server_types::{
 };
 use tracing::info;
 
-use crate::{MeteringArgs, RpcStandardNodeArgs, StandardNodeArgs};
+use crate::{MeteringArgs, RpcStandardNodeArgs, ShadowIndexerArgs, StandardNodeArgs};
 
 const DEFAULT_BASE_MAX_INBOUND_EL_PEERS: usize = 80;
 const DEFAULT_BASE_MAX_OUTBOUND_EL_PEERS: usize = 80;
@@ -141,6 +141,7 @@ impl ExecutionNodeConfigArgs {
             era,
             static_files,
             storage,
+            jit: Default::default(),
         };
 
         if node_config.network.max_inbound_peers.is_none() {
@@ -173,6 +174,10 @@ pub struct ExecutionNodeArgs {
     /// Metering RPC and priority-fee resource budget arguments.
     #[command(flatten)]
     pub metering: MeteringArgs,
+
+    /// Shadow indexer `ExEx` arguments.
+    #[command(flatten)]
+    pub shadow_indexer: ShadowIndexerArgs,
 }
 
 impl ExecutionNodeArgs {
@@ -181,7 +186,9 @@ impl ExecutionNodeArgs {
         let runtime = self.node.into_runtime_config(chain);
         ExecutionNodeLaunchConfig {
             node_config: runtime.node_config,
-            standard: StandardNodeArgs::from(self.standard).with_metering(self.metering),
+            standard: StandardNodeArgs::from(self.standard)
+                .with_metering(self.metering)
+                .with_shadow_indexer(self.shadow_indexer),
             with_unused_ports: runtime.with_unused_ports,
             upgrade_signal_startup: runtime.upgrade_signal_startup,
         }
@@ -413,17 +420,19 @@ mod tests {
         let args = CommandParser::<ExecutionNodeArgs>::parse_from([
             "reth",
             "--enable-metering",
-            "--metering.execution-time-us",
-            "5000000",
+            "--metering.target-flashblocks-per-block",
+            "4",
+            "--metering.gas-limit",
+            "30000000",
         ])
         .args;
 
         assert!(args.metering.enable_metering);
-        assert_eq!(args.metering.metering_execution_time_us, Some(5_000_000));
+        assert_eq!(args.metering.metering_gas_limit, Some(30_000_000));
 
         let launch_config = args.into_launch_config(Arc::new(BaseChainSpec::devnet()));
         assert!(launch_config.standard.metering.enable_metering);
-        assert_eq!(launch_config.standard.metering.metering_execution_time_us, Some(5_000_000));
+        assert_eq!(launch_config.standard.metering.metering_gas_limit, Some(30_000_000));
     }
 
     #[test]

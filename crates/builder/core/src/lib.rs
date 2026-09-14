@@ -31,19 +31,27 @@ pub use metering::{MeteringProvider, NoopMeteringProvider, SharedMeteringProvide
 mod rejected_tx_forwarder;
 pub use rejected_tx_forwarder::RejectedTxForwarder;
 
+// Internal-only helpers for emitting builder transaction events. The event surface
+// is shared via `base-observability-events`, while this module keeps
+// builder-specific payload construction private to the builder crate.
+mod transaction_events;
+
 mod rejection_cache;
 pub use rejection_cache::RejectionCache;
 
 mod flashblocks;
 pub use flashblocks::{
-    BasePayloadBuilderCtx, BestFlashblocksTxs, BlockCell, BlockPayloadJob,
-    BlockPayloadJobGenerator, BuildArguments, FlashblockDiagnostics, FlashblockSelectionOutcome,
-    FlashblocksExtraCtx, FlashblocksServiceBuilder, PayloadBuilder, PayloadHandler, ResolvePayload,
-    WaitForValue,
+    BasePayloadBuilderCtx, BestFlashblocksTxs, BlockPayloadJob, BlockPayloadJobGenerator,
+    BuildArguments, FlashblockDiagnostics, FlashblockSelectionOutcome, FlashblocksExtraCtx,
+    FlashblocksServiceBuilder, ParkableBestPayloadTransactions, ParkablePayloadTransactions,
+    ParkedPredicateIndex, PayloadBuilder, PayloadHandler, PayloadJobDeadline,
+    PayloadTransactionInvalidated, ResolvePayload, ValidityPredicateKey,
 };
 
 mod extension;
-pub use extension::BuilderApiExtension;
+pub use extension::{
+    BuilderApiExtension, BuilderApiExtensionConfig, DEFAULT_MAX_VALIDITY_PREDICATES,
+};
 
 /// Shared test infrastructure: local node instances, chain drivers, transaction builders, and pool observers.
 #[cfg(any(test, feature = "test-utils"))]

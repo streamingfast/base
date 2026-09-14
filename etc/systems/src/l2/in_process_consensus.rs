@@ -6,7 +6,7 @@
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    num::NonZeroUsize,
+    num::{NonZeroU64, NonZeroUsize},
     sync::Arc,
     time::Duration,
 };
@@ -20,10 +20,14 @@ use base_common_genesis::RollupConfig;
 use base_consensus_disc::LocalNode;
 use base_consensus_node::{
     EngineConfig, L1ConfigBuilder, NetworkConfig, NodeMode, RollupNodeBuilder, SequencerConfig,
+    UpgradeSignalBuilderConfig,
 };
 use base_consensus_peers::{PeerScoreLevel, SecretKeyLoader};
 use base_consensus_rpc::{AdminApiClient, BaseP2PApiClient, RollupNodeApiClient, RpcBuilder};
 use base_consensus_sources::BlockSigner;
+use base_upgrade_signal::{
+    UpgradeSignalConfig, UpgradeSignalMetricLayer, UpgradeSignalRuntimeApplier,
+};
 use eyre::{Result, WrapErr};
 use jsonrpsee::http_client::HttpClientBuilder;
 use tempfile::TempDir;
@@ -72,6 +76,19 @@ pub struct InProcessConsensusConfig {
     pub sequencer_stopped: bool,
     /// Number of L1 blocks to keep distance from the L1 head for the verifier.
     pub verifier_l1_confs: u64,
+    /// Number of private blocks to build per cycle when running as a shadow sequencer.
+    ///
+    /// When [`None`], the node runs as a normal sequencer. When [`Some`], the node runs as a
+    /// shadow sequencer: it buffers canonical payloads gossiped by the active sequencer, builds
+    /// the given number of private blocks per cycle, then reconciles back to the canonical chain.
+    pub shadow_blocks_per_cycle: Option<NonZeroU64>,
+    /// Optional L1 upgrade signal configuration.
+    ///
+    /// When the mode applies at startup, the schedule is read from L1 (over `l1_rpc_url`) and
+    /// applied to the rollup config before the node starts, mirroring the standalone consensus
+    /// CLI. The config is also passed to the node for live polling (and, in runtime-admin mode,
+    /// automatic re-application of observed L1 changes).
+    pub upgrade_signal: Option<UpgradeSignalConfig>,
 }
 
 /// A running in-process consensus node.
@@ -96,8 +113,31 @@ impl std::fmt::Debug for InProcessConsensus {
 impl InProcessConsensus {
     /// Starts an in-process consensus node with the given configuration.
     pub async fn start(config: InProcessConsensusConfig) -> Result<Self> {
-        let rollup_config = config.rollup_config;
+        let mut rollup_config = config.rollup_config;
         let l1_chain_config = config.l1_chain_config;
+
+        // Mirror the standalone consensus CLI: read the validated L1 schedule and apply it to
+        // the rollup config before the node starts.
+        if let Some(signal_config) = &config.upgrade_signal
+            && signal_config.mode.applies_at_startup()
+        {
+            let reader = signal_config.reader(config.l1_rpc_url.clone())?;
+            let schedule = signal_config
+                .read_validated_schedule(
+                    &reader,
+                    "system test consensus startup",
+                    &[UpgradeSignalMetricLayer::Consensus],
+                )
+                .await
+                .wrap_err("Failed to read upgrade signal schedule at startup")?;
+            UpgradeSignalRuntimeApplier::apply_schedule_to_sink(
+                rollup_config.l2_chain_id.id(),
+                &schedule,
+                &mut rollup_config,
+            )
+            .unwrap_or_else(|never| match never {})
+            .log("rollup config");
+        }
 
         let rpc_port = config.rpc_port.unwrap_or_else(get_available_port);
         let p2p_tcp_port = config.p2p_tcp_port.unwrap_or_else(get_available_port);
@@ -151,8 +191,10 @@ impl InProcessConsensus {
             trust_rpc: true,
             beacon: config.l1_beacon_url,
             rpc_url: config.l1_rpc_url.clone(),
+            rpc_timeout: base_consensus_providers::L1_RPC_TIMEOUT,
             slot_duration_override: config.l1_slot_duration_override,
             verifier_l1_confs: config.verifier_l1_confs,
+            da_batcher_sender_override: None,
         };
 
         let engine_config = EngineConfig {
@@ -160,6 +202,7 @@ impl InProcessConsensus {
             l2_url: config.l2_engine_url,
             l2_jwt_secret: config.jwt_secret,
             l1_url: config.l1_rpc_url,
+            l1_rpc_timeout: base_consensus_providers::L1_RPC_TIMEOUT,
             mode: config.mode,
         };
 
@@ -189,11 +232,17 @@ impl InProcessConsensus {
             net_config,
             Some(rpc_config),
         )
+        .with_upgrade_signal_config(UpgradeSignalBuilderConfig {
+            metrics_config: config.upgrade_signal,
+            l1_rpc: None,
+        })
         .with_checkpoint_path(checkpoint_path);
 
         if config.mode == NodeMode::Sequencer {
             builder = builder.with_sequencer_config(SequencerConfig {
                 sequencer_stopped: config.sequencer_stopped,
+                shadow_blocks_per_cycle: config.shadow_blocks_per_cycle,
+                l1_rpc_timeout: base_consensus_providers::L1_RPC_TIMEOUT,
                 ..Default::default()
             });
         }

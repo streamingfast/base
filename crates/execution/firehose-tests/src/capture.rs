@@ -3,7 +3,7 @@
 //! The capture / invariants / projection / golden machinery lives in `firehose-tracer-test` and is
 //! chain-agnostic. Installing the process-wide tracer is the one part that cannot: the
 //! `GLOBAL_TRACER` singleton and the `is_tracer_initialized()` gate the live engine path checks
-//! (`crates/execution/engine-tree/src/validator.rs`) both live in `reth-firehose`. This module is
+//! (reth's engine validator) both live in `reth-firehose`. This module is
 //! the thin adapter that installs reth's buffer-backed tracer and hands the buffer to
 //! [`FirehoseCapture`].
 

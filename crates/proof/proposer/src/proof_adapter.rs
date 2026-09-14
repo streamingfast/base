@@ -1,10 +1,10 @@
 //! Adapters between proposer proof types and the shared prover-service protocol.
 
 use alloy_primitives::B256;
-use base_proof_primitives::{ProofRequest as PrimitiveProofRequest, Proposal};
+use base_proof_primitives::ProofRequest as PrimitiveProofRequest;
 use base_prover_service_protocol::{
     ProofRequest, ProofRequestKind, ProofResult, ProofSessionId, ProveBlockRangeRequest, TeeKind,
-    TeeProofRequest,
+    TeeProofRequest, TeeProofResult,
 };
 
 use crate::ProposerError;
@@ -14,7 +14,7 @@ use crate::ProposerError;
 pub struct ProposerProofAdapter;
 
 impl ProposerProofAdapter {
-    const SESSION_NAMESPACE: &'static [u8] = b"base/proposer/proof-session/v1";
+    const SESSION_NAMESPACE: &'static [u8] = b"base/proposer/proof-session/v2";
 
     const TEE_SESSION_LABEL: &'static str = "tee/aws_nitro";
 
@@ -42,13 +42,12 @@ impl ProposerProofAdapter {
                     tee_kind: TeeKind::AwsNitro,
                 }),
             },
+            retry_failed: true,
         }
     }
 
     /// Converts a prover-service TEE proof result into proposal parts.
-    pub fn tee_proof_result(
-        result: ProofResult,
-    ) -> Result<(Proposal, Vec<Proposal>), ProposerError> {
+    pub fn tee_proof_result(result: ProofResult) -> Result<TeeProofResult, ProposerError> {
         let result = match result {
             ProofResult::Tee(result) => result,
             ProofResult::Compressed(_) => {
@@ -56,9 +55,9 @@ impl ProposerProofAdapter {
                     "expected TEE proof result, got Compressed".into(),
                 ));
             }
-            ProofResult::SnarkGroth16(_) => {
+            ProofResult::SnarkPlonk(_) => {
                 return Err(ProposerError::Prover(
-                    "expected TEE proof result, got SnarkGroth16".into(),
+                    "expected TEE proof result, got SnarkPlonk".into(),
                 ));
             }
         };
@@ -69,7 +68,7 @@ impl ProposerProofAdapter {
             )));
         }
 
-        Ok((result.aggregate_proposal, result.proposals))
+        Ok(result)
     }
 }
 
@@ -77,7 +76,7 @@ impl ProposerProofAdapter {
 mod tests {
     use alloy_primitives::{Address, B256, Bytes};
     use base_prover_service_protocol::{
-        ProofRequestKind, ProofResult, SnarkGroth16ProofResult, TeeKind, TeeProofResult,
+        ProofRequestKind, ProofResult, SnarkPlonkProofResult, TeeKind, TeeProofResult,
         ZkProofResult, ZkVm,
     };
 
@@ -94,7 +93,7 @@ mod tests {
             proposer: Address::repeat_byte(0x04),
             intermediate_block_interval: 300,
             l1_head_number: 1200,
-            image_hash: B256::repeat_byte(0x05),
+            schedule_l2_block_number: None,
         }
     }
 
@@ -124,11 +123,14 @@ mod tests {
             aggregate_proposal: aggregate.clone(),
             proposals: vec![proposal.clone()],
             tee_kind: TeeKind::AwsNitro,
+            tee_signer: Address::repeat_byte(0x11),
         });
 
         let converted = ProposerProofAdapter::tee_proof_result(result).unwrap();
 
-        assert_eq!(converted, (aggregate, vec![proposal]));
+        assert_eq!(converted.aggregate_proposal, aggregate);
+        assert_eq!(converted.proposals, vec![proposal]);
+        assert_eq!(converted.tee_signer, Address::repeat_byte(0x11));
     }
 
     #[test]
@@ -143,14 +145,14 @@ mod tests {
                 "expected TEE proof result, got Compressed",
             ),
             (
-                ProofResult::SnarkGroth16(SnarkGroth16ProofResult {
+                ProofResult::SnarkPlonk(SnarkPlonkProofResult {
                     proof: ZkProofResult {
                         zk_vm: ZkVm::Sp1,
                         proof: Bytes::from(vec![]),
                         execution_stats: None,
                     },
                 }),
-                "expected TEE proof result, got SnarkGroth16",
+                "expected TEE proof result, got SnarkPlonk",
             ),
         ] {
             let err = ProposerProofAdapter::tee_proof_result(result).unwrap_err();

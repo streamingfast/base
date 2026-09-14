@@ -16,13 +16,16 @@ use base_common_chains::Upgrades;
 use base_common_consensus::{BaseReceipt, BaseTransactionSigned, DepositReceipt, OpTxType};
 use base_common_evm::{BaseReceiptBuilder, BaseSpecId, L1BlockInfo};
 use base_execution_chainspec::BaseChainSpec;
+use base_execution_eip8130::IntrinsicGas;
 use base_execution_evm::{BaseEvmConfig, BaseNextBlockEnvAttributes};
 use base_execution_payload_builder::{
     BasePayloadBuilderAttributes, error::BasePayloadBuilderError,
 };
 use base_execution_txpool::{
-    BundleTransaction, TimestampedTransaction, estimated_da_size::DataAvailabilitySized,
+    BasePooledTx, BundleTransaction, GuardMetrics, PredicateContext, TimestampedTransaction,
+    ValidityPredicate, estimated_da_size::DataAvailabilitySized,
 };
+use base_observability_events::TransactionEventType;
 use reth_basic_payload_builder::PayloadConfig;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_evm::{
@@ -35,44 +38,24 @@ use reth_primitives_traits::{InMemorySize, SealedHeader, SignedTransaction};
 use reth_revm::{State, context::Block};
 use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction};
 use revm::{DatabaseCommit, context::result::ResultAndState, interpreter::as_u64_saturated};
+use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, debug, span, trace, warn};
 
 use crate::{
-    BuilderConfig, BuilderMetrics, ExecutionInfo, ExecutionMeteringLimitExceeded, PayloadTxsBounds,
-    ResourceLimits, TxResources, TxnExecutionError, TxnOutcome,
+    BuilderConfig, BuilderMetrics, ExecutionInfo, ExecutionMeteringLimitExceeded,
+    ParkedPredicateIndex, PayloadTxsBounds, ResourceLimits, TxResources, TxnExecutionError,
+    TxnOutcome, ValidityPredicateKey,
+    transaction_events::{
+        BuilderAcceptedEventData, BuilderConsideredEventData, BuilderRejectedEventData,
+        BuilderTransactionEventContext, emit_builder_transaction_event, rejection_reason_code,
+    },
 };
 
 /// Records the priority fee of a rejected transaction with the given reason as a label.
 fn record_rejected_tx_priority_fee(reason: &TxnExecutionError, priority_fee: f64) {
-    let r = match reason {
-        TxnExecutionError::TransactionDASizeExceeded(_, _) => "tx_da_size_exceeded",
-        TxnExecutionError::BlockDASizeExceeded { .. } => "block_da_size_exceeded",
-        TxnExecutionError::DAFootprintLimitExceeded { .. } => "da_footprint_limit_exceeded",
-        TxnExecutionError::TransactionGasLimitExceeded { .. } => "transaction_gas_limit_exceeded",
-        TxnExecutionError::BlockUncompressedSizeExceeded { .. } => {
-            "block_uncompressed_size_exceeded"
-        }
-        TxnExecutionError::MeteringDataPending => "metering_data_pending",
-        TxnExecutionError::ExecutionMeteringLimitExceeded(inner) => match inner {
-            ExecutionMeteringLimitExceeded::TransactionExecutionTime(_, _) => {
-                "tx_execution_time_exceeded"
-            }
-            ExecutionMeteringLimitExceeded::FlashblockExecutionTime(_, _, _) => {
-                "flashblock_execution_time_exceeded"
-            }
-            ExecutionMeteringLimitExceeded::BlockStateRootGas(_, _, _) => {
-                "block_state_root_gas_exceeded"
-            }
-        },
-        TxnExecutionError::SequencerTransaction => "sequencer_transaction",
-        TxnExecutionError::NonceTooLow => "nonce_too_low",
-        TxnExecutionError::InternalError(_) => "internal_error",
-        TxnExecutionError::EvmError => "evm_error",
-        TxnExecutionError::MaxGasUsageExceeded => "max_gas_usage_exceeded",
-    };
-    BuilderMetrics::rejected_tx_priority_fee(r).record(priority_fee);
+    BuilderMetrics::rejected_tx_priority_fee(rejection_reason_code(reason)).record(priority_fee);
 }
 
 /// Diagnostics captured during a single flashblock's transaction execution.
@@ -115,10 +98,8 @@ pub struct FlashblockDiagnostics {
     pub txs_rejected_da: u64,
     /// Number rejected by DA footprint limit.
     pub txs_rejected_da_footprint: u64,
-    /// Number rejected by execution time limits (tx or flashblock).
+    /// Number rejected by the per-transaction execution time limit.
     pub txs_rejected_execution_time: u64,
-    /// Number rejected by state root time limits (tx or block).
-    pub txs_rejected_state_root_time: u64,
     /// Number rejected by uncompressed size limit.
     pub txs_rejected_uncompressed_size: u64,
     /// Number skipped because metering data has not yet arrived.
@@ -144,13 +125,12 @@ impl FlashblockDiagnostics {
     }
 
     /// Returns the rejection counts keyed by their metric/log reason labels.
-    pub const fn rejection_counts(&self) -> [(&'static str, u64); 8] {
+    pub const fn rejection_counts(&self) -> [(&'static str, u64); 7] {
         [
             ("gas_limit", self.txs_rejected_gas),
             ("da_size", self.txs_rejected_da),
             ("da_footprint", self.txs_rejected_da_footprint),
             ("execution_time", self.txs_rejected_execution_time),
-            ("state_root_time", self.txs_rejected_state_root_time),
             ("uncompressed_size", self.txs_rejected_uncompressed_size),
             ("metering_data_pending", self.txs_rejected_metering_data_pending),
             ("other", self.txs_rejected_other),
@@ -171,7 +151,6 @@ impl FlashblockDiagnostics {
             + self.txs_rejected_da
             + self.txs_rejected_da_footprint
             + self.txs_rejected_execution_time
-            + self.txs_rejected_state_root_time
             + self.txs_rejected_uncompressed_size
             + self.txs_rejected_metering_data_pending
             + self.txs_rejected_other
@@ -193,15 +172,10 @@ impl FlashblockDiagnostics {
             TxnExecutionError::BlockUncompressedSizeExceeded { .. } => {
                 self.txs_rejected_uncompressed_size += 1;
             }
-            TxnExecutionError::ExecutionMeteringLimitExceeded(inner) => match inner {
-                ExecutionMeteringLimitExceeded::TransactionExecutionTime(_, _)
-                | ExecutionMeteringLimitExceeded::FlashblockExecutionTime(_, _, _) => {
-                    self.txs_rejected_execution_time += 1;
-                }
-                ExecutionMeteringLimitExceeded::BlockStateRootGas(_, _, _) => {
-                    self.txs_rejected_state_root_time += 1;
-                }
-            },
+            TxnExecutionError::ExecutionMeteringLimitExceeded(inner) => {
+                let ExecutionMeteringLimitExceeded::TransactionExecutionTime(_, _) = inner;
+                self.txs_rejected_execution_time += 1;
+            }
             TxnExecutionError::MeteringDataPending => {
                 self.txs_rejected_metering_data_pending += 1;
             }
@@ -232,20 +206,12 @@ pub struct FlashblocksExtraCtx {
     pub target_da_for_batch: Option<u64>,
     /// Total DA footprint left for the current flashblock
     pub target_da_footprint_for_batch: Option<u64>,
-    /// Target execution time for the current flashblock in microseconds
-    pub target_execution_time_for_batch_us: Option<u128>,
-    /// Target state root gas for the current flashblock
-    pub target_state_root_gas_for_batch: Option<u64>,
     /// Gas limit per flashblock
     pub gas_per_batch: u64,
     /// DA bytes limit per flashblock
     pub da_per_batch: Option<u64>,
     /// DA footprint limit per flashblock
     pub da_footprint_per_batch: Option<u64>,
-    /// Execution time limit per flashblock in microseconds
-    pub execution_time_per_batch_us: Option<u128>,
-    /// State root gas limit per flashblock
-    pub state_root_gas_per_batch: Option<u64>,
 }
 
 impl FlashblocksExtraCtx {
@@ -258,16 +224,12 @@ impl FlashblocksExtraCtx {
         target_gas_for_batch: u64,
         target_da_for_batch: Option<u64>,
         target_da_footprint_for_batch: Option<u64>,
-        target_execution_time_for_batch_us: Option<u128>,
-        target_state_root_gas_for_batch: Option<u64>,
     ) -> Self {
         Self {
             flashblock_index: self.flashblock_index + 1,
             target_gas_for_batch,
             target_da_for_batch,
             target_da_footprint_for_batch,
-            target_execution_time_for_batch_us,
-            target_state_root_gas_for_batch,
             ..self
         }
     }
@@ -497,6 +459,44 @@ impl BasePayloadBuilderCtx {
             }
         }
     }
+
+    fn builder_transaction_event_context(
+        &self,
+        payload_id: &str,
+        ordering_position: Option<u64>,
+        block_hash: Option<BlockHash>,
+    ) -> BuilderTransactionEventContext {
+        BuilderTransactionEventContext {
+            payload_id: payload_id.to_string(),
+            block_number: self.block_number(),
+            block_hash,
+            parent_hash: self.parent_hash(),
+            flashblock_index: Some(self.flashblock_index()),
+            target_flashblock_count: self.target_flashblock_count(),
+            ordering_position,
+            builder_mode: "flashblocks",
+            source_queue: "txpool_best",
+        }
+    }
+
+    fn emit_builder_decision_event<D, F>(
+        &self,
+        payload_id: &str,
+        event_type: TransactionEventType,
+        tx_hash: TxHash,
+        ordering_position: Option<u64>,
+        data: F,
+    ) where
+        D: Serialize,
+        F: FnOnce() -> D,
+    {
+        emit_builder_transaction_event(
+            self.builder_transaction_event_context(payload_id, ordering_position, None),
+            event_type,
+            tx_hash,
+            data,
+        );
+    }
 }
 
 impl BasePayloadBuilderCtx {
@@ -671,55 +671,283 @@ impl BasePayloadBuilderCtx {
             block_data_limit = ?limits.block_data_limit,
             tx_data_limit = ?limits.tx_data_limit,
             block_gas_limit = ?limits.block_gas_limit,
-            flashblock_execution_time_limit_us = ?limits.flashblock_execution_time_limit_us,
-            block_state_root_gas_limit = ?limits.block_state_root_gas_limit,
             execution_metering_mode = ?self.builder_config.execution_metering_mode,
         );
 
         let block_number = as_u64_saturated!(self.evm_env.block_env.number);
         let block_timestamp = self.attributes().timestamp();
+        let payload_id = self.payload_id().to_string();
+        let mut predicate_index = ParkedPredicateIndex::default();
+        let predicate_context =
+            PredicateContext { block_number, flashblock_index: self.flashblock_index() };
 
         while let Some(tx) = best_txs.next(()) {
-            if let Some(target) = tx.target_block_number()
-                && target != block_number
-            {
-                trace!(
-                    target: "payload_builder",
-                    tx_hash = ?tx.hash(),
-                    target_block = target,
-                    current_block = block_number,
-                    "skipping bundle tx: wrong target block"
-                );
-                best_txs.mark_invalid(tx.sender(), tx.nonce());
-                continue;
+            if self.cancel.is_cancelled() {
+                diag.cancelled = true;
+                diag.txs_considered = num_txs_considered;
+                diag.txs_included =
+                    (info.executed_transactions.len() as u64).saturating_sub(min_tx_index);
+                return Ok(diag);
             }
 
             if tx.is_bundle_expired(block_number, block_timestamp) {
+                let tx_hash = *tx.hash();
+                let min_block_number = tx.min_block_number();
+                let max_block_number = tx.max_block_number();
+                num_txs_considered += 1;
+                let ordering_position = num_txs_considered;
                 trace!(
                     target: "payload_builder",
-                    tx_hash = ?tx.hash(),
+                    tx_hash = ?tx_hash,
                     block = block_number,
                     timestamp = block_timestamp,
                     "skipping bundle tx: expired"
                 );
+                self.emit_builder_decision_event(
+                    &payload_id,
+                    TransactionEventType::BuilderConsidered,
+                    tx_hash,
+                    Some(ordering_position),
+                    || {
+                        BuilderConsideredEventData::new(info, limits, None)
+                            .with_bundle_block_window(min_block_number, max_block_number)
+                    },
+                );
+                self.emit_builder_decision_event(
+                    &payload_id,
+                    TransactionEventType::BuilderRejected,
+                    tx_hash,
+                    Some(ordering_position),
+                    || {
+                        BuilderRejectedEventData::new(
+                            "bundle_expired",
+                            "bundle validity window expired",
+                            false,
+                            info,
+                            limits,
+                            None,
+                        )
+                        .with_bundle_block_window(min_block_number, max_block_number)
+                        .with_block_timestamp(block_timestamp)
+                    },
+                );
                 best_txs.mark_invalid(tx.sender(), tx.nonce());
                 continue;
             }
 
-            if tx.is_bundle_not_yet_valid(block_timestamp) {
+            if tx.is_bundle_not_yet_valid(block_number, block_timestamp) {
+                let tx_hash = *tx.hash();
+                let min_block_number = tx.min_block_number();
+                let max_block_number = tx.max_block_number();
+                num_txs_considered += 1;
+                let ordering_position = num_txs_considered;
                 trace!(
                     target: "payload_builder",
-                    tx_hash = ?tx.hash(),
+                    tx_hash = ?tx_hash,
                     block = block_number,
                     timestamp = block_timestamp,
                     "skipping bundle tx: not yet valid"
                 );
+                self.emit_builder_decision_event(
+                    &payload_id,
+                    TransactionEventType::BuilderConsidered,
+                    tx_hash,
+                    Some(ordering_position),
+                    || {
+                        BuilderConsideredEventData::new(info, limits, None)
+                            .with_bundle_block_window(min_block_number, max_block_number)
+                    },
+                );
+                self.emit_builder_decision_event(
+                    &payload_id,
+                    TransactionEventType::BuilderRejected,
+                    tx_hash,
+                    Some(ordering_position),
+                    || {
+                        BuilderRejectedEventData::new(
+                            "bundle_not_yet_valid",
+                            "bundle validity window has not started",
+                            false,
+                            info,
+                            limits,
+                            None,
+                        )
+                        .with_bundle_block_window(min_block_number, max_block_number)
+                        .with_current_block(block_number)
+                        .with_block_timestamp(block_timestamp)
+                    },
+                );
+                best_txs.mark_invalid(tx.sender(), tx.nonce());
+                continue;
+            }
+
+            let tx_hash = *tx.hash();
+            let mut predicate_read_failed = false;
+            let blocking_predicate = match ValidityPredicateKey::first_unsatisfied(
+                tx.validity_predicates(),
+                evm.db_mut(),
+                &predicate_context,
+            ) {
+                Ok(blocking_predicate) => blocking_predicate,
+                Err(error) => {
+                    warn!(
+                        target: "payload_builder",
+                        tx_hash = ?tx_hash,
+                        error = ?error,
+                        "failed to read validity predicate state"
+                    );
+                    predicate_read_failed = true;
+                    None
+                }
+            };
+            if predicate_read_failed || blocking_predicate.is_some() {
+                num_txs_considered += 1;
+                let ordering_position = num_txs_considered;
+                // A position predicate (block_number / flashblock_index) whose
+                // upper bound the build has passed can never be satisfied again,
+                // so the transaction is expired rather than merely unsatisfied.
+                let predicate_expired = !predicate_read_failed
+                    && ValidityPredicate::is_batch_expired(
+                        tx.validity_predicates(),
+                        &predicate_context,
+                    );
+                let (rejection_reason, rejection_detail) = if predicate_read_failed {
+                    (
+                        "validity_predicate_read_failed",
+                        "failed to read state required by a validity predicate",
+                    )
+                } else if predicate_expired {
+                    (
+                        "validity_predicate_expired",
+                        "a validity predicate can no longer be satisfied at or after the current build position",
+                    )
+                } else {
+                    (
+                        "validity_predicate_not_satisfied",
+                        "a validity predicate is not satisfied by the current build state",
+                    )
+                };
+                trace!(
+                    target: "payload_builder",
+                    tx_hash = ?tx_hash,
+                    rejection_reason,
+                    "skipping transaction with unsatisfied validity predicate"
+                );
+                self.emit_builder_decision_event(
+                    &payload_id,
+                    TransactionEventType::BuilderConsidered,
+                    tx_hash,
+                    Some(ordering_position),
+                    || BuilderConsideredEventData::new(info, limits, None),
+                );
+                self.emit_builder_decision_event(
+                    &payload_id,
+                    TransactionEventType::BuilderRejected,
+                    tx_hash,
+                    Some(ordering_position),
+                    || {
+                        BuilderRejectedEventData::new(
+                            rejection_reason,
+                            rejection_detail,
+                            false,
+                            info,
+                            limits,
+                            None,
+                        )
+                    },
+                );
+                diag.txs_rejected_other += 1;
+                // A read failure cannot be retried at a later ordering position: including the
+                // transaction there could place it behind a lower-priority transaction even though
+                // its predicate may have already been satisfied at its first position. An expired
+                // position predicate is terminal too — no later position can satisfy it — so both
+                // are dropped rather than parked; only recoverable state mismatches are parked.
+                if predicate_read_failed || predicate_expired {
+                    // A passed position bound can never be satisfied in any later
+                    // block, so an expired predicate is permanently terminal:
+                    // record it for the rejection cache and pool eviction so it is
+                    // not re-evaluated on subsequent flashblock rebuilds. A read
+                    // failure is only terminal for this scan, so it is not cached.
+                    if predicate_expired {
+                        diag.permanently_rejected_txs.push(tx_hash);
+                    }
+                    best_txs.mark_invalid(tx.sender(), tx.nonce());
+                } else if let Some(blocking_predicate) = blocking_predicate
+                    && best_txs.park_current()
+                {
+                    predicate_index.park(tx_hash, tx, blocking_predicate);
+                } else {
+                    best_txs.mark_invalid(tx.sender(), tx.nonce());
+                }
+                continue;
+            }
+
+            if self.builder_config.manifest_precheck_enabled
+                && let Some(manifest) = tx.watch_manifest()
+                && let Err(stale) = manifest.revalidate(evm.db_mut(), block_timestamp)
+            {
+                let tx_hash = *tx.hash();
+                num_txs_considered += 1;
+                let ordering_position = num_txs_considered;
+                trace!(
+                    target: "payload_builder",
+                    tx_hash = ?tx_hash,
+                    cause = stale.cause(),
+                    "skipping EIP-8130 transaction with stale authorization manifest"
+                );
+                GuardMetrics::record_builder_precheck_drop(&stale);
+                self.emit_builder_decision_event(
+                    &payload_id,
+                    TransactionEventType::BuilderConsidered,
+                    tx_hash,
+                    Some(ordering_position),
+                    || BuilderConsideredEventData::new(info, limits, None),
+                );
+                self.emit_builder_decision_event(
+                    &payload_id,
+                    TransactionEventType::BuilderRejected,
+                    tx_hash,
+                    Some(ordering_position),
+                    || {
+                        BuilderRejectedEventData::new(
+                            "manifest_precheck_stale",
+                            stale.cause(),
+                            false,
+                            info,
+                            limits,
+                            None,
+                        )
+                    },
+                );
+                diag.txs_rejected_other += 1;
                 best_txs.mark_invalid(tx.sender(), tx.nonce());
                 continue;
             }
 
             let tx_da_size = tx.estimated_da_size();
             let tx_received_at_ms = tx.received_at();
+
+            // EIP-8130 meters payer authentication gas on top of the declared gas limit, so it must
+            // be reserved against the block gas budget in addition to `gas_limit`. Reserve a
+            // conservative upper bound (worst-case payer policy gate) derived from the payer auth
+            // blob (`0` for non-8130 / self-pay); see `IntrinsicGas::max_payer_auth_cost`.
+            let tx_payer_auth = match tx.as_eip8130() {
+                Some(signed) => match IntrinsicGas::max_payer_auth_cost(signed) {
+                    Ok(payer_auth) => payer_auth,
+                    Err(err) => {
+                        trace!(
+                            target: "payload_builder",
+                            %err,
+                            tx_hash = ?tx.hash(),
+                            "skipping EIP-8130 transaction with unschedulable payer authenticator"
+                        );
+                        best_txs.mark_invalid(tx.sender(), tx.nonce());
+                        continue;
+                    }
+                },
+                None => 0,
+            };
+
             let tx = tx.into_consensus();
             let tx_hash = tx.tx_hash();
             let tx_uncompressed_size = tx.encode_2718_len() as u64;
@@ -739,6 +967,7 @@ impl BasePayloadBuilderCtx {
             };
 
             num_txs_considered += 1;
+            let ordering_position = num_txs_considered;
 
             let resource_usage = self.builder_config.metering_provider.get(&tx_hash);
 
@@ -753,7 +982,40 @@ impl BasePayloadBuilderCtx {
                     .unwrap_or(0);
                 let tx_age_ms = now_ms.saturating_sub(tx_received_at_ms);
                 if tx_age_ms < wait_duration.as_millis() {
-                    log_txn(Err(TxnExecutionError::MeteringDataPending));
+                    let err = TxnExecutionError::MeteringDataPending;
+                    let tx_resources = TxResources {
+                        da_size: tx_da_size,
+                        gas_limit: tx.gas_limit(),
+                        payer_auth: tx_payer_auth,
+                        execution_time_us: None,
+                        uncompressed_size: tx_uncompressed_size,
+                    };
+                    self.emit_builder_decision_event(
+                        &payload_id,
+                        TransactionEventType::BuilderConsidered,
+                        tx_hash,
+                        Some(ordering_position),
+                        || {
+                            BuilderConsideredEventData::new(info, limits, Some(&tx_resources))
+                                .with_metering_wait(tx_age_ms, wait_duration.as_millis())
+                        },
+                    );
+                    self.emit_builder_decision_event(
+                        &payload_id,
+                        TransactionEventType::BuilderRejected,
+                        tx_hash,
+                        Some(ordering_position),
+                        || {
+                            BuilderRejectedEventData::from_error(
+                                &err,
+                                info,
+                                limits,
+                                Some(&tx_resources),
+                            )
+                            .with_metering_wait(tx_age_ms, wait_duration.as_millis())
+                        },
+                    );
+                    log_txn(Err(err));
                     BuilderMetrics::metering_data_pending_skip().increment(1);
                     self.builder_config.metering_provider.skip(&tx_hash);
                     best_txs.mark_invalid(tx.signer(), tx.nonce());
@@ -764,30 +1026,22 @@ impl BasePayloadBuilderCtx {
             // Extract predicted execution time from metering data
             let predicted_execution_time_us =
                 resource_usage.as_ref().map(|m| m.total_execution_time_us);
-            let predicted_state_root_time_us =
-                resource_usage.as_ref().map(|m| m.state_root_time_us);
-
-            // Compute state root gas from metering data:
-            // sr_gas = gas_used × (1 + K × max(0, SR_ms - anchor_ms))
-            let state_root_gas = resource_usage.as_ref().map(|m| {
-                let gas_used = m.total_gas_used;
-                let sr_us = m.state_root_time_us;
-                let anchor_us = self.builder_config.state_root_gas_anchor_us;
-                let k = self.builder_config.state_root_gas_coefficient;
-                let excess_us = sr_us.saturating_sub(anchor_us);
-                let excess_ms = excess_us as f64 / 1000.0;
-                let multiplier = 1.0 + k * excess_ms;
-                (gas_used as f64 * multiplier) as u64
-            });
 
             // Build tx resources struct
             let tx_resources = TxResources {
                 da_size: tx_da_size,
                 gas_limit: tx.gas_limit(),
+                payer_auth: tx_payer_auth,
                 execution_time_us: predicted_execution_time_us,
-                state_root_gas,
                 uncompressed_size: tx_uncompressed_size,
             };
+            self.emit_builder_decision_event(
+                &payload_id,
+                TransactionEventType::BuilderConsidered,
+                tx_hash,
+                Some(ordering_position),
+                || BuilderConsideredEventData::new(info, limits, Some(&tx_resources)),
+            );
 
             // ensure we still have capacity for this transaction
             if let Err(err) = info.is_tx_over_limits(&tx_resources, limits) {
@@ -820,23 +1074,36 @@ impl BasePayloadBuilderCtx {
                             diag.permanently_rejected_txs.push(tx_hash);
                         }
 
-                        if let ExecutionMeteringLimitExceeded::TransactionExecutionTime(
+                        let ExecutionMeteringLimitExceeded::TransactionExecutionTime(
                             tx_time_us,
                             limit_us,
-                        ) = limit_err
-                        {
-                            // Only record per-tx execution time limits for the audit trail for now
-                            self.record_rejected_tx(
-                                info,
-                                tx_hash,
-                                RejectionReason::ExecutionTimeExceeded {
-                                    tx_time_us: *tx_time_us,
-                                    limit_us: *limit_us,
-                                },
-                                resource_usage.unwrap_or_default(),
-                            );
-                        }
+                        ) = limit_err;
+                        // Only record per-tx execution time limits for the audit trail for now
+                        self.record_rejected_tx(
+                            info,
+                            tx_hash,
+                            RejectionReason::ExecutionTimeExceeded {
+                                tx_time_us: *tx_time_us,
+                                limit_us: *limit_us,
+                            },
+                            resource_usage.unwrap_or_default(),
+                        );
 
+                        self.emit_builder_decision_event(
+                            &payload_id,
+                            TransactionEventType::BuilderRejected,
+                            tx_hash,
+                            Some(ordering_position),
+                            || {
+                                BuilderRejectedEventData::from_error(
+                                    &err,
+                                    info,
+                                    limits,
+                                    Some(&tx_resources),
+                                )
+                                .with_dry_run(false)
+                            },
+                        );
                         log_txn(Err(err));
                         best_txs.mark_invalid(tx.signer(), tx.nonce());
                         continue;
@@ -852,6 +1119,20 @@ impl BasePayloadBuilderCtx {
                         diag.permanently_rejected_txs.push(tx_hash);
                     }
 
+                    self.emit_builder_decision_event(
+                        &payload_id,
+                        TransactionEventType::BuilderRejected,
+                        tx_hash,
+                        Some(ordering_position),
+                        || {
+                            BuilderRejectedEventData::from_error(
+                                &err,
+                                info,
+                                limits,
+                                Some(&tx_resources),
+                            )
+                        },
+                    );
                     log_txn(Err(err));
                     best_txs.mark_invalid(tx.signer(), tx.nonce());
                     continue;
@@ -862,28 +1143,29 @@ impl BasePayloadBuilderCtx {
             if let Some(predicted_us) = predicted_execution_time_us {
                 BuilderMetrics::tx_predicted_execution_time_us().record(predicted_us as f64);
             }
-            if let Some(predicted_us) = predicted_state_root_time_us {
-                BuilderMetrics::tx_predicted_state_root_time_us().record(predicted_us as f64);
-            }
-
             // A sequencer's block should never contain blob or deposit transactions from the pool.
             if tx.is_eip4844() || tx.is_deposit() {
                 let err = TxnExecutionError::SequencerTransaction;
                 diag.record_rejection(&err);
                 let priority_fee = tx.effective_tip_per_gas(base_fee).unwrap_or(0) as f64;
                 record_rejected_tx_priority_fee(&err, priority_fee);
+                self.emit_builder_decision_event(
+                    &payload_id,
+                    TransactionEventType::BuilderRejected,
+                    tx_hash,
+                    Some(ordering_position),
+                    || {
+                        BuilderRejectedEventData::from_error(
+                            &err,
+                            info,
+                            limits,
+                            Some(&tx_resources),
+                        )
+                    },
+                );
                 log_txn(Err(err));
                 best_txs.mark_invalid(tx.signer(), tx.nonce());
                 continue;
-            }
-
-            // check if the job was cancelled, if so we can exit early
-            if self.cancel.is_cancelled() {
-                diag.cancelled = true;
-                diag.txs_considered = num_txs_considered;
-                diag.txs_included =
-                    (info.executed_transactions.len() as u64).saturating_sub(min_tx_index);
-                return Ok(diag);
             }
 
             let tx_span = span!(
@@ -906,8 +1188,23 @@ impl BasePayloadBuilderCtx {
                             let priority_fee =
                                 tx.effective_tip_per_gas(base_fee).unwrap_or(0) as f64;
                             record_rejected_tx_priority_fee(&diag_err, priority_fee);
+                            self.emit_builder_decision_event(
+                                &payload_id,
+                                TransactionEventType::BuilderRejected,
+                                tx_hash,
+                                Some(ordering_position),
+                                || {
+                                    BuilderRejectedEventData::from_error(
+                                        &diag_err,
+                                        info,
+                                        limits,
+                                        Some(&tx_resources),
+                                    )
+                                },
+                            );
                             log_txn(Err(diag_err));
                             trace!(target: "payload_builder", %err, ?tx, "skipping nonce too low transaction");
+                            best_txs.mark_current_committed();
                         } else {
                             // if the transaction is invalid, we can skip it and all of its
                             // descendants
@@ -916,6 +1213,20 @@ impl BasePayloadBuilderCtx {
                             let priority_fee =
                                 tx.effective_tip_per_gas(base_fee).unwrap_or(0) as f64;
                             record_rejected_tx_priority_fee(&diag_err, priority_fee);
+                            self.emit_builder_decision_event(
+                                &payload_id,
+                                TransactionEventType::BuilderRejected,
+                                tx_hash,
+                                Some(ordering_position),
+                                || {
+                                    BuilderRejectedEventData::from_error(
+                                        &diag_err,
+                                        info,
+                                        limits,
+                                        Some(&tx_resources),
+                                    )
+                                },
+                            );
                             log_txn(Err(diag_err));
                             trace!(target: "payload_builder", %err, ?tx, "skipping invalid transaction and its descendants");
                             best_txs.mark_invalid(tx.signer(), tx.nonce());
@@ -981,6 +1292,20 @@ impl BasePayloadBuilderCtx {
                 if err.is_permanent() {
                     diag.permanently_rejected_txs.push(tx_hash);
                 }
+                self.emit_builder_decision_event(
+                    &payload_id,
+                    TransactionEventType::BuilderRejected,
+                    tx_hash,
+                    Some(ordering_position),
+                    || {
+                        BuilderRejectedEventData::from_error(
+                            &err,
+                            info,
+                            limits,
+                            Some(&tx_resources),
+                        )
+                    },
+                );
                 log_txn(Err(err));
                 best_txs.mark_invalid(tx.signer(), tx.nonce());
                 continue;
@@ -991,23 +1316,22 @@ impl BasePayloadBuilderCtx {
             info.cumulative_da_bytes_used += tx_da_size;
             // record uncompressed tx size
             info.cumulative_uncompressed_bytes += tx_uncompressed_size;
-            // record execution time (only from predictions; unmetered txs count as zero)
-            if let Some(execution_time) = predicted_execution_time_us {
-                info.flashblock_execution_time_us += execution_time;
-            }
-            // record state root gas (only from predictions)
-            if let Some(sr_gas) = state_root_gas {
-                info.cumulative_state_root_gas += sr_gas;
-                BuilderMetrics::tx_state_root_gas().record(sr_gas as f64);
-            }
-            // record state root time / gas ratio for anomaly detection
-            if let Some(state_root_time) = predicted_state_root_time_us
-                && gas_used > 0
-            {
-                let ratio = state_root_time as f64 / gas_used as f64;
-                BuilderMetrics::state_root_time_per_gas_ratio().record(ratio);
-            }
 
+            self.emit_builder_decision_event(
+                &payload_id,
+                TransactionEventType::BuilderAccepted,
+                tx_hash,
+                Some(ordering_position),
+                || {
+                    BuilderAcceptedEventData::new(
+                        if is_success { "success" } else { "reverted" },
+                        gas_used,
+                        info,
+                        limits,
+                        Some(&tx_resources),
+                    )
+                },
+            );
             // Push transaction changeset and calculate header bloom filter for receipt.
             let ctx = ReceiptBuilderCtx {
                 tx_type: tx.tx_type(),
@@ -1018,8 +1342,59 @@ impl BasePayloadBuilderCtx {
             };
             info.receipts.push(self.build_receipt(ctx, None));
 
+            let affected_parked = if predicate_index.is_empty() {
+                Vec::new()
+            } else {
+                predicate_index.affected_by_state(&state)
+            };
+
             // commit changes
             evm.db_mut().commit(state);
+
+            // Release the committed transaction's lane before promoting predicate-unblocked heads.
+            best_txs.mark_current_committed();
+            let predicate_rescan_start = Instant::now();
+            for parked_hash in &affected_parked {
+                let mut predicate_read_failed = false;
+                let Some(parked_transaction) = predicate_index.transaction(*parked_hash) else {
+                    warn!(
+                        target: "payload_builder",
+                        tx_hash = ?parked_hash,
+                        "affected transaction is no longer predicate-indexed"
+                    );
+                    continue;
+                };
+                let blocking_predicate = match ValidityPredicateKey::first_unsatisfied(
+                    parked_transaction.validity_predicates(),
+                    evm.db_mut(),
+                    &predicate_context,
+                ) {
+                    Ok(blocking_predicate) => blocking_predicate,
+                    Err(error) => {
+                        warn!(
+                            target: "payload_builder",
+                            tx_hash = ?parked_hash,
+                            error = ?error,
+                            "failed to re-read validity predicate state"
+                        );
+                        predicate_read_failed = true;
+                        None
+                    }
+                };
+                if predicate_read_failed {
+                    predicate_index.remove(*parked_hash);
+                    best_txs.discard_parked(*parked_hash);
+                } else if let Some(blocking_predicate) = blocking_predicate {
+                    predicate_index.reindex(*parked_hash, blocking_predicate);
+                } else {
+                    predicate_index.remove(*parked_hash);
+                    best_txs.promote(*parked_hash);
+                }
+            }
+            if !affected_parked.is_empty() {
+                BuilderMetrics::validity_predicate_rescan_duration()
+                    .record(predicate_rescan_start.elapsed().as_secs_f64());
+            }
 
             // update add to total fees
             let miner_fee = tx
@@ -1045,11 +1420,6 @@ impl BasePayloadBuilderCtx {
             // append sender and transaction to the respective lists
             info.executed_senders.push(tx.signer());
             info.executed_transactions.push(tx.into_inner());
-        }
-
-        // Record cumulative state root gas for the block
-        if info.cumulative_state_root_gas > 0 {
-            BuilderMetrics::block_state_root_gas().record(info.cumulative_state_root_gas as f64);
         }
 
         let payload_transaction_simulation_time = execute_txs_start_time.elapsed();
@@ -1103,12 +1473,6 @@ impl BasePayloadBuilderCtx {
         match limit {
             ExecutionMeteringLimitExceeded::TransactionExecutionTime(_, _) => {
                 BuilderMetrics::tx_execution_time_exceeded_total().increment(1);
-            }
-            ExecutionMeteringLimitExceeded::FlashblockExecutionTime(_, _, _) => {
-                BuilderMetrics::flashblock_execution_time_exceeded_total().increment(1);
-            }
-            ExecutionMeteringLimitExceeded::BlockStateRootGas(_, _, _) => {
-                BuilderMetrics::block_state_root_gas_exceeded_total().increment(1);
             }
         }
     }
@@ -1173,17 +1537,178 @@ impl BasePayloadBuilderCtx {
 mod tests {
     use alloy_consensus::{Header, TxEip1559};
     use alloy_eips::Encodable2718;
-    use alloy_primitives::{TxKind, U256};
+    use alloy_primitives::{Address, TxKind, U256};
     use alloy_signer_local::PrivateKeySigner;
-    use base_common_consensus::BaseTypedTransaction;
+    use base_common_consensus::{BaseTransactionSigned, BaseTypedTransaction, TxDeposit};
     use base_execution_chainspec::BaseChainSpec;
+    use base_execution_txpool::BasePooledTransaction;
     use reth_chainspec::ChainSpec;
-    use reth_primitives_traits::{SealedHeader, WithEncoded};
+    use reth_payload_util::PayloadTransactions;
+    use reth_primitives_traits::{Recovered, SealedHeader, WithEncoded};
     use reth_provider::noop::NoopProvider;
     use reth_revm::{State, database::StateProviderDatabase};
 
     use super::*;
-    use crate::test_utils::sign_base_tx;
+    use crate::{ParkablePayloadTransactions, test_utils::sign_base_tx};
+
+    fn test_builder_context() -> BasePayloadBuilderCtx {
+        let genesis: serde_json::Value = serde_json::json!({
+            "config": { "chainId": 901 },
+            "gasLimit": "0x1C9C380",
+            "timestamp": "0x0"
+        });
+        let genesis = serde_json::from_value(genesis).expect("valid genesis");
+        let inner =
+            ChainSpec::builder().chain(901.into()).genesis(genesis).cancun_activated().build();
+        let chain_spec = Arc::new(BaseChainSpec::from(inner));
+        let parent_header = Header { gas_limit: 30_000_000, timestamp: 0, ..Default::default() };
+        let parent = Arc::new(SealedHeader::seal_slow(parent_header));
+        BasePayloadBuilderCtx::for_test(chain_spec, parent)
+    }
+
+    fn pooled_test_transaction() -> BasePooledTransaction {
+        let signer = PrivateKeySigner::random();
+        let transaction = TxEip1559 {
+            chain_id: 901,
+            nonce: 0,
+            gas_limit: 21_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 0,
+            to: TxKind::Call(signer.address()),
+            ..Default::default()
+        };
+        let recovered = sign_base_tx(&signer, BaseTypedTransaction::Eip1559(transaction))
+            .expect("sign test transaction");
+        let encoded_len = recovered.encode_2718_len();
+        BasePooledTransaction::new(recovered, encoded_len)
+    }
+
+    fn pooled_deposit_test_transaction() -> BasePooledTransaction {
+        let sender = Address::ZERO;
+        let transaction = TxDeposit {
+            source_hash: B256::ZERO,
+            from: sender,
+            to: TxKind::Create,
+            mint: 0,
+            value: U256::ZERO,
+            gas_limit: 0,
+            is_system_transaction: false,
+            input: Default::default(),
+        };
+        let signed: BaseTransactionSigned = transaction.into();
+        let recovered = Recovered::new_unchecked(signed, sender);
+        let encoded_len = recovered.encode_2718_len();
+        BasePooledTransaction::new(recovered, encoded_len)
+    }
+
+    #[derive(Debug)]
+    struct LimitRejectionTransactions {
+        within_limit_transaction: BasePooledTransaction,
+        over_limit_transaction: BasePooledTransaction,
+        within_limit_remaining: usize,
+        over_limit_remaining: usize,
+        current_is_over_limit: bool,
+        over_limit_rejections: usize,
+        cancel: CancellationToken,
+    }
+
+    impl LimitRejectionTransactions {
+        fn new(within_limit: usize, over_limit: usize, cancel: CancellationToken) -> Self {
+            Self {
+                within_limit_transaction: pooled_deposit_test_transaction(),
+                over_limit_transaction: pooled_test_transaction(),
+                within_limit_remaining: within_limit,
+                over_limit_remaining: over_limit,
+                current_is_over_limit: false,
+                over_limit_rejections: 0,
+                cancel,
+            }
+        }
+    }
+
+    impl PayloadTransactions for LimitRejectionTransactions {
+        type Transaction = BasePooledTransaction;
+
+        fn next(&mut self, _ctx: ()) -> Option<Self::Transaction> {
+            if self.within_limit_remaining > 0 {
+                self.within_limit_remaining -= 1;
+                self.current_is_over_limit = false;
+                return Some(self.within_limit_transaction.clone());
+            }
+            if self.over_limit_remaining > 0 {
+                self.over_limit_remaining -= 1;
+                self.current_is_over_limit = true;
+                return Some(self.over_limit_transaction.clone());
+            }
+            None
+        }
+
+        fn mark_invalid(&mut self, _sender: alloy_primitives::Address, _nonce: u64) {
+            if self.current_is_over_limit {
+                self.over_limit_rejections += 1;
+                self.cancel.cancel();
+            }
+        }
+    }
+
+    impl ParkablePayloadTransactions for LimitRejectionTransactions {
+        fn park_current(&mut self) -> bool {
+            false
+        }
+
+        fn mark_current_committed(&mut self) {}
+
+        fn promote(&mut self, _transaction_hash: TxHash) -> bool {
+            false
+        }
+
+        fn discard_parked(&mut self, _transaction_hash: TxHash) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn cancellation_is_checked_after_each_limit_rejection() {
+        let ctx = test_builder_context();
+        let mut best_txs = LimitRejectionTransactions::new(0, 2, ctx.cancel.clone());
+        let db = StateProviderDatabase::new(NoopProvider::default());
+        let mut state = State::builder().with_database(db).with_bundle_update().build();
+        let mut info = ExecutionInfo::default();
+        let limits = ResourceLimits { block_gas_limit: 0, ..Default::default() };
+
+        let diagnostics = ctx
+            .execute_best_transactions(&mut info, &mut state, &mut best_txs, &limits)
+            .expect("cancelled selection should succeed");
+
+        assert!(diagnostics.cancelled);
+        assert_eq!(diagnostics.txs_considered, 1);
+        assert_eq!(diagnostics.txs_rejected_gas, 1);
+        assert_eq!(best_txs.over_limit_rejections, 1);
+    }
+
+    #[test]
+    fn cancellation_stops_twenty_thousand_transaction_limit_rejection_tail() {
+        const WITHIN_LIMIT: usize = 10_000;
+        const OVER_LIMIT: usize = 20_000;
+
+        let ctx = test_builder_context();
+        let mut best_txs =
+            LimitRejectionTransactions::new(WITHIN_LIMIT, OVER_LIMIT, ctx.cancel.clone());
+        let db = StateProviderDatabase::new(NoopProvider::default());
+        let mut state = State::builder().with_database(db).with_bundle_update().build();
+        let mut info = ExecutionInfo::default();
+        let limits = ResourceLimits { block_gas_limit: 0, ..Default::default() };
+
+        let diagnostics = ctx
+            .execute_best_transactions(&mut info, &mut state, &mut best_txs, &limits)
+            .expect("cancelled selection should succeed");
+
+        assert!(diagnostics.cancelled);
+        assert_eq!(diagnostics.txs_considered, WITHIN_LIMIT as u64 + 1);
+        assert_eq!(diagnostics.txs_rejected_gas, 1);
+        assert_eq!(best_txs.over_limit_rejections, 1);
+        assert!(best_txs.over_limit_remaining > OVER_LIMIT - 10);
+    }
 
     #[test]
     fn diagnostics_report_selection_outcome() {
@@ -1213,11 +1738,7 @@ mod tests {
 
     #[test]
     fn diagnostics_report_rejection_counts() {
-        let diag = FlashblockDiagnostics {
-            txs_rejected_gas: 2,
-            txs_rejected_state_root_time: 1,
-            ..Default::default()
-        };
+        let diag = FlashblockDiagnostics { txs_rejected_gas: 2, ..Default::default() };
 
         assert_eq!(
             diag.rejection_counts(),
@@ -1226,7 +1747,6 @@ mod tests {
                 ("da_size", 0),
                 ("da_footprint", 0),
                 ("execution_time", 0),
-                ("state_root_time", 1),
                 ("uncompressed_size", 0),
                 ("metering_data_pending", 0),
                 ("other", 0),
@@ -1267,21 +1787,15 @@ mod tests {
             target_gas_for_batch: 1_000_000,
             target_da_for_batch: Some(500),
             target_da_footprint_for_batch: Some(200),
-            target_execution_time_for_batch_us: Some(100_000),
-            target_state_root_gas_for_batch: Some(50_000),
             gas_per_batch: 3_000_000,
             da_per_batch: Some(1_500),
             da_footprint_per_batch: Some(600),
-            execution_time_per_batch_us: Some(300_000),
-            state_root_gas_per_batch: Some(150_000),
         };
 
         let next = ctx.next(
-            2_000_000,     // new gas target
-            Some(800),     // new DA target
-            Some(350),     // new DA footprint target
-            Some(200_000), // new execution time target
-            Some(80_000),  // new state root gas target
+            2_000_000, // new gas target
+            Some(800), // new DA target
+            Some(350), // new DA footprint target
         );
 
         // Index incremented
@@ -1291,16 +1805,12 @@ mod tests {
         assert_eq!(next.target_gas_for_batch, 2_000_000);
         assert_eq!(next.target_da_for_batch, Some(800));
         assert_eq!(next.target_da_footprint_for_batch, Some(350));
-        assert_eq!(next.target_execution_time_for_batch_us, Some(200_000));
-        assert_eq!(next.target_state_root_gas_for_batch, Some(80_000));
 
         // Per-batch limits and target count are preserved (..self)
         assert_eq!(next.target_flashblock_count, 10);
         assert_eq!(next.gas_per_batch, 3_000_000);
         assert_eq!(next.da_per_batch, Some(1_500));
         assert_eq!(next.da_footprint_per_batch, Some(600));
-        assert_eq!(next.execution_time_per_batch_us, Some(300_000));
-        assert_eq!(next.state_root_gas_per_batch, Some(150_000));
     }
 
     /// Regression test: when the payload attributes are derived (`no_tx_pool=true`), an
@@ -1315,21 +1825,6 @@ mod tests {
     /// safe-head whose state cannot be reproduced by an honest proof client.
     #[test]
     fn execute_sequencer_transactions_propagates_invalid_tx_when_no_tx_pool() {
-        // Minimal Base chainspec: chain id 901 with all L1 forks through Cancun active at
-        // genesis. No inherited rollup forks, so block construction stays on the simplest
-        // path. (Mirrors the helper used by the `build_block` tests in `payload.rs`.)
-        let genesis: serde_json::Value = serde_json::json!({
-            "config": { "chainId": 901 },
-            "gasLimit": "0x1C9C380",
-            "timestamp": "0x0"
-        });
-        let genesis = serde_json::from_value(genesis).expect("valid genesis");
-        let inner =
-            ChainSpec::builder().chain(901.into()).genesis(genesis).cancun_activated().build();
-        let chain_spec = Arc::new(BaseChainSpec::from(inner));
-        let parent_header = Header { gas_limit: 30_000_000, timestamp: 0, ..Default::default() };
-        let parent = Arc::new(SealedHeader::seal_slow(parent_header));
-
         // A randomly-generated signer with no balance in the (empty) NoopProvider state.
         // Any non-deposit transfer attempt will fail validation with
         // `InvalidTransaction::LackOfFundForMaxFee` — an `is_invalid_tx_err()` outcome.
@@ -1351,7 +1846,7 @@ mod tests {
         let with_encoded = WithEncoded::new(encoded, signed);
 
         // Strict mode: derived attributes (`no_tx_pool=true`) — the invalid tx must be fatal.
-        let mut ctx = BasePayloadBuilderCtx::for_test(chain_spec, parent);
+        let mut ctx = test_builder_context();
         ctx.config.attributes.no_tx_pool = true;
         ctx.config.attributes.transactions = vec![with_encoded];
 

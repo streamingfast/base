@@ -15,6 +15,8 @@
 
 use std::time::Duration;
 
+use alloy_primitives::Address;
+use base_proof_primitives::Proposal;
 use base_prover_service_db::{
     ApiProofType, ClaimProofJob, CompleteClaimedProofJob, CreateProofRequest,
     CreateProofRequestError, CreateProofRequestOutcome, CreateProofSession,
@@ -25,8 +27,9 @@ use base_prover_service_db::{
 };
 use base_prover_service_protocol::{
     ProofRequest as ProtocolProofRequest, ProofRequestKind as ProtocolProofRequestKind,
-    ProofResult as ProtocolProofResult, SnarkGroth16ProofRequest, SnarkGroth16ProofResult,
-    TeeKind as ProtocolTeeKind, TeeProofRequest, ZkProofRequest, ZkProofResult, ZkVm,
+    ProofResult as ProtocolProofResult, SnarkPlonkProofRequest, SnarkPlonkProofResult,
+    TeeKind as ProtocolTeeKind, TeeProofRequest, TeeProofResult, ZkBackend, ZkProofRequest,
+    ZkProofResult, ZkVm,
 };
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use uuid::Uuid;
@@ -56,6 +59,13 @@ fn compressed_request() -> CreateProofRequest {
 }
 
 fn compressed_request_at(start_block_number: u64) -> CreateProofRequest {
+    compressed_request_at_with_backend(start_block_number, ZkBackend::Cluster)
+}
+
+fn compressed_request_at_with_backend(
+    start_block_number: u64,
+    zk_backend: ZkBackend,
+) -> CreateProofRequest {
     CreateProofRequest::new(ProtocolProofRequest {
         session_id: Uuid::new_v4().to_string(),
         request: ProtocolProofRequestKind::Compressed(ZkProofRequest {
@@ -64,7 +74,9 @@ fn compressed_request_at(start_block_number: u64) -> CreateProofRequest {
             sequence_window: Some(50),
             l1_head: None,
             intermediate_root_interval: None,
+            schedule_l2_block_number: None,
             zk_vm: ZkVm::Sp1,
+            zk_backend,
         }),
     })
     .expect("compressed request should validate")
@@ -79,7 +91,9 @@ fn compressed_request_with_l1_head(l1_head: &str) -> CreateProofRequest {
             sequence_window: Some(50),
             l1_head: Some(l1_head.parse().expect("valid hash")),
             intermediate_root_interval: None,
+            schedule_l2_block_number: None,
             zk_vm: ZkVm::Sp1,
+            zk_backend: ZkBackend::Cluster,
         }),
     })
     .expect("compressed request should validate")
@@ -88,7 +102,7 @@ fn compressed_request_with_l1_head(l1_head: &str) -> CreateProofRequest {
 fn snark_request() -> CreateProofRequest {
     CreateProofRequest::new(ProtocolProofRequest {
         session_id: Uuid::new_v4().to_string(),
-        request: ProtocolProofRequestKind::SnarkGroth16(SnarkGroth16ProofRequest {
+        request: ProtocolProofRequestKind::SnarkPlonk(SnarkPlonkProofRequest {
             proof: ZkProofRequest {
                 start_block_number: 200,
                 number_of_blocks_to_prove: 10,
@@ -99,7 +113,9 @@ fn snark_request() -> CreateProofRequest {
                         .expect("valid hash"),
                 ),
                 intermediate_root_interval: None,
+                schedule_l2_block_number: None,
                 zk_vm: ZkVm::Sp1,
+                zk_backend: ZkBackend::Cluster,
             },
             prover_address: "0x1234567890abcdef1234567890abcdef12345678"
                 .parse()
@@ -189,7 +205,7 @@ async fn test_create_and_get_snark() {
 
     assert_eq!(req.start_block_number, 200);
     assert_eq!(req.number_of_blocks_to_prove, 10);
-    assert_eq!(req.proof_type, Some(ProofType::OpSuccinctSp1ClusterSnarkGroth16));
+    assert_eq!(req.proof_type, Some(ProofType::OpSuccinctSp1ClusterSnarkPlonk));
     assert_eq!(req.prover_address.as_deref(), Some("0x1234567890abcdef1234567890abcdef12345678"));
     assert_eq!(
         req.l1_head.as_deref(),
@@ -286,7 +302,7 @@ async fn test_legacy_rollout_request_without_protocol_storage_is_readable_and_re
     assert_eq!(listed.api_proof_type, ApiProofType::Compressed);
     assert_eq!(listed.zk_vm, Some(ZkVmKind::Sp1));
 
-    let outcome = repo.create_for_worker_queue(req, TEST_MAX_PROOF_RETRIES).await.unwrap();
+    let outcome = repo.create_for_worker_queue(req, TEST_MAX_PROOF_RETRIES, true).await.unwrap();
     assert_eq!(outcome, CreateProofRequestOutcome::Replayed(explicit_id));
 }
 
@@ -1044,7 +1060,7 @@ async fn test_create_for_worker_queue_creates_claimable_job() {
     let mut req = compressed_request();
     set_request_session_id(&mut req, explicit_id.to_string());
 
-    let outcome = repo.create_for_worker_queue(req, TEST_MAX_PROOF_RETRIES).await.unwrap();
+    let outcome = repo.create_for_worker_queue(req, TEST_MAX_PROOF_RETRIES, true).await.unwrap();
     assert!(matches!(outcome, CreateProofRequestOutcome::Created(id) if id == explicit_id));
 
     let job = repo
@@ -1066,7 +1082,7 @@ async fn test_create_for_worker_queue_accepts_tee_requests() {
     let mut req = tee_request();
     set_request_session_id(&mut req, explicit_id.clone());
 
-    let outcome = repo.create_for_worker_queue(req, TEST_MAX_PROOF_RETRIES).await.unwrap();
+    let outcome = repo.create_for_worker_queue(req, TEST_MAX_PROOF_RETRIES, true).await.unwrap();
     let id = outcome.id();
 
     let row = repo.get(id).await.unwrap().expect("TEE request should be stored");
@@ -1085,19 +1101,50 @@ async fn test_create_for_worker_queue_accepts_tee_requests() {
 
 #[tokio::test]
 #[ignore = "requires a running Postgres with the prover schema (set DATABASE_URL); run with `cargo nextest run --run-ignored all -p base-prover-service-db --test postgres_integration --test-threads=1`"]
-async fn test_create_for_worker_queue_idempotent() {
+async fn test_create_for_worker_queue_idempotent_for_legacy_null_backend() {
     let pool = test_pool().await;
-    let repo = test_repo(pool);
+    let repo = test_repo(pool.clone());
 
     let explicit_id = Uuid::new_v4();
     let mut req = compressed_request();
     set_request_session_id(&mut req, explicit_id.to_string());
 
-    let first = repo.create_for_worker_queue(req.clone(), TEST_MAX_PROOF_RETRIES).await.unwrap();
-    let second = repo.create_for_worker_queue(req, TEST_MAX_PROOF_RETRIES).await.unwrap();
+    let first =
+        repo.create_for_worker_queue(req.clone(), TEST_MAX_PROOF_RETRIES, true).await.unwrap();
+    sqlx::query("UPDATE proof_requests SET zk_backend = NULL WHERE id = $1")
+        .bind(explicit_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let second = repo.create_for_worker_queue(req, TEST_MAX_PROOF_RETRIES, true).await.unwrap();
 
     assert!(matches!(first, CreateProofRequestOutcome::Created(id) if id == explicit_id));
     assert!(matches!(second, CreateProofRequestOutcome::Replayed(id) if id == explicit_id));
+    let claimed = repo
+        .claim_next_proof_job(compressed_claim("legacy-cluster-worker", 3))
+        .await
+        .unwrap()
+        .expect("legacy NULL backend should be claimable as cluster");
+    assert_eq!(claimed.id, explicit_id);
+}
+
+#[tokio::test]
+#[ignore = "requires a running Postgres with the prover schema (set DATABASE_URL); run with `cargo nextest run --run-ignored all -p base-prover-service-db --test postgres_integration --test-threads=1`"]
+async fn test_create_for_worker_queue_rejects_backend_collision() {
+    let pool = test_pool().await;
+    let repo = test_repo(pool);
+
+    let explicit_id = Uuid::new_v4();
+    let mut cluster = compressed_request_at_with_backend(100, ZkBackend::Cluster);
+    set_request_session_id(&mut cluster, explicit_id.to_string());
+    repo.create_for_worker_queue(cluster, TEST_MAX_PROOF_RETRIES, true).await.unwrap();
+
+    let mut network = compressed_request_at_with_backend(100, ZkBackend::Network);
+    set_request_session_id(&mut network, explicit_id.to_string());
+    assert!(matches!(
+        repo.create_for_worker_queue(network, TEST_MAX_PROOF_RETRIES, true).await.unwrap_err(),
+        CreateProofRequestError::IdCollision { id, field: "zk_backend" } if id == explicit_id
+    ));
 }
 
 #[tokio::test]
@@ -1110,7 +1157,8 @@ async fn test_create_for_worker_queue_requeues_failed_row() {
     let mut req = compressed_request();
     set_request_session_id(&mut req, explicit_id.to_string());
 
-    let first = repo.create_for_worker_queue(req.clone(), TEST_MAX_PROOF_RETRIES).await.unwrap();
+    let first =
+        repo.create_for_worker_queue(req.clone(), TEST_MAX_PROOF_RETRIES, true).await.unwrap();
     assert!(matches!(first, CreateProofRequestOutcome::Created(id) if id == explicit_id));
     drive_to_failed(&repo, explicit_id, "transient backend error").await;
 
@@ -1124,7 +1172,7 @@ async fn test_create_for_worker_queue_requeues_failed_row() {
     .await
     .unwrap();
 
-    let second = repo.create_for_worker_queue(req, TEST_MAX_PROOF_RETRIES).await.unwrap();
+    let second = repo.create_for_worker_queue(req, TEST_MAX_PROOF_RETRIES, true).await.unwrap();
     assert!(matches!(second, CreateProofRequestOutcome::Requeued(id) if id == explicit_id));
 
     let after = repo.get(explicit_id).await.unwrap().unwrap();
@@ -1146,6 +1194,33 @@ async fn test_create_for_worker_queue_requeues_failed_row() {
 
 #[tokio::test]
 #[ignore = "requires a running Postgres with the prover schema (set DATABASE_URL); run with `cargo nextest run --run-ignored all -p base-prover-service-db --test postgres_integration --test-threads=1`"]
+async fn test_create_for_worker_queue_does_not_requeue_failed_row_without_approval() {
+    let repo = test_repo(test_pool().await);
+
+    let explicit_id = Uuid::new_v4();
+    let mut req = compressed_request();
+    set_request_session_id(&mut req, explicit_id.to_string());
+
+    let first =
+        repo.create_for_worker_queue(req.clone(), TEST_MAX_PROOF_RETRIES, true).await.unwrap();
+    assert!(matches!(first, CreateProofRequestOutcome::Created(id) if id == explicit_id));
+    drive_to_failed(&repo, explicit_id, "transient backend error").await;
+
+    let second = repo.create_for_worker_queue(req, TEST_MAX_PROOF_RETRIES, false).await.unwrap();
+    assert!(matches!(
+        second,
+        CreateProofRequestOutcome::RetryNotAllowed(id) if id == explicit_id
+    ));
+
+    let after = repo.get(explicit_id).await.unwrap().unwrap();
+    assert_eq!(after.status, ProofStatus::Failed);
+    assert_eq!(after.retry_count, 0);
+    assert_eq!(after.error_message.as_deref(), Some("transient backend error"));
+    assert!(after.completed_at.is_some());
+}
+
+#[tokio::test]
+#[ignore = "requires a running Postgres with the prover schema (set DATABASE_URL); run with `cargo nextest run --run-ignored all -p base-prover-service-db --test postgres_integration --test-threads=1`"]
 async fn test_create_for_worker_queue_replays_succeeded_row() {
     let pool = test_pool().await;
     let repo = test_repo(pool.clone());
@@ -1154,7 +1229,8 @@ async fn test_create_for_worker_queue_replays_succeeded_row() {
     let mut req = compressed_request();
     set_request_session_id(&mut req, explicit_id.to_string());
 
-    let first = repo.create_for_worker_queue(req.clone(), TEST_MAX_PROOF_RETRIES).await.unwrap();
+    let first =
+        repo.create_for_worker_queue(req.clone(), TEST_MAX_PROOF_RETRIES, true).await.unwrap();
     assert!(matches!(first, CreateProofRequestOutcome::Created(id) if id == explicit_id));
 
     sqlx::query(
@@ -1166,7 +1242,7 @@ async fn test_create_for_worker_queue_replays_succeeded_row() {
     .await
     .unwrap();
 
-    let second = repo.create_for_worker_queue(req, TEST_MAX_PROOF_RETRIES).await.unwrap();
+    let second = repo.create_for_worker_queue(req, TEST_MAX_PROOF_RETRIES, true).await.unwrap();
     assert!(matches!(second, CreateProofRequestOutcome::Replayed(id) if id == explicit_id));
 
     let after = repo.get(explicit_id).await.unwrap().unwrap();
@@ -1188,7 +1264,7 @@ async fn test_create_for_worker_queue_rejects_succeeded_row_with_new_l1_head() {
     );
     set_request_session_id(&mut req, explicit_id.to_string());
 
-    let first = repo.create_for_worker_queue(req, TEST_MAX_PROOF_RETRIES).await.unwrap();
+    let first = repo.create_for_worker_queue(req, TEST_MAX_PROOF_RETRIES, true).await.unwrap();
     assert!(matches!(first, CreateProofRequestOutcome::Created(id) if id == explicit_id));
 
     sqlx::query(
@@ -1205,7 +1281,7 @@ async fn test_create_for_worker_queue_rejects_succeeded_row_with_new_l1_head() {
     );
     set_request_session_id(&mut req, explicit_id.to_string());
 
-    let err = repo.create_for_worker_queue(req, TEST_MAX_PROOF_RETRIES).await.unwrap_err();
+    let err = repo.create_for_worker_queue(req, TEST_MAX_PROOF_RETRIES, true).await.unwrap_err();
     assert!(matches!(
         err,
         CreateProofRequestError::IdCollision { id, field: "l1_head" } if id == explicit_id
@@ -1223,7 +1299,7 @@ async fn test_delete_proof_request_by_session_id_deletes_terminal_rows() {
         let mut req = compressed_request();
         set_request_session_id(&mut req, explicit_id.to_string());
 
-        let first = repo.create_for_worker_queue(req, TEST_MAX_PROOF_RETRIES).await.unwrap();
+        let first = repo.create_for_worker_queue(req, TEST_MAX_PROOF_RETRIES, true).await.unwrap();
         assert!(matches!(first, CreateProofRequestOutcome::Created(id) if id == explicit_id));
 
         sqlx::query(
@@ -1270,7 +1346,7 @@ async fn test_delete_proof_request_by_session_id_rejects_non_terminal_row() {
     let mut req = compressed_request();
     set_request_session_id(&mut req, explicit_id.to_string());
 
-    let first = repo.create_for_worker_queue(req, TEST_MAX_PROOF_RETRIES).await.unwrap();
+    let first = repo.create_for_worker_queue(req, TEST_MAX_PROOF_RETRIES, true).await.unwrap();
     assert!(matches!(first, CreateProofRequestOutcome::Created(id) if id == explicit_id));
 
     let outcome = repo.delete_proof_request_by_session_id(&explicit_id.to_string()).await.unwrap();
@@ -1448,7 +1524,7 @@ async fn test_full_snark_pipeline() {
         serde_json::from_value(result_payload).expect("SNARK result payload should deserialize");
     assert_eq!(
         result,
-        ProtocolProofResult::SnarkGroth16(SnarkGroth16ProofResult {
+        ProtocolProofResult::SnarkPlonk(SnarkPlonkProofResult {
             proof: ZkProofResult {
                 zk_vm: ZkVm::Sp1,
                 proof: snark_receipt.into(),
@@ -1483,6 +1559,11 @@ fn claim_job(
         api_proof_type,
         tee_kinds,
         zk_vms,
+        zk_backends: if api_proof_type == ApiProofType::Tee {
+            Vec::new()
+        } else {
+            vec![ZkBackend::Cluster]
+        },
         lock_duration_seconds: 3600,
         max_attempts,
     }
@@ -1582,9 +1663,10 @@ async fn test_claim_next_proof_job_claim_and_capabilities() {
     repo.create(compressed_request()).await.unwrap();
     assert!(repo.claim_next_proof_job(tee_claim("worker-2", 3)).await.unwrap().is_none());
 
-    // A ZK worker can claim a compressed job (block-number ordering may surface a
-    // lower-block pending ZK job from another test, so we only assert the proof type).
-    let zk = claim_job("zk-worker", ApiProofType::Compressed, vec![], vec![ZkVmKind::Sp1], 3);
+    // An empty backend list defaults to cluster. Block-number ordering may surface a lower-block
+    // pending ZK job from another test, so we only assert the proof type.
+    let mut zk = claim_job("zk-worker", ApiProofType::Compressed, vec![], vec![ZkVmKind::Sp1], 3);
+    zk.zk_backends.clear();
     let job = repo
         .claim_next_proof_job(zk)
         .await
@@ -1868,6 +1950,63 @@ async fn test_complete_claimed_proof_job_guards_and_stores_result() {
 
 #[tokio::test]
 #[ignore = "requires a running Postgres with the prover schema (set DATABASE_URL); run with `cargo nextest run --run-ignored all -p base-prover-service-db --test postgres_integration --test-threads=1`"]
+async fn test_delete_proof_requests_by_tee_signer() {
+    let pool = test_pool().await;
+    let repo = test_repo(pool);
+    let signer = "0x1111111111111111111111111111111111111111";
+    let other_signer = "0x2222222222222222222222222222222222222222";
+
+    drain_claimable_tee_jobs(&repo).await;
+    let mut ids = Vec::new();
+    for submitted_signer in [signer, signer, other_signer] {
+        let id = repo.create(tee_request()).await.unwrap();
+        let claimed = repo
+            .claim_next_proof_job(tee_claim("batch-delete-worker", 3))
+            .await
+            .unwrap()
+            .expect("TEE job should be claimed");
+        assert_eq!(claimed.id, id);
+        let outcome = repo
+            .complete_claimed_proof_job(CompleteClaimedProofJob {
+                session_id: claimed.session_id,
+                lock_id: claimed.lock_id.expect("claimed job has lock"),
+                worker_id: "batch-delete-worker".to_owned(),
+                result: ProtocolProofResult::Tee(TeeProofResult {
+                    aggregate_proposal: Proposal {
+                        output_root: Default::default(),
+                        signature: Default::default(),
+                        l1_origin_hash: Default::default(),
+                        l1_origin_number: 0,
+                        l2_block_number: 0,
+                        prev_output_root: Default::default(),
+                        config_hash: Default::default(),
+                        schedule_id: Default::default(),
+                    },
+                    proposals: vec![],
+                    tee_kind: ProtocolTeeKind::AwsNitro,
+                    tee_signer: submitted_signer.parse().unwrap(),
+                }),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(outcome, SubmitProofOutcome::Completed(_)));
+        ids.push(id);
+    }
+
+    assert_eq!(repo.delete_proof_requests_by_tee_signer(signer).await.unwrap(), 2);
+    assert!(repo.get(ids[0]).await.unwrap().is_none());
+    assert!(repo.get(ids[1]).await.unwrap().is_none());
+    let result: ProtocolProofResult =
+        serde_json::from_value(repo.get(ids[2]).await.unwrap().unwrap().result_payload.unwrap())
+            .unwrap();
+    let ProtocolProofResult::Tee(result) = result else { panic!("expected TEE proof") };
+    assert_eq!(result.tee_signer, other_signer.parse::<Address>().unwrap());
+
+    assert_eq!(repo.delete_proof_requests_by_tee_signer(other_signer).await.unwrap(), 1);
+}
+
+#[tokio::test]
+#[ignore = "requires a running Postgres with the prover schema (set DATABASE_URL); run with `cargo nextest run --run-ignored all -p base-prover-service-db --test postgres_integration --test-threads=1`"]
 async fn test_complete_claimed_proof_job_rejects_mismatched_result() {
     let pool = test_pool().await;
     let repo = test_repo(pool);
@@ -1888,7 +2027,7 @@ async fn test_complete_claimed_proof_job_rejects_mismatched_result() {
             session_id: claimed.session_id.clone(),
             lock_id: Uuid::new_v4(),
             worker_id: "non-owner".to_owned(),
-            result: ProtocolProofResult::SnarkGroth16(SnarkGroth16ProofResult {
+            result: ProtocolProofResult::SnarkPlonk(SnarkPlonkProofResult {
                 proof: ZkProofResult {
                     zk_vm: ZkVm::Sp1,
                     proof: vec![0x01].into(),
@@ -1906,7 +2045,7 @@ async fn test_complete_claimed_proof_job_rejects_mismatched_result() {
             session_id: claimed.session_id.clone(),
             lock_id,
             worker_id: "mismatch-worker".to_owned(),
-            result: ProtocolProofResult::SnarkGroth16(SnarkGroth16ProofResult {
+            result: ProtocolProofResult::SnarkPlonk(SnarkPlonkProofResult {
                 proof: ZkProofResult {
                     zk_vm: ZkVm::Sp1,
                     proof: vec![0x01].into(),

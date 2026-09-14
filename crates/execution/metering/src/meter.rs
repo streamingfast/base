@@ -3,6 +3,7 @@
 use std::{sync::Arc, time::Instant};
 
 use alloy_consensus::{BlockHeader, Transaction as _};
+use alloy_evm::block::TxResult as _;
 use alloy_primitives::{
     Address, B256, U256,
     map::{HashMap, HashSet},
@@ -17,34 +18,15 @@ use base_execution_evm::{BaseEvmConfig, BaseNextBlockEnvAttributes};
 use eyre::{Result as EyreResult, eyre};
 use reth_evm::{ConfigureEvm, Evm as _, execute::BlockBuilder};
 use reth_primitives_traits::{Account, SealedHeader};
-use reth_revm::{database::StateProviderDatabase, db::State, primitives::KECCAK_EMPTY};
-use reth_trie_common::{HashedPostState, TrieInput};
+use reth_revm::{
+    database::StateProviderDatabase, db::State, primitives::KECCAK_EMPTY,
+    revm::context_interface::cfg::GasParams,
+};
+use revm::primitives::hardfork::SpecId;
 use revm_bytecode::opcode::OpCode;
-use revm_database::states::{BundleState, CacheState, bundle_state::BundleRetention};
+use revm_database::states::{BundleState, CacheState};
 
-use crate::{inspector::MeteringInspector, metrics::Metrics, transaction::validate_tx};
-
-/// Computes the pending trie input from a pre-built [`HashedPostState`].
-///
-/// This function records metrics for cache misses and compute duration.
-pub(crate) fn compute_pending_trie_input<SP>(
-    state_provider: &SP,
-    hashed_state: HashedPostState,
-) -> EyreResult<PendingTrieInput>
-where
-    SP: reth_provider::StateProvider + ?Sized,
-{
-    Metrics::pending_trie_cache_misses().increment(1);
-    let start = Instant::now();
-
-    let (_state_root, trie_updates) =
-        state_provider.state_root_with_updates(hashed_state.clone())?;
-
-    let elapsed = start.elapsed();
-    Metrics::pending_trie_compute_duration().record(elapsed.as_secs_f64());
-
-    Ok(PendingTrieInput { trie_updates, hashed_state })
-}
+use crate::{inspector::MeteringInspector, transaction::validate_tx};
 
 /// Converts a pending [`BundleState`] into a [`CacheState`] for use with
 /// `with_cached_prestate()`.
@@ -63,19 +45,6 @@ fn cache_state_from_bundle_state(bundle_state: &BundleState) -> CacheState {
     }
 }
 
-/// Pre-computed trie input from pending state for efficient state root calculation.
-///
-/// When metering bundles on top of pending flashblocks, we first compute the trie updates
-/// and hashed state for the pending state. This can then be prepended to the bundle's
-/// trie input, so state root calculation only performs I/O for the bundle's changes.
-#[derive(Debug, Clone)]
-pub struct PendingTrieInput {
-    /// Trie updates from computing pending state root.
-    pub trie_updates: reth_trie_common::updates::TrieUpdates,
-    /// Hashed state from pending flashblocks.
-    pub hashed_state: reth_trie_common::HashedPostState,
-}
-
 /// Pending state from flashblocks used as the base for bundle metering.
 ///
 /// This contains the accumulated state changes from pending flashblocks,
@@ -84,9 +53,6 @@ pub struct PendingTrieInput {
 pub struct PendingState {
     /// The accumulated bundle of state changes from pending flashblocks.
     pub bundle_state: Arc<BundleState>,
-    /// Optional pre-computed trie input for faster state root calculation.
-    /// If provided, state root calculation skips recomputing the pending state's trie.
-    pub trie_input: Option<PendingTrieInput>,
 }
 
 const BLOCK_TIME: u64 = 2; // 2 seconds per block
@@ -107,77 +73,95 @@ pub struct MeterBundleOutput {
     pub total_gas_fees: U256,
     /// Bundle hash
     pub bundle_hash: B256,
-    /// Total time in microseconds (includes transaction execution and state root calculation)
+    /// Total time spent executing the bundle in microseconds.
     pub total_time_us: u128,
-    /// State root calculation time in microseconds
-    pub state_root_time_us: u128,
-    /// Count of account leaves in the bundle's `HashedPostState`: one per modified account that
-    /// survives in the post-state trie. Proportional to gas (each account touch costs gas) and
-    /// does not reflect trie depth.
-    pub state_root_account_leaf_count: u64,
-    /// Count of account branch/removal nodes emitted by `TrieUpdates` during state root
-    /// calculation. These are intermediate trie nodes that were rebuilt or removed, and their
-    /// count scales with trie depth — the structural cost that gas does not price.
-    pub state_root_account_branch_count: u64,
-    /// Count of storage slot leaves in the bundle's `HashedPostState`: one per modified non-zero
-    /// storage slot. Like account leaves, proportional to gas and does not reflect trie depth.
-    pub state_root_storage_leaf_count: u64,
-    /// Count of storage branch/removal nodes emitted by `TrieUpdates` during state root
-    /// calculation, restricted to tries the bundle actually modified. Like account branches,
-    /// these scale with trie depth.
-    pub state_root_storage_branch_count: u64,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct StateRootTrieNodeCounts {
-    account_leaves: u64,
-    account_branches: u64,
-    storage_leaves: u64,
-    storage_branches: u64,
-}
-
-/// Counts surviving leaves in the bundle's `HashedPostState`.
+/// Transaction-level pseudo-opcodes exposed by bundle metering.
 ///
-/// These are the values that changed, not intermediate trie structure. Account leaves are one per
-/// modified surviving account; storage leaves are one per modified non-zero storage slot. Deleted
-/// accounts and zero-valued storage removals are represented through trie updates, not here.
-fn count_state_root_leaf_nodes(hashed_state: &HashedPostState) -> StateRootTrieNodeCounts {
-    let account_leaves =
-        hashed_state.accounts.values().filter(|account| account.is_some()).count() as u64;
-    let storage_leaves = hashed_state
-        .storages
-        .values()
-        .map(|storage| storage.storage.values().filter(|value| !value.is_zero()).count())
-        .sum::<usize>() as u64;
-
-    StateRootTrieNodeCounts { account_leaves, storage_leaves, ..Default::default() }
+/// The string representation is the stable CLI/RPC name. Internally, metering
+/// uses this enum so comparisons do not depend on repeated string literals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PseudoOpcode {
+    /// Aggregate of the active transaction intrinsic components.
+    IntrinsicTotal,
+    /// EIP-2028/EIP-7623 zero-byte transaction data cost.
+    IntrinsicTxDataZeroByteCost,
+    /// EIP-2028/EIP-7623 non-zero-byte transaction data cost.
+    IntrinsicTxDataNonZeroByteCost,
+    /// EIP-2930 prepaid access-list address cost.
+    IntrinsicAccessListAddressCost,
+    /// EIP-2930 prepaid access-list storage-key cost.
+    IntrinsicAccessListStorageKeyCost,
+    /// EIP-3860 transaction initcode word cost.
+    IntrinsicInitcodeWordCost,
+    /// EIP-7623 transaction floor-gas candidate.
+    TxFloorGas,
+    /// Pre-Amsterdam legacy transaction base cost.
+    IntrinsicLegacyTxBaseCost,
+    /// Pre-Amsterdam legacy contract-creation cost.
+    IntrinsicLegacyCreateCost,
+    /// EIP-7702 legacy authorization-list empty-account cost.
+    IntrinsicPerEmptyAccountCost,
+    /// EIP-2780 resource-based transaction base cost.
+    IntrinsicTxBaseCost,
+    /// EIP-2780 cold account access cost.
+    IntrinsicColdAccountAccess,
+    /// EIP-2780 transaction value cost.
+    IntrinsicTxValueCost,
+    /// EIP-2780/EIP-7708 transfer-log cost.
+    IntrinsicTransferLogCost,
+    /// EIP-2780 account-creation access cost.
+    IntrinsicCreateAccess,
+    /// EIP-2780 regular authorization base cost.
+    IntrinsicRegularPerAuthBaseCost,
+    /// Successful top-level ETH transfer to a nonexistent account.
+    TxEffectEthTransferToNonexistentAccount,
+    /// Successful top-level ETH transfer to an existing account.
+    TxEffectEthTransferToExistingAccount,
+    /// Successful top-level ETH self-transfer.
+    TxEffectEthSelfTransfer,
 }
 
-/// Adds branch/removal counts from `TrieUpdates` emitted during state root calculation.
-///
-/// These are intermediate trie nodes that were rebuilt or removed — the structural work whose cost
-/// scales with trie depth. The `changed_storage_tries` filter restricts storage-side attribution
-/// to tries the bundle actually modified, excluding cached pending-state tries and empty-storage
-/// deletion markers.
-fn add_state_root_trie_update_counts(
-    counts: &mut StateRootTrieNodeCounts,
-    changed_storage_tries: &HashSet<B256>,
-    trie_updates: &reth_trie_common::updates::TrieUpdates,
-) {
-    counts.account_branches = counts.account_branches.saturating_add(
-        trie_updates
-            .account_nodes_ref()
-            .len()
-            .saturating_add(trie_updates.removed_nodes_ref().len()) as u64,
-    );
-    counts.storage_branches = counts.storage_branches.saturating_add(
-        trie_updates
-            .storage_tries_ref()
-            .iter()
-            .filter(|(hashed_address, _)| changed_storage_tries.contains(*hashed_address))
-            .map(|(_, updates)| updates.len())
-            .sum::<usize>() as u64,
-    );
+impl PseudoOpcode {
+    /// Returns the stable CLI/RPC name for this pseudo-opcode.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IntrinsicTotal => "INTRINSIC_TOTAL",
+            Self::IntrinsicTxDataZeroByteCost => "INTRINSIC_TX_DATA_ZERO_BYTE_COST",
+            Self::IntrinsicTxDataNonZeroByteCost => "INTRINSIC_TX_DATA_NON_ZERO_BYTE_COST",
+            Self::IntrinsicAccessListAddressCost => "INTRINSIC_ACCESS_LIST_ADDRESS_COST",
+            Self::IntrinsicAccessListStorageKeyCost => "INTRINSIC_ACCESS_LIST_STORAGE_KEY_COST",
+            Self::IntrinsicInitcodeWordCost => "INTRINSIC_INITCODE_WORD_COST",
+            Self::TxFloorGas => "TX_FLOOR_GAS",
+            Self::IntrinsicLegacyTxBaseCost => "INTRINSIC_LEGACY_TX_BASE_COST",
+            Self::IntrinsicLegacyCreateCost => "INTRINSIC_LEGACY_CREATE_COST",
+            Self::IntrinsicPerEmptyAccountCost => "INTRINSIC_PER_EMPTY_ACCOUNT_COST",
+            Self::IntrinsicTxBaseCost => "INTRINSIC_TX_BASE_COST",
+            Self::IntrinsicColdAccountAccess => "INTRINSIC_COLD_ACCOUNT_ACCESS",
+            Self::IntrinsicTxValueCost => "INTRINSIC_TX_VALUE_COST",
+            Self::IntrinsicTransferLogCost => "INTRINSIC_TRANSFER_LOG_COST",
+            Self::IntrinsicCreateAccess => "INTRINSIC_CREATE_ACCESS",
+            Self::IntrinsicRegularPerAuthBaseCost => "INTRINSIC_REGULAR_PER_AUTH_BASE_COST",
+            Self::TxEffectEthTransferToNonexistentAccount => {
+                "TX_EFFECT_ETH_TRANSFER_TO_NONEXISTENT_ACCOUNT"
+            }
+            Self::TxEffectEthTransferToExistingAccount => {
+                "TX_EFFECT_ETH_TRANSFER_TO_EXISTING_ACCOUNT"
+            }
+            Self::TxEffectEthSelfTransfer => "TX_EFFECT_ETH_SELF_TRANSFER",
+        }
+    }
+
+    /// Returns whether this pseudo-opcode classifies a top-level ETH transfer.
+    pub const fn is_eth_transfer_effect(self) -> bool {
+        matches!(
+            self,
+            Self::TxEffectEthTransferToNonexistentAccount
+                | Self::TxEffectEthTransferToExistingAccount
+                | Self::TxEffectEthSelfTransfer
+        )
+    }
 }
 
 /// Opcodes and precompiles to track during bundle metering.
@@ -194,6 +178,8 @@ pub struct MeteredOpcodes {
     pub beryl_b20_asset_precompiles: bool,
     /// Whether to track dynamic Beryl B-20 stablecoin-token precompile addresses.
     pub beryl_b20_stablecoin_precompiles: bool,
+    /// Synthetic transaction-level gas buckets to track.
+    pub pseudo_opcodes: HashSet<PseudoOpcode>,
 }
 
 /// Constructs a precompile address from a `u16` value.
@@ -239,6 +225,37 @@ const BERYL_PRECOMPILES: &[(&str, Address)] = &[
     (BERYL_POLICY_REGISTRY_PRECOMPILE, PolicyRegistryStorage::ADDRESS),
 ];
 
+const PSEUDO_OPCODES: &[PseudoOpcode] = &[
+    // EIP-2780: aggregate of the active transaction intrinsic components.
+    PseudoOpcode::IntrinsicTotal,
+    // EIP-2028 and EIP-7623: transaction data cost.
+    PseudoOpcode::IntrinsicTxDataZeroByteCost,
+    PseudoOpcode::IntrinsicTxDataNonZeroByteCost,
+    // EIP-2930: prepaid access-list entry costs.
+    PseudoOpcode::IntrinsicAccessListAddressCost,
+    PseudoOpcode::IntrinsicAccessListStorageKeyCost,
+    // EIP-3860: transaction initcode jumpdest-analysis cost.
+    PseudoOpcode::IntrinsicInitcodeWordCost,
+    // EIP-7623: floor candidate, separate from intrinsic gas.
+    PseudoOpcode::TxFloorGas,
+    // Pre-Amsterdam legacy aggregates. These are not EIP-2780 primitives.
+    PseudoOpcode::IntrinsicLegacyTxBaseCost,
+    PseudoOpcode::IntrinsicLegacyCreateCost,
+    // EIP-7702: legacy authorization-list charge.
+    PseudoOpcode::IntrinsicPerEmptyAccountCost,
+    // EIP-2780: resource-based intrinsic transaction primitives.
+    PseudoOpcode::IntrinsicTxBaseCost,
+    PseudoOpcode::IntrinsicColdAccountAccess,
+    PseudoOpcode::IntrinsicTxValueCost,
+    PseudoOpcode::IntrinsicTransferLogCost,
+    PseudoOpcode::IntrinsicCreateAccess,
+    PseudoOpcode::IntrinsicRegularPerAuthBaseCost,
+    // EIP-2780/EIP-7708: zero-gas top-level ETH-transfer classifiers.
+    PseudoOpcode::TxEffectEthTransferToNonexistentAccount,
+    PseudoOpcode::TxEffectEthTransferToExistingAccount,
+    PseudoOpcode::TxEffectEthSelfTransfer,
+];
+
 impl MeteredOpcodes {
     /// Returns true if no opcodes or precompiles are configured.
     pub fn is_empty(&self) -> bool {
@@ -246,6 +263,7 @@ impl MeteredOpcodes {
             && self.precompiles.is_empty()
             && !self.beryl_b20_asset_precompiles
             && !self.beryl_b20_stablecoin_precompiles
+            && self.pseudo_opcodes.is_empty()
     }
 
     /// Returns true if any fixed or dynamic precompile metering is configured.
@@ -323,6 +341,8 @@ impl MeteredOpcodes {
             .chain(BERYL_PRECOMPILES.iter())
             .map(|&(name, addr)| (name, (addr, name)))
             .collect();
+        let pseudo_lookup: HashMap<&str, PseudoOpcode> =
+            PSEUDO_OPCODES.iter().map(|&opcode| (opcode.as_str(), opcode)).collect();
 
         let mut result = Self::default();
         for name in names {
@@ -335,12 +355,217 @@ impl MeteredOpcodes {
                 result.beryl_b20_asset_precompiles = true;
             } else if upper == BERYL_B20_STABLECOIN_PRECOMPILE {
                 result.beryl_b20_stablecoin_precompiles = true;
+            } else if let Some(&pseudo_opcode) = pseudo_lookup.get(upper.as_str()) {
+                result.pseudo_opcodes.insert(pseudo_opcode);
             } else {
                 return Err(eyre!("unknown opcode or precompile: {name}"));
             }
         }
         Ok(result)
     }
+}
+
+fn is_dead_provider_account(account: &Account) -> bool {
+    account.nonce == 0
+        && account.balance.is_zero()
+        && account.bytecode_hash.is_none_or(|hash| hash == KECCAK_EMPTY)
+}
+
+fn is_dead_account_info(account: &reth_revm::state::AccountInfo) -> bool {
+    account.nonce == 0 && account.balance.is_zero() && account.code_hash == KECCAK_EMPTY
+}
+
+fn lookup_value_recipient_is_dead<SP>(
+    state_provider: &SP,
+    pending_state: Option<&PendingState>,
+    address: &Address,
+) -> EyreResult<bool>
+where
+    SP: reth_provider::StateProvider,
+{
+    if let Some(pending_account) =
+        pending_state.and_then(|pending_state| pending_state.bundle_state.account(address))
+    {
+        return Ok(pending_account.info.as_ref().is_none_or(is_dead_account_info));
+    }
+
+    Ok(state_provider.basic_account(address)?.as_ref().is_none_or(is_dead_provider_account))
+}
+
+fn intrinsic_gas_entries<T: alloy_consensus::Transaction>(
+    tx: &alloy_consensus::transaction::Recovered<T>,
+    recipient_is_dead: bool,
+    tx_succeeded: bool,
+    metered: &MeteredOpcodes,
+    spec: BaseSpecId,
+) -> Vec<OpcodeGas> {
+    if metered.pseudo_opcodes.is_empty() {
+        return Vec::new();
+    }
+
+    let requested = |opcode: PseudoOpcode| metered.pseudo_opcodes.contains(&opcode);
+    let mut entries = Vec::new();
+    let gas_params = GasParams::new_spec(spec.into());
+
+    // EIP-2028/EIP-7623: revm's active token schedule is the source of truth for
+    // calldata pricing. In particular, do not hardcode the Istanbul non-zero
+    // byte price because future schedules may change the multiplier.
+    let zero_bytes = tx.input().iter().filter(|&&byte| byte == 0).count() as u64;
+    let non_zero_bytes = tx.input().len() as u64 - zero_bytes;
+    let zero_byte_cost = gas_params.tx_token_cost();
+    let non_zero_byte_cost =
+        zero_byte_cost.saturating_mul(gas_params.tx_token_non_zero_byte_multiplier());
+    let calldata_zero_gas = zero_bytes.saturating_mul(zero_byte_cost);
+    let calldata_non_zero_gas = non_zero_bytes.saturating_mul(non_zero_byte_cost);
+
+    let is_create = tx.to().is_none();
+    // Pre-Amsterdam Base execution uses this legacy aggregate. The exact
+    // EIP-2780 primitive names are registered above but are deliberately not
+    // emitted until a Base execution schedule implements that decomposition.
+    let legacy_tx_base_gas = gas_params.tx_base_stipend();
+    let legacy_create_gas = if is_create { gas_params.tx_create_cost() } else { 0 };
+    let initcode_words = if is_create { tx.input().len().div_ceil(32) as u64 } else { 0 };
+    let initcode_gas = if is_create { gas_params.tx_initcode_cost(tx.input().len()) } else { 0 };
+
+    // EIP-2930: these are prepaid access-list entries, not EIP-7928 BAL
+    // observations. The active schedule can update their per-entry prices.
+    let access_list_addresses = tx.access_list().map_or(0, |access_list| access_list.len() as u64);
+    let access_list_storage_keys = tx.access_list().map_or(0, |access_list| {
+        access_list.iter().map(|item| item.storage_keys.len() as u64).sum()
+    });
+    let access_list_address_gas =
+        access_list_addresses.saturating_mul(gas_params.tx_access_list_address_cost());
+    let access_list_storage_key_gas =
+        access_list_storage_keys.saturating_mul(gas_params.tx_access_list_storage_key_cost());
+
+    // EIP-7702: `tx_eip7702_per_empty_account_cost` includes the active
+    // regular/state portions, so it remains correct if the schedule changes.
+    let authorization_count = tx.authorization_count().unwrap_or_default();
+    let per_empty_account_cost = gas_params.tx_eip7702_per_empty_account_cost();
+    let authorization_gas = authorization_count.saturating_mul(per_empty_account_cost);
+
+    let eip2780 = spec.into_eth_spec().is_enabled_in(SpecId::AMSTERDAM).then(|| {
+        revm::context_interface::cfg::gas_params::Eip2780TxInfo {
+            value: tx.value(),
+            // Self-transfer: a `Call` whose recipient is the sender itself.
+            is_self_transfer: tx.kind().to() == Some(tx.signer_ref()),
+        }
+    });
+
+    let initial_gas = gas_params.initial_tx_gas(
+        tx.input(),
+        is_create,
+        access_list_addresses,
+        access_list_storage_keys,
+        authorization_count,
+        eip2780,
+    );
+    let intrinsic_gas = initial_gas.initial_total_gas();
+    let floor_gas = initial_gas.floor_gas();
+
+    if requested(PseudoOpcode::IntrinsicTotal) {
+        entries.push(OpcodeGas {
+            contract_address: Address::ZERO,
+            opcode: PseudoOpcode::IntrinsicTotal.as_str().to_string(),
+            count: 1,
+            gas_used: intrinsic_gas,
+        });
+    }
+    if requested(PseudoOpcode::IntrinsicTxDataZeroByteCost) && zero_bytes > 0 {
+        entries.push(OpcodeGas {
+            contract_address: Address::ZERO,
+            opcode: PseudoOpcode::IntrinsicTxDataZeroByteCost.as_str().to_string(),
+            count: zero_bytes,
+            gas_used: calldata_zero_gas,
+        });
+    }
+    if requested(PseudoOpcode::IntrinsicTxDataNonZeroByteCost) && non_zero_bytes > 0 {
+        entries.push(OpcodeGas {
+            contract_address: Address::ZERO,
+            opcode: PseudoOpcode::IntrinsicTxDataNonZeroByteCost.as_str().to_string(),
+            count: non_zero_bytes,
+            gas_used: calldata_non_zero_gas,
+        });
+    }
+    if requested(PseudoOpcode::IntrinsicInitcodeWordCost) && initcode_words > 0 {
+        entries.push(OpcodeGas {
+            contract_address: Address::ZERO,
+            opcode: PseudoOpcode::IntrinsicInitcodeWordCost.as_str().to_string(),
+            count: initcode_words,
+            gas_used: initcode_gas,
+        });
+    }
+    if requested(PseudoOpcode::IntrinsicAccessListAddressCost) && access_list_addresses > 0 {
+        entries.push(OpcodeGas {
+            contract_address: Address::ZERO,
+            opcode: PseudoOpcode::IntrinsicAccessListAddressCost.as_str().to_string(),
+            count: access_list_addresses,
+            gas_used: access_list_address_gas,
+        });
+    }
+    if requested(PseudoOpcode::IntrinsicAccessListStorageKeyCost) && access_list_storage_keys > 0 {
+        entries.push(OpcodeGas {
+            contract_address: Address::ZERO,
+            opcode: PseudoOpcode::IntrinsicAccessListStorageKeyCost.as_str().to_string(),
+            count: access_list_storage_keys,
+            gas_used: access_list_storage_key_gas,
+        });
+    }
+    if requested(PseudoOpcode::IntrinsicLegacyTxBaseCost) {
+        entries.push(OpcodeGas {
+            contract_address: Address::ZERO,
+            opcode: PseudoOpcode::IntrinsicLegacyTxBaseCost.as_str().to_string(),
+            count: 1,
+            gas_used: legacy_tx_base_gas,
+        });
+    }
+    if requested(PseudoOpcode::IntrinsicLegacyCreateCost) && is_create {
+        entries.push(OpcodeGas {
+            contract_address: Address::ZERO,
+            opcode: PseudoOpcode::IntrinsicLegacyCreateCost.as_str().to_string(),
+            count: 1,
+            gas_used: legacy_create_gas,
+        });
+    }
+    if requested(PseudoOpcode::IntrinsicPerEmptyAccountCost) && authorization_count > 0 {
+        entries.push(OpcodeGas {
+            contract_address: Address::ZERO,
+            opcode: PseudoOpcode::IntrinsicPerEmptyAccountCost.as_str().to_string(),
+            count: authorization_count,
+            gas_used: authorization_gas,
+        });
+    }
+    if requested(PseudoOpcode::TxFloorGas) && floor_gas > 0 {
+        entries.push(OpcodeGas {
+            contract_address: Address::ZERO,
+            opcode: PseudoOpcode::TxFloorGas.as_str().to_string(),
+            count: 1,
+            gas_used: floor_gas,
+        });
+    }
+
+    if tx_succeeded
+        && tx.value() > U256::ZERO
+        && let Some(to) = tx.to()
+    {
+        let opcode = if to == tx.signer() {
+            PseudoOpcode::TxEffectEthSelfTransfer
+        } else if recipient_is_dead {
+            PseudoOpcode::TxEffectEthTransferToNonexistentAccount
+        } else {
+            PseudoOpcode::TxEffectEthTransferToExistingAccount
+        };
+        if requested(opcode) {
+            entries.push(OpcodeGas {
+                contract_address: Address::ZERO,
+                opcode: opcode.as_str().to_string(),
+                count: 1,
+                gas_used: 0,
+            });
+        }
+    }
+
+    entries
 }
 
 /// Inputs for [`meter_bundle`].
@@ -392,40 +617,27 @@ where
     // Get bundle hash
     let bundle_hash = bundle.bundle_hash();
 
-    // Get pending trie input before starting timers. This ensures we only measure
-    // the bundle's incremental I/O cost, not I/O from pending flashblocks.
-    let pending_trie = pending_state
-        .as_ref()
-        .map(|ps| -> EyreResult<PendingTrieInput> {
-            // Use cached trie input if available, otherwise compute it
-            ps.trie_input.as_ref().map_or_else(
-                || {
-                    let hashed = state_provider.hashed_post_state(&ps.bundle_state);
-                    compute_pending_trie_input(&state_provider, hashed)
-                },
-                |cached| {
-                    Metrics::pending_trie_cache_hits().increment(1);
-                    Ok(cached.clone())
-                },
-            )
-        })
-        .transpose()?;
+    let meters_value_transfer_effects =
+        metered_opcodes.pseudo_opcodes.iter().any(|opcode| opcode.is_eth_transfer_effect());
+    let mut initial_value_recipient_is_dead: HashMap<Address, bool> = HashMap::default();
+    if meters_value_transfer_effects {
+        for tx in bundle.transactions() {
+            if let Some(to) = tx.to()
+                && tx.value() > U256::ZERO
+                && !initial_value_recipient_is_dead.contains_key(&to)
+            {
+                let is_dead =
+                    lookup_value_recipient_is_dead(&state_provider, pending_state.as_ref(), &to)?;
+                initial_value_recipient_is_dead.insert(to, is_dead);
+            }
+        }
+    }
 
     // Create state database
     let state_db = StateProviderDatabase::new(state_provider);
 
-    // Track bundle state changes. When metering on top of pending flashblocks, seed execution
-    // from a cache prestate instead of `with_bundle_prestate()`. The two approaches produce
-    // identical execution results, but differ in what `take_bundle()` returns:
-    //
-    // - `with_bundle_prestate()`: `take_bundle()` includes the pending prestate in its output,
-    //   so `hashed_post_state()` generates prefix sets for every pending path. The trie walker
-    //   then rebuilds all of them — even though `prepend_cached` already provides those nodes —
-    //   making state root time proportional to pending state size.
-    //
-    // - `with_cached_prestate()`: `take_bundle()` returns only the bundle's delta, so prefix
-    //   sets cover only bundle-changed paths. The trie walker skips pending paths (reusing
-    //   cached nodes) and state root time is proportional to bundle size alone.
+    // Seed execution from the pending cache prestate so bundles observe non-canonical state
+    // already published by flashblocks.
     let mut db = if let Some(ref ps) = pending_state {
         State::builder()
             .with_database(state_db)
@@ -511,6 +723,11 @@ where
         block.basefee = block.basefee.min(MIN_BASEFEE);
         builder.apply_pre_execution_changes()?;
 
+        // TX_EFFECT_ETH_* classifies top-level ETH transfers. Within a
+        // bundle, only earlier successful top-level value transfers update this
+        // liveness cache; internal CALL/CREATE effects from prior transactions
+        // are intentionally not re-read here.
+        let mut live_value_recipients: HashSet<Address> = HashSet::default();
         for tx in bundle.transactions() {
             let tx_start = Instant::now();
             let tx_hash = tx.tx_hash();
@@ -518,6 +735,18 @@ where
             let to = tx.to();
             let value = tx.value();
             let gas_price = tx.max_fee_per_gas();
+            let recipient_is_dead = if meters_value_transfer_effects
+                && let Some(to) = to
+                && value > U256::ZERO
+            {
+                if live_value_recipients.contains(&to) {
+                    false
+                } else {
+                    initial_value_recipient_is_dead.get(&to).copied().unwrap_or(false)
+                }
+            } else {
+                false
+            };
             let account = account_infos
                 .get(&from)
                 .ok_or_else(|| eyre!("Account not found for address: {from}"))?
@@ -526,10 +755,19 @@ where
             validate_tx(account, tx, &mut l1_block_info, spec)
                 .map_err(|e| eyre!("Transaction {tx_hash} validation failed: {e}"))?;
 
+            let mut tx_succeeded = false;
             let gas_used = builder
-                .execute_transaction(tx.clone())
+                .execute_transaction_with_result_closure(tx.clone(), |result| {
+                    tx_succeeded = result.result().result.is_success();
+                })
                 .map_err(|e| eyre!("Transaction {tx_hash} execution failed: {e}"))?
                 .tx_gas_used();
+            if tx_succeeded
+                && let Some(to) = to
+                && value > U256::ZERO
+            {
+                live_value_recipients.insert(to);
+            }
 
             let gas_fees = U256::from(gas_used) * U256::from(gas_price);
             total_gas_used = total_gas_used.saturating_add(gas_used);
@@ -540,16 +778,16 @@ where
             let opcode_data = inspector.take_opcode_gas();
             let precompile_data = inspector.take_precompile_gas();
 
-            let mut opcode_gas: Vec<OpcodeGas> = opcode_data
-                .iter()
-                .filter(|(_, usage)| usage.count > 0)
-                .map(|(&(contract_address, opcode), usage)| OpcodeGas {
+            let mut opcode_gas =
+                intrinsic_gas_entries(tx, recipient_is_dead, tx_succeeded, &metered_opcodes, spec);
+            opcode_gas.extend(opcode_data.iter().filter(|(_, usage)| usage.count > 0).map(
+                |(&(contract_address, opcode), usage)| OpcodeGas {
                     contract_address,
                     opcode: opcode.as_str().to_string(),
                     count: usage.count,
                     gas_used: usage.gas_used,
-                })
-                .collect();
+                },
+            ));
 
             for (addr, usage) in &precompile_data {
                 if let Some(name) = metered_opcodes.precompile_name(*addr)
@@ -583,87 +821,14 @@ where
         }
     }
 
-    // Calculate state root and measure its calculation time. If pending flashblocks were present,
-    // `bundle_update` now contains only this bundle's delta; the cached pending trie is prepended
-    // below so state-root work stays incremental.
-    db.merge_transitions(BundleRetention::Reverts);
-    let bundle_update = db.take_bundle();
-
-    // Gets the number of storage slots modified from every account
-    let storage_slots_modified: usize =
-        bundle_update.state().values().map(|account| account.storage.len()).sum();
-    Metrics::storage_slots_modified().record(storage_slots_modified as f64);
-
-    // Gets the number of accounts modified
-    let accounts_modified: usize = bundle_update.state().len();
-    Metrics::accounts_modified().record(accounts_modified as f64);
-    // `state_root_*_with_updates` reports structural trie updates for the entire overlay we hand
-    // to `reth`, not just the bundle delta. When the bundle made no state changes, those updates
-    // can come entirely from cached pending trie nodes or root-maintenance bookkeeping. In that
-    // case we still time the calculation, but we intentionally attribute zero trie nodes to the
-    // bundle itself.
-    let has_bundle_state_changes = accounts_modified > 0;
-
-    let state_provider = db.database.as_ref();
-
-    let state_root_start = Instant::now();
-    let hashed_state = state_provider.hashed_post_state(&bundle_update);
-    let changed_storage_tries = hashed_state.storages.keys().copied().collect::<HashSet<_>>();
-    let mut trie_node_counts = count_state_root_leaf_nodes(&hashed_state);
-
-    if let Some(cached_trie) = pending_trie {
-        // Build the trie input so the state root reflects canonical + pending + bundle.
-        //
-        // `from_state` generates prefix sets only for bundle-changed paths.
-        // `prepend_cached` merges the pending state's trie nodes and hashed values
-        // WITHOUT adding prefix sets — so the trie walker reuses cached nodes for
-        // pending-only paths and only rebuilds paths the bundle actually changed.
-        //
-        // Note: `prepend_cached` (not `prepend_self`) is essential here.
-        // `prepend_self` would merge prefix sets from the pending state, causing the
-        // walker to redundantly rebuild every pending path and defeating the
-        // optimization.
-        let mut trie_input = TrieInput::from_state(hashed_state);
-        trie_input.prepend_cached(cached_trie.trie_updates, cached_trie.hashed_state);
-        let (_, trie_updates) = state_provider.state_root_from_nodes_with_updates(trie_input)?;
-        if has_bundle_state_changes {
-            add_state_root_trie_update_counts(
-                &mut trie_node_counts,
-                &changed_storage_tries,
-                &trie_updates,
-            );
-        }
-    } else {
-        // No pending state, just calculate bundle state root
-        let (_, trie_updates) = state_provider.state_root_with_updates(hashed_state)?;
-        if has_bundle_state_changes {
-            add_state_root_trie_update_counts(
-                &mut trie_node_counts,
-                &changed_storage_tries,
-                &trie_updates,
-            );
-        }
-    }
-
-    let state_root_time_us = state_root_start.elapsed().as_micros();
     let total_time_us = total_start.elapsed().as_micros();
 
-    Ok(MeterBundleOutput {
-        results,
-        total_gas_used,
-        total_gas_fees,
-        bundle_hash,
-        total_time_us,
-        state_root_time_us,
-        state_root_account_leaf_count: trie_node_counts.account_leaves,
-        state_root_account_branch_count: trie_node_counts.account_branches,
-        state_root_storage_leaf_count: trie_node_counts.storage_leaves,
-        state_root_storage_branch_count: trie_node_counts.storage_branches,
-    })
+    Ok(MeterBundleOutput { results, total_gas_used, total_gas_fees, bundle_hash, total_time_us })
 }
 
 #[cfg(test)]
 mod tests {
+    use alloy_consensus::transaction::Recovered;
     use alloy_eips::Encodable2718;
     use alloy_primitives::{Address, Bytes, keccak256, utils::Unit};
     use alloy_sol_types::{SolCall, SolValue};
@@ -689,7 +854,9 @@ mod tests {
 
         let bundle = Bundle {
             txs,
-            block_number: 0,
+            block_number: None,
+            min_block_number: None,
+            max_block_number: None,
             flashblock_number_min: None,
             flashblock_number_max: None,
             min_timestamp: None,
@@ -745,6 +912,53 @@ mod tests {
         assert!(entry.gas_used > 0, "{opcode} gas_used should be non-zero");
     }
 
+    fn value_call_contract_initcode(target: Address) -> Bytes {
+        // Runtime:
+        //   CALL(gas(), target, 1 wei, 0, 0, 0, 0)
+        //   STOP
+        let mut runtime = Vec::new();
+        runtime.extend_from_slice(&[0x60, 0x00]); // out size
+        runtime.extend_from_slice(&[0x60, 0x00]); // out offset
+        runtime.extend_from_slice(&[0x60, 0x00]); // in size
+        runtime.extend_from_slice(&[0x60, 0x00]); // in offset
+        runtime.extend_from_slice(&[0x60, 0x01]); // value
+        runtime.push(0x73); // PUSH20 target
+        runtime.extend_from_slice(target.as_slice());
+        runtime.push(0x5a); // GAS
+        runtime.push(0xf1); // CALL
+        runtime.push(0x00); // STOP
+
+        assert!(runtime.len() <= u8::MAX as usize);
+        let runtime_len = runtime.len() as u8;
+
+        let mut initcode = Vec::new();
+        initcode.extend_from_slice(&[
+            0x60,
+            runtime_len,
+            0x60,
+            0x0a,
+            0x5f,
+            0x39, // CODECOPY(0, 10, runtime_len)
+            0x60,
+            runtime_len,
+            0x5f,
+            0xf3, // RETURN(0, runtime_len)
+        ]);
+        initcode.extend_from_slice(&runtime);
+        Bytes::from(initcode)
+    }
+
+    async fn deploy_value_call_contract(
+        harness: &TestHarness,
+        target: Address,
+        nonce: u64,
+    ) -> eyre::Result<Address> {
+        let (deployment_tx, contract_address, _) =
+            Account::Deployer.create_deployment_tx(value_call_contract_initcode(target), nonce)?;
+        harness.build_block_from_transactions(vec![deployment_tx]).await?;
+        Ok(contract_address)
+    }
+
     #[tokio::test]
     async fn meter_bundle_empty_transactions() -> eyre::Result<()> {
         let harness = TestHarness::new().await?;
@@ -774,11 +988,6 @@ mod tests {
         assert_eq!(output.total_gas_fees, U256::ZERO);
         // Even empty bundles have some EVM setup overhead
         assert!(output.total_time_us > 0);
-        assert!(output.state_root_time_us > 0);
-        assert_eq!(output.state_root_account_leaf_count, 0);
-        assert_eq!(output.state_root_account_branch_count, 0);
-        assert_eq!(output.state_root_storage_leaf_count, 0);
-        assert_eq!(output.state_root_storage_branch_count, 0);
         assert_eq!(output.bundle_hash, keccak256([]));
 
         Ok(())
@@ -828,12 +1037,6 @@ mod tests {
         assert_eq!(output.results.len(), 1);
         let result = &output.results[0];
         assert!(output.total_time_us > 0);
-        assert!(output.state_root_time_us > 0);
-        assert!(
-            output.state_root_account_leaf_count > 0 || output.state_root_account_branch_count > 0
-        );
-        assert_eq!(output.state_root_storage_leaf_count, 0);
-        assert_eq!(output.state_root_storage_branch_count, 0);
 
         assert_eq!(result.from_address, Account::Alice.address());
         assert_eq!(result.to_address, Some(to));
@@ -850,6 +1053,65 @@ mod tests {
         assert_eq!(output.bundle_hash, keccak256(concatenated));
 
         assert!(result.execution_time_us > 0, "execution_time_us should be greater than zero");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn meter_bundle_reports_active_intrinsic_components_and_floor() -> eyre::Result<()> {
+        let harness = TestHarness::new().await?;
+        let latest = harness.latest_block();
+        let header = latest.sealed_header().clone();
+        let to = Address::random();
+        let signed_tx = TransactionBuilder::default()
+            .signer(Account::Alice.signer_b256())
+            .chain_id(harness.chain_id())
+            .nonce(0)
+            .to(to)
+            .gas_limit(100_000)
+            .max_fee_per_gas(MIN_BASEFEE as u128)
+            .max_priority_fee_per_gas(0)
+            .input(Bytes::from_static(&[0, 1]))
+            .into_eip1559();
+        let tx = BaseTransactionSigned::Eip1559(
+            signed_tx.as_eip1559().expect("eip1559 transaction").clone(),
+        );
+        let state_provider = harness
+            .blockchain_provider()
+            .state_by_block_hash(latest.hash())
+            .context("getting state provider")?;
+        let parsed_bundle = create_parsed_bundle(vec![tx])?;
+        let metered = MeteredOpcodes::parse(&[
+            "INTRINSIC_TOTAL".to_string(),
+            "INTRINSIC_TX_DATA_ZERO_BYTE_COST".to_string(),
+            "INTRINSIC_TX_DATA_NON_ZERO_BYTE_COST".to_string(),
+            "INTRINSIC_LEGACY_TX_BASE_COST".to_string(),
+            "TX_FLOOR_GAS".to_string(),
+        ])?;
+
+        let output = meter_bundle(MeterBundleInput {
+            state_provider,
+            chain_spec: harness.chain_spec(),
+            bundle: parsed_bundle,
+            header: header.clone(),
+            parent_beacon_block_root: header.parent_beacon_block_root(),
+            pending_state: None,
+            l1_block_info: L1BlockInfo::default(),
+            metered_opcodes: Arc::new(metered),
+        })?;
+
+        let entries = &output.results[0].opcode_gas;
+        let gas = |opcode: &str| {
+            entries.iter().find(|entry| entry.opcode == opcode).map(|entry| entry.gas_used)
+        };
+        // Osaka inherits EIP-2028's 4/16 calldata prices and EIP-7623's
+        // 21,000 + 10 * (zero + 4 * non-zero) floor candidate.
+        assert_eq!(gas("INTRINSIC_LEGACY_TX_BASE_COST"), Some(21_000));
+        assert_eq!(gas("INTRINSIC_TX_DATA_ZERO_BYTE_COST"), Some(4));
+        assert_eq!(gas("INTRINSIC_TX_DATA_NON_ZERO_BYTE_COST"), Some(16));
+        assert_eq!(gas("INTRINSIC_TOTAL"), Some(21_020));
+        assert_eq!(gas("TX_FLOOR_GAS"), Some(21_050));
+        assert_ne!(gas("INTRINSIC_TOTAL"), gas("TX_FLOOR_GAS"));
 
         Ok(())
     }
@@ -899,13 +1161,8 @@ mod tests {
         })?;
 
         assert_eq!(output.results.len(), 1);
-        assert!(
-            output.state_root_account_leaf_count > 0 || output.state_root_account_branch_count > 0
-        );
-        assert!(
-            output.state_root_storage_leaf_count > 0 || output.state_root_storage_branch_count > 0,
-            "storage-writing transactions should attribute storage trie work"
-        );
+        assert!(output.total_time_us > 0);
+        assert!(output.results[0].execution_time_us > 0);
 
         Ok(())
     }
@@ -1179,6 +1436,205 @@ mod tests {
             "CALL gas should exclude nested callee gas: CALL={} SSTORE={}",
             call.gas_used,
             sstore.gas_used
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn meter_bundle_opcode_gas_for_top_level_value_transfer() -> eyre::Result<()> {
+        let harness = TestHarness::new().await?;
+
+        let existing_account = Address::random();
+        let create_existing_account_tx = TransactionBuilder::default()
+            .signer(Account::Bob.signer_b256())
+            .chain_id(harness.chain_id())
+            .nonce(0)
+            .to(existing_account)
+            .value(1)
+            .gas_limit(21_000)
+            .max_fee_per_gas(MIN_BASEFEE as u128)
+            .max_priority_fee_per_gas(0)
+            .into_eip1559();
+        harness
+            .build_block_from_transactions(vec![Bytes::from(
+                BaseTransactionSigned::Eip1559(
+                    create_existing_account_tx.as_eip1559().expect("eip1559 transaction").clone(),
+                )
+                .encoded_2718(),
+            )])
+            .await?;
+
+        let latest = harness.latest_block();
+        let header = latest.sealed_header().clone();
+        let new_account = Address::random();
+        let transfers = [new_account, existing_account, Account::Alice.address()]
+            .into_iter()
+            .enumerate()
+            .map(|(idx, to)| {
+                let signed_tx = TransactionBuilder::default()
+                    .signer(Account::Alice.signer_b256())
+                    .chain_id(harness.chain_id())
+                    .nonce(idx as u64)
+                    .to(to)
+                    .value(1)
+                    .gas_limit(21_000)
+                    .max_fee_per_gas(MIN_BASEFEE as u128)
+                    .max_priority_fee_per_gas(0)
+                    .into_eip1559();
+                BaseTransactionSigned::Eip1559(
+                    signed_tx.as_eip1559().expect("eip1559 transaction").clone(),
+                )
+            })
+            .collect();
+
+        let state_provider = harness
+            .blockchain_provider()
+            .state_by_block_hash(latest.hash())
+            .context("getting state provider")?;
+        let parsed_bundle = create_parsed_bundle(transfers)?;
+        let metered = MeteredOpcodes::parse(&[
+            "CALL".to_string(),
+            "INTRINSIC_TOTAL".to_string(),
+            "TX_EFFECT_ETH_TRANSFER_TO_NONEXISTENT_ACCOUNT".to_string(),
+            "TX_EFFECT_ETH_TRANSFER_TO_EXISTING_ACCOUNT".to_string(),
+            "TX_EFFECT_ETH_SELF_TRANSFER".to_string(),
+        ])
+        .unwrap();
+
+        let output = meter_bundle(MeterBundleInput {
+            state_provider,
+            chain_spec: harness.chain_spec(),
+            bundle: parsed_bundle,
+            header: header.clone(),
+            parent_beacon_block_root: header.parent_beacon_block_root(),
+            pending_state: None,
+            l1_block_info: L1BlockInfo::default(),
+            metered_opcodes: Arc::new(metered),
+        })?;
+
+        assert_eq!(output.results.len(), 3);
+        for result in &output.results {
+            assert_eq!(result.gas_used, 21_000);
+            assert!(
+                result
+                    .opcode_gas
+                    .iter()
+                    .any(|entry| entry.opcode == "INTRINSIC_TOTAL" && entry.gas_used == 21_000),
+                "top-level value transfers should report intrinsic gas"
+            );
+            assert!(
+                result.opcode_gas.iter().all(|entry| entry.opcode != "CALL"),
+                "top-level value transfers do not execute a CALL opcode"
+            );
+        }
+        assert!(output.results[0].opcode_gas.iter().any(|entry| {
+            entry.opcode == "TX_EFFECT_ETH_TRANSFER_TO_NONEXISTENT_ACCOUNT" && entry.count == 1
+        }));
+        assert!(output.results[1].opcode_gas.iter().any(|entry| {
+            entry.opcode == "TX_EFFECT_ETH_TRANSFER_TO_EXISTING_ACCOUNT" && entry.count == 1
+        }));
+        assert!(
+            output.results[2]
+                .opcode_gas
+                .iter()
+                .any(|entry| { entry.opcode == "TX_EFFECT_ETH_SELF_TRANSFER" && entry.count == 1 })
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn meter_bundle_call_value_distinguishes_new_and_existing_accounts() -> eyre::Result<()> {
+        let harness = TestHarness::new().await?;
+
+        let existing_account = Address::random();
+        let create_existing_account_tx = TransactionBuilder::default()
+            .signer(Account::Bob.signer_b256())
+            .chain_id(harness.chain_id())
+            .nonce(0)
+            .to(existing_account)
+            .value(1)
+            .gas_limit(21_000)
+            .max_fee_per_gas(MIN_BASEFEE as u128)
+            .max_priority_fee_per_gas(0)
+            .into_eip1559();
+        harness
+            .build_block_from_transactions(vec![Bytes::from(
+                BaseTransactionSigned::Eip1559(
+                    create_existing_account_tx.as_eip1559().expect("eip1559 transaction").clone(),
+                )
+                .encoded_2718(),
+            )])
+            .await?;
+
+        let new_account = Address::random();
+        let call_new_contract = deploy_value_call_contract(&harness, new_account, 0).await?;
+        let call_existing_contract =
+            deploy_value_call_contract(&harness, existing_account, 1).await?;
+
+        let latest = harness.latest_block();
+        let header = latest.sealed_header().clone();
+        let calls = [call_new_contract, call_existing_contract]
+            .into_iter()
+            .enumerate()
+            .map(|(idx, to)| {
+                let signed_tx = TransactionBuilder::default()
+                    .signer(Account::Alice.signer_b256())
+                    .chain_id(harness.chain_id())
+                    .nonce(idx as u64)
+                    .to(to)
+                    .value(1)
+                    .gas_limit(100_000)
+                    .max_fee_per_gas(MIN_BASEFEE as u128)
+                    .max_priority_fee_per_gas(0)
+                    .into_eip1559();
+                BaseTransactionSigned::Eip1559(
+                    signed_tx.as_eip1559().expect("eip1559 transaction").clone(),
+                )
+            })
+            .collect();
+
+        let state_provider = harness
+            .blockchain_provider()
+            .state_by_block_hash(latest.hash())
+            .context("getting state provider")?;
+        let parsed_bundle = create_parsed_bundle(calls)?;
+        let metered = MeteredOpcodes::parse(&["CALL".to_string()]).unwrap();
+
+        let output = meter_bundle(MeterBundleInput {
+            state_provider,
+            chain_spec: harness.chain_spec(),
+            bundle: parsed_bundle,
+            header: header.clone(),
+            parent_beacon_block_root: header.parent_beacon_block_root(),
+            pending_state: None,
+            l1_block_info: L1BlockInfo::default(),
+            metered_opcodes: Arc::new(metered),
+        })?;
+
+        assert_eq!(output.results.len(), 2);
+        let call_new = output.results[0]
+            .opcode_gas
+            .iter()
+            .find(|entry| entry.opcode == "CALL")
+            .expect("CALL to new account should be metered");
+        let call_existing = output.results[1]
+            .opcode_gas
+            .iter()
+            .find(|entry| entry.opcode == "CALL")
+            .expect("CALL to existing account should be metered");
+
+        assert_eq!(call_new.count, 1);
+        assert_eq!(call_existing.count, 1);
+        assert!(
+            call_new.gas_used > call_existing.gas_used,
+            "CALL with value to a new account should include the account-creation surcharge"
+        );
+        assert_eq!(
+            call_new.gas_used - call_existing.gas_used,
+            25_000,
+            "new-account CALL value surcharge should be visible in opcode gas"
         );
 
         Ok(())
@@ -1469,6 +1925,111 @@ mod tests {
     }
 
     #[test]
+    fn metered_opcodes_parse_recognizes_intrinsic_pseudo_opcodes() {
+        let result = MeteredOpcodes::parse(&[
+            "INTRINSIC_TOTAL".to_string(),
+            "intrinsic_tx_data_zero_byte_cost".to_string(),
+            "intrinsic_tx_data_non_zero_byte_cost".to_string(),
+            "intrinsic_access_list_address_cost".to_string(),
+            "INTRINSIC_ACCESS_LIST_STORAGE_KEY_COST".to_string(),
+            "intrinsic_initcode_word_cost".to_string(),
+            "tx_floor_gas".to_string(),
+            "intrinsic_legacy_tx_base_cost".to_string(),
+            "intrinsic_legacy_create_cost".to_string(),
+            "intrinsic_per_empty_account_cost".to_string(),
+            "intrinsic_tx_base_cost".to_string(),
+            "intrinsic_cold_account_access".to_string(),
+            "intrinsic_tx_value_cost".to_string(),
+            "intrinsic_transfer_log_cost".to_string(),
+            "intrinsic_create_access".to_string(),
+            "intrinsic_regular_per_auth_base_cost".to_string(),
+            "tx_effect_eth_transfer_to_nonexistent_account".to_string(),
+            "tx_effect_eth_transfer_to_existing_account".to_string(),
+            "tx_effect_eth_self_transfer".to_string(),
+        ])
+        .unwrap();
+        assert!(result.pseudo_opcodes.contains(&PseudoOpcode::IntrinsicTotal));
+        assert!(result.pseudo_opcodes.contains(&PseudoOpcode::IntrinsicTxDataZeroByteCost));
+        assert!(result.pseudo_opcodes.contains(&PseudoOpcode::IntrinsicTxDataNonZeroByteCost));
+        assert!(result.pseudo_opcodes.contains(&PseudoOpcode::IntrinsicAccessListAddressCost));
+        assert!(result.pseudo_opcodes.contains(&PseudoOpcode::IntrinsicAccessListStorageKeyCost));
+        assert!(result.pseudo_opcodes.contains(&PseudoOpcode::IntrinsicInitcodeWordCost));
+        assert!(result.pseudo_opcodes.contains(&PseudoOpcode::TxFloorGas));
+        assert!(result.pseudo_opcodes.contains(&PseudoOpcode::IntrinsicLegacyTxBaseCost));
+        assert!(result.pseudo_opcodes.contains(&PseudoOpcode::IntrinsicLegacyCreateCost));
+        assert!(result.pseudo_opcodes.contains(&PseudoOpcode::IntrinsicPerEmptyAccountCost));
+        assert!(result.pseudo_opcodes.contains(&PseudoOpcode::IntrinsicTxBaseCost));
+        assert!(result.pseudo_opcodes.contains(&PseudoOpcode::IntrinsicColdAccountAccess));
+        assert!(result.pseudo_opcodes.contains(&PseudoOpcode::IntrinsicTxValueCost));
+        assert!(result.pseudo_opcodes.contains(&PseudoOpcode::IntrinsicTransferLogCost));
+        assert!(result.pseudo_opcodes.contains(&PseudoOpcode::IntrinsicCreateAccess));
+        assert!(result.pseudo_opcodes.contains(&PseudoOpcode::IntrinsicRegularPerAuthBaseCost));
+        assert!(
+            result.pseudo_opcodes.contains(&PseudoOpcode::TxEffectEthTransferToNonexistentAccount)
+        );
+        assert!(
+            result.pseudo_opcodes.contains(&PseudoOpcode::TxEffectEthTransferToExistingAccount)
+        );
+        assert!(result.pseudo_opcodes.contains(&PseudoOpcode::TxEffectEthSelfTransfer));
+    }
+
+    #[test]
+    fn old_intrinsic_names_are_not_compatibility_aliases() {
+        for name in [
+            "INTRINSIC_BASE",
+            "INTRINSIC_CALLDATA_ZERO",
+            "INTRINSIC_CALLDATA_NON_ZERO",
+            "INTRINSIC_CREATE",
+            "INTRINSIC_INITCODE_WORD",
+            "INTRINSIC_ACCESS_LIST_ADDRESS",
+            "INTRINSIC_ACCESS_LIST_STORAGE_KEY",
+            "INTRINSIC_AUTHORIZATION",
+            "TX_EFFECT_VALUE_TO_NEW_ACCOUNT",
+            "TX_EFFECT_VALUE_TO_EXISTING_ACCOUNT",
+        ] {
+            assert!(MeteredOpcodes::parse(&[name.to_string()]).is_err(), "{name} must be rejected");
+        }
+    }
+
+    #[test]
+    fn osaka_schedule_does_not_emit_eip2780_primitives() {
+        let signed_tx = create_call_tx(
+            DEVNET_CHAIN_ID,
+            0,
+            Address::repeat_byte(0x11),
+            Bytes::from_static(&[0, 1]),
+            100_000,
+        );
+        let tx = Recovered::new_unchecked(signed_tx, Account::Alice.address());
+        let metered = MeteredOpcodes::parse(&[
+            "INTRINSIC_LEGACY_TX_BASE_COST".to_string(),
+            "INTRINSIC_TX_BASE_COST".to_string(),
+            "INTRINSIC_COLD_ACCOUNT_ACCESS".to_string(),
+            "INTRINSIC_TX_VALUE_COST".to_string(),
+            "INTRINSIC_TRANSFER_LOG_COST".to_string(),
+            "INTRINSIC_CREATE_ACCESS".to_string(),
+            "INTRINSIC_REGULAR_PER_AUTH_BASE_COST".to_string(),
+        ])
+        .unwrap();
+
+        // Azul is Base's Osaka execution schedule. EIP-2780 is not active, so its
+        // primitive names must not be populated with legacy gas values.
+        let entries =
+            intrinsic_gas_entries(&tx, false, true, &metered, BaseSpecId::new(BaseUpgrade::Azul));
+        assert!(entries.iter().any(|entry| entry.opcode == "INTRINSIC_LEGACY_TX_BASE_COST"));
+        for name in [
+            "INTRINSIC_TX_BASE_COST",
+            "INTRINSIC_COLD_ACCOUNT_ACCESS",
+            "INTRINSIC_TX_VALUE_COST",
+            "INTRINSIC_TRANSFER_LOG_COST",
+            "INTRINSIC_CREATE_ACCESS",
+            "INTRINSIC_REGULAR_PER_AUTH_BASE_COST",
+        ] {
+            assert!(!entries.iter().any(|entry| entry.opcode == name), "{name} must be gated");
+        }
+    }
+
+    #[test]
     fn metered_opcodes_parse_recognizes_azul_additions() {
         // CLZ opcode (EIP-7939) and P256VERIFY precompile gas-cost change (EIP-7951)
         // are the new metering surfaces introduced by Azul.
@@ -1606,7 +2167,6 @@ mod tests {
         })?;
 
         assert!(output.total_time_us > 0);
-        assert!(output.state_root_time_us > 0);
 
         Ok(())
     }
@@ -1675,7 +2235,6 @@ mod tests {
 
         assert_eq!(output.results.len(), 2);
         assert!(output.total_time_us > 0);
-        assert!(output.state_root_time_us > 0);
 
         // Check first transaction
         let result_1 = &output.results[0];
@@ -1709,61 +2268,6 @@ mod tests {
 
         assert!(result_1.execution_time_us > 0, "execution_time_us should be greater than zero");
         assert!(result_2.execution_time_us > 0, "execution_time_us should be greater than zero");
-
-        Ok(())
-    }
-
-    /// Test that `state_root_time_us` is always <= `total_time_us`
-    #[tokio::test]
-    async fn meter_bundle_state_root_time_invariant() -> eyre::Result<()> {
-        let harness = TestHarness::new().await?;
-        let latest = harness.latest_block();
-        let header = latest.sealed_header().clone();
-
-        let to = Address::random();
-        let signed_tx = TransactionBuilder::default()
-            .signer(Account::Alice.signer_b256())
-            .chain_id(harness.chain_id())
-            .nonce(0)
-            .to(to)
-            .value(1_000)
-            .gas_limit(21_000)
-            .max_fee_per_gas(10)
-            .max_priority_fee_per_gas(1)
-            .into_eip1559();
-
-        let tx = BaseTransactionSigned::Eip1559(
-            signed_tx.as_eip1559().expect("eip1559 transaction").clone(),
-        );
-
-        let state_provider = harness
-            .blockchain_provider()
-            .state_by_block_hash(latest.hash())
-            .context("getting state provider")?;
-
-        let parsed_bundle = create_parsed_bundle(vec![tx])?;
-
-        let output = meter_bundle(MeterBundleInput {
-            state_provider,
-            chain_spec: harness.chain_spec(),
-            bundle: parsed_bundle,
-            header: header.clone(),
-            parent_beacon_block_root: header.parent_beacon_block_root(),
-            pending_state: None,
-            l1_block_info: L1BlockInfo::default(),
-            metered_opcodes: Arc::new(MeteredOpcodes::default()),
-        })?;
-
-        // Verify invariant: total time must include state root time
-        assert!(
-            output.total_time_us >= output.state_root_time_us,
-            "total_time_us ({}) should be >= state_root_time_us ({})",
-            output.total_time_us,
-            output.state_root_time_us
-        );
-
-        // State root time should be non-zero
-        assert!(output.state_root_time_us > 0, "state_root_time_us should be greater than zero");
 
         Ok(())
     }
@@ -1858,7 +2362,7 @@ mod tests {
             Vec::<Vec<(Address, Option<Option<AccountInfo>>, Vec<(U256, U256)>)>>::new(),
             Vec::<(B256, Bytecode)>::new(),
         );
-        let pending_state = PendingState { bundle_state: Arc::new(bundle_state), trie_input: None };
+        let pending_state = PendingState { bundle_state: Arc::new(bundle_state) };
 
         // Transaction with nonce=0 — "too low" relative to pending nonce of 5
         let to = Address::random();
@@ -1907,8 +2411,7 @@ mod tests {
         Ok(())
     }
 
-    /// Verifies pending flashblock prestate is loaded into the execution cache, not the output
-    /// bundle. This keeps later trie prefix invalidation scoped to the simulated bundle delta.
+    /// Verifies pending flashblock prestate is loaded into the execution cache.
     #[test]
     fn cached_prestate_does_not_leak_into_bundle_output() -> eyre::Result<()> {
         let pending_bundle = BundleState::new(
@@ -1944,14 +2447,6 @@ mod tests {
             pending_account.account.as_ref().expect("pending account").info.nonce,
             5,
             "execution must read the pending prestate nonce from the cache"
-        );
-
-        db.merge_transitions(BundleRetention::Reverts);
-        let bundle_update = db.take_bundle();
-
-        assert!(
-            bundle_update.state().is_empty(),
-            "cached prestate must not be included in the simulated bundle output"
         );
 
         Ok(())
@@ -2121,13 +2616,9 @@ mod tests {
         Ok(())
     }
 
-    /// Exercises the full optimized path: pending state with a cached trie input.
-    ///
-    /// Computes a real [`PendingTrieInput`] from pending state, then meters a bundle
-    /// on top of it. This covers the `prepend_cached` code path with the
-    /// `with_cached_prestate` change, verifying the two work correctly together.
+    /// Meters a bundle on top of pending flashblock state.
     #[tokio::test]
-    async fn meter_bundle_with_pending_state_and_cached_trie() -> eyre::Result<()> {
+    async fn meter_bundle_with_pending_state_and_cached_prestate() -> eyre::Result<()> {
         let harness = TestHarness::new().await?;
         let latest = harness.latest_block();
         let header = latest.sealed_header().clone();
@@ -2157,17 +2648,7 @@ mod tests {
             Vec::<(B256, Bytecode)>::new(),
         );
 
-        // Compute the pending trie input
-        let state_provider = harness
-            .blockchain_provider()
-            .state_by_block_hash(latest.hash())
-            .context("getting state provider for trie")?;
-        let hashed = state_provider.hashed_post_state(&bundle_state);
-        let trie_input = compute_pending_trie_input(&state_provider, hashed)?;
-        drop(state_provider);
-
-        let pending_state =
-            PendingState { bundle_state: Arc::new(bundle_state), trie_input: Some(trie_input) };
+        let pending_state = PendingState { bundle_state: Arc::new(bundle_state) };
 
         // Create a bundle tx: Alice (nonce=1 from pending) sends to a random address
         let to = Address::random();
@@ -2206,13 +2687,7 @@ mod tests {
         assert_eq!(output.results.len(), 1);
         assert_eq!(output.total_gas_used, 21_000);
         assert!(output.total_time_us > 0);
-        assert!(output.state_root_time_us > 0);
-        assert!(
-            output.total_time_us >= output.state_root_time_us,
-            "total_time_us ({}) should be >= state_root_time_us ({})",
-            output.total_time_us,
-            output.state_root_time_us
-        );
+        assert!(output.results[0].execution_time_us > 0);
 
         Ok(())
     }

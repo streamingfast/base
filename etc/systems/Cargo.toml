@@ -14,11 +14,15 @@ workspace = true
 [dependencies]
 # workspace
 base-runtime.workspace = true
+base-test-utils = { workspace = true, optional = true }
 base-txpool-rpc.workspace = true
 base-tx-manager.workspace = true
 base-flashblocks.workspace = true
 base-tx-forwarding.workspace = true
+base-execution-cli.workspace = true
 base-txpool-tracing.workspace = true
+base-upgrade-signal.workspace = true
+base-batcher-encoder.workspace = true
 base-batcher-service.workspace = true
 base-bundle-extension.workspace = true
 base-flashblocks-node.workspace = true
@@ -33,6 +37,7 @@ base-consensus-node.workspace = true
 base-consensus-peers.workspace = true
 base-consensus-gossip.workspace = true
 base-consensus-sources.workspace = true
+base-consensus-providers.workspace = true
 base-common-genesis.workspace = true
 
 # reth
@@ -70,7 +75,10 @@ tokio-util.workspace = true
 tokio = { workspace = true, features = ["full", "rt-multi-thread", "macros"] }
 
 # rpc
+axum = { workspace = true, features = ["http1", "tokio"] }
 jsonrpsee = { workspace = true, features = ["http-client"] }
+reth-rpc-layer.workspace = true
+tower.workspace = true
 
 # p2p
 k256.workspace = true
@@ -84,10 +92,20 @@ eyre.workspace = true
 nanoid.workspace = true
 reqwest.workspace = true
 tempfile.workspace = true
+async-trait.workspace = true
 tracing = { workspace = true, features = ["std"] }
 serde_json = { workspace = true, features = ["std"] }
 serde = { workspace = true, features = ["derive", "std"] }
 testcontainers = { workspace = true, features = ["blocking", "host-port-exposure"] }
+
+[features]
+default = [ "upgrade-signal" ]
+# The upgrade-signal stack deploys a mock ProtocolVersions contract via base-test-utils, whose
+# contract bindings embed Foundry `out/` artifacts through `sol!(..., concat!(...))` at compile
+# time. Those artifacts are gitignored, so base-test-utils cannot compile when pulled over a git
+# dependency. External consumers that only need the core L1+L2 stack disable this feature
+# (`default-features = false`); it stays on by default for in-tree use where the artifacts exist.
+upgrade-signal = [ "base-test-utils/contracts", "dep:base-test-utils" ]
 
 [dev-dependencies]
 # cli
@@ -95,6 +113,9 @@ clap = { workspace = true, features = ["derive"] }
 
 # firehose
 base-firehose-tests.workspace = true
+
+# load testing
+base-load-tests.workspace = true
 
 # consensus
 base-consensus-derive.workspace = true
@@ -108,14 +129,26 @@ base-common-consensus.workspace = true
 base-common-rpc-types-engine.workspace = true
 
 # proof
-base-proof-rpc.workspace = true
 base-optimism-rpc.workspace = true
 base-prover-service-client.workspace = true
 base-prover-service-protocol.workspace = true
 
+# execution
+base-shadow-indexer.workspace = true
+base-shadow-metrics.workspace = true
+base-shadow-indexer-db.workspace = true
+
+# reth
+reth-primitives-traits.workspace = true
+
+# database
+sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "chrono", "json", "migrate", "macros", "tls-native-tls"] }
+
 # misc
+chrono.workspace = true
+anyhow.workspace = true
 indicatif.workspace = true
-async-trait.workspace = true
+testcontainers-modules = { workspace = true, features = ["postgres"] }
 
 [[bench]]
 name = "b20_zk_proving"

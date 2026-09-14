@@ -4,12 +4,19 @@ use alloy_primitives::{B256, TxHash};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use strum::IntoEnumIterator;
 
 /// Current transaction event schema version.
 pub const SCHEMA_VERSION: &str = "transaction-event/v1";
 
 /// Default bounded channel capacity for the background writer.
 pub const DEFAULT_QUEUE_CAPACITY: usize = 16_384;
+
+/// Default maximum size of an active transaction event journal segment.
+pub const DEFAULT_MAX_FILE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Default number of transaction event journal segments to retain, including the active file.
+pub const DEFAULT_MAX_FILES: usize = 8;
 
 const MAX_DATA_VALIDATION_DEPTH: usize = 16;
 
@@ -43,7 +50,7 @@ impl fmt::Display for TransactionEventProducer {
 }
 
 /// Versioned transaction event vocabulary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 pub enum TransactionEventType {
     /// Proxyd accepted a transaction request from a client.
     #[serde(rename = "PROXY_RECEIVED")]
@@ -120,12 +127,6 @@ pub enum TransactionEventType {
     /// Txpool tracking overflowed before all events could be retained.
     #[serde(rename = "TXPOOL_TRACKING_OVERFLOWED")]
     Overflowed,
-    /// A txpool transaction was included in a finalized block payload.
-    #[serde(rename = "TXPOOL_BLOCK_INCLUDED")]
-    Included,
-    /// A txpool transaction was included in a flashblock.
-    #[serde(rename = "TXPOOL_FLASHBLOCK_INCLUDED")]
-    FlashblockIncluded,
     /// Txpool attempted to forward a transaction to the builder.
     #[serde(rename = "TXPOOL_BUILDER_FORWARD_ATTEMPT")]
     TxpoolBuilderForwardAttempt,
@@ -173,6 +174,13 @@ pub enum TransactionEventType {
     BuilderFlashblockBuildStopped,
 }
 
+impl TransactionEventType {
+    /// Every variant in declaration order.
+    pub fn all() -> impl Iterator<Item = Self> {
+        Self::iter()
+    }
+}
+
 impl fmt::Display for TransactionEventType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
@@ -201,8 +209,6 @@ impl fmt::Display for TransactionEventType {
             Self::Dropped => "TXPOOL_DROPPED",
             Self::Replaced => "TXPOOL_REPLACED",
             Self::Overflowed => "TXPOOL_TRACKING_OVERFLOWED",
-            Self::Included => "TXPOOL_BLOCK_INCLUDED",
-            Self::FlashblockIncluded => "TXPOOL_FLASHBLOCK_INCLUDED",
             Self::TxpoolBuilderForwardAttempt => "TXPOOL_BUILDER_FORWARD_ATTEMPT",
             Self::TxpoolBuilderForwardSuccess => "TXPOOL_BUILDER_FORWARD_SUCCESS",
             Self::TxpoolBuilderForwardFailure => "TXPOOL_BUILDER_FORWARD_FAILURE",

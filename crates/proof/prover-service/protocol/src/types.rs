@@ -27,8 +27,8 @@ impl ProofRequestIdCollisionMessage {
 pub enum ProofType {
     /// Compressed ZK proof.
     Compressed,
-    /// Groth16 SNARK proof.
-    SnarkGroth16,
+    /// PLONK SNARK proof.
+    SnarkPlonk,
     /// Trusted execution environment proof.
     Tee,
 }
@@ -47,6 +47,49 @@ pub enum TeeKind {
 pub enum ZkVm {
     /// Succinct SP1.
     Sp1,
+}
+
+/// ZK proving backend that executes a proof request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZkBackend {
+    /// Local SP1 execution statistics without proof bytes.
+    DryRun,
+    /// Self-hosted SP1 cluster.
+    #[default]
+    Cluster,
+    /// Succinct SP1 prover network.
+    Network,
+}
+
+impl ZkBackend {
+    /// Returns the canonical wire and database representation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DryRun => "dry_run",
+            Self::Cluster => "cluster",
+            Self::Network => "network",
+        }
+    }
+}
+
+impl fmt::Display for ZkBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<&str> for ZkBackend {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "dry_run" => Ok(Self::DryRun),
+            "cluster" => Ok(Self::Cluster),
+            "network" => Ok(Self::Network),
+            other => Err(format!("Unknown ZK backend: {other}")),
+        }
+    }
 }
 
 /// Status of a submitted proof request.
@@ -82,6 +125,20 @@ pub enum ProofJobStatus {
 pub struct ProveBlockRangeRequest {
     /// Proof request payload.
     pub proof: ProofRequest,
+    /// Whether an existing failed session may be atomically requeued.
+    ///
+    /// Defaults to `true` when omitted for compatibility with clients that
+    /// predate explicit failed-session retry control.
+    #[serde(default = "ProveBlockRangeRequest::default_retry_failed")]
+    pub retry_failed: bool,
+}
+
+impl ProveBlockRangeRequest {
+    /// Returns the legacy failed-session retry behavior used when the wire
+    /// request omits `retry_failed`.
+    pub const fn default_retry_failed() -> bool {
+        true
+    }
 }
 
 /// Response returned after a prove-block-range request is accepted.
@@ -96,6 +153,13 @@ pub struct ProveBlockRangeResponse {
 pub struct DeleteProofRequest {
     /// Proof session identifier.
     pub session_id: String,
+}
+
+/// Request to delete completed TEE proofs produced by one signer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteProofsByTeeSignerRequest {
+    /// TEE signer whose completed proof requests should be deleted.
+    pub tee_signer: Address,
 }
 
 /// Submitted proof request.
@@ -113,8 +177,8 @@ pub struct ProofRequest {
 pub enum ProofRequestKind {
     /// Request a compressed ZK proof.
     Compressed(ZkProofRequest),
-    /// Request a Groth16 SNARK proof.
-    SnarkGroth16(SnarkGroth16ProofRequest),
+    /// Request a PLONK SNARK proof.
+    SnarkPlonk(SnarkPlonkProofRequest),
     /// Request a TEE proof.
     Tee(TeeProofRequest),
 }
@@ -135,13 +199,21 @@ pub struct ZkProofRequest {
     /// Optional intermediate output root interval.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intermediate_root_interval: Option<u64>,
+    /// L2 block used to pin the upgrade schedule; defaults to the claimed block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_l2_block_number: Option<u64>,
     /// ZK virtual machine implementation to use.
     pub zk_vm: ZkVm,
+    /// Proving backend that should execute this request.
+    ///
+    /// Defaults to [`ZkBackend::Cluster`] when omitted so older clients keep working.
+    #[serde(default)]
+    pub zk_backend: ZkBackend,
 }
 
-/// Groth16 SNARK proof request parameters.
+/// PLONK SNARK proof request parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SnarkGroth16ProofRequest {
+pub struct SnarkPlonkProofRequest {
     /// Underlying ZK proof request.
     pub proof: ZkProofRequest,
     /// On-chain prover address.
@@ -163,8 +235,8 @@ pub struct TeeProofRequest {
 pub enum ProofResult {
     /// Compressed ZK proof result.
     Compressed(ZkProofResult),
-    /// Groth16 SNARK proof result.
-    SnarkGroth16(SnarkGroth16ProofResult),
+    /// PLONK SNARK proof result.
+    SnarkPlonk(SnarkPlonkProofResult),
     /// TEE proof result.
     Tee(TeeProofResult),
 }
@@ -196,9 +268,9 @@ pub struct ExecutionStats {
     pub execution_ms: u64,
 }
 
-/// Groth16 SNARK proof result.
+/// PLONK SNARK proof result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SnarkGroth16ProofResult {
+pub struct SnarkPlonkProofResult {
     /// Wrapped ZK proof result.
     pub proof: ZkProofResult,
 }
@@ -212,6 +284,9 @@ pub struct TeeProofResult {
     pub proposals: Vec<Proposal>,
     /// Trusted execution environment implementation that produced the proof.
     pub tee_kind: TeeKind,
+    /// Signer that produced the proof, recovered host-side from the proof
+    /// signature.
+    pub tee_signer: Address,
 }
 
 /// Request to fetch proof status and result data.
@@ -327,6 +402,9 @@ pub struct GetNextProofRequest {
     /// ZK virtual machines this worker can execute for ZK proofs.
     #[serde(default)]
     pub zk_vms: Vec<ZkVm>,
+    /// ZK proving backends this worker can execute for ZK proofs.
+    #[serde(default)]
+    pub zk_backends: Vec<ZkBackend>,
     /// Requested lock duration in seconds. Zero uses the server default.
     pub lock_duration_seconds: u32,
 }
@@ -461,7 +539,7 @@ pub struct RecordProofSessionResponse {
 mod tests {
     use std::collections::HashMap;
 
-    use alloy_primitives::{Bytes, address};
+    use alloy_primitives::{Address, Bytes, address};
     use serde_json::json;
 
     use super::*;
@@ -477,9 +555,12 @@ mod tests {
                     sequence_window: None,
                     l1_head: Some(B256::repeat_byte(0xab)),
                     intermediate_root_interval: Some(128),
+                    schedule_l2_block_number: None,
                     zk_vm: ZkVm::Sp1,
+                    zk_backend: ZkBackend::Cluster,
                 }),
             },
+            retry_failed: true,
         };
 
         let value = serde_json::to_value(request).expect("proof request should serialize");
@@ -496,12 +577,34 @@ mod tests {
                             "number_of_blocks_to_prove": 20,
                             "l1_head": format!("{:#x}", B256::repeat_byte(0xab)),
                             "intermediate_root_interval": 128,
-                            "zk_vm": "sp1"
+                            "zk_vm": "sp1",
+                            "zk_backend": "cluster"
                         }
                     }
-                }
+                },
+                "retry_failed": true
             })
         );
+    }
+
+    #[test]
+    fn proof_request_defaults_retry_failed_for_legacy_clients() {
+        let request = serde_json::from_value::<ProveBlockRangeRequest>(json!({
+            "proof": {
+                "session_id": "proof-session",
+                "request": {
+                    "proof_type": "compressed",
+                    "payload": {
+                        "start_block_number": 10,
+                        "number_of_blocks_to_prove": 20,
+                        "zk_vm": "sp1"
+                    }
+                }
+            }
+        }))
+        .expect("legacy request should deserialize");
+
+        assert!(request.retry_failed);
     }
 
     #[test]
@@ -575,7 +678,7 @@ mod tests {
                 proposer: address!("0000000000000000000000000000000000000006"),
                 intermediate_block_interval: 7,
                 l1_head_number: 8,
-                image_hash: B256::repeat_byte(9),
+                schedule_l2_block_number: None,
             },
             tee_kind: TeeKind::AwsNitro,
         };
@@ -594,7 +697,6 @@ mod tests {
                     "proposer": "0x0000000000000000000000000000000000000006",
                     "intermediate_block_interval": 7,
                     "l1_head_number": 8,
-                    "image_hash": format!("{:#x}", B256::repeat_byte(9)),
                 },
                 "tee_kind": "aws_nitro",
             })
@@ -613,7 +715,6 @@ mod tests {
                 "proposer": "0x0000000000000000000000000000000000000006",
                 "intermediate_block_interval": 7,
                 "l1_head_number": 8,
-                "image_hash": format!("{:#x}", B256::repeat_byte(9)),
             }
         }));
 
@@ -631,7 +732,6 @@ mod tests {
             "proposer": "0x0000000000000000000000000000000000000006",
             "intermediate_block_interval": 7,
             "l1_head_number": 8,
-            "image_hash": format!("{:#x}", B256::repeat_byte(9)),
             "tee_kind": "aws_nitro"
         }));
 
@@ -646,6 +746,7 @@ mod tests {
             aggregate_proposal: aggregate_proposal.clone(),
             proposals: vec![proposal.clone()],
             tee_kind: TeeKind::AwsNitro,
+            tee_signer: Address::repeat_byte(0x11),
         });
 
         let value = serde_json::to_value(result).expect("tee result should serialize");
@@ -662,6 +763,7 @@ mod tests {
                 "l2_block_number": aggregate_proposal.l2_block_number,
                 "prev_output_root": format!("{:#x}", aggregate_proposal.prev_output_root),
                 "config_hash": format!("{:#x}", aggregate_proposal.config_hash),
+                "schedule_id": format!("{:#x}", aggregate_proposal.schedule_id),
             })
         );
         assert_eq!(
@@ -674,6 +776,7 @@ mod tests {
                 "l2_block_number": proposal.l2_block_number,
                 "prev_output_root": format!("{:#x}", proposal.prev_output_root),
                 "config_hash": format!("{:#x}", proposal.config_hash),
+                "schedule_id": format!("{:#x}", proposal.schedule_id),
             })
         );
     }
@@ -736,7 +839,7 @@ mod tests {
             proposer: address!("0000000000000000000000000000000000000006"),
             intermediate_block_interval: 7,
             l1_head_number: 8,
-            image_hash: B256::repeat_byte(9),
+            schedule_l2_block_number: None,
         };
 
         let value = serde_json::to_value(request).expect("tee request payload should serialize");
@@ -752,7 +855,6 @@ mod tests {
                 "proposer": "0x0000000000000000000000000000000000000006",
                 "intermediate_block_interval": 7,
                 "l1_head_number": 8,
-                "image_hash": format!("{:#x}", B256::repeat_byte(9)),
             })
         );
     }
@@ -765,6 +867,7 @@ mod tests {
             aggregate_proposal: aggregate_proposal.clone(),
             proposals: vec![proposal.clone()],
             tee_kind: TeeKind::AwsNitro,
+            tee_signer: Address::repeat_byte(0x11),
         };
 
         let value = serde_json::to_value(result).expect("tee result payload should serialize");
@@ -779,6 +882,7 @@ mod tests {
                 "l2_block_number": aggregate_proposal.l2_block_number,
                 "prev_output_root": format!("{:#x}", aggregate_proposal.prev_output_root),
                 "config_hash": format!("{:#x}", aggregate_proposal.config_hash),
+                "schedule_id": format!("{:#x}", aggregate_proposal.schedule_id),
             })
         );
         assert_eq!(
@@ -791,6 +895,7 @@ mod tests {
                 "l2_block_number": proposal.l2_block_number,
                 "prev_output_root": format!("{:#x}", proposal.prev_output_root),
                 "config_hash": format!("{:#x}", proposal.config_hash),
+                "schedule_id": format!("{:#x}", proposal.schedule_id),
             })
         );
     }
@@ -812,9 +917,32 @@ mod tests {
                 sequence_window: None,
                 l1_head: None,
                 intermediate_root_interval: None,
+                schedule_l2_block_number: None,
                 zk_vm: ZkVm::Sp1,
+                zk_backend: ZkBackend::Cluster,
             }
         );
+    }
+
+    #[test]
+    fn schedule_l2_block_number_round_trips_through_json() {
+        let request = ZkProofRequest {
+            start_block_number: 10,
+            number_of_blocks_to_prove: 20,
+            sequence_window: None,
+            l1_head: None,
+            intermediate_root_interval: None,
+            schedule_l2_block_number: Some(42),
+            zk_vm: ZkVm::Sp1,
+            zk_backend: ZkBackend::Cluster,
+        };
+
+        let value = serde_json::to_value(&request).expect("zk request should serialize");
+        assert_eq!(value["schedule_l2_block_number"], json!(42));
+
+        let round_tripped: ZkProofRequest =
+            serde_json::from_value(value).expect("zk request should deserialize");
+        assert_eq!(round_tripped, request);
     }
 
     #[test]
@@ -836,6 +964,7 @@ mod tests {
             proof_type: ProofType::Compressed,
             tee_kinds: Vec::new(),
             zk_vms: vec![ZkVm::Sp1],
+            zk_backends: vec![ZkBackend::Cluster, ZkBackend::DryRun],
             lock_duration_seconds: 30,
         };
 
@@ -848,6 +977,7 @@ mod tests {
                 "proof_type": "compressed",
                 "tee_kinds": [],
                 "zk_vms": ["sp1"],
+                "zk_backends": ["cluster", "dry_run"],
                 "lock_duration_seconds": 30
             })
         );
@@ -864,6 +994,7 @@ mod tests {
 
         assert_eq!(request.tee_kinds, Vec::new());
         assert_eq!(request.zk_vms, Vec::new());
+        assert_eq!(request.zk_backends, Vec::new());
     }
 
     #[test]
@@ -924,6 +1055,7 @@ mod tests {
             l2_block_number,
             prev_output_root: B256::repeat_byte(byte + 2),
             config_hash: B256::repeat_byte(byte + 3),
+            schedule_id: B256::repeat_byte(byte + 4),
         }
     }
 }

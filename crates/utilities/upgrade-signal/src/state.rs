@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use alloy_primitives::U256;
 use base_common_genesis::BaseUpgrade;
+use tracing::info;
 
 use crate::{AlloyUpgradeSignalReader, UpgradeSignalMetricLayer, UpgradeSignalMetrics};
 
@@ -16,8 +17,6 @@ pub struct UpgradeSignal {
     pub activation_timestamp: u64,
     /// Minimum node protocol version announced on L1.
     pub protocol_version: U256,
-    /// L1 block number used for the contract read.
-    pub l1_block_number: u64,
 }
 
 impl UpgradeSignal {
@@ -35,16 +34,18 @@ impl UpgradeSignal {
 }
 
 /// L1 upgrade signal values for a configured upgrade schedule.
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct UpgradeSignalSchedule {
+    /// L1 block number used to read the complete schedule.
+    pub l1_block_number: u64,
     /// Signals read from L1.
     pub signals: Vec<UpgradeSignal>,
 }
 
 impl UpgradeSignalSchedule {
     /// Creates a new upgrade signal schedule.
-    pub const fn new(signals: Vec<UpgradeSignal>) -> Self {
-        Self { signals }
+    pub const fn new(l1_block_number: u64, signals: Vec<UpgradeSignal>) -> Self {
+        Self { l1_block_number, signals }
     }
 }
 
@@ -57,6 +58,18 @@ enum UpgradeSignalStateUpdate {
     Unchanged,
     /// The signal changed while the node was live.
     Changed,
+}
+
+impl UpgradeSignalStateUpdate {
+    /// Returns true when this update requires re-applying the schedule.
+    ///
+    /// [`Self::Initialized`] requires apply: a signal observed live for the first time may carry
+    /// a schedule change that landed after the baseline should have been established (an upgrade
+    /// registered on L1 after node start, or a startup window of failed reads), so it must not be
+    /// silently adopted as the baseline.
+    const fn requires_apply(self) -> bool {
+        matches!(self, Self::Initialized | Self::Changed)
+    }
 }
 
 /// Stateful live metrics tracker for one contract-backed upgrade.
@@ -97,31 +110,44 @@ pub struct UpgradeSignalMonitor {
 }
 
 impl UpgradeSignalMonitor {
-    /// Creates a monitor for the provided upgrade IDs.
-    pub fn new(metrics_layer: UpgradeSignalMetricLayer, upgrade_ids: &[BaseUpgrade]) -> Self {
+    /// Creates a monitor for all contract-backed upgrades.
+    pub fn new(metrics_layer: UpgradeSignalMetricLayer) -> Self {
         UpgradeSignalMetrics::init();
         let mut states = BTreeMap::new();
-        for upgrade_id in upgrade_ids {
-            states.insert(*upgrade_id, UpgradeSignalState::new());
+        for upgrade_id in BaseUpgrade::CONTRACT_VARIANTS {
+            states.insert(upgrade_id, UpgradeSignalState::new());
         }
         Self { metrics_layer, states }
     }
 
-    /// Tolerantly polls the reader, records live metrics, and returns the number of changed signals.
+    /// Tolerantly polls the reader, records live metrics, and returns the schedule that was read
+    /// when any signals updated.
     ///
     /// This is the single live-poll routine shared by the consensus actor and the execution
-    /// metrics extension; per-upgrade read failures are recorded but do not abort the poll.
+    /// metrics extension; read failures are recorded but do not abort the poll. See
+    /// [`UpgradeSignalStateUpdate::requires_apply`] for why a first observation counts as an
+    /// update.
     pub async fn poll(
         &mut self,
         reader: &AlloyUpgradeSignalReader,
-        upgrade_ids: &[BaseUpgrade],
-    ) -> usize {
+    ) -> Option<UpgradeSignalSchedule> {
         let metrics_layers = [self.metrics_layer];
-        let schedule = reader.read_schedule_tolerant(upgrade_ids, &metrics_layers).await;
-        self.update_schedule(schedule)
+        let schedule = reader.read_schedule_tolerant(&metrics_layers).await?;
+        let updated_signals = self
+            .update_schedule(schedule.clone())
             .iter()
-            .filter(|update| matches!(update, UpgradeSignalStateUpdate::Changed))
-            .count()
+            .filter(|update| update.requires_apply())
+            .count();
+        if updated_signals == 0 {
+            return None;
+        }
+
+        info!(
+            target: "upgrade_signal",
+            updated_signals,
+            "observed live L1 upgrade signal update"
+        );
+        Some(schedule)
     }
 
     /// Applies signals read from L1 and records corresponding live metrics.
@@ -129,13 +155,21 @@ impl UpgradeSignalMonitor {
         &mut self,
         schedule: UpgradeSignalSchedule,
     ) -> Vec<UpgradeSignalStateUpdate> {
-        schedule.signals.into_iter().map(|signal| self.update_signal(signal)).collect()
+        schedule
+            .signals
+            .into_iter()
+            .map(|signal| self.update_signal(schedule.l1_block_number, signal))
+            .collect()
     }
 
     /// Applies one signal read from L1 and records corresponding live metrics.
-    fn update_signal(&mut self, signal: UpgradeSignal) -> UpgradeSignalStateUpdate {
+    fn update_signal(
+        &mut self,
+        l1_block_number: u64,
+        signal: UpgradeSignal,
+    ) -> UpgradeSignalStateUpdate {
         let upgrade_id = signal.upgrade_id;
-        UpgradeSignalMetrics::record_signal(self.metrics_layer, &signal);
+        UpgradeSignalMetrics::record_signal(self.metrics_layer, l1_block_number, &signal);
 
         let update = self.states.entry(upgrade_id).or_default().update_signal(signal);
         if matches!(update, UpgradeSignalStateUpdate::Changed) {
@@ -157,7 +191,6 @@ mod tests {
             upgrade_id: BaseUpgrade::Azul,
             activation_timestamp: timestamp,
             protocol_version: U256::from(7),
-            l1_block_number: 1,
         }
     }
 
@@ -188,14 +221,61 @@ mod tests {
         assert_eq!(state.update_signal(signal(12)), UpgradeSignalStateUpdate::Changed);
     }
 
+    fn monitor() -> UpgradeSignalMonitor {
+        UpgradeSignalMonitor::new(UpgradeSignalMetricLayer::Consensus)
+    }
+
+    fn schedule(timestamp: u64) -> UpgradeSignalSchedule {
+        UpgradeSignalSchedule::new(1, vec![signal(timestamp)])
+    }
+
     #[test]
-    fn l1_block_update_does_not_count_as_contract_value_change() {
-        let mut state = UpgradeSignalState::new();
-        let mut updated_signal = signal(10);
+    fn first_observation_and_change_require_apply_but_unchanged_does_not() {
+        assert!(UpgradeSignalStateUpdate::Initialized.requires_apply());
+        assert!(UpgradeSignalStateUpdate::Changed.requires_apply());
+        assert!(!UpgradeSignalStateUpdate::Unchanged.requires_apply());
+    }
 
-        state.update_signal(signal(10));
-        updated_signal.l1_block_number = 2;
+    #[test]
+    fn monitor_counts_first_observation_as_update() {
+        let mut monitor = monitor();
 
-        assert_eq!(state.update_signal(updated_signal), UpgradeSignalStateUpdate::Unchanged);
+        let updates = monitor.update_schedule(schedule(10));
+
+        assert_eq!(updates, vec![UpgradeSignalStateUpdate::Initialized]);
+    }
+
+    #[test]
+    fn monitor_ignores_unchanged_signal() {
+        let mut monitor = monitor();
+
+        monitor.update_schedule(schedule(10));
+
+        assert_eq!(
+            monitor.update_schedule(schedule(10)),
+            vec![UpgradeSignalStateUpdate::Unchanged]
+        );
+    }
+
+    #[test]
+    fn monitor_ignores_l1_block_update_with_unchanged_contract_values() {
+        let mut monitor = monitor();
+
+        monitor.update_schedule(schedule(10));
+        let updated_schedule = UpgradeSignalSchedule::new(2, vec![signal(10)]);
+
+        assert_eq!(
+            monitor.update_schedule(updated_schedule),
+            vec![UpgradeSignalStateUpdate::Unchanged]
+        );
+    }
+
+    #[test]
+    fn monitor_detects_changed_signal() {
+        let mut monitor = monitor();
+
+        monitor.update_schedule(schedule(10));
+
+        assert_eq!(monitor.update_schedule(schedule(12)), vec![UpgradeSignalStateUpdate::Changed]);
     }
 }

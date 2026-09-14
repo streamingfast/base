@@ -77,16 +77,6 @@ pub struct ChallengerArgs {
     #[arg(long = "zk-rpc-url", env = cli_env!("ZK_RPC_URL"))]
     pub zk_rpc_url: Url,
 
-    /// Timeout for establishing the initial gRPC connection to the ZK proof
-    /// service (e.g., "10s", "1m").
-    #[arg(
-        long = "zk-connect-timeout",
-        env = cli_env!("ZK_CONNECT_TIMEOUT"),
-        default_value = "10s",
-        value_parser = humantime::parse_duration
-    )]
-    pub zk_connect_timeout: Duration,
-
     /// Timeout for individual gRPC requests to the ZK proof service
     /// (e.g., "30s", "1m").
     #[arg(
@@ -124,7 +114,7 @@ pub struct ChallengerArgs {
     #[command(flatten)]
     pub tx_manager: TxManagerCli,
 
-    /// Number of recent factory games scanned by bond discovery.
+    /// Number of recent factory games scanned by each bond discovery pass.
     #[arg(
         long = "bond-discovery-lookback-games",
         env = cli_env!("BOND_DISCOVERY_LOOKBACK_GAMES"),
@@ -132,8 +122,7 @@ pub struct ChallengerArgs {
     )]
     pub bond_discovery_lookback_games: u64,
 
-    /// How often a full rescan of the bond lookback window is performed to
-    /// catch state transitions (games challenged or resolved by other actors).
+    /// How often the bond lookback window is scanned from scratch.
     #[arg(
         long = "bond-discovery-interval",
         env = cli_env!("BOND_DISCOVERY_INTERVAL"),

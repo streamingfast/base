@@ -1,22 +1,32 @@
 //! Standard Base execution-node arguments and runner wiring.
 
-use std::{sync::Arc, time::Duration};
+use std::{env, path::PathBuf, sync::Arc, time::Duration};
 
 use base_bundle_extension::BundleExtension;
 use base_execution_eip8130_rpc_node::{Eip8130RpcExtension, Eip8130RpcMode};
 use base_flashblocks::FlashblocksConfig;
 use base_flashblocks_node::FlashblocksExtension;
 use base_metering::{MeteredOpcodes, MeteringConfig, MeteringExtension, MeteringResourceLimits};
-use base_node_core::args::RollupArgs;
+use base_node_core::{HasRollupArgs, RollupArgs};
 use base_node_runner::{BaseNodeBuilder, BaseNodeRunner, LaunchedBaseNode, PayloadServiceBuilder};
+use base_observability_events::{
+    DEFAULT_MAX_FILE_BYTES, DEFAULT_MAX_FILES, DEFAULT_QUEUE_CAPACITY,
+    GlobalTransactionEventWriter, TransactionEventProducer, TransactionEventWriterConfig,
+};
 use base_proofs_extension::ProofsHistoryExtension;
+use base_shadow_indexer::{ShadowIndexerConfig, ShadowIndexerExtension};
+use base_shadow_indexer_db::ShadowDbConfig;
 use base_tx_forwarding::{
     DEFAULT_MAX_BATCH_SIZE, DEFAULT_MAX_RPS, DEFAULT_RESEND_AFTER_MS, TxForwardingConfig,
     TxForwardingExtension,
 };
-use base_txpool_rpc::{TxPoolRpcConfig, TxPoolRpcExtension};
+use base_txpool_rpc::{
+    DEFAULT_MAX_VALIDITY_PREDICATES, SendRawTransactionValidityExtension, TxPoolRpcConfig,
+    TxPoolRpcExtension,
+};
 use base_txpool_tracing::{TxPoolExtension, TxpoolConfig};
 use base_upgrade_signal::UpgradeSignalStartupMode;
+use tracing::warn;
 use url::Url;
 
 use crate::upgrade_signal::{
@@ -37,14 +47,15 @@ pub struct MeteringArgs {
     )]
     pub metering_gas_limit: Option<u64>,
 
-    /// Per-flashblock execution time budget in microseconds for priority fee estimation.
-    #[arg(long = "metering.execution-time-us", requires = "enable_metering")]
+    /// Deprecated and ignored. Kept so older deployment configurations remain accepted.
+    #[arg(long = "metering.execution-time-us", requires = "enable_metering", hide = true)]
     pub metering_execution_time_us: Option<u64>,
 
-    /// Whole-block state root computation budget in microseconds for priority fee estimation.
+    /// Deprecated and ignored. Kept so older deployment configurations remain accepted.
     #[arg(
         long = "metering.state-root-time-us",
-        requires_all = ["enable_metering", "metering_target_flashblocks_per_block"]
+        requires_all = ["enable_metering", "metering_target_flashblocks_per_block"],
+        hide = true
     )]
     pub metering_state_root_time_us: Option<u64>,
 
@@ -57,8 +68,8 @@ pub struct MeteringArgs {
 
     /// Target number of tx-pool flashblocks the builder budgets per block.
     ///
-    /// This excludes the base flashblock at index `0` and is required when gas, state root
-    /// time, or DA estimation is enabled.
+    /// This excludes the base flashblock at index `0` and is required when gas or DA
+    /// estimation is enabled.
     #[arg(long = "metering.target-flashblocks-per-block", requires = "enable_metering")]
     pub metering_target_flashblocks_per_block: Option<usize>,
 
@@ -66,6 +77,61 @@ pub struct MeteringArgs {
     /// (e.g., "SSTORE,SLOAD,KECCAK256"). Precompile gas is always tracked.
     #[arg(long = "metering.metered-opcodes", requires = "enable_metering", value_delimiter = ',')]
     pub metering_metered_opcodes: Vec<String>,
+}
+
+/// Default maximum number of open shadow indexer database connections.
+const DEFAULT_SHADOW_INDEXER_MAX_CONNECTIONS: u32 = 5;
+/// Default timeout when acquiring a shadow indexer database connection.
+const DEFAULT_SHADOW_INDEXER_CONNECTION_TIMEOUT: &str = "30s";
+
+/// CLI arguments for the shadow indexer `ExEx` that persists committed execution blocks.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct ShadowIndexerArgs {
+    /// Enable the shadow indexer `ExEx` that persists committed execution blocks to Postgres.
+    #[arg(long = "enable-shadow-indexer", env = "ENABLE_SHADOW_INDEXER")]
+    pub enable_shadow_indexer: bool,
+
+    /// `PostgreSQL` connection URL for the shadow indexer database.
+    #[arg(
+        long = "shadow-indexer.database-url",
+        env = "SHADOW_INDEXER_DATABASE_URL",
+        value_name = "SHADOW_INDEXER_DATABASE_URL",
+        requires = "enable_shadow_indexer"
+    )]
+    pub shadow_indexer_database_url: Option<String>,
+
+    /// Maximum number of open shadow indexer database connections.
+    #[arg(
+        long = "shadow-indexer.max-connections",
+        env = "SHADOW_INDEXER_MAX_CONNECTIONS",
+        default_value_t = DEFAULT_SHADOW_INDEXER_MAX_CONNECTIONS,
+        requires = "enable_shadow_indexer"
+    )]
+    pub shadow_indexer_max_connections: u32,
+
+    /// Timeout when acquiring a shadow indexer database connection.
+    #[arg(
+        long = "shadow-indexer.connection-timeout",
+        env = "SHADOW_INDEXER_CONNECTION_TIMEOUT",
+        default_value = DEFAULT_SHADOW_INDEXER_CONNECTION_TIMEOUT,
+        value_parser = humantime::parse_duration,
+        requires = "enable_shadow_indexer"
+    )]
+    pub shadow_indexer_connection_timeout: Duration,
+}
+
+impl Default for ShadowIndexerArgs {
+    fn default() -> Self {
+        Self {
+            enable_shadow_indexer: false,
+            shadow_indexer_database_url: None,
+            shadow_indexer_max_connections: DEFAULT_SHADOW_INDEXER_MAX_CONNECTIONS,
+            shadow_indexer_connection_timeout: humantime::parse_duration(
+                DEFAULT_SHADOW_INDEXER_CONNECTION_TIMEOUT,
+            )
+            .expect("valid default shadow indexer connection timeout"),
+        }
+    }
 }
 
 /// CLI arguments for a standard Base execution node.
@@ -80,6 +146,10 @@ pub struct StandardNodeArgs {
     #[command(flatten)]
     pub metering: MeteringArgs,
 
+    /// Shadow indexer `ExEx` arguments.
+    #[command(flatten)]
+    pub shadow_indexer: ShadowIndexerArgs,
+
     /// Enable transaction forwarding for mempool nodes to builder RPC endpoints
     #[arg(
         long = "enable-tx-forwarding",
@@ -87,6 +157,20 @@ pub struct StandardNodeArgs {
         requires = "builder_rpc_urls"
     )]
     pub enable_tx_forwarding: bool,
+
+    /// Enable the experimental validity transaction RPC.
+    ///
+    /// Validity predicates are forwarded to builders but are not yet enforced.
+    #[arg(long = "enable-experimental-validity-transactions", requires = "enable_tx_forwarding")]
+    pub enable_experimental_validity_transactions: bool,
+
+    /// Maximum validity predicates accepted per experimental transaction.
+    #[arg(
+        long = "experimental-validity-max-predicates",
+        default_value_t = DEFAULT_MAX_VALIDITY_PREDICATES,
+        requires = "enable_experimental_validity_transactions"
+    )]
+    pub experimental_validity_max_predicates: usize,
 
     /// Builder RPC endpoints for transaction forwarding (one forwarder per URL), used by mempool nodes
     #[arg(
@@ -156,10 +240,6 @@ pub struct RpcStandardNodeArgs {
     )]
     pub max_pending_blocks_depth: u64,
 
-    /// Enable cached execution via the flashblocks-aware engine validator.
-    #[arg(long = "flashblocks.cached-execution", requires = "flashblocks_url")]
-    pub flashblocks_cached_execution: bool,
-
     /// Interval between flashblocks upstream websocket ping frames.
     #[arg(
         long = "flashblocks.ping-interval",
@@ -180,6 +260,21 @@ pub struct RpcStandardNodeArgs {
         value_name = "ENABLE_TRANSACTION_TRACING_LOGS"
     )]
     pub enable_transaction_tracing_logs: bool,
+
+    /// Enable durable transaction event journal emission from txpool tracing.
+    #[arg(
+        long = "enable-transaction-event-journal",
+        value_name = "ENABLE_TRANSACTION_EVENT_JOURNAL"
+    )]
+    pub enable_transaction_event_journal: bool,
+
+    /// Dedicated JSONL path for durable transaction event journal emission.
+    #[arg(
+        long = "transaction-event-journal-path",
+        value_name = "TRANSACTION_EVENT_JOURNAL_PATH",
+        requires = "enable_transaction_event_journal"
+    )]
+    pub transaction_event_journal_path: Option<PathBuf>,
 }
 
 impl From<RpcStandardNodeArgs> for StandardNodeArgs {
@@ -191,7 +286,10 @@ impl From<RpcStandardNodeArgs> for StandardNodeArgs {
         Self {
             rpc: args,
             metering: MeteringArgs::default(),
+            shadow_indexer: ShadowIndexerArgs::default(),
             enable_tx_forwarding: false,
+            enable_experimental_validity_transactions: false,
+            experimental_validity_max_predicates: DEFAULT_MAX_VALIDITY_PREDICATES,
             builder_rpc_urls: Vec::new(),
             tx_forwarding_resend_after_ms: DEFAULT_RESEND_AFTER_MS,
             tx_forwarding_batch_size: DEFAULT_MAX_BATCH_SIZE,
@@ -206,15 +304,52 @@ impl StandardNodeArgs {
         self.metering = metering;
         self
     }
+
+    /// Sets the shadow indexer arguments on this standard node configuration.
+    pub fn with_shadow_indexer(mut self, shadow_indexer: ShadowIndexerArgs) -> Self {
+        self.shadow_indexer = shadow_indexer;
+        self
+    }
+}
+
+impl TryFrom<&ShadowIndexerArgs> for ShadowIndexerConfig {
+    type Error = eyre::Error;
+
+    fn try_from(args: &ShadowIndexerArgs) -> eyre::Result<Self> {
+        let url = if args.enable_shadow_indexer {
+            args.shadow_indexer_database_url.clone().ok_or_else(|| {
+                eyre::eyre!(
+                    "--enable-shadow-indexer (env ENABLE_SHADOW_INDEXER) requires \
+                     --shadow-indexer.database-url (env SHADOW_INDEXER_DATABASE_URL)"
+                )
+            })?
+        } else {
+            String::new()
+        };
+
+        Ok(Self {
+            enabled: args.enable_shadow_indexer,
+            db: ShadowDbConfig {
+                url,
+                max_connections: args.shadow_indexer_max_connections,
+                connection_timeout: args.shadow_indexer_connection_timeout,
+            },
+            builder_version: env!("CARGO_PKG_VERSION").to_string(),
+        })
+    }
+}
+
+impl HasRollupArgs for StandardNodeArgs {
+    fn rollup_args(&self) -> &RollupArgs {
+        &self.rpc.rollup_args
+    }
 }
 
 impl From<&StandardNodeArgs> for Option<FlashblocksConfig> {
     fn from(args: &StandardNodeArgs) -> Self {
         args.rpc.flashblocks_url.clone().map(|url| {
-            let mut config = FlashblocksConfig::new(url, args.rpc.max_pending_blocks_depth)
-                .with_subscriber_ping_interval(args.rpc.flashblocks_ping_interval);
-            config.cached_execution = args.rpc.flashblocks_cached_execution;
-            config
+            FlashblocksConfig::new(url, args.rpc.max_pending_blocks_depth)
+                .with_subscriber_ping_interval(args.rpc.flashblocks_ping_interval)
         })
     }
 }
@@ -238,11 +373,11 @@ pub struct StandardBaseRethNode;
 
 impl StandardBaseRethNode {
     /// Applies a configured L1 upgrade signal to the execution chain spec before startup.
-    pub async fn apply_initial_upgrade_signal(
+    pub async fn apply_initial_upgrade_signal<A: HasRollupArgs + ?Sized>(
         builder: BaseNodeBuilder,
-        args: &StandardNodeArgs,
+        args: &A,
     ) -> eyre::Result<BaseNodeBuilder> {
-        Self::apply_initial_upgrade_signal_from_rollup_args(builder, &args.rpc.rollup_args).await
+        Self::apply_initial_upgrade_signal_from_rollup_args(builder, args.rollup_args()).await
     }
 
     /// Applies a configured L1 upgrade signal from rollup args before startup.
@@ -297,7 +432,7 @@ impl StandardBaseRethNode {
     /// configured upgrade-signal contract always requires an explicit `--upgrade-signal.l1-rpc` for
     /// its startup application, runtime admin refresh, and live metrics observer.
     pub fn validate_upgrade_signal_args(rollup_args: &RollupArgs) -> eyre::Result<()> {
-        if rollup_args.upgrade_signal.config()?.is_some()
+        if rollup_args.upgrade_signal.config().is_some()
             && rollup_args.upgrade_signal_l1_rpc.upgrade_signal_l1_rpc.is_none()
         {
             eyre::bail!(
@@ -313,7 +448,7 @@ impl StandardBaseRethNode {
     fn upgrade_signal_config(
         rollup_args: &RollupArgs,
     ) -> eyre::Result<Option<ExecutionUpgradeSignalConfig>> {
-        let Some(signal_config) = rollup_args.upgrade_signal.config()? else {
+        let Some(signal_config) = rollup_args.upgrade_signal.config() else {
             return Ok(None);
         };
         Self::validate_upgrade_signal_args(rollup_args)?;
@@ -335,6 +470,16 @@ impl StandardBaseRethNode {
 
         // Create flashblocks config first so we can share its state with metering.
         let flashblocks_config: Option<FlashblocksConfig> = (&args).into();
+        let transaction_event_env = TransactionEventEnv::read();
+        let transaction_event_writer_config =
+            transaction_event_writer_config(&args.rpc, &transaction_event_env)?;
+        // Initialize before installing extensions so node-started hooks that emit
+        // transaction events (e.g. tx forwarding) see a ready writer.
+        if let Some(config) = transaction_event_writer_config
+            && let Err(err) = GlobalTransactionEventWriter::init(Some(config))
+        {
+            tracing::warn!(error = %err, "transaction event journal disabled");
+        }
 
         // Feature extensions. Several use `replace_configured` (which is overwrite,
         // not compose) on overlapping RPC methods, so install order would otherwise
@@ -351,15 +496,22 @@ impl StandardBaseRethNode {
             sequencer_rpc: args.rpc.rollup_args.sequencer.clone(),
         });
         runner.install_ext::<TxPoolExtension>(TxpoolConfig {
-            tracing_enabled: args.rpc.enable_transaction_tracing,
+            tracing_enabled: args.rpc.enable_transaction_tracing
+                || args.rpc.enable_transaction_event_journal
+                || transaction_event_env.enabled,
             tracing_logs_enabled: args.rpc.enable_transaction_tracing_logs,
+            transaction_event_node_role: transaction_event_node_role(),
             flashblocks_config: flashblocks_config.clone(),
         });
 
+        if args.metering.metering_execution_time_us.is_some()
+            || args.metering.metering_state_root_time_us.is_some()
+        {
+            warn!("deprecated metering resource limit flags are ignored");
+        }
+
         let resource_limits = MeteringResourceLimits {
             gas_limit: args.metering.metering_gas_limit,
-            execution_time_us: args.metering.metering_execution_time_us,
-            state_root_time_us: args.metering.metering_state_root_time_us,
             da_bytes: args.metering.metering_da_bytes,
         };
         let metering_config = if args.metering.enable_metering {
@@ -385,8 +537,20 @@ impl StandardBaseRethNode {
             MeteringConfig::disabled()
         };
         runner.install_ext::<MeteringExtension>(metering_config);
+        runner.install_ext::<ShadowIndexerExtension>((&args.shadow_indexer).try_into()?);
         runner.install_ext::<BundleExtension>(());
-        runner.install_ext::<TxForwardingExtension>((&args).into());
+        let tx_forwarding_config: TxForwardingConfig = (&args).into();
+        if args.enable_experimental_validity_transactions {
+            if !tx_forwarding_config.enabled || tx_forwarding_config.builder_urls.is_empty() {
+                eyre::bail!(
+                    "experimental validity transactions require enabled transaction forwarding"
+                );
+            }
+            runner.install_ext::<SendRawTransactionValidityExtension>(
+                args.experimental_validity_max_predicates,
+            );
+        }
+        runner.install_ext::<TxForwardingExtension>(tx_forwarding_config);
         runner.install_ext::<ProofsHistoryExtension>(rollup_args.clone());
         Self::install_upgrade_signal_runtime_extension(&mut runner, &rollup_args)?;
         let eip8130_rpc_mode = if flashblocks_config.is_some() {
@@ -446,10 +610,92 @@ impl StandardBaseRethNode {
     }
 }
 
+fn transaction_event_writer_config(
+    args: &RpcStandardNodeArgs,
+    env: &TransactionEventEnv,
+) -> eyre::Result<Option<TransactionEventWriterConfig>> {
+    if !args.enable_transaction_event_journal && !env.enabled {
+        return Ok(None);
+    }
+
+    let file_path =
+        args.transaction_event_journal_path.clone().or_else(|| env.path.clone()).ok_or_else(
+            || {
+                eyre::eyre!(
+                    "--enable-transaction-event-journal requires --transaction-event-journal-path \
+                 or BASE_TRANSACTION_EVENTS_PATH"
+                )
+            },
+        )?;
+
+    Ok(Some(TransactionEventWriterConfig {
+        enabled: true,
+        file_path,
+        queue_capacity: DEFAULT_QUEUE_CAPACITY,
+        max_file_bytes: env.max_file_bytes,
+        max_files: env.max_files,
+        required: false,
+        producer: TransactionEventProducer::BaseRethNode,
+        network: env.network.clone(),
+    }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TransactionEventEnv {
+    enabled: bool,
+    path: Option<PathBuf>,
+    max_file_bytes: u64,
+    max_files: usize,
+    network: String,
+}
+
+impl TransactionEventEnv {
+    fn read() -> Self {
+        Self {
+            enabled: transaction_event_journal_env_enabled(),
+            path: env::var_os("BASE_TRANSACTION_EVENTS_PATH").map(PathBuf::from),
+            max_file_bytes: env::var("BASE_TRANSACTION_EVENTS_MAX_FILE_BYTES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(DEFAULT_MAX_FILE_BYTES),
+            max_files: env::var("BASE_TRANSACTION_EVENTS_MAX_FILES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(DEFAULT_MAX_FILES),
+            network: env::var("BASE_TRANSACTION_EVENTS_NETWORK")
+                .or_else(|_| env::var("BASE_NODE_NETWORK"))
+                .unwrap_or_else(|_| "unknown".to_string()),
+        }
+    }
+}
+
+fn transaction_event_journal_env_enabled() -> bool {
+    env::var("BASE_TRANSACTION_EVENTS_ENABLED").map(transaction_event_env_bool).unwrap_or(false)
+}
+
+fn transaction_event_env_bool(value: String) -> bool {
+    matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+}
+
+fn transaction_event_node_role() -> Option<String> {
+    env::var("BASE_TRANSACTION_EVENTS_NODE_ROLE")
+        .ok()
+        .or_else(|| parse_otel_resource_attribute("base.node"))
+}
+
+fn parse_otel_resource_attribute(key: &str) -> Option<String> {
+    env::var("OTEL_RESOURCE_ATTRIBUTES").ok().and_then(|attrs| {
+        attrs.split(',').find_map(|part| {
+            let (attr_key, attr_value) = part.split_once('=')?;
+            (attr_key.trim() == key)
+                .then(|| attr_value.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use alloy_primitives::address;
     use clap::{Args, Parser};
 
@@ -467,11 +713,18 @@ mod tests {
             rpc_forwarding_endpoint: None,
             flashblocks_url: None,
             max_pending_blocks_depth: 3,
-            flashblocks_cached_execution: false,
             flashblocks_ping_interval: Duration::from_secs(30),
             enable_transaction_tracing: false,
             enable_transaction_tracing_logs: false,
+            enable_transaction_event_journal: false,
+            transaction_event_journal_path: None,
         }
+    }
+
+    #[test]
+    fn standard_node_args_provides_embedded_rollup_args() {
+        let args = StandardNodeArgs::from(default_rpc_standard_node_args());
+        assert!(std::ptr::eq(args.rollup_args(), &args.rpc.rollup_args));
     }
 
     #[test]
@@ -544,6 +797,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_transaction_event_journal_flags() {
+        let args = CommandParser::<RpcStandardNodeArgs>::parse_from([
+            "base-reth",
+            "--enable-transaction-event-journal",
+            "--transaction-event-journal-path",
+            "/var/log/transaction-events/execution/events.jsonl",
+        ])
+        .args;
+
+        assert!(args.enable_transaction_event_journal);
+        assert_eq!(
+            args.transaction_event_journal_path.as_deref(),
+            Some(std::path::Path::new("/var/log/transaction-events/execution/events.jsonl"))
+        );
+    }
+
+    #[test]
     fn test_rpc_forwarding_endpoint_keeps_tx_forwarding_extension_disabled() {
         let args = CommandParser::<RpcStandardNodeArgs>::parse_from([
             "reth",
@@ -565,8 +835,56 @@ mod tests {
         let config = TxForwardingConfig::from(&standard_args);
 
         assert_eq!(standard_args.rpc.rollup_args.sequencer, None);
+        assert!(!standard_args.enable_experimental_validity_transactions);
+        assert_eq!(
+            standard_args.experimental_validity_max_predicates,
+            DEFAULT_MAX_VALIDITY_PREDICATES
+        );
         assert!(!config.enabled);
         assert!(config.builder_urls.is_empty());
+    }
+
+    #[test]
+    fn experimental_validity_transactions_require_forwarding() {
+        let error = CommandParser::<StandardNodeArgs>::try_parse_from([
+            "base-reth",
+            "--enable-experimental-validity-transactions",
+        ])
+        .expect_err("validity transactions should require forwarding");
+
+        assert!(error.to_string().contains("--enable-tx-forwarding"));
+    }
+
+    #[test]
+    fn experimental_validity_transactions_parse_with_forwarding() {
+        let args = CommandParser::<StandardNodeArgs>::parse_from([
+            "base-reth",
+            "--enable-tx-forwarding",
+            "--builder-rpc-urls",
+            "http://localhost:8545",
+            "--enable-experimental-validity-transactions",
+            "--experimental-validity-max-predicates",
+            "8",
+        ])
+        .args;
+
+        assert!(args.enable_tx_forwarding);
+        assert!(args.enable_experimental_validity_transactions);
+        assert_eq!(args.experimental_validity_max_predicates, 8);
+        assert_eq!(args.builder_rpc_urls.len(), 1);
+    }
+
+    #[test]
+    fn programmatic_validity_config_requires_forwarding() {
+        let mut args = StandardNodeArgs::from(default_rpc_standard_node_args());
+        args.enable_experimental_validity_transactions = true;
+
+        let error = match StandardBaseRethNode::runner(args) {
+            Ok(_) => panic!("invalid programmatic validity config should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("require enabled transaction forwarding"));
     }
 
     #[test]
@@ -588,12 +906,124 @@ mod tests {
         let args = CommandParser::<StandardNodeArgs>::parse_from([
             "reth",
             "--enable-metering",
-            "--metering.execution-time-us",
-            "5000000",
+            "--metering.target-flashblocks-per-block",
+            "4",
+            "--metering.gas-limit",
+            "30000000",
         ])
         .args;
 
         assert!(args.metering.enable_metering);
+        assert_eq!(args.metering.metering_gas_limit, Some(30_000_000));
+    }
+
+    #[test]
+    fn test_standard_node_args_parses_shadow_indexer_flags() {
+        let args = CommandParser::<StandardNodeArgs>::parse_from([
+            "reth",
+            "--enable-shadow-indexer",
+            "--shadow-indexer.database-url",
+            "postgres://localhost/shadow",
+            "--shadow-indexer.max-connections",
+            "9",
+            "--shadow-indexer.connection-timeout",
+            "45s",
+        ])
+        .args;
+
+        assert!(args.shadow_indexer.enable_shadow_indexer);
+        assert_eq!(
+            args.shadow_indexer.shadow_indexer_database_url.as_deref(),
+            Some("postgres://localhost/shadow")
+        );
+        assert_eq!(args.shadow_indexer.shadow_indexer_max_connections, 9);
+        assert_eq!(args.shadow_indexer.shadow_indexer_connection_timeout, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn test_shadow_indexer_database_url_requires_enable_flag() {
+        let error = CommandParser::<StandardNodeArgs>::try_parse_from([
+            "reth",
+            "--shadow-indexer.database-url",
+            "postgres://localhost/shadow",
+        ])
+        .expect_err("shadow indexer database url should require the enable flag");
+
+        assert!(error.to_string().contains("--enable-shadow-indexer"));
+    }
+
+    #[test]
+    fn test_shadow_indexer_config_requires_database_url_when_enabled() {
+        let args =
+            ShadowIndexerArgs { enable_shadow_indexer: true, ..ShadowIndexerArgs::default() };
+        let error = ShadowIndexerConfig::try_from(&args)
+            .expect_err("enabled shadow indexer should require a database url");
+
+        assert!(error.to_string().contains("--shadow-indexer.database-url"));
+    }
+
+    #[test]
+    fn test_shadow_indexer_config_disabled_by_default() {
+        let config = ShadowIndexerConfig::try_from(&ShadowIndexerArgs::default())
+            .expect("disabled shadow indexer config should build without a url");
+
+        assert!(!config.enabled);
+        assert_eq!(config.builder_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn transaction_event_journal_requires_path_when_no_env_path_exists() {
+        let args = CommandParser::<RpcStandardNodeArgs>::parse_from([
+            "base-reth",
+            "--enable-transaction-event-journal",
+            "--transaction-event-journal-path",
+            "/tmp/events.jsonl",
+        ])
+        .args;
+
+        let env = TransactionEventEnv {
+            enabled: false,
+            path: None,
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+            max_files: DEFAULT_MAX_FILES,
+            network: "unknown".to_string(),
+        };
+        let config = transaction_event_writer_config(&args, &env).unwrap().unwrap();
+        assert_eq!(config.file_path, PathBuf::from("/tmp/events.jsonl"));
+        assert_eq!(config.producer, TransactionEventProducer::BaseRethNode);
+    }
+
+    #[test]
+    fn transaction_event_journal_can_be_enabled_by_env() {
+        let args = CommandParser::<RpcStandardNodeArgs>::parse_from(["base-reth"]).args;
+        let env = TransactionEventEnv {
+            enabled: true,
+            path: Some(PathBuf::from("/tmp/env-events.jsonl")),
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+            max_files: DEFAULT_MAX_FILES,
+            network: "base-devnet".to_string(),
+        };
+        let config = transaction_event_writer_config(&args, &env).unwrap().unwrap();
+
+        assert_eq!(config.file_path, PathBuf::from("/tmp/env-events.jsonl"));
+        assert_eq!(config.network, "base-devnet");
+    }
+
+    #[test]
+    fn test_standard_node_args_accepts_deprecated_metering_flags() {
+        let args = CommandParser::<StandardNodeArgs>::parse_from([
+            "reth",
+            "--enable-metering",
+            "--metering.execution-time-us",
+            "5000000",
+            "--metering.state-root-time-us",
+            "1000000",
+            "--metering.target-flashblocks-per-block",
+            "4",
+        ])
+        .args;
+
         assert_eq!(args.metering.metering_execution_time_us, Some(5_000_000));
+        assert_eq!(args.metering.metering_state_root_time_us, Some(1_000_000));
     }
 }

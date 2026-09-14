@@ -87,7 +87,6 @@ impl ProverServiceServer {
             .map_err(|e| internal(format!("Database error: {e}")))?
             .ok_or_else(|| not_found(PROOF_REQUEST_NOT_FOUND_MESSAGE))?;
         let proof_request_id = proof_req.id;
-
         info!(
             proof_request_id = %proof_request_id,
             session_id = %proof_req.session_id,
@@ -136,7 +135,7 @@ mod tests {
             request_payload: serde_json::json!({}),
             api_proof_type: match proof_type {
                 ProofType::OpSuccinctSp1ClusterCompressed => ApiProofType::Compressed,
-                ProofType::OpSuccinctSp1ClusterSnarkGroth16 => ApiProofType::SnarkGroth16,
+                ProofType::OpSuccinctSp1ClusterSnarkPlonk => ApiProofType::SnarkPlonk,
             },
             zk_vm: Some(ZkVmKind::Sp1),
             tee_kind: None,

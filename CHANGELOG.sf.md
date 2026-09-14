@@ -1,3 +1,23 @@
+## Unreleased
+
+### Changed
+
+* Rebased on upstream Base `v1.3.2` and `streamingfast/reth` `release/base-2.x` (Base's reth fork
+  `base-v2.5.2.3` plus Firehose). Upstream removed Base's own engine validator, so live
+  `engine_newPayload` blocks are now traced by reth's engine validator. `OpFirehoseEvmConfig`
+  selects the OP hooks it installs (`OpPreTxAdjust`, `OpPostTxExtras`) through
+  `reth_firehose::FirehoseLiveHooks`.
+
+### Fixed
+
+* Live-traced blocks now pass the state-root task its execution updates, run transactions in block
+  order, and build the block access list, matching the untraced execution path.
+
+### Added
+
+* The live tracing regression test now checks the OP hooks: deposit nonces and `BaseFeeVault`
+  fee credits in live-traced blocks.
+
 ## v1.2.0-fh3.2
 
 ### Fixed

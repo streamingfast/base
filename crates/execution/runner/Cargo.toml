@@ -13,7 +13,6 @@ workspace = true
 
 [dependencies]
 # workspace
-base-engine-tree.workspace = true
 base-test-utils = { workspace = true, optional = true }
 
 # reth
@@ -78,9 +77,11 @@ tracing-subscriber = { workspace = true, optional = true }
 [dev-dependencies]
 base-node-runner = { path = ".", features = ["test-utils"] }
 criterion = { workspace = true, features = ["async_tokio", "html_reports"] }
-reth-firehose.workspace = true
 reth-chainspec.workspace = true
+firehose-tracer.workspace = true
 base-test-utils.workspace = true
+base-firehose-tests.workspace = true
+base-common-rpc-types.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [[bench]]

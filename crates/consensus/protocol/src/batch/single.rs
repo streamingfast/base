@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{BlockHash, Bytes};
-use alloy_rlp::{RlpDecodable, RlpEncodable};
+use alloy_rlp::{Encodable, Header, RlpDecodable, RlpEncodable};
 use base_common_consensus::OpTxType;
 use base_common_genesis::RollupConfig;
 use tracing::warn;
@@ -28,6 +28,14 @@ pub struct SingleBatch {
 }
 
 impl SingleBatch {
+    /// Returns the RLP string header wrapping this batch inside a channel.
+    ///
+    /// A channel entry is an RLP byte string holding the batch type byte
+    /// followed by the encoded batch.
+    pub fn rlp_header(&self) -> Header {
+        Header { list: false, payload_length: 1 + self.length() }
+    }
+
     /// Returns the [`BlockNumHash`] of the batch.
     pub const fn epoch(&self) -> BlockNumHash {
         BlockNumHash { number: self.epoch_num, hash: self.epoch_hash }
@@ -40,7 +48,8 @@ impl SingleBatch {
         l2_safe_head: L2BlockInfo,
         inclusion_block: &BlockInfo,
     ) -> BatchValidity {
-        let next_timestamp = l2_safe_head.block_info.timestamp + cfg.block_time;
+        let next_timestamp =
+            cfg.l2_block_timestamp(l2_safe_head.block_info.number.saturating_add(1));
         if self.timestamp > next_timestamp {
             if cfg.is_holocene_active(inclusion_block.timestamp) {
                 return BatchValidity::Drop(BatchDropReason::FutureTimestampHolocene);
@@ -202,7 +211,7 @@ mod tests {
     use alloy_primitives::{Address, Bytes, Sealed, Signature, TxKind, U256};
     use alloy_rlp::{Decodable, Encodable};
     use base_common_consensus::{BaseTxEnvelope, TxDeposit};
-    use base_common_genesis::{BaseUpgradeConfig, UpgradeConfig};
+    use base_common_genesis::{BaseUpgradeConfig, ChainGenesis, UpgradeConfig};
     use tracing::Level;
 
     use super::*;
@@ -288,6 +297,8 @@ mod tests {
     #[test]
     fn test_check_batch_timestamp_holocene_active_past() {
         let cfg = RollupConfig {
+            block_time: 1,
+            genesis: ChainGenesis { l2_time: 1, ..Default::default() },
             upgrades: UpgradeConfig { holocene_time: Some(0), ..Default::default() },
             ..Default::default()
         };
@@ -305,7 +316,11 @@ mod tests {
 
     #[test]
     fn test_check_batch_timestamp_holocene_inactive_drop() {
-        let cfg = RollupConfig::default();
+        let cfg = RollupConfig {
+            block_time: 1,
+            genesis: ChainGenesis { l2_time: 1, ..Default::default() },
+            ..Default::default()
+        };
         let l2_safe_head = L2BlockInfo {
             block_info: BlockInfo { timestamp: 2, ..Default::default() },
             ..Default::default()
@@ -320,7 +335,11 @@ mod tests {
 
     #[test]
     fn test_check_batch_timestamp_accept() {
-        let cfg = RollupConfig::default();
+        let cfg = RollupConfig {
+            block_time: 1,
+            genesis: ChainGenesis { l2_time: 1, ..Default::default() },
+            ..Default::default()
+        };
         let l2_safe_head = L2BlockInfo {
             block_info: BlockInfo { timestamp: 2, ..Default::default() },
             ..Default::default()
@@ -330,6 +349,61 @@ mod tests {
         assert_eq!(
             batch.check_batch_timestamp(&cfg, l2_safe_head, &inclusion_block),
             BatchValidity::Accept
+        );
+    }
+
+    #[test]
+    fn test_check_batch_timestamp_accepts_same_second_in_denim_era() {
+        let cfg = RollupConfig {
+            block_time: 2,
+            genesis: ChainGenesis { l2_time: 98, ..Default::default() },
+            upgrades: UpgradeConfig {
+                base: BaseUpgradeConfig { denim: Some(102), ..Default::default() },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let l2_safe_head = L2BlockInfo {
+            block_info: BlockInfo { number: 2, timestamp: 102, ..Default::default() },
+            ..Default::default()
+        };
+        let inclusion_block = BlockInfo { timestamp: 102, ..Default::default() };
+        let batch = SingleBatch { epoch_num: 1, timestamp: 102, ..Default::default() };
+        assert_eq!(
+            batch.check_batch_timestamp(&cfg, l2_safe_head, &inclusion_block),
+            BatchValidity::Accept
+        );
+    }
+
+    #[test]
+    fn test_check_batch_timestamp_non_denim_unchanged() {
+        let cfg = RollupConfig {
+            block_time: 2,
+            genesis: ChainGenesis { l2_time: 98, ..Default::default() },
+            ..Default::default()
+        };
+        let l2_safe_head = L2BlockInfo {
+            block_info: BlockInfo { number: 1, timestamp: 100, ..Default::default() },
+            ..Default::default()
+        };
+        let inclusion_block = BlockInfo { timestamp: 100, ..Default::default() };
+
+        let accept = SingleBatch { epoch_num: 1, timestamp: 102, ..Default::default() };
+        assert_eq!(
+            accept.check_batch_timestamp(&cfg, l2_safe_head, &inclusion_block),
+            BatchValidity::Accept
+        );
+
+        let past = SingleBatch { epoch_num: 1, timestamp: 101, ..Default::default() };
+        assert_eq!(
+            past.check_batch_timestamp(&cfg, l2_safe_head, &inclusion_block),
+            BatchValidity::Drop(BatchDropReason::PastTimestampPreHolocene)
+        );
+
+        let future = SingleBatch { epoch_num: 1, timestamp: 103, ..Default::default() };
+        assert_eq!(
+            future.check_batch_timestamp(&cfg, l2_safe_head, &inclusion_block),
+            BatchValidity::Future
         );
     }
 
@@ -350,10 +424,10 @@ mod tests {
 
     #[test]
     fn test_check_batch_succeeds() {
-        let cfg = RollupConfig { max_sequencer_drift: 1, ..Default::default() };
+        let cfg = RollupConfig { max_sequencer_drift: 1, block_time: 1, ..Default::default() };
         let l1_blocks = vec![BlockInfo::default(), BlockInfo::default()];
         let l2_safe_head = L2BlockInfo {
-            block_info: BlockInfo { timestamp: 1, ..Default::default() },
+            block_info: BlockInfo { timestamp: 0, ..Default::default() },
             ..Default::default()
         };
         let inclusion_block = BlockInfo::default();
@@ -427,10 +501,10 @@ mod tests {
         let single_batch =
             SingleBatch { parent_hash, epoch_num, epoch_hash, timestamp, transactions };
 
-        let cfg = RollupConfig { max_sequencer_drift: 1, ..Default::default() };
+        let cfg = RollupConfig { max_sequencer_drift: 1, block_time: 1, ..Default::default() };
         let l1_blocks = vec![BlockInfo::default(), BlockInfo::default()];
         let l2_safe_head = L2BlockInfo {
-            block_info: BlockInfo { timestamp: 1, ..Default::default() },
+            block_info: BlockInfo { timestamp: 0, ..Default::default() },
             ..Default::default()
         };
         let inclusion_block = BlockInfo::default();
@@ -477,10 +551,10 @@ mod tests {
             SingleBatch { parent_hash, epoch_num, epoch_hash, timestamp, transactions };
 
         // Notice: Isthmus is _not_ active yet.
-        let cfg = RollupConfig { max_sequencer_drift: 1, ..Default::default() };
+        let cfg = RollupConfig { max_sequencer_drift: 1, block_time: 1, ..Default::default() };
         let l1_blocks = vec![BlockInfo::default(), BlockInfo::default()];
         let l2_safe_head = L2BlockInfo {
-            block_info: BlockInfo { timestamp: 1, ..Default::default() },
+            block_info: BlockInfo { timestamp: 0, ..Default::default() },
             ..Default::default()
         };
         let inclusion_block = BlockInfo::default();
@@ -515,12 +589,13 @@ mod tests {
         // Notice: Isthmus is active.
         let cfg = RollupConfig {
             max_sequencer_drift: 1,
+            block_time: 1,
             upgrades: UpgradeConfig { isthmus_time: Some(0), ..Default::default() },
             ..Default::default()
         };
         let l1_blocks = vec![BlockInfo::default(), BlockInfo::default()];
         let l2_safe_head = L2BlockInfo {
-            block_info: BlockInfo { timestamp: 1, ..Default::default() },
+            block_info: BlockInfo { timestamp: 0, ..Default::default() },
             ..Default::default()
         };
         let inclusion_block = BlockInfo::default();
@@ -551,10 +626,10 @@ mod tests {
         };
 
         // Notice: Cobalt is _not_ active yet.
-        let cfg = RollupConfig { max_sequencer_drift: 1, ..Default::default() };
+        let cfg = RollupConfig { max_sequencer_drift: 1, block_time: 1, ..Default::default() };
         let l1_blocks = vec![BlockInfo::default(), BlockInfo::default()];
         let l2_safe_head = L2BlockInfo {
-            block_info: BlockInfo { timestamp: 1, ..Default::default() },
+            block_info: BlockInfo { timestamp: 0, ..Default::default() },
             ..Default::default()
         };
         let inclusion_block = BlockInfo::default();
@@ -580,6 +655,7 @@ mod tests {
         // Notice: Cobalt is active.
         let cfg = RollupConfig {
             max_sequencer_drift: 1,
+            block_time: 1,
             upgrades: UpgradeConfig {
                 base: BaseUpgradeConfig { cobalt: Some(0), ..Default::default() },
                 ..Default::default()
@@ -588,7 +664,7 @@ mod tests {
         };
         let l1_blocks = vec![BlockInfo::default(), BlockInfo::default()];
         let l2_safe_head = L2BlockInfo {
-            block_info: BlockInfo { timestamp: 1, ..Default::default() },
+            block_info: BlockInfo { timestamp: 0, ..Default::default() },
             ..Default::default()
         };
         let inclusion_block = BlockInfo::default();
@@ -614,10 +690,10 @@ mod tests {
             SingleBatch { parent_hash, epoch_num, epoch_hash, timestamp, transactions };
 
         // Notice: Isthmus is _not_ active yet.
-        let cfg = RollupConfig { max_sequencer_drift: 1, ..Default::default() };
+        let cfg = RollupConfig { max_sequencer_drift: 1, block_time: 1, ..Default::default() };
         let l1_blocks = vec![BlockInfo::default(), BlockInfo::default()];
         let l2_safe_head = L2BlockInfo {
-            block_info: BlockInfo { timestamp: 1, ..Default::default() },
+            block_info: BlockInfo { timestamp: 0, ..Default::default() },
             ..Default::default()
         };
         let inclusion_block = BlockInfo::default();
@@ -657,10 +733,10 @@ mod tests {
             SingleBatch { parent_hash, epoch_num, epoch_hash, timestamp, transactions };
 
         // Notice: Isthmus is _not_ active yet.
-        let cfg = RollupConfig { max_sequencer_drift: 1, ..Default::default() };
+        let cfg = RollupConfig { max_sequencer_drift: 1, block_time: 1, ..Default::default() };
         let l1_blocks = vec![BlockInfo::default(), BlockInfo::default()];
         let l2_safe_head = L2BlockInfo {
-            block_info: BlockInfo { timestamp: 1, ..Default::default() },
+            block_info: BlockInfo { timestamp: 0, ..Default::default() },
             ..Default::default()
         };
         let inclusion_block = BlockInfo::default();

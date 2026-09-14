@@ -3,11 +3,11 @@
 
 use alloy_genesis::ChainConfig;
 use alloy_primitives::{Address, B256, U256, uint};
-use base_common_genesis::RollupConfig;
+use base_common_genesis::{BaseUpgrade, RollupConfig};
 use base_proof_preimage::{PreimageKey, PreimageOracleClient};
 use serde::{Deserialize, Serialize};
 
-use crate::errors::OracleProviderError;
+use crate::{ScheduleId, errors::OracleProviderError};
 
 /// The local key identifier for the L1 head hash.
 ///
@@ -46,9 +46,10 @@ pub const L2_CHAIN_ID_KEY: U256 = uint!(5_U256);
 
 /// The local key identifier for the L2 rollup configuration.
 ///
-/// This key is used as a fallback to retrieve the rollup configuration from
-/// the preimage oracle when no hardcoded configuration is available for the
-/// given chain ID. Oracle-loaded configs require additional validation.
+/// This key retrieves the rollup configuration served by the L2 node. For fixed built-in chains,
+/// only its contract-backed upgrade activation timestamps are used; all static derivation
+/// parameters come from the compiled chain configuration. The mutable local devnet uses the full
+/// node-served configuration.
 pub const L2_ROLLUP_CONFIG_KEY: U256 = uint!(6_U256);
 
 /// The local key identifier for the L1 chain configuration.
@@ -78,6 +79,9 @@ pub const INTERMEDIATE_BLOCK_INTERVAL_KEY: U256 = uint!(9_U256);
 /// This key retrieves the block number corresponding to `L1_HEAD_KEY`, allowing
 /// the enclave to reference the L1 head number without an extra lookup.
 pub const L1_HEAD_NUMBER_KEY: U256 = uint!(10_U256);
+
+/// L2 block number used to pin the activated upgrade schedule.
+pub const L2_SCHEDULE_BLOCK_NUMBER_KEY: U256 = uint!(11_U256);
 
 /// The boot information for the client program.
 ///
@@ -154,7 +158,9 @@ pub struct BootInfo {
     /// derivation, including genesis configuration, system addresses, gas limits,
     /// and upgrade activation heights.
     ///
-    /// **Security**: Loaded from built-in config (secure) or oracle (requires validation).
+    /// **Security**: Fixed built-in chains use trusted compiled derivation parameters. Their
+    /// oracle-provided contract-backed upgrade timestamps are separately bound by `schedule_id`;
+    /// the mutable local devnet and unknown chains use the oracle-provided configuration.
     pub rollup_config: RollupConfig,
     /// An optional configuration for the l1 chain associated with the l2 chain.
     ///
@@ -181,6 +187,9 @@ pub struct BootInfo {
     /// block number without an extra lookup. Defaults to 0 when not set.
     #[serde(default)]
     pub l1_head_number: u64,
+    /// The locally derived schedule ID for this proof attempt.
+    #[serde(default)]
+    pub schedule_id: B256,
 }
 
 impl BootInfo {
@@ -244,42 +253,49 @@ impl BootInfo {
                 .map_err(OracleProviderError::SliceConversion)?,
         );
 
-        let built_in_chain_config = base_common_chains::ChainConfig::by_chain_id(chain_id);
         let activation_admin_address =
             base_common_chains::ChainConfig::beryl_activation_admin_address_by_chain_id(chain_id);
 
-        // Attempt to load the rollup config from the chain ID. If there is no config for the chain,
-        // fall back to loading the config from the preimage oracle.
-        let rollup_config = if let Some(config) = built_in_chain_config {
-            config.rollup_config()
-        } else {
-            warn!(
-                target: "boot_loader",
-                chain_id,
-                "no built-in rollup config found for chain ID, falling back to preimage oracle; this is insecure in production without additional validation"
-            );
-            let ser_cfg = oracle
-                .get(PreimageKey::new_local(L2_ROLLUP_CONFIG_KEY.to()))
-                .await
-                .map_err(OracleProviderError::Preimage)?;
-            serde_json::from_slice(&ser_cfg).map_err(OracleProviderError::Serde)?
-        };
+        let ser_cfg = oracle
+            .get(PreimageKey::new_local(L2_ROLLUP_CONFIG_KEY.to()))
+            .await
+            .map_err(OracleProviderError::Preimage)?;
+        let oracle_rollup_config: RollupConfig =
+            serde_json::from_slice(&ser_cfg).map_err(OracleProviderError::Serde)?;
 
-        // Built-in configs should already match, but oracle-provided configs must be bound to the
-        // committed boot chain ID before any config-derived chain parameters are trusted.
-        let rollup_config_chain_id = rollup_config.l2_chain_id.id();
+        // Bind the node-served schedule to the committed boot chain ID before using any of it.
+        let rollup_config_chain_id = oracle_rollup_config.l2_chain_id.id();
         if chain_id != rollup_config_chain_id {
             return Err(OracleProviderError::RollupConfigChainIdMismatch {
                 boot_chain_id: chain_id,
                 rollup_config_chain_id,
             });
         }
-        // The activation registry is installed at Beryl. For built-in chains, the admin comes from
-        // `ChainConfig`; for oracle-provided rollup configs, do not infer an admin from untrusted
-        // fallback data until the admin has an explicit committed source.
-        if activation_admin_address.is_none() && rollup_config.upgrades.base.beryl.is_some() {
-            return Err(OracleProviderError::MissingActivationAdminAddress { chain_id });
-        }
+
+        // Fixed built-in chains must execute with their compiled static derivation parameters. Only
+        // contract-backed activation timestamps may come from the node, because ScheduleId commits
+        // them separately. The local devnet is mutable, so its live node-served config is required.
+        let trusted_chain_config =
+            base_common_chains::ChainConfig::by_chain_id(chain_id).filter(|chain_config| {
+                chain_config.chain_id != base_common_chains::ChainConfig::DEVNET.chain_id
+            });
+        let mut rollup_config = if let Some(chain_config) = trusted_chain_config {
+            let mut trusted_rollup_config = chain_config.rollup_config();
+            for upgrade in BaseUpgrade::CONTRACT_VARIANTS {
+                trusted_rollup_config.apply_upgrade_activation(
+                    upgrade,
+                    oracle_rollup_config.upgrades.activation(upgrade),
+                );
+            }
+            trusted_rollup_config
+        } else {
+            warn!(
+                target: "boot_loader",
+                chain_id,
+                "no fixed trusted rollup config available, falling back to preimage oracle; insecure in production without additional validation"
+            );
+            oracle_rollup_config
+        };
 
         // Attempt to load the L1 config from the rollup config's L1 chain ID. If there is no config
         // for the chain, fall back to loading the config from the preimage oracle.
@@ -358,6 +374,69 @@ impl BootInfo {
             }
         };
 
+        // Missing or zero values default to the claimed block.
+        let schedule_l2_block_number = match oracle
+            .get(PreimageKey::new_local(L2_SCHEDULE_BLOCK_NUMBER_KEY.to()))
+            .await
+        {
+            Ok(bytes) => {
+                let value = u64::from_be_bytes(
+                    bytes.as_slice().try_into().map_err(OracleProviderError::SliceConversion)?,
+                );
+                if value == 0 { l2_claim_block } else { value }
+            }
+            Err(e) => {
+                debug!(
+                    target: "boot_loader",
+                    error = %e,
+                    "Schedule L2 block number preimage not found, defaulting to claimed L2 block number"
+                );
+                l2_claim_block
+            }
+        };
+
+        if rollup_config.block_time == 0 {
+            return Err(OracleProviderError::InvalidL2BlockTime);
+        }
+        if rollup_config.genesis.l2_time == 0 {
+            return Err(OracleProviderError::InvalidL2GenesisTimestamp);
+        }
+        if l2_claim_block < rollup_config.genesis.l2.number {
+            return Err(OracleProviderError::L2ClaimBeforeGenesis {
+                claim_block: l2_claim_block,
+                genesis_block: rollup_config.genesis.l2.number,
+            });
+        }
+        if schedule_l2_block_number < l2_claim_block {
+            return Err(OracleProviderError::ScheduleBlockBeforeClaim {
+                schedule_block: schedule_l2_block_number,
+                claim_block: l2_claim_block,
+            });
+        }
+        let blocks_since_genesis = schedule_l2_block_number - rollup_config.genesis.l2.number;
+        let l2_schedule_timestamp = blocks_since_genesis
+            .checked_mul(rollup_config.block_time)
+            .and_then(|offset| rollup_config.genesis.l2_time.checked_add(offset))
+            .ok_or(OracleProviderError::L2ScheduleTimestampOverflow {
+                schedule_block: schedule_l2_block_number,
+            })?;
+
+        // Zenith is not contract-backed, so reject it when active and remove it when future.
+        match rollup_config.upgrades.base.zenith {
+            Some(zenith_time) if zenith_time <= l2_schedule_timestamp => {
+                return Err(OracleProviderError::UncommittedZenithUpgrade);
+            }
+            Some(_) => rollup_config.upgrades.base.zenith = None,
+            None => {}
+        }
+
+        let schedule_id = ScheduleId::pin(&mut rollup_config, l2_schedule_timestamp);
+
+        // Only a pinned Beryl schedule requires its trusted built-in admin.
+        if activation_admin_address.is_none() && rollup_config.upgrades.base.beryl.is_some() {
+            return Err(OracleProviderError::MissingActivationAdminAddress { chain_id });
+        }
+
         Ok(Self {
             l1_head,
             agreed_l2_output_root: l2_output_root,
@@ -370,6 +449,7 @@ impl BootInfo {
             proposer,
             intermediate_block_interval,
             l1_head_number,
+            schedule_id,
         })
     }
 }
@@ -381,12 +461,15 @@ mod tests {
     use alloy_primitives::B256;
     use async_trait::async_trait;
     use base_common_chains::ChainConfig as BaseChainConfig;
+    use base_common_genesis::{BaseUpgradeConfig, UpgradeConfig};
     use base_proof_preimage::{
         PreimageKey, PreimageOracleClient,
         errors::{PreimageOracleError, PreimageOracleResult},
     };
 
     use super::*;
+
+    const ORACLE_CHAIN_ID: u64 = 999_999_999;
 
     struct MockOracle {
         data: Vec<(PreimageKey, Vec<u8>)>,
@@ -399,6 +482,17 @@ mod tests {
 
         fn insert(&mut self, key: U256, value: Vec<u8>) {
             self.data.push((PreimageKey::new_local(key.to()), value));
+        }
+
+        fn insert_rollup_config(&mut self, chain_id: u64, rollup_config: &RollupConfig) {
+            let mut value =
+                serde_json::to_value(rollup_config).expect("rollup config should convert to value");
+            value["l2_chain_id"] = serde_json::json!(chain_id);
+            self.insert(L2_CHAIN_ID_KEY, chain_id.to_be_bytes().to_vec());
+            self.insert(
+                L2_ROLLUP_CONFIG_KEY,
+                serde_json::to_vec(&value).expect("rollup config should serialize"),
+            );
         }
     }
 
@@ -425,6 +519,7 @@ mod tests {
     #[tokio::test]
     async fn loads_activation_admin_address_from_builtin_chain_id() {
         let chain_config = BaseChainConfig::ZERONET;
+        let rollup_config = chain_config.rollup_config();
 
         let mut oracle = MockOracle::new();
         oracle.insert(L1_HEAD_KEY, B256::repeat_byte(0x11).to_vec());
@@ -432,6 +527,10 @@ mod tests {
         oracle.insert(L2_CLAIM_KEY, B256::repeat_byte(0x33).to_vec());
         oracle.insert(L2_CLAIM_BLOCK_NUMBER_KEY, 40_308_263u64.to_be_bytes().to_vec());
         oracle.insert(L2_CHAIN_ID_KEY, chain_config.chain_id.to_be_bytes().to_vec());
+        oracle.insert(
+            L2_ROLLUP_CONFIG_KEY,
+            serde_json::to_vec(&rollup_config).expect("rollup config should serialize"),
+        );
 
         let boot_info = BootInfo::load(&oracle).await.expect("boot info should load");
 
@@ -439,6 +538,352 @@ mod tests {
             boot_info.activation_admin_address,
             Some(base_common_chains::ZERONET_BERYL_ACTIVATION_ADMIN_ADDRESS)
         );
+    }
+
+    #[tokio::test]
+    async fn uses_trusted_static_rollup_config_for_builtin_chain() {
+        const CLAIM_BLOCK: u64 = 40_308_263;
+
+        let chain_config = BaseChainConfig::MAINNET;
+        let upgrades = UpgradeConfig {
+            canyon_time: Some(123),
+            base: BaseUpgradeConfig {
+                azul: Some(456),
+                beryl: None,
+                cobalt: None,
+                denim: None,
+                zenith: None,
+            },
+            ..Default::default()
+        };
+        let mut oracle_rollup_config = chain_config.rollup_config();
+        oracle_rollup_config.seq_window_size += 1;
+        oracle_rollup_config.channel_timeout = 777;
+        oracle_rollup_config.upgrades = upgrades;
+        oracle_rollup_config.upgrades.base.zenith = Some(1);
+
+        let mut oracle = MockOracle::new();
+        oracle.insert(L1_HEAD_KEY, B256::repeat_byte(0x11).to_vec());
+        oracle.insert(L2_OUTPUT_ROOT_KEY, B256::repeat_byte(0x22).to_vec());
+        oracle.insert(L2_CLAIM_KEY, B256::repeat_byte(0x33).to_vec());
+        oracle.insert(L2_CLAIM_BLOCK_NUMBER_KEY, CLAIM_BLOCK.to_be_bytes().to_vec());
+        oracle.insert_rollup_config(chain_config.chain_id, &oracle_rollup_config);
+
+        let boot_info = BootInfo::load(&oracle).await.expect("boot info should load");
+
+        let mut expected_rollup_config = chain_config.rollup_config();
+        expected_rollup_config.upgrades = upgrades;
+        let claim_timestamp = expected_rollup_config.genesis.l2_time
+            + (CLAIM_BLOCK - expected_rollup_config.genesis.l2.number)
+                * expected_rollup_config.block_time;
+        let expected_schedule_id = ScheduleId::pin(&mut expected_rollup_config, claim_timestamp);
+
+        assert_eq!(boot_info.rollup_config, expected_rollup_config);
+        assert_eq!(boot_info.schedule_id, expected_schedule_id);
+    }
+
+    #[tokio::test]
+    async fn uses_live_rollup_config_for_local_devnet() {
+        const CLAIM_BLOCK: u64 = 100;
+
+        let chain_config = BaseChainConfig::DEVNET;
+        let mut rollup_config = chain_config.rollup_config();
+        rollup_config.genesis.l2_time = 1_000;
+        rollup_config.seq_window_size += 1;
+
+        let mut oracle = MockOracle::new();
+        oracle.insert(L1_HEAD_KEY, B256::repeat_byte(0x11).to_vec());
+        oracle.insert(L2_OUTPUT_ROOT_KEY, B256::repeat_byte(0x22).to_vec());
+        oracle.insert(L2_CLAIM_KEY, B256::repeat_byte(0x33).to_vec());
+        oracle.insert(L2_CLAIM_BLOCK_NUMBER_KEY, CLAIM_BLOCK.to_be_bytes().to_vec());
+        oracle.insert_rollup_config(chain_config.chain_id, &rollup_config);
+        oracle.insert(
+            L1_CONFIG_KEY,
+            serde_json::to_vec(
+                base_common_chains::L1_CONFIGS
+                    .get(&1)
+                    .expect("mainnet L1 config should be available"),
+            )
+            .expect("L1 config should serialize"),
+        );
+
+        let boot_info = BootInfo::load(&oracle).await.expect("boot info should load");
+
+        assert_eq!(boot_info.rollup_config.genesis.l2_time, 1_000);
+        assert_eq!(boot_info.rollup_config.seq_window_size, rollup_config.seq_window_size);
+    }
+
+    #[tokio::test]
+    async fn pins_schedule_to_claimed_l2_timestamp() {
+        let chain_config = BaseChainConfig::MAINNET;
+        let mut rollup_config = chain_config.rollup_config();
+        rollup_config.upgrades = UpgradeConfig {
+            regolith_time: Some(100),
+            canyon_time: Some(500),
+            delta_time: Some(200),
+            base: BaseUpgradeConfig { azul: Some(u64::MAX), ..Default::default() },
+            ..Default::default()
+        };
+
+        let mut oracle = MockOracle::new();
+        oracle.insert(L1_HEAD_KEY, B256::repeat_byte(0x11).to_vec());
+        oracle.insert(L2_OUTPUT_ROOT_KEY, B256::repeat_byte(0x22).to_vec());
+        oracle.insert(L2_CLAIM_KEY, B256::repeat_byte(0x33).to_vec());
+        oracle.insert(L2_CLAIM_BLOCK_NUMBER_KEY, 100u64.to_be_bytes().to_vec());
+        oracle.insert(L2_CHAIN_ID_KEY, chain_config.chain_id.to_be_bytes().to_vec());
+        oracle.insert(
+            L2_ROLLUP_CONFIG_KEY,
+            serde_json::to_vec(&rollup_config).expect("rollup config should serialize"),
+        );
+
+        let boot_info = BootInfo::load(&oracle).await.expect("boot info should load");
+
+        assert_eq!(boot_info.rollup_config.upgrades.regolith_time, Some(100));
+        assert_eq!(boot_info.rollup_config.upgrades.canyon_time, Some(500));
+        assert_eq!(boot_info.rollup_config.upgrades.delta_time, Some(200));
+        assert_eq!(boot_info.rollup_config.upgrades.base.azul, None);
+        let expected = ScheduleId::next_link(
+            ScheduleId::next_link(ScheduleId::next_link(B256::ZERO, 0, 100), 1, 500),
+            2,
+            200,
+        );
+        assert_eq!(boot_info.schedule_id, expected);
+    }
+
+    #[tokio::test]
+    async fn pins_schedule_to_schedule_block_override() {
+        let chain_config = BaseChainConfig::MAINNET;
+        let mut rollup_config = chain_config.rollup_config();
+        rollup_config.upgrades = UpgradeConfig {
+            regolith_time: Some(100),
+            canyon_time: Some(350),
+            ..Default::default()
+        };
+
+        let mut oracle = MockOracle::new();
+        oracle.insert(L1_HEAD_KEY, B256::repeat_byte(0x11).to_vec());
+        oracle.insert(L2_OUTPUT_ROOT_KEY, B256::repeat_byte(0x22).to_vec());
+        oracle.insert(L2_CLAIM_KEY, B256::repeat_byte(0x33).to_vec());
+        oracle.insert(L2_CLAIM_BLOCK_NUMBER_KEY, 100u64.to_be_bytes().to_vec());
+        oracle.insert(L2_SCHEDULE_BLOCK_NUMBER_KEY, 200u64.to_be_bytes().to_vec());
+        oracle.insert(L2_CHAIN_ID_KEY, chain_config.chain_id.to_be_bytes().to_vec());
+        oracle.insert(
+            L2_ROLLUP_CONFIG_KEY,
+            serde_json::to_vec(&rollup_config).expect("rollup config should serialize"),
+        );
+
+        let boot_info = BootInfo::load(&oracle).await.expect("boot info should load");
+
+        assert_eq!(boot_info.rollup_config.upgrades.canyon_time, Some(350));
+        let expected = ScheduleId::next_link(ScheduleId::next_link(B256::ZERO, 0, 100), 1, 350);
+        assert_eq!(boot_info.schedule_id, expected);
+    }
+
+    #[tokio::test]
+    async fn treats_explicit_zero_schedule_block_as_unset() {
+        let chain_config = BaseChainConfig::MAINNET;
+        let rollup_config = chain_config.rollup_config();
+
+        let mut oracle = MockOracle::new();
+        oracle.insert(L1_HEAD_KEY, B256::repeat_byte(0x11).to_vec());
+        oracle.insert(L2_OUTPUT_ROOT_KEY, B256::repeat_byte(0x22).to_vec());
+        oracle.insert(L2_CLAIM_KEY, B256::repeat_byte(0x33).to_vec());
+        oracle.insert(L2_CLAIM_BLOCK_NUMBER_KEY, 100u64.to_be_bytes().to_vec());
+        oracle.insert(L2_SCHEDULE_BLOCK_NUMBER_KEY, 0u64.to_be_bytes().to_vec());
+        oracle.insert(L2_CHAIN_ID_KEY, chain_config.chain_id.to_be_bytes().to_vec());
+        oracle.insert(
+            L2_ROLLUP_CONFIG_KEY,
+            serde_json::to_vec(&rollup_config).expect("rollup config should serialize"),
+        );
+
+        let boot_info = BootInfo::load(&oracle).await.expect("boot info should load");
+
+        assert_eq!(boot_info.claimed_l2_block_number, 100);
+    }
+
+    #[tokio::test]
+    async fn normalizes_genesis_active_zero_timestamps() {
+        const CLAIM_BLOCK: u64 = 100;
+
+        let chain_config = BaseChainConfig::MAINNET;
+        let mut rollup_config = chain_config.rollup_config();
+        let genesis_timestamp = rollup_config.genesis.l2_time;
+        rollup_config.upgrades.regolith_time = Some(0);
+        assert_eq!(rollup_config.upgrades.regolith_time, Some(0), "premise: genesis-active");
+
+        let mut oracle = MockOracle::new();
+        oracle.insert(L1_HEAD_KEY, B256::repeat_byte(0x11).to_vec());
+        oracle.insert(L2_OUTPUT_ROOT_KEY, B256::repeat_byte(0x22).to_vec());
+        oracle.insert(L2_CLAIM_KEY, B256::repeat_byte(0x33).to_vec());
+        oracle.insert(L2_CLAIM_BLOCK_NUMBER_KEY, CLAIM_BLOCK.to_be_bytes().to_vec());
+        oracle.insert(L2_CHAIN_ID_KEY, chain_config.chain_id.to_be_bytes().to_vec());
+        oracle.insert(
+            L2_ROLLUP_CONFIG_KEY,
+            serde_json::to_vec(&rollup_config).expect("rollup config should serialize"),
+        );
+
+        let boot_info = BootInfo::load(&oracle).await.expect("boot info should load");
+
+        assert_eq!(boot_info.rollup_config.upgrades.regolith_time, Some(genesis_timestamp));
+
+        let claim_timestamp = genesis_timestamp
+            + (CLAIM_BLOCK - rollup_config.genesis.l2.number) * rollup_config.block_time;
+        assert_eq!(
+            boot_info.schedule_id,
+            ScheduleId::pin(&mut rollup_config.clone(), claim_timestamp)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_schedule_block_before_claim_block() {
+        let chain_config = BaseChainConfig::MAINNET;
+        let rollup_config = chain_config.rollup_config();
+
+        let mut oracle = MockOracle::new();
+        oracle.insert(L1_HEAD_KEY, B256::repeat_byte(0x11).to_vec());
+        oracle.insert(L2_OUTPUT_ROOT_KEY, B256::repeat_byte(0x22).to_vec());
+        oracle.insert(L2_CLAIM_KEY, B256::repeat_byte(0x33).to_vec());
+        oracle.insert(L2_CLAIM_BLOCK_NUMBER_KEY, 100u64.to_be_bytes().to_vec());
+        oracle.insert(L2_SCHEDULE_BLOCK_NUMBER_KEY, 99u64.to_be_bytes().to_vec());
+        oracle.insert(L2_CHAIN_ID_KEY, chain_config.chain_id.to_be_bytes().to_vec());
+        oracle.insert(
+            L2_ROLLUP_CONFIG_KEY,
+            serde_json::to_vec(&rollup_config).expect("rollup config should serialize"),
+        );
+
+        let err =
+            BootInfo::load(&oracle).await.expect_err("schedule block before claim should fail");
+        assert!(matches!(
+            err,
+            OracleProviderError::ScheduleBlockBeforeClaim { schedule_block: 99, claim_block: 100 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_zero_l2_block_time() {
+        let chain_config = BaseChainConfig::MAINNET;
+        let mut rollup_config = chain_config.rollup_config();
+        rollup_config.block_time = 0;
+
+        let mut oracle = MockOracle::new();
+        oracle.insert(L1_HEAD_KEY, B256::repeat_byte(0x11).to_vec());
+        oracle.insert(L2_OUTPUT_ROOT_KEY, B256::repeat_byte(0x22).to_vec());
+        oracle.insert(L2_CLAIM_KEY, B256::repeat_byte(0x33).to_vec());
+        oracle.insert(L2_CLAIM_BLOCK_NUMBER_KEY, 100u64.to_be_bytes().to_vec());
+        oracle.insert_rollup_config(ORACLE_CHAIN_ID, &rollup_config);
+
+        let err = BootInfo::load(&oracle).await.expect_err("zero block time should fail");
+        assert!(matches!(err, OracleProviderError::InvalidL2BlockTime));
+    }
+
+    #[tokio::test]
+    async fn rejects_l2_claim_before_genesis() {
+        let chain_config = BaseChainConfig::MAINNET;
+        let mut rollup_config = chain_config.rollup_config();
+        rollup_config.genesis.l2.number = 101;
+
+        let mut oracle = MockOracle::new();
+        oracle.insert(L1_HEAD_KEY, B256::repeat_byte(0x11).to_vec());
+        oracle.insert(L2_OUTPUT_ROOT_KEY, B256::repeat_byte(0x22).to_vec());
+        oracle.insert(L2_CLAIM_KEY, B256::repeat_byte(0x33).to_vec());
+        oracle.insert(L2_CLAIM_BLOCK_NUMBER_KEY, 100u64.to_be_bytes().to_vec());
+        oracle.insert_rollup_config(ORACLE_CHAIN_ID, &rollup_config);
+
+        let err = BootInfo::load(&oracle).await.expect_err("pre-genesis claim should fail");
+        assert!(matches!(
+            err,
+            OracleProviderError::L2ClaimBeforeGenesis { claim_block: 100, genesis_block: 101 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_l2_schedule_timestamp_overflow() {
+        let chain_config = BaseChainConfig::MAINNET;
+        let mut rollup_config = chain_config.rollup_config();
+        rollup_config.genesis.l2.number = 0;
+        rollup_config.genesis.l2_time = u64::MAX;
+        rollup_config.block_time = 2;
+
+        let mut oracle = MockOracle::new();
+        oracle.insert(L1_HEAD_KEY, B256::repeat_byte(0x11).to_vec());
+        oracle.insert(L2_OUTPUT_ROOT_KEY, B256::repeat_byte(0x22).to_vec());
+        oracle.insert(L2_CLAIM_KEY, B256::repeat_byte(0x33).to_vec());
+        oracle.insert(L2_CLAIM_BLOCK_NUMBER_KEY, 1u64.to_be_bytes().to_vec());
+        oracle.insert(L2_SCHEDULE_BLOCK_NUMBER_KEY, 2u64.to_be_bytes().to_vec());
+        oracle.insert_rollup_config(ORACLE_CHAIN_ID, &rollup_config);
+
+        let err = BootInfo::load(&oracle).await.expect_err("overflowing timestamp should fail");
+        assert!(matches!(
+            err,
+            OracleProviderError::L2ScheduleTimestampOverflow { schedule_block: 2 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_active_zenith_upgrade() {
+        let chain_config = BaseChainConfig::MAINNET;
+
+        for zenith_timestamp in [0, 1_000] {
+            let mut rollup_config = chain_config.rollup_config();
+            rollup_config.upgrades.base.zenith = Some(zenith_timestamp);
+
+            let mut oracle = MockOracle::new();
+            oracle.insert(L1_HEAD_KEY, B256::repeat_byte(0x11).to_vec());
+            oracle.insert(L2_OUTPUT_ROOT_KEY, B256::repeat_byte(0x22).to_vec());
+            oracle.insert(L2_CLAIM_KEY, B256::repeat_byte(0x33).to_vec());
+            oracle.insert(L2_CLAIM_BLOCK_NUMBER_KEY, 100u64.to_be_bytes().to_vec());
+            oracle.insert_rollup_config(ORACLE_CHAIN_ID, &rollup_config);
+
+            let err = BootInfo::load(&oracle).await.expect_err("active Zenith upgrade should fail");
+            assert!(matches!(err, OracleProviderError::UncommittedZenithUpgrade));
+        }
+    }
+
+    #[tokio::test]
+    async fn clears_future_zenith_upgrade() {
+        const CLAIM_BLOCK: u64 = 100;
+
+        let chain_config = BaseChainConfig::MAINNET;
+        let mut rollup_config = chain_config.rollup_config();
+        let schedule_timestamp = rollup_config.genesis.l2_time
+            + (CLAIM_BLOCK - rollup_config.genesis.l2.number) * rollup_config.block_time;
+        rollup_config.upgrades.base.zenith = Some(schedule_timestamp + 1);
+
+        let mut oracle = MockOracle::new();
+        oracle.insert(L1_HEAD_KEY, B256::repeat_byte(0x11).to_vec());
+        oracle.insert(L2_OUTPUT_ROOT_KEY, B256::repeat_byte(0x22).to_vec());
+        oracle.insert(L2_CLAIM_KEY, B256::repeat_byte(0x33).to_vec());
+        oracle.insert(L2_CLAIM_BLOCK_NUMBER_KEY, CLAIM_BLOCK.to_be_bytes().to_vec());
+        oracle.insert_rollup_config(ORACLE_CHAIN_ID, &rollup_config);
+
+        let boot_info = BootInfo::load(&oracle).await.expect("boot info should load");
+
+        assert_eq!(boot_info.rollup_config.upgrades.base.zenith, None);
+
+        let mut expected_config = rollup_config.clone();
+        expected_config.upgrades.base.zenith = None;
+        assert_eq!(
+            boot_info.schedule_id,
+            ScheduleId::pin(&mut expected_config, schedule_timestamp)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_zero_l2_genesis_timestamp() {
+        let chain_config = BaseChainConfig::MAINNET;
+        let mut rollup_config = chain_config.rollup_config();
+        rollup_config.genesis.l2.number = 0;
+        rollup_config.genesis.l2_time = 0;
+
+        let mut oracle = MockOracle::new();
+        oracle.insert(L1_HEAD_KEY, B256::repeat_byte(0x11).to_vec());
+        oracle.insert(L2_OUTPUT_ROOT_KEY, B256::repeat_byte(0x22).to_vec());
+        oracle.insert(L2_CLAIM_KEY, B256::repeat_byte(0x33).to_vec());
+        oracle.insert(L2_CLAIM_BLOCK_NUMBER_KEY, 1u64.to_be_bytes().to_vec());
+        oracle.insert_rollup_config(ORACLE_CHAIN_ID, &rollup_config);
+
+        let err = BootInfo::load(&oracle).await.expect_err("zero L2 genesis timestamp should fail");
+        assert!(matches!(err, OracleProviderError::InvalidL2GenesisTimestamp));
     }
 
     #[tokio::test]
@@ -450,7 +895,7 @@ mod tests {
         oracle.insert(L2_OUTPUT_ROOT_KEY, B256::repeat_byte(0x22).to_vec());
         oracle.insert(L2_CLAIM_KEY, B256::repeat_byte(0x33).to_vec());
         oracle.insert(L2_CLAIM_BLOCK_NUMBER_KEY, 40_308_263u64.to_be_bytes().to_vec());
-        oracle.insert(L2_CHAIN_ID_KEY, 999_999_999u64.to_be_bytes().to_vec());
+        oracle.insert(L2_CHAIN_ID_KEY, ORACLE_CHAIN_ID.to_be_bytes().to_vec());
         oracle.insert(
             L2_ROLLUP_CONFIG_KEY,
             serde_json::to_vec(&rollup_config).expect("rollup config should serialize"),
@@ -460,7 +905,7 @@ mod tests {
         assert!(matches!(
             err,
             OracleProviderError::RollupConfigChainIdMismatch {
-                boot_chain_id: 999_999_999,
+                boot_chain_id: ORACLE_CHAIN_ID,
                 rollup_config_chain_id: 84532,
             }
         ));
@@ -468,9 +913,7 @@ mod tests {
 
     #[tokio::test]
     async fn accepts_oracle_rollup_config_with_matching_chain_id() {
-        const ORACLE_CHAIN_ID: u64 = 999_999_999;
-
-        let rollup_config = base_common_chains::rollup_config!(BaseChainConfig::SEPOLIA);
+        let rollup_config = BaseChainConfig::SEPOLIA.rollup_config();
         let mut rollup_config_value =
             serde_json::to_value(&rollup_config).expect("rollup config should convert to value");
         rollup_config_value["l2_chain_id"] = serde_json::json!(ORACLE_CHAIN_ID);
@@ -495,14 +938,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_oracle_rollup_config_with_beryl_and_no_activation_admin() {
-        const ORACLE_CHAIN_ID: u64 = 999_999_999;
-
-        let rollup_config = base_common_chains::rollup_config!(BaseChainConfig::SEPOLIA);
+    async fn accepts_pre_beryl_oracle_chain_without_activation_admin() {
+        let rollup_config = BaseChainConfig::SEPOLIA.rollup_config();
         let mut rollup_config_value =
             serde_json::to_value(&rollup_config).expect("rollup config should convert to value");
         rollup_config_value["l2_chain_id"] = serde_json::json!(ORACLE_CHAIN_ID);
-        rollup_config_value["base"] = serde_json::json!({ "beryl": 0 });
+        rollup_config_value["base"] = serde_json::json!({ "beryl": u64::MAX });
+
+        let mut oracle = MockOracle::new();
+        oracle.insert(L1_HEAD_KEY, B256::repeat_byte(0x11).to_vec());
+        oracle.insert(L2_OUTPUT_ROOT_KEY, B256::repeat_byte(0x22).to_vec());
+        oracle.insert(L2_CLAIM_KEY, B256::repeat_byte(0x33).to_vec());
+        oracle.insert(L2_CLAIM_BLOCK_NUMBER_KEY, 40_308_263u64.to_be_bytes().to_vec());
+        oracle.insert(L2_CHAIN_ID_KEY, ORACLE_CHAIN_ID.to_be_bytes().to_vec());
+        oracle.insert(
+            L2_ROLLUP_CONFIG_KEY,
+            serde_json::to_vec(&rollup_config_value).expect("rollup config should serialize"),
+        );
+
+        let boot_info = BootInfo::load(&oracle).await.expect("pre-Beryl boot info should load");
+
+        assert_eq!(boot_info.activation_admin_address, None);
+        assert_eq!(boot_info.rollup_config.upgrades.base.beryl, None);
+    }
+
+    #[tokio::test]
+    async fn rejects_oracle_rollup_config_with_beryl_and_no_activation_admin() {
+        let rollup_config = BaseChainConfig::SEPOLIA.rollup_config();
+        let mut rollup_config_value =
+            serde_json::to_value(&rollup_config).expect("rollup config should convert to value");
+        rollup_config_value["l2_chain_id"] = serde_json::json!(ORACLE_CHAIN_ID);
+        rollup_config_value["base"] = serde_json::json!({ "beryl": 1 });
 
         let mut oracle = MockOracle::new();
         oracle.insert(L1_HEAD_KEY, B256::repeat_byte(0x11).to_vec());

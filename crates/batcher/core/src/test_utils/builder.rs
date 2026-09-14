@@ -3,8 +3,8 @@
 use std::{sync::Arc, time::Duration};
 
 use alloy_primitives::Address;
-use base_batcher_encoder::{BatchSubmission, DaType, SubmissionId};
-use base_protocol::{ChannelId, Frame};
+use base_batcher_encoder::{BatchSubmission, BlobPayload, SubmissionId};
+use base_protocol::Frame;
 use base_runtime::Runtime;
 use base_tx_manager::TxManager;
 
@@ -25,12 +25,10 @@ impl SubmissionStub {
 
     /// Returns a stub submission with the given id.
     pub fn with_id(id: u64) -> BatchSubmission {
-        BatchSubmission {
-            id: SubmissionId(id),
-            channel_id: ChannelId::default(),
-            da_type: DaType::Blob,
-            frames: vec![Arc::new(Frame::default())],
-        }
+        BatchSubmission::blobs(
+            SubmissionId(id),
+            vec![BlobPayload::new(vec![Arc::new(Frame::default())])],
+        )
     }
 }
 
@@ -70,7 +68,7 @@ impl DriverFixture {
         Arc<NoopThrottleClient>,
         PendingL1HeadSource,
     > {
-        BatchDriver::new(
+        BatchDriver::new_without_derivation_status(
             runtime,
             pipeline,
             PendingSource,

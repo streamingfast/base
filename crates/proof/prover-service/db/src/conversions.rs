@@ -8,7 +8,7 @@ use base_prover_service_protocol::{
     ProofJob as ProtocolProofJob, ProofJobStatus as ProtocolProofJobStatus,
     ProofResult as ProtocolProofResult, ProofStatus as ProtocolProofStatus,
     ProofSummary as ProtocolProofSummary, ProofType as ProtocolProofType,
-    SessionType as ProtocolSessionType, SnarkGroth16ProofResult, TeeKind as ProtocolTeeKind,
+    SessionType as ProtocolSessionType, SnarkPlonkProofResult, TeeKind as ProtocolTeeKind,
     ZkProofResult, ZkVm as ProtocolZkVm,
 };
 
@@ -44,7 +44,7 @@ impl From<ProtocolProofType> for ApiProofType {
     fn from(proof_type: ProtocolProofType) -> Self {
         match proof_type {
             ProtocolProofType::Compressed => Self::Compressed,
-            ProtocolProofType::SnarkGroth16 => Self::SnarkGroth16,
+            ProtocolProofType::SnarkPlonk => Self::SnarkPlonk,
             ProtocolProofType::Tee => Self::Tee,
         }
     }
@@ -54,7 +54,7 @@ impl From<ApiProofType> for ProtocolProofType {
     fn from(proof_type: ApiProofType) -> Self {
         match proof_type {
             ApiProofType::Compressed => Self::Compressed,
-            ApiProofType::SnarkGroth16 => Self::SnarkGroth16,
+            ApiProofType::SnarkPlonk => Self::SnarkPlonk,
             ApiProofType::Tee => Self::Tee,
         }
     }
@@ -244,8 +244,8 @@ impl ProofRequest {
                     execution_stats: None,
                 })
             }),
-            Some(ProofType::OpSuccinctSp1ClusterSnarkGroth16) => self.snark_receipt.map(|proof| {
-                ProtocolProofResult::SnarkGroth16(SnarkGroth16ProofResult {
+            Some(ProofType::OpSuccinctSp1ClusterSnarkPlonk) => self.snark_receipt.map(|proof| {
+                ProtocolProofResult::SnarkPlonk(SnarkPlonkProofResult {
                     proof: ZkProofResult {
                         zk_vm: ProtocolZkVm::Sp1,
                         proof: proof.into(),
@@ -260,7 +260,9 @@ impl ProofRequest {
 
 #[cfg(test)]
 mod tests {
-    use base_prover_service_protocol::{ProofRequest as ProtocolProofRequest, ProofRequestKind};
+    use base_prover_service_protocol::{
+        ProofRequest as ProtocolProofRequest, ProofRequestKind, ZkBackend as ProtocolZkBackend,
+    };
     use chrono::Utc;
     use uuid::Uuid;
 
@@ -275,7 +277,9 @@ mod tests {
                 sequence_window: None,
                 l1_head: None,
                 intermediate_root_interval: None,
+                schedule_l2_block_number: None,
                 zk_vm: ProtocolZkVm::Sp1,
+                zk_backend: ProtocolZkBackend::Cluster,
             }),
         })
         .expect("protocol request should serialize")
@@ -339,7 +343,7 @@ mod tests {
     #[test]
     fn proof_type_round_trips() {
         for proof_type in
-            [ProtocolProofType::Compressed, ProtocolProofType::SnarkGroth16, ProtocolProofType::Tee]
+            [ProtocolProofType::Compressed, ProtocolProofType::SnarkPlonk, ProtocolProofType::Tee]
         {
             assert_eq!(ProtocolProofType::from(ApiProofType::from(proof_type)), proof_type);
         }
@@ -452,12 +456,12 @@ mod tests {
 
     #[test]
     fn stored_proof_result_falls_back_to_snark_receipt() {
-        let mut req = proof_request(Some(ProofType::OpSuccinctSp1ClusterSnarkGroth16));
+        let mut req = proof_request(Some(ProofType::OpSuccinctSp1ClusterSnarkPlonk));
         req.snark_receipt = Some(vec![4, 5, 6]);
 
         assert_eq!(
             req.stored_proof_result().unwrap(),
-            Some(ProtocolProofResult::SnarkGroth16(SnarkGroth16ProofResult {
+            Some(ProtocolProofResult::SnarkPlonk(SnarkPlonkProofResult {
                 proof: ZkProofResult {
                     zk_vm: ProtocolZkVm::Sp1,
                     proof: vec![4, 5, 6].into(),
@@ -482,7 +486,8 @@ mod tests {
                     "config_hash": "0x0000000000000000000000000000000000000000000000000000000000000000"
                 },
                 "proposals": [],
-                "tee_kind": "aws_nitro"
+                "tee_kind": "aws_nitro",
+                "tee_signer": "0x1111111111111111111111111111111111111111"
             }
         });
         let mut req = proof_request(None);

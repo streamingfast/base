@@ -9,6 +9,15 @@ Vector tails these same JSONL files and ships newline-delimited event records to
 `audit-archiver`. The audit HTTP ingest endpoint is collector-facing and expects
 one event JSON object per line, not a wrapped JSON batch.
 
+## Postgres Retention
+
+`audit-archiver` stores events in Postgres for operational queries. Postgres is
+not the long-term archive. A background worker deletes rows by event type:
+high-volume proxy and builder-decision events default to 3 days, ingress and
+forwarding events default to 7 days, and failures, drops, inclusion, and
+flashblock events default to 30 days. Autovacuum reclaims the resulting table
+bloat.
+
 ## Configuration Fields
 
 Rust producers should expose these config fields directly or with a
@@ -19,6 +28,8 @@ producer-specific prefix:
 | `enabled` | boolean | Enables transaction event journal writes. |
 | `file_path` | string | Dedicated JSONL file path tailed by Vector. |
 | `queue_capacity` | integer | Bounded in-process event queue size. Producers drop on backpressure instead of blocking transaction serving paths. |
+| `max_file_bytes` | integer | Maximum size of the active JSONL segment before it is renamed and a new segment is opened. |
+| `max_files` | integer | Maximum number of JSONL segments retained, including the active segment. |
 | `required` | boolean | If true, fail service initialization when the file writer cannot open. Runtime write failures remain observable and non-fatal. |
 | `producer` | string | One of the producer identities below. |
 | `network` | string | Network label, for example `base-mainnet` or `base-sepolia`. |
@@ -30,6 +41,8 @@ For Go/proxyd, mirror the same names in TOML:
 enabled = true
 file_path = "/var/log/base/transaction-events.jsonl"
 queue_capacity = 16384
+max_file_bytes = 134217728
+max_files = 8
 required = false
 producer = "base-routing/proxyd"
 network = "base-mainnet"
@@ -94,8 +107,11 @@ and `privateKey` before ingest.
 
 ## Local Devnet Verification
 
-The ingress devnet stack runs a local Postgres, Vector shipper, and
-Postgres-backed `audit-archiver` ingest path:
+Core devnet (`just devnet up` / `just devnet up-single`) enables durable
+transaction event journals on `base-client` and `base-builder`, writing JSONL
+under `.devnet/transaction-events/`. The ingress overlay adds the collection
+pipeline (Vector, Postgres, `audit-archiver`) plus ingress/proxyd producers; it
+does not own node journal config.
 
 ```bash
 just devnet ingress
@@ -115,6 +131,10 @@ The smoke test sends one transaction through ingress, waits for Vector to ship
 JSONL events from ingress, proxyd, txpool tracing, and builder producers, and
 verifies `audit-archiver` can read the persisted events back from Postgres by
 transaction hash.
+
+For local Vector health, alert or inspect `component_discarded_events_total`.
+`parse_transaction_events` drops malformed JSONL lines, and
+`validate_transaction_events` drops parsed events with unsafe `data` keys.
 
 ## Producer Values
 
@@ -154,9 +174,6 @@ Ingress/audit:
 - `SIMULATION_STARTED`
 - `SIMULATION_SUCCEEDED`
 - `SIMULATION_FAILED`
-- `INGRESS_TX_FORWARD_ATTEMPT`
-- `INGRESS_TX_FORWARD_SUCCESS`
-- `INGRESS_TX_FORWARD_FAILURE`
 - `INGRESS_METERING_SEND_ATTEMPT`
 - `INGRESS_METERING_SEND_SUCCESS`
 - `INGRESS_METERING_SEND_FAILURE`
@@ -171,8 +188,6 @@ Mempool/node:
 - `TXPOOL_DROPPED`
 - `TXPOOL_REPLACED`
 - `TXPOOL_TRACKING_OVERFLOWED`
-- `TXPOOL_BLOCK_INCLUDED`
-- `TXPOOL_FLASHBLOCK_INCLUDED`
 
 Forwarding:
 

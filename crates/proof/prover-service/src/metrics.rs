@@ -15,8 +15,6 @@ use metrics::{counter, describe_counter, describe_histogram, histogram};
 pub const REQUESTS: &str = "prover_service.requests";
 /// RPC response latency in milliseconds. Tags: method, success
 pub const RESPONSE_LATENCY_MS: &str = "prover_service.response_latency_ms";
-/// Time spent in witness generation only. Tags: `proof_type`, success
-pub const WITNESS_GENERATION_DURATION_MS: &str = "prover_service.witness_generation_duration_ms";
 /// End-to-end wall-clock duration from proof request creation to completion.
 /// Tags: `proof_type`, status
 pub const PROOF_REQUEST_DURATION_MS: &str = "prover_service.proof_request_duration_ms";
@@ -48,10 +46,6 @@ impl ProverMetrics {
     pub fn init() {
         describe_counter!(REQUESTS, "Unified RPC request counter");
         describe_histogram!(RESPONSE_LATENCY_MS, "RPC response latency (ms)");
-        describe_histogram!(
-            WITNESS_GENERATION_DURATION_MS,
-            "Time spent in witness generation only (ms)"
-        );
         describe_histogram!(
             PROOF_REQUEST_DURATION_MS,
             "End-to-end wall-clock proof request duration (ms)"
@@ -96,15 +90,6 @@ pub fn inc_worker_requests(method: &str, success: bool, status_code: &str, worke
 pub fn record_response_latency(method: &str, success: bool, duration_ms: f64) {
     histogram!(RESPONSE_LATENCY_MS,
         "method" => method.to_string(),
-        "success" => success.to_string(),
-    )
-    .record(duration_ms);
-}
-
-/// Record witness generation duration in milliseconds.
-pub fn record_witness_generation_duration(proof_type: &str, success: bool, duration_ms: f64) {
-    histogram!(WITNESS_GENERATION_DURATION_MS,
-        "proof_type" => proof_type.to_string(),
         "success" => success.to_string(),
     )
     .record(duration_ms);
@@ -172,7 +157,7 @@ pub fn record_terminal_proof_job(status: &str, job: &ProofJob) {
 pub const fn proof_type_label(proof_type: ProofType) -> &'static str {
     match proof_type {
         ProofType::OpSuccinctSp1ClusterCompressed => "compressed",
-        ProofType::OpSuccinctSp1ClusterSnarkGroth16 => "snark_groth16",
+        ProofType::OpSuccinctSp1ClusterSnarkPlonk => "snark_plonk",
     }
 }
 
@@ -180,7 +165,7 @@ pub const fn proof_type_label(proof_type: ProofType) -> &'static str {
 pub const fn api_proof_type_label(proof_type: ApiProofType) -> &'static str {
     match proof_type {
         ApiProofType::Compressed => "compressed",
-        ApiProofType::SnarkGroth16 => "snark_groth16",
+        ApiProofType::SnarkPlonk => "snark_plonk",
         ApiProofType::Tee => "tee",
     }
 }

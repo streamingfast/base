@@ -3,119 +3,81 @@
 use base_common_genesis::RollupConfig;
 use base_protocol::{
     BLOB_DERIVATION_PREFIX_SIZE as PROTOCOL_BLOB_DERIVATION_PREFIX_SIZE,
-    BLOB_MAX_DATA_SIZE as PROTOCOL_BLOB_MAX_DATA_SIZE, BatchType,
+    BLOB_MAX_DATA_SIZE as PROTOCOL_BLOB_MAX_DATA_SIZE, Frame,
     MAX_BLOB_FRAME_SIZE as PROTOCOL_MAX_BLOB_FRAME_SIZE,
 };
 
-use crate::DaType;
+use crate::{BrotliLevel, DaType};
 
 /// Configuration for the [`BatchEncoder`](crate::BatchEncoder).
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
-    /// Target compressed output size per channel. Drives `ShadowCompressor` closure.
-    /// Default: 130,043 bytes (`MAX_BLOB_FRAME_SIZE`).
-    pub target_frame_size: usize,
-
-    /// Maximum byte size of each output frame when draining a closed channel.
+    /// Optional soft target for stable bytes emitted by the compression stream.
+    /// The reaching batch stays, then the channel closes. `None` closes on
+    /// duration, flush, or protocol limits.
     ///
-    /// Set smaller to force multi-frame output (e.g. in tests that exercise
-    /// partial-channel submission and channel timeouts).
+    /// Default: `None`.
+    pub compressed_size_target: Option<usize>,
+
+    /// Maximum serialized derivation frame size.
+    ///
+    /// Smaller values force channel output across more frames. Every frame must
+    /// still fit in a blob because calldata submissions may temporarily switch
+    /// to blob DA while throttling.
+    ///
+    /// Default: [`Self::MAX_BLOB_FRAME_SIZE`].
     pub max_frame_size: usize,
 
     /// Maximum L1 blocks a channel may stay open.
+    ///
+    /// Its effective duration before closing is
+    /// `max_channel_duration - sub_safety_margin`.
+    ///
     /// Default: 2.
     pub max_channel_duration: u64,
 
-    /// Safety margin subtracted from `max_channel_duration` when evaluating channel
-    /// timeout. The effective timeout is `max_channel_duration - sub_safety_margin`,
-    /// ensuring channels have closed this many L1 blocks before the configured
-    /// duration expires.
+    /// Subtracted from `max_channel_duration` for the close deadline.
     ///
-    /// Set this large enough so that in-flight frames land well within the protocol's
-    /// `channel_timeout` inclusion window. A margin of 4–10 is typical; the default
-    /// of 0 means no margin (effective timeout equals `max_channel_duration` exactly).
-    ///
-    /// Note: if `sub_safety_margin >= max_channel_duration` the effective timeout
-    /// saturates to 0 L1 blocks and every channel closes immediately on the next
-    /// `advance_l1_head` call. Ensure `sub_safety_margin < max_channel_duration`.
+    /// This leaves time for in-flight frames to land before the derivation
+    /// channel timeout. It must be smaller than `max_channel_duration`.
     ///
     /// Default: 0.
     pub sub_safety_margin: u64,
 
-    /// Number of frames to pack into a single L1 transaction.
+    /// Maximum blobs packed into one L1 transaction.
     ///
-    /// Each frame maps to one EIP-4844 blob, so setting this to N submits N blobs
-    /// per transaction. Cancun supports up to 6; Isthmus (EIP-7892) up to 21.
+    /// This controls transaction packing and does not close channels. It cannot
+    /// exceed [`Self::MAX_BLOBS_PER_TX`].
     ///
-    /// Default: 1 (one blob per transaction).
-    pub target_num_frames: usize,
+    /// Default: 6.
+    pub max_blobs_per_tx: usize,
 
-    /// Maximum number of L2 blocks to accumulate into one span batch.
+    /// How frames are encoded for L1 submission.
     ///
-    /// When unset, span batches close only on size and channel-duration thresholds.
-    /// Set this to match the reference batcher's `max-blocks-per-span-batch` behavior.
-    ///
-    /// Default: `None`.
-    pub max_blocks_per_span_batch: Option<usize>,
-
-    /// Whether to encode blocks as individual
-    /// [`SingleBatch`](base_protocol::batch::SingleBatch)es
-    /// or accumulate them into a single [`SpanBatch`](base_protocol::SpanBatch).
-    ///
-    /// Default: [`BatchType::Single`].
-    pub batch_type: BatchType,
-
-    /// How frames should be encoded for L1 submission.
-    ///
-    /// When set to [`DaType::Calldata`], set [`target_num_frames`] to `1` so
-    /// that each [`BatchSubmission`](crate::BatchSubmission) contains exactly one frame
-    /// (one calldata tx per frame matches the derivation protocol).
+    /// Calldata submissions carry one frame per transaction. Blob submissions
+    /// may pack frames from multiple channels.
     ///
     /// Default: [`DaType::Blob`].
-    ///
-    /// [`target_num_frames`]: EncoderConfig::target_num_frames
     pub da_type: DaType,
 
-    /// Approximate compression ratio used when estimating span batch compressed size.
+    /// Brotli quality used for newly opened channels.
     ///
-    /// Applied as `raw_bytes * approx_compr_ratio` to predict compressed output size
-    /// without actually compressing. Should be slightly below the typical observed ratio
-    /// to avoid creating a small leftover frame. Also passed to the `ShadowCompressor`
-    /// as the ratio hint used when operating in [`BatchType::Single`] mode.
+    /// Brotli channels require Fjord.
     ///
-    /// Default: `0.6` (matches the reference batcher's `--approx-compr-ratio` default).
-    pub approx_compr_ratio: f64,
-
-    /// Maximum serialized size of a single L1 calldata transaction in bytes.
-    ///
-    /// When set, the calldata frame packing path accumulates frames until adding
-    /// the next frame would exceed this limit, then cuts the transaction at that point.
-    /// At least one frame is always included regardless of size, so oversized frames
-    /// are still submitted (governed by [`max_frame_size`] instead).
-    ///
-    /// This is a no-op when [`da_type`] is [`DaType::Blob`], since the blob size is
-    /// the binding constraint for blob DA.
-    ///
-    /// Default: `None` (no cap; reference batcher equivalent default is 120,000 bytes).
-    ///
-    /// [`max_frame_size`]: EncoderConfig::max_frame_size
-    /// [`da_type`]: EncoderConfig::da_type
-    pub max_l1_tx_size_bytes: Option<usize>,
+    /// Default: [`BrotliLevel::Brotli10`].
+    pub brotli_level: BrotliLevel,
 }
 
 impl Default for EncoderConfig {
     fn default() -> Self {
         Self {
-            target_frame_size: Self::MAX_BLOB_FRAME_SIZE,
+            compressed_size_target: None,
             max_frame_size: Self::MAX_BLOB_FRAME_SIZE,
             max_channel_duration: 2,
             sub_safety_margin: 0,
-            target_num_frames: 1,
-            max_blocks_per_span_batch: None,
-            batch_type: BatchType::Single,
+            max_blobs_per_tx: 6,
             da_type: DaType::Blob,
-            approx_compr_ratio: 0.6,
-            max_l1_tx_size_bytes: None,
+            brotli_level: BrotliLevel::DEFAULT,
         }
     }
 }
@@ -131,54 +93,82 @@ impl EncoderConfig {
     /// derivation-version prefix.
     pub const MAX_BLOB_FRAME_SIZE: usize = PROTOCOL_MAX_BLOB_FRAME_SIZE;
 
+    /// Fusaka hard limit for blobs carried by one transaction.
+    pub const MAX_BLOBS_PER_TX: usize = 6;
+
     /// Validate the configuration, returning an error if any constraint is violated.
     ///
-    /// This should be called at service startup before constructing a
-    /// [`BatchEncoder`](crate::BatchEncoder). Catching misconfigurations early prevents
-    /// subtle runtime failures such as channels closing immediately on every
-    /// `advance_l1_head` call (which occurs when `sub_safety_margin >= max_channel_duration`).
-    pub const fn validate(&self) -> Result<(), EncoderConfigError> {
+    /// [`BatchEncoder::new`](crate::BatchEncoder::new) calls this automatically.
+    /// It remains public for CLI and service startup validation.
+    pub fn validate(&self) -> Result<(), EncoderConfigError> {
+        // Channel timing must leave at least one L1 block of usable duration.
         if self.sub_safety_margin >= self.max_channel_duration {
             return Err(EncoderConfigError::SafetyMarginTooLarge {
                 sub_safety_margin: self.sub_safety_margin,
                 max_channel_duration: self.max_channel_duration,
             });
         }
-        if matches!(self.da_type, DaType::Calldata) && self.target_num_frames != 1 {
-            return Err(EncoderConfigError::CalldataRequiresSingleFrame {
-                target_num_frames: self.target_num_frames,
+
+        // Frame limits must satisfy derivation framing before DA-specific checks.
+        // Every frame must carry at least one complete channel byte.
+        let min_frame_size = Frame::ENCODED_OVERHEAD + 1;
+        if self.max_frame_size < min_frame_size {
+            return Err(EncoderConfigError::FrameSizeTooSmall {
+                max_frame_size: self.max_frame_size,
+                min_frame_size,
             });
         }
-        if matches!(self.max_blocks_per_span_batch, Some(0 | 1)) {
-            return Err(EncoderConfigError::InvalidMaxBlocksPerSpanBatch);
+
+        let max_protocol_frame_size = Frame::ENCODED_OVERHEAD + Frame::MAX_LEN;
+        if self.max_frame_size > max_protocol_frame_size {
+            return Err(EncoderConfigError::FrameSizeTooLarge {
+                max_frame_size: self.max_frame_size,
+                max_protocol_frame_size,
+            });
         }
-        if matches!(self.da_type, DaType::Blob) && self.max_frame_size > Self::MAX_BLOB_FRAME_SIZE {
-            return Err(EncoderConfigError::BlobFrameSizeTooLarge {
+
+        // Channel and transaction targets are independently configurable, but
+        // neither accepts a zero-sized unit of work.
+        if self.compressed_size_target == Some(0) {
+            return Err(EncoderConfigError::CompressedTargetZero);
+        }
+        if self.max_blobs_per_tx == 0 {
+            return Err(EncoderConfigError::MaxBlobsPerTxZero);
+        }
+        if self.max_blobs_per_tx > Self::MAX_BLOBS_PER_TX {
+            return Err(EncoderConfigError::TooManyBlobsPerTx {
+                configured: self.max_blobs_per_tx,
+                maximum: Self::MAX_BLOBS_PER_TX,
+            });
+        }
+
+        // All frames remain packable as blobs, including calldata configurations
+        // that may switch to blob DA while throttling.
+        if self.max_frame_size > Self::MAX_BLOB_FRAME_SIZE {
+            return Err(EncoderConfigError::FrameExceedsBlobPackingLimit {
                 max_frame_size: self.max_frame_size,
                 max_blob_frame_size: Self::MAX_BLOB_FRAME_SIZE,
             });
         }
-        if matches!(self.da_type, DaType::Blob)
-            && self.target_frame_size > Self::MAX_BLOB_FRAME_SIZE
-        {
-            return Err(EncoderConfigError::BlobTargetFrameSizeTooLarge {
-                target_frame_size: self.target_frame_size,
-                max_blob_frame_size: Self::MAX_BLOB_FRAME_SIZE,
-            });
-        }
-        if self.approx_compr_ratio <= 0.0 || self.approx_compr_ratio > 1.0 {
-            return Err(EncoderConfigError::InvalidApproxComprRatio {
-                approx_compr_ratio: self.approx_compr_ratio,
-            });
-        }
+
         Ok(())
+    }
+
+    /// Minimum of pre- and post-Granite `channel_timeout`; `0` is treated as unset.
+    pub fn confirmation_channel_timeout(rollup_config: &RollupConfig) -> u64 {
+        let pre_granite = rollup_config.channel_timeout(0);
+        let post_granite = rollup_config.channel_timeout(u64::MAX);
+        match (pre_granite, post_granite) {
+            (0, timeout) | (timeout, 0) => timeout,
+            (pre, post) => pre.min(post),
+        }
     }
 
     /// Validate the configuration against the active rollup state.
     ///
     /// `next_l2_timestamp` should be the timestamp of the next L2 block the
-    /// batcher may encode. Span batches are only valid once Fjord is active for
-    /// that next block.
+    /// batcher may encode. Brotli compression is only valid once Fjord is active
+    /// for that next block.
     pub fn validate_for_rollup_config(
         &self,
         rollup_config: &RollupConfig,
@@ -186,22 +176,26 @@ impl EncoderConfig {
     ) -> Result<(), EncoderConfigError> {
         self.validate()?;
 
-        if matches!(self.batch_type, BatchType::Span)
-            && !rollup_config.is_fjord_active(next_l2_timestamp)
-        {
-            return rollup_config.upgrades.fjord_time.map_or(
-                Err(EncoderConfigError::SpanBatchRequiresScheduledFjord { next_l2_timestamp }),
-                |fjord_time| {
-                    Err(EncoderConfigError::SpanBatchBeforeFjord { next_l2_timestamp, fjord_time })
-                },
-            );
+        if !rollup_config.is_fjord_active(next_l2_timestamp) {
+            return Err(EncoderConfigError::BrotliRequiresFjord { next_l2_timestamp });
+        }
+
+        let channel_timeout = Self::confirmation_channel_timeout(rollup_config);
+        let effective_channel_duration = self.max_channel_duration - self.sub_safety_margin;
+        if channel_timeout > 0 && effective_channel_duration >= channel_timeout {
+            return Err(EncoderConfigError::ChannelDurationExceedsTimeout {
+                max_channel_duration: self.max_channel_duration,
+                sub_safety_margin: self.sub_safety_margin,
+                effective_channel_duration,
+                channel_timeout,
+            });
         }
 
         Ok(())
     }
 }
 
-/// Errors returned by [`EncoderConfig::validate`].
+/// Errors returned when validating [`EncoderConfig`].
 #[derive(Debug, thiserror::Error)]
 pub enum EncoderConfigError {
     /// `sub_safety_margin >= max_channel_duration`.
@@ -219,74 +213,77 @@ pub enum EncoderConfigError {
         /// The configured maximum channel duration.
         max_channel_duration: u64,
     },
-    /// `da_type == DaType::Calldata` but `target_num_frames != 1`.
-    ///
-    /// Calldata mode submits one frame per L1 transaction. Set
-    /// `target_num_frames = 1` when using [`DaType::Calldata`].
-    #[error("calldata DA requires target_num_frames == 1, got {target_num_frames}")]
-    CalldataRequiresSingleFrame {
-        /// The configured target number of frames.
-        target_num_frames: usize,
-    },
-    /// `max_blocks_per_span_batch <= 1`.
-    #[error("max_blocks_per_span_batch must be greater than one when set")]
-    InvalidMaxBlocksPerSpanBatch,
-    /// `da_type == DaType::Blob` but `max_frame_size` leaves no room for the
-    /// derivation-version prefix.
+    /// `max_frame_size` cannot carry one complete channel byte.
     #[error(
-        "blob DA max_frame_size ({max_frame_size}) must be at most \
+        "max_frame_size ({max_frame_size}) must be at least {min_frame_size} bytes \
+         to carry frame metadata and payload"
+    )]
+    FrameSizeTooSmall {
+        /// The configured maximum frame size.
+        max_frame_size: usize,
+        /// The minimum frame size that can carry channel data.
+        min_frame_size: usize,
+    },
+    /// `max_frame_size` exceeds the protocol decoder limit.
+    #[error("max_frame_size ({max_frame_size}) must be at most {max_protocol_frame_size} bytes")]
+    FrameSizeTooLarge {
+        /// Configured maximum serialized frame size.
+        max_frame_size: usize,
+        /// Largest serialized frame accepted by the protocol decoder.
+        max_protocol_frame_size: usize,
+    },
+    /// `compressed_size_target == Some(0)`.
+    #[error("compressed_size_target must be greater than zero when configured")]
+    CompressedTargetZero,
+    /// `max_blobs_per_tx == 0`.
+    #[error("max_blobs_per_tx must be greater than zero")]
+    MaxBlobsPerTxZero,
+    /// `max_blobs_per_tx` exceeds the protocol transaction limit.
+    #[error("max_blobs_per_tx ({configured}) must be at most {maximum}")]
+    TooManyBlobsPerTx {
+        /// Configured blob count.
+        configured: usize,
+        /// Protocol maximum blob count.
+        maximum: usize,
+    },
+    /// `max_frame_size` leaves no room for a blob derivation-version prefix.
+    ///
+    /// This also applies to calldata configurations because DA throttling may
+    /// switch any encoder to blob submissions at runtime.
+    #[error(
+        "max_frame_size ({max_frame_size}) must be at most \
          {max_blob_frame_size} to leave room for the derivation-version prefix"
     )]
-    BlobFrameSizeTooLarge {
+    FrameExceedsBlobPackingLimit {
         /// The configured maximum frame size.
         max_frame_size: usize,
         /// The maximum frame size that leaves room for the derivation-version prefix.
         max_blob_frame_size: usize,
     },
-    /// `da_type == DaType::Blob` but `target_frame_size` leaves no room for the
-    /// derivation-version prefix.
+    /// Brotli compression is configured before Fjord activates.
     #[error(
-        "blob DA target_frame_size ({target_frame_size}) must be at most \
-         {max_blob_frame_size} to leave room for the derivation-version prefix"
-    )]
-    BlobTargetFrameSizeTooLarge {
-        /// The configured target frame size.
-        target_frame_size: usize,
-        /// The maximum frame size that leaves room for the derivation-version prefix.
-        max_blob_frame_size: usize,
-    },
-    /// `approx_compr_ratio <= 0.0 || approx_compr_ratio > 1.0`.
-    ///
-    /// A ratio ≤ 0.0 causes `compressed_estimate` to always be 0, so the span
-    /// accumulator never triggers a size-based channel close, growing unboundedly in
-    /// memory until timeout. A ratio > 1.0 overestimates compressed size, causing
-    /// channels to close after a single block and producing many tiny span batches.
-    ///
-    /// Use a value in the range `(0.0, 1.0]`.
-    #[error("approx_compr_ratio ({approx_compr_ratio}) must be in the range (0.0, 1.0]")]
-    InvalidApproxComprRatio {
-        /// The configured approximate compression ratio.
-        approx_compr_ratio: f64,
-    },
-    /// `batch_type == BatchType::Span` before Fjord activates.
-    #[error(
-        "span batches require Fjord to be active for the next L2 block; \
-         next_l2_timestamp ({next_l2_timestamp}) is before fjord_time ({fjord_time})"
-    )]
-    SpanBatchBeforeFjord {
-        /// The timestamp of the next L2 block the batcher may encode.
-        next_l2_timestamp: u64,
-        /// The configured Fjord activation timestamp.
-        fjord_time: u64,
-    },
-    /// `batch_type == BatchType::Span` but Fjord is not scheduled.
-    #[error(
-        "span batches require Fjord to be scheduled and active for the next L2 block; \
+        "brotli compression requires Fjord to be active for the next L2 block; \
          next_l2_timestamp is {next_l2_timestamp}"
     )]
-    SpanBatchRequiresScheduledFjord {
+    BrotliRequiresFjord {
         /// The timestamp of the next L2 block the batcher may encode.
         next_l2_timestamp: u64,
+    },
+    /// `max_channel_duration - sub_safety_margin >= channel_timeout`.
+    #[error(
+        "effective channel duration ({max_channel_duration} - {sub_safety_margin} = \
+         {effective_channel_duration}) must be less than \
+         the derivation channel_timeout ({channel_timeout})"
+    )]
+    ChannelDurationExceedsTimeout {
+        /// Configured duration in L1 blocks.
+        max_channel_duration: u64,
+        /// Safety margin subtracted from the configured duration.
+        sub_safety_margin: u64,
+        /// Operational duration after subtracting the safety margin.
+        effective_channel_duration: u64,
+        /// Derivation channel timeout in L1 blocks.
+        channel_timeout: u64,
     },
 }
 
@@ -305,13 +302,14 @@ mod tests {
     fn default_blob_max_frame_size_reserves_derivation_prefix() {
         let cfg = EncoderConfig::default();
 
-        assert_eq!(cfg.target_frame_size, EncoderConfig::MAX_BLOB_FRAME_SIZE);
         assert_eq!(cfg.max_frame_size, EncoderConfig::MAX_BLOB_FRAME_SIZE);
+        assert_eq!(cfg.compressed_size_target, None);
+        assert_eq!(cfg.max_blobs_per_tx, 6);
+        assert_eq!(cfg.brotli_level, BrotliLevel::DEFAULT);
         assert_eq!(
             cfg.max_frame_size + EncoderConfig::BLOB_DERIVATION_PREFIX_SIZE,
             EncoderConfig::BLOB_MAX_DATA_SIZE
         );
-        assert_eq!(cfg.max_blocks_per_span_batch, None);
     }
 
     #[rstest]
@@ -342,6 +340,69 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_frame_without_payload_capacity() {
+        let max_frame_size = Frame::ENCODED_OVERHEAD;
+        let min_frame_size = Frame::ENCODED_OVERHEAD + 1;
+        let cfg = EncoderConfig { max_frame_size, ..EncoderConfig::default() };
+
+        let err = cfg.validate().unwrap_err();
+
+        assert!(matches!(
+            err,
+            EncoderConfigError::FrameSizeTooSmall {
+                max_frame_size: actual,
+                min_frame_size: minimum,
+            } if actual == max_frame_size && minimum == min_frame_size
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_frame_with_payload_capacity() {
+        let max_frame_size = Frame::ENCODED_OVERHEAD + 1;
+        let cfg = EncoderConfig { max_frame_size, ..EncoderConfig::default() };
+
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_compressed_target() {
+        let cfg = EncoderConfig { compressed_size_target: Some(0), ..EncoderConfig::default() };
+
+        assert!(matches!(cfg.validate().unwrap_err(), EncoderConfigError::CompressedTargetZero));
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_blobs_per_tx() {
+        let cfg = EncoderConfig { max_blobs_per_tx: 0, ..EncoderConfig::default() };
+
+        assert!(matches!(cfg.validate().unwrap_err(), EncoderConfigError::MaxBlobsPerTxZero));
+    }
+
+    #[test]
+    fn validate_rejects_transaction_above_blob_limit() {
+        let cfg = EncoderConfig {
+            max_blobs_per_tx: EncoderConfig::MAX_BLOBS_PER_TX + 1,
+            ..EncoderConfig::default()
+        };
+
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            EncoderConfigError::TooManyBlobsPerTx { configured: 7, maximum: 6 }
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_frame_above_protocol_limit() {
+        let cfg = EncoderConfig {
+            da_type: DaType::Calldata,
+            max_frame_size: Frame::ENCODED_OVERHEAD + Frame::MAX_LEN + 1,
+            ..EncoderConfig::default()
+        };
+
+        assert!(matches!(cfg.validate(), Err(EncoderConfigError::FrameSizeTooLarge { .. })));
+    }
+
+    #[test]
     fn validate_rejects_blob_frame_size_that_leaves_no_prefix_room() {
         let cfg = EncoderConfig {
             max_frame_size: EncoderConfig::BLOB_MAX_DATA_SIZE,
@@ -351,7 +412,7 @@ mod tests {
         let err = cfg.validate().unwrap_err();
         assert!(matches!(
             err,
-            EncoderConfigError::BlobFrameSizeTooLarge {
+            EncoderConfigError::FrameExceedsBlobPackingLimit {
                 max_frame_size,
                 max_blob_frame_size,
             } if max_frame_size == EncoderConfig::BLOB_MAX_DATA_SIZE
@@ -361,68 +422,17 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_blob_target_frame_size_that_leaves_no_prefix_room() {
-        let cfg = EncoderConfig {
-            target_frame_size: EncoderConfig::BLOB_MAX_DATA_SIZE,
-            ..EncoderConfig::default()
-        };
-
-        let err = cfg.validate().unwrap_err();
-        assert!(matches!(
-            err,
-            EncoderConfigError::BlobTargetFrameSizeTooLarge {
-                target_frame_size,
-                max_blob_frame_size,
-            } if target_frame_size == EncoderConfig::BLOB_MAX_DATA_SIZE
-                && max_blob_frame_size == EncoderConfig::MAX_BLOB_FRAME_SIZE
-        ));
-        assert!(err.to_string().contains("target_frame_size"));
-    }
-
-    #[test]
-    fn validate_allows_calldata_frame_size_without_blob_prefix_room() {
+    fn validate_reserves_blob_prefix_room_for_calldata_override() {
         let cfg = EncoderConfig {
             da_type: DaType::Calldata,
-            target_frame_size: EncoderConfig::BLOB_MAX_DATA_SIZE,
             max_frame_size: EncoderConfig::BLOB_MAX_DATA_SIZE,
             ..EncoderConfig::default()
         };
 
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_tiny_max_blocks_per_span_batch() {
-        for max_blocks_per_span_batch in [0, 1] {
-            let cfg = EncoderConfig {
-                max_blocks_per_span_batch: Some(max_blocks_per_span_batch),
-                ..EncoderConfig::default()
-            };
-
-            let err = cfg.validate().unwrap_err();
-            assert!(matches!(err, EncoderConfigError::InvalidMaxBlocksPerSpanBatch));
-        }
-    }
-
-    #[rstest]
-    #[case(0.1)] // low but valid
-    #[case(0.6)] // default
-    #[case(1.0)] // exactly 1.0: upper bound is inclusive
-    fn validate_approx_compr_ratio_ok(#[case] approx_compr_ratio: f64) {
-        let cfg = EncoderConfig { approx_compr_ratio, ..EncoderConfig::default() };
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[rstest]
-    #[case(0.0)] // exactly 0: compressed_estimate always 0
-    #[case(-1.0)] // negative: nonsensical ratio
-    #[case(1.1)] // above 1: overestimates compressed size
-    #[case(f64::INFINITY)]
-    fn validate_approx_compr_ratio_err(#[case] approx_compr_ratio: f64) {
-        let cfg = EncoderConfig { approx_compr_ratio, ..EncoderConfig::default() };
-        let err = cfg.validate().unwrap_err();
-        assert!(matches!(err, EncoderConfigError::InvalidApproxComprRatio { .. }));
-        assert!(err.to_string().contains("approx_compr_ratio"));
+        assert!(matches!(
+            cfg.validate(),
+            Err(EncoderConfigError::FrameExceedsBlobPackingLimit { .. })
+        ));
     }
 
     fn rollup_config_with(block_time: u64, fjord_time: Option<u64>) -> RollupConfig {
@@ -434,42 +444,81 @@ mod tests {
     }
 
     #[test]
-    fn validate_for_rollup_config_allows_single_before_fjord() {
+    fn validate_for_rollup_config_rejects_brotli_before_fjord() {
         let cfg = EncoderConfig::default();
         let rollup_config = rollup_config_with(2, Some(100));
 
-        assert!(cfg.validate_for_rollup_config(&rollup_config, 98).is_ok());
-    }
-
-    #[test]
-    fn validate_for_rollup_config_rejects_span_before_fjord() {
-        let cfg = EncoderConfig { batch_type: BatchType::Span, ..EncoderConfig::default() };
-        let rollup_config = rollup_config_with(2, Some(100));
-
         let err = cfg.validate_for_rollup_config(&rollup_config, 98).unwrap_err();
+        assert!(matches!(err, EncoderConfigError::BrotliRequiresFjord { next_l2_timestamp: 98 }));
+    }
+
+    fn rollup_config_with_channel_timeouts(
+        pre_granite: u64,
+        post_granite: u64,
+        granite_time: Option<u64>,
+    ) -> RollupConfig {
+        RollupConfig {
+            channel_timeout: pre_granite,
+            granite_channel_timeout: post_granite,
+            upgrades: UpgradeConfig {
+                fjord_time: Some(0),
+                granite_time,
+                ..UpgradeConfig::default()
+            },
+            ..RollupConfig::default()
+        }
+    }
+
+    #[test]
+    fn confirmation_channel_timeout_takes_the_conservative_minimum() {
+        let rollup_config = rollup_config_with_channel_timeouts(300, 50, Some(10));
+        assert_eq!(EncoderConfig::confirmation_channel_timeout(&rollup_config), 50);
+    }
+
+    #[test]
+    fn confirmation_channel_timeout_treats_zero_as_unset() {
+        let rollup_config = rollup_config_with_channel_timeouts(0, 50, Some(10));
+        assert_eq!(EncoderConfig::confirmation_channel_timeout(&rollup_config), 50);
+    }
+
+    #[test]
+    fn validate_for_rollup_config_rejects_effective_duration_at_channel_timeout() {
+        let cfg = EncoderConfig {
+            max_channel_duration: 60,
+            sub_safety_margin: 10,
+            ..EncoderConfig::default()
+        };
+        let rollup_config = rollup_config_with_channel_timeouts(300, 50, Some(10));
+
+        let err = cfg.validate_for_rollup_config(&rollup_config, 0).unwrap_err();
         assert!(matches!(
             err,
-            EncoderConfigError::SpanBatchBeforeFjord { next_l2_timestamp: 98, fjord_time: 100 }
+            EncoderConfigError::ChannelDurationExceedsTimeout {
+                max_channel_duration: 60,
+                sub_safety_margin: 10,
+                effective_channel_duration: 50,
+                channel_timeout: 50,
+            }
         ));
     }
 
     #[test]
-    fn validate_for_rollup_config_allows_span_at_fjord_activation() {
-        let cfg = EncoderConfig { batch_type: BatchType::Span, ..EncoderConfig::default() };
-        let rollup_config = rollup_config_with(2, Some(100));
+    fn validate_for_rollup_config_allows_effective_duration_below_channel_timeout() {
+        let cfg = EncoderConfig {
+            max_channel_duration: 50,
+            sub_safety_margin: 10,
+            ..EncoderConfig::default()
+        };
+        let rollup_config = rollup_config_with_channel_timeouts(300, 50, Some(10));
 
-        assert!(cfg.validate_for_rollup_config(&rollup_config, 100).is_ok());
+        assert!(cfg.validate_for_rollup_config(&rollup_config, 0).is_ok());
     }
 
     #[test]
-    fn validate_for_rollup_config_rejects_unscheduled_fjord_for_span() {
-        let cfg = EncoderConfig { batch_type: BatchType::Span, ..EncoderConfig::default() };
-        let rollup_config = rollup_config_with(2, None);
+    fn validate_for_rollup_config_skips_when_channel_timeout_is_unset() {
+        let cfg = EncoderConfig { max_channel_duration: 1000, ..EncoderConfig::default() };
+        let rollup_config = rollup_config_with_channel_timeouts(0, 0, None);
 
-        let err = cfg.validate_for_rollup_config(&rollup_config, 2).unwrap_err();
-        assert!(matches!(
-            err,
-            EncoderConfigError::SpanBatchRequiresScheduledFjord { next_l2_timestamp: 2 }
-        ));
+        assert!(cfg.validate_for_rollup_config(&rollup_config, 0).is_ok());
     }
 }

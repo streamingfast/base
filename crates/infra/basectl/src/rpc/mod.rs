@@ -8,10 +8,10 @@ pub use admin::{
 
 mod conductor;
 pub use conductor::{
-    ConductorClusterSnapshot, ConductorControl, ConductorFanoutReport, ConductorNodeFailure,
-    ConductorNodeStatus, ConductorPollUpdate, PausedPeers, conductor_pause_all_nodes,
-    conductor_pause_node, conductor_resume_all_nodes, conductor_resume_node,
-    restart_conductor_node, run_conductor_poller, transfer_conductor_leader,
+    ConductorClusterSnapshot, ConductorControl, ConductorFanoutAction, ConductorFanoutReport,
+    ConductorNodeFailure, ConductorNodeStatus, ConductorPollUpdate, PausedPeers,
+    conductor_pause_all_nodes, conductor_pause_node, conductor_resume_all_nodes,
+    conductor_resume_node, restart_conductor_node, run_conductor_poller, transfer_conductor_leader,
 };
 
 mod el;
@@ -25,6 +25,11 @@ pub use el::{
 mod flashblocks;
 pub use flashblocks::{TimestampedFlashblock, run_flashblock_ws, run_flashblock_ws_timestamped};
 
+mod games;
+pub use games::{
+    EXPECTED_RESOLUTION_NEVER, GameDetails, GameListFilter, GameStatus, GameSummary, GamesClient,
+};
+
 mod l1;
 pub use l1::{
     L1BlockInfo, L1ConnectionMode, fetch_full_system_config, fetch_l1_block_number,
@@ -33,19 +38,33 @@ pub use l1::{
 
 mod p2p;
 pub use p2p::{
-    ClInfoReport, DiscoveryInfo, ElInfoReport, NodeEndpoint, NodeInfoReport, PeerListReport,
-    PeerStatsReport, PeerSummary, RawInfoReport, RawPeerCounts, RawPeersReport, add_peer, ban_peer,
-    connect_peer, disconnect_peer, fetch_cl_info, fetch_connected_peers, fetch_el_info, fetch_info,
-    fetch_raw_info, fetch_raw_peers, list_banned_peers, remove_peer, unban_peer,
+    ClInfoReport, ClNodeIdentity, DiscoveryInfo, ElInfoReport, ElNodeIdentity, NodeEndpoint,
+    NodeInfoReport, PeerDirection, PeerListReport, PeerStatsReport, PeerSummary, RawInfoReport,
+    RawPeerCounts, RawPeersReport, add_peer, ban_el_peer, ban_peer, connect_peer, disconnect_peer,
+    el_peer_is_trusted, fetch_cl_info, fetch_connected_peers, fetch_el_info, fetch_info,
+    fetch_raw_info, fetch_raw_peers, list_banned_peers, remove_peer, unban_el_peer, unban_peer,
 };
 
 mod pods;
 pub use pods::{PodGroupStatus, PodStatus, PodsPoller, PodsSnapshot, run_pods_poller};
 
+mod prover;
+pub use prover::{ProofProposeRequest, ProofsClient};
+
 mod rollup;
 pub use rollup::{
     LatestProposal, ProofsSnapshot, SyncStatusReport, ValidatorNodeStatus, fetch_safe_and_latest,
-    fetch_sync_status, run_proofs_poller, run_safe_head_poller, run_validator_poller,
+    fetch_sync_status, run_proofs_poller, run_rollup_config_poller, run_safe_head_poller,
+    run_validator_poller,
+};
+
+mod submit;
+pub use submit::{ProposalProofSubmitter, SnarkPlonkProofBytes, SubmittedProof, SubmitterKey};
+
+mod telemetry;
+pub use telemetry::{
+    ReachabilityOutcome, ReachabilityResponse, TelemetryApiError, TelemetryClient,
+    TelemetryClientError, TelemetryErrorResponse,
 };
 
 mod txpool;

@@ -21,7 +21,8 @@ use base_prover_service_db::{
 use base_prover_service_protocol::{
     GetNextProofRequest, HeartbeatRequest, ProofJobStatus, ProofRequest as ProtocolProofRequest,
     ProofRequestKind, ProofResult, ProofType, ProverRequesterApiServer, ProverWorkerApiClient,
-    ProverWorkerApiServer, WorkerSubmitProofRequest, ZkProofRequest, ZkProofResult, ZkVm,
+    ProverWorkerApiServer, WorkerSubmitProofRequest, ZkBackend, ZkProofRequest, ZkProofResult,
+    ZkVm,
 };
 use jsonrpsee::{
     core::client::Error as ClientError,
@@ -105,6 +106,7 @@ async fn drain_claimable_compressed_jobs(repo: &ProofRequestRepo) {
         api_proof_type: ApiProofType::Compressed,
         tee_kinds: Vec::new(),
         zk_vms: vec![ZkVmKind::Sp1],
+        zk_backends: vec![ZkBackend::Cluster],
         lock_duration_seconds: 3600,
         max_attempts: u32::MAX,
     };
@@ -126,7 +128,9 @@ fn compressed_request(session_id: &str, start_block_number: u64) -> CreateProofR
             sequence_window: None,
             l1_head: None,
             intermediate_root_interval: None,
+            schedule_l2_block_number: None,
             zk_vm: ZkVm::Sp1,
+            zk_backend: ZkBackend::Cluster,
         }),
     })
     .expect("compressed request should validate")
@@ -138,6 +142,8 @@ fn worker_claim(worker_id: &str) -> GetNextProofRequest {
         proof_type: ProofType::Compressed,
         tee_kinds: Vec::new(),
         zk_vms: vec![ZkVm::Sp1],
+        // Omitted by legacy workers; the server defaults this capability to cluster.
+        zk_backends: Vec::new(),
         lock_duration_seconds: 60,
     }
 }
@@ -149,7 +155,7 @@ async fn worker_claim_heartbeat_submit_round_trip() {
     drain_claimable_compressed_jobs(&repo).await;
 
     let session_id = Uuid::new_v4().to_string();
-    repo.create_for_worker_queue(compressed_request(&session_id, 10), TEST_MAX_PROOF_RETRIES)
+    repo.create_for_worker_queue(compressed_request(&session_id, 10), TEST_MAX_PROOF_RETRIES, true)
         .await
         .expect("seeding the worker queue should succeed");
 

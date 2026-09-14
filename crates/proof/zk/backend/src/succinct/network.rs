@@ -9,10 +9,10 @@ use std::{fmt, sync::Arc, time::Duration};
 
 use alloy_primitives::B256;
 use async_trait::async_trait;
-use base_proof_succinct_client_utils::client::DEFAULT_INTERMEDIATE_ROOT_INTERVAL;
 use base_proof_zk_host::{ZkProver, ZkProverError, ZkSessionState};
+use base_proof_zk_utils::client::DEFAULT_INTERMEDIATE_ROOT_INTERVAL;
 use base_prover_service_protocol::{
-    ProofResult, SessionType, SnarkGroth16ProofRequest, SnarkGroth16ProofResult, ZkProofRequest,
+    ProofResult, SessionType, SnarkPlonkProofRequest, SnarkPlonkProofResult, ZkProofRequest,
     ZkProofResult, ZkVm,
 };
 use sp1_sdk::{
@@ -146,6 +146,7 @@ impl NetworkZkProver {
     /// Builds an SP1 Network backend.
     pub async fn build_until_cancelled(
         config: SuccinctNetworkBackendConfig,
+        witness_provider: Option<OpSuccinctWitnessProvider>,
         cancel: &CancellationToken,
     ) -> Result<Option<Arc<dyn ZkProver>>, SuccinctZkProverBuildError> {
         let SuccinctNetworkBackendConfig {
@@ -183,9 +184,16 @@ impl NetworkZkProver {
         };
         info!("range and aggregation proving keys computed successfully");
 
-        let Some(provider) = SuccinctZkProverBuilder::build_witness_provider(rpc, cancel).await?
-        else {
-            return Ok(None);
+        let provider = match witness_provider {
+            Some(provider) => provider,
+            None => {
+                let Some(provider) =
+                    SuccinctZkProverBuilder::build_witness_provider(rpc, cancel).await?
+                else {
+                    return Ok(None);
+                };
+                provider
+            }
         };
 
         // This worker always submits public SP1 Network auction requests; reserved and hosted
@@ -331,7 +339,7 @@ impl NetworkZkProver {
         );
 
         let witness_start = std::time::Instant::now();
-        let stdin = self
+        let stdin = match self
             .provider
             .generate_witness(WitnessParams {
                 start_block,
@@ -345,24 +353,27 @@ impl NetworkZkProver {
                     L1HeadSource::Pinned,
                 ),
                 intermediate_root_interval,
+                schedule_l2_block_number: request.schedule_l2_block_number,
             })
             .await
-            .map_err(|e| {
+        {
+            Ok(stdin) => stdin,
+            Err(e) => {
                 error!(
                     start_block = start_block,
                     end_block = end_block,
                     error = %e,
                     "witness generation failed"
                 );
-                backend_error!("witness generation failed: {e}")
-            })?;
-        let witness_gen_duration_ms = witness_start.elapsed().as_secs_f64() * 1000.0;
+                return Err(backend_error!("witness generation failed: {e}"));
+            }
+        };
 
         info!(
             request_session_id = %request_session_id,
-            witness_gen_duration_ms = witness_gen_duration_ms,
             range_cycle_limit = self.config.range_cycle_limit,
             range_gas_limit = self.config.range_gas_limit,
+            witness_gen_duration_ms = witness_start.elapsed().as_millis(),
             "witness generated, submitting range proof to SP1 Network"
         );
 
@@ -392,7 +403,7 @@ impl NetworkZkProver {
         Ok(proof_id.to_string())
     }
 
-    /// Submit the Groth16 aggregation proof after the compressed range proof completes.
+    /// Submit the PLONK aggregation proof after the compressed range proof completes.
     ///
     /// Unlike the cluster backend, the SP1 Network assigns the proof id, so this submission
     /// cannot be made idempotent: a crash after the network accepts the request but before the
@@ -400,7 +411,7 @@ impl NetworkZkProver {
     /// resume. The orphaned proof only wastes proving resources; it does not affect correctness.
     pub async fn submit_aggregation_proof(
         &self,
-        request: &SnarkGroth16ProofRequest,
+        request: &SnarkPlonkProofRequest,
         request_session_id: &str,
         range_backend_session_id: &str,
     ) -> Result<String, ZkProverError> {
@@ -433,21 +444,20 @@ impl NetworkZkProver {
             )
             .await
             .map_err(|e| backend_error!("aggregation witness generation failed: {e}"))?;
-        let witness_gen_duration_ms = witness_start.elapsed().as_secs_f64() * 1000.0;
 
         info!(
             request_session_id = %request_session_id,
-            witness_gen_duration_ms = witness_gen_duration_ms,
             aggregation_cycle_limit = self.config.aggregation_cycle_limit,
             aggregation_gas_limit = self.config.aggregation_gas_limit,
-            "aggregation witness generated, submitting Groth16 proof to SP1 Network"
+            witness_gen_duration_ms = witness_start.elapsed().as_millis(),
+            "aggregation witness generated, submitting PLONK proof to SP1 Network"
         );
 
         let proof_id = self
             .config
             .network_prover
             .prove(self.config.aggregation_pk.as_ref(), stdin)
-            .groth16()
+            .plonk()
             .skip_simulation(true)
             .strategy(FulfillmentStrategy::Auction)
             .timeout(self.config.timeout)
@@ -482,7 +492,7 @@ impl ZkProver for NetworkZkProver {
 
     async fn submit_next(
         &self,
-        request: &SnarkGroth16ProofRequest,
+        request: &SnarkPlonkProofRequest,
         request_session_id: &str,
         completed_backend_session_id: &str,
     ) -> Result<String, ZkProverError> {
@@ -523,7 +533,7 @@ impl ZkProver for NetworkZkProver {
 
         let proof = ZkProofResult { zk_vm: ZkVm::Sp1, proof: proof.into(), execution_stats: None };
         match session_type {
-            SessionType::Snark => Ok(ProofResult::SnarkGroth16(SnarkGroth16ProofResult { proof })),
+            SessionType::Snark => Ok(ProofResult::SnarkPlonk(SnarkPlonkProofResult { proof })),
             SessionType::Stark => Ok(ProofResult::Compressed(proof)),
         }
     }

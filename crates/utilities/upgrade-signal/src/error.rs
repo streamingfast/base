@@ -1,7 +1,5 @@
 //! Upgrade signal error types.
 
-use alloy_primitives::U256;
-
 /// Error returned by upgrade signal readers.
 #[derive(Debug, thiserror::Error)]
 pub enum UpgradeSignalError {
@@ -21,9 +19,6 @@ pub enum UpgradeSignalError {
         /// Decode error string.
         error: String,
     },
-    /// The activation timestamp does not fit in a `u64`.
-    #[error("activation timestamp {0} does not fit in u64")]
-    TimestampOverflow(U256),
     /// A positive activation timestamp was not paired with a minimum node protocol version.
     #[error(
         "upgrade signal for {0} has an activation timestamp but no minimum node protocol version"
@@ -41,12 +36,6 @@ pub enum UpgradeSignalError {
         /// Node protocol version supported by this binary.
         node_protocol_version: String,
     },
-    /// A runtime Beryl schedule was requested without a known activation admin address.
-    #[error("missing activation admin address for Beryl-enabled chain ID: {chain_id}")]
-    MissingActivationAdminAddress {
-        /// L2 chain ID whose runtime schedule was validated.
-        chain_id: u64,
-    },
 }
 
 impl UpgradeSignalError {
@@ -58,11 +47,6 @@ impl UpgradeSignalError {
     /// Creates a decode error.
     pub fn decode(context: &'static str, error: impl ToString) -> Self {
         Self::Decode { context, error: error.to_string() }
-    }
-
-    /// Creates a timestamp overflow error.
-    pub const fn timestamp_overflow(value: U256) -> Self {
-        Self::TimestampOverflow(value)
     }
 
     /// Creates a missing protocol version error.
@@ -81,10 +65,5 @@ impl UpgradeSignalError {
             minimum_protocol_version: minimum_protocol_version.to_string(),
             node_protocol_version: node_protocol_version.to_string(),
         }
-    }
-
-    /// Creates a missing activation admin address error.
-    pub const fn missing_activation_admin_address(chain_id: u64) -> Self {
-        Self::MissingActivationAdminAddress { chain_id }
     }
 }

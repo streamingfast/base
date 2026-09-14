@@ -7,11 +7,8 @@ base_metrics::define_metrics! {
     #[describe("Challenger is running")]
     up: gauge,
 
-    #[describe("Total number of game indices evaluated during scanning, including tracked games")]
+    #[describe("Total number of factory game indices evaluated during scanning")]
     games_scanned_total: counter,
-
-    #[describe("Number of in-progress game indices retained by the game scanner")]
-    scan_tracked_in_progress: gauge,
 
     #[describe("Latest factory index scanned by the game scanner")]
     scan_head: gauge,
@@ -101,17 +98,11 @@ base_metrics::define_metrics! {
     #[describe("Latency in seconds for bond transaction confirmation")]
     bond_tx_latency_seconds: histogram,
 
-    #[describe("Number of games currently tracked for bond claiming")]
-    bonds_tracked: gauge,
-
     #[describe("Total number of bonds successfully claimed")]
     bonds_completed_total: counter,
 
-    #[describe("Total number of bonds dropped because recipient changed after resolve")]
-    bonds_not_claimable_total: counter,
-
     #[describe("Total bond discovery scans performed")]
-    #[label(name = "scan_type", default = ["full", "incremental"])]
+    #[label(name = "scan_type", default = ["full"])]
     bond_discovery_scans_total: counter,
 
     #[describe("Total claimable games found by bond discovery")]
@@ -132,6 +123,11 @@ base_metrics::define_metrics! {
     )]
     #[no_zero]
     anchor_l2_block_number: gauge,
+
+    #[describe(
+        "Elapsed time in seconds from a resolved game's L2 block timestamp to resolve transaction confirmation"
+    )]
+    game_finality_time_seconds: histogram,
 
     #[describe("Challenger account balance in wei")]
     account_balance_wei: gauge,

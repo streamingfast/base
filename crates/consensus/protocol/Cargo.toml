@@ -51,6 +51,7 @@ tracing-subscriber = { workspace = true, features = ["fmt"], optional = true }
 spin.workspace = true
 rstest.workspace = true
 proptest.workspace = true
+criterion.workspace = true
 serde_json.workspace = true
 base-common-chains.workspace = true
 base-common-rpc-types.workspace = true
@@ -61,9 +62,21 @@ rand = { workspace = true, features = ["std", "std_rng"] }
 tracing-subscriber = { workspace = true, features = ["fmt"] }
 alloy-primitives = { workspace = true, features = ["arbitrary"] }
 
+[[bench]]
+name = "batch_transaction"
+harness = false
+
+[[bench]]
+name = "frame_parse"
+harness = false
+
 [features]
 default = [ "std" ]
-test-utils = [ "dep:spin", "dep:tracing-subscriber" ]
+test-utils = [
+	"base-common-genesis/test-utils",
+	"dep:spin",
+	"dep:tracing-subscriber",
+]
 std = [
 	"alloy-consensus/std",
 	"alloy-eips/std",

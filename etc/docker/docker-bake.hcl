@@ -3,7 +3,7 @@ variable "PROFILE" {
 }
 
 variable "RUST_VERSION" {
-  default = "1.94.1"
+  default = "1.95.0"
 }
 
 variable "BASE_SUCCINCT_ELF_REQUIRE" {
@@ -15,11 +15,19 @@ variable "ZK_HOST_PROFILE" {
 }
 
 variable "REGISTRY_IMAGE" {
-  default = "ghcr.io/base/node-reth-dev"
+  default = "ghcr.io/base/node"
 }
 
 variable "PLATFORM_PAIR" {
   default = "linux-amd64"
+}
+
+variable "DEVNET_TARGETS" {
+  default = ["base"]
+}
+
+variable "INGRESS_TARGETS" {
+  default = ["base", "ingress-rpc", "audit-archiver"]
 }
 
 group "default" {
@@ -38,7 +46,6 @@ group "rust-services" {
     "websocket-proxy",
     "ingress-rpc",
     "audit-archiver",
-    "batcher",
     "sidecrush",
     "prover-service",
     "zk-host",
@@ -46,16 +53,11 @@ group "rust-services" {
 }
 
 group "devnet" {
-  targets = ["base", "batcher", "prover-service", "zk-host"]
+  targets = DEVNET_TARGETS
 }
 
 group "ingress" {
-  targets = [
-    "base",
-    "ingress-rpc",
-    "audit-archiver",
-    "batcher",
-  ]
+  targets = INGRESS_TARGETS
 }
 
 target "_rust-service-common" {
@@ -138,16 +140,6 @@ target "audit-archiver" {
   inherits = ["_rust-service-common"]
   target = "audit-archiver"
   tags = ["audit-archiver:local"]
-}
-
-target "batcher" {
-  inherits = ["_rust-service-common"]
-  target = "batcher"
-  tags = ["base-batcher:local"]
-  cache-from = [
-    "type=registry,ref=${REGISTRY_IMAGE}:cache-${PLATFORM_PAIR}",
-    "type=registry,ref=${REGISTRY_IMAGE}:cache-batcher-${PLATFORM_PAIR}",
-  ]
 }
 
 target "sidecrush" {

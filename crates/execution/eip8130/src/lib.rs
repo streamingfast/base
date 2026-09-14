@@ -33,6 +33,9 @@ pub use tx_error::TxAuthError;
 mod verify;
 pub use verify::{ActorTxVerifier, AuthorizedActor, TxActors};
 
+mod signature;
+pub use signature::{SignatureError, SignatureType, SignatureVerifier};
+
 mod config;
 pub use config::ConfigChangeAuthorizer;
 
@@ -41,6 +44,11 @@ pub use nonce_error::NonceError;
 
 mod validate;
 pub use validate::{NonceMode, NonceStatus, NonceValidator};
+
+mod events;
+pub use events::{
+    AccountConfigurationEvents, AccountCreated, ActorAuthorized, ActorRevoked, DelegationApplied,
+};
 
 mod apply;
 pub use apply::{

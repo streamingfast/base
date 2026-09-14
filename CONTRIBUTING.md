@@ -67,12 +67,14 @@ If you want to work on something that doesn't have an issue yet, open an issue f
 
 ### Developer Setup
 
-- Rust `1.94` or newer
+- Rust `1.95` or newer
 - [`just`](https://github.com/casey/just) `1.51.0` or newer
 - Foundry (`forge`) for Solidity-based test fixtures
 - Bun and Node.js `22+` if you want to run the spec site locally
 - Docker if you want to use the local devnet or build container images
 - Run `just setup` to install other deps
+
+`docker compose up` from the repository root pulls the **public operator node** (`ghcr.io/base/node`). Pass `--build` to compile this tree. Use `just devnet up` for the local developer stack.
 
 
 ### Making Changes
@@ -84,6 +86,8 @@ If you want to work on something that doesn't have an issue yet, open an issue f
    ```sh
    just ci
    ```
+   See [docs/guides/TESTING.md](docs/guides/TESTING.md) for what `just ci` runs, the different
+   testing tiers (unit/action/system/fuzz), and how local checks map to CI.
 
 ### Opening the Pull Request
 

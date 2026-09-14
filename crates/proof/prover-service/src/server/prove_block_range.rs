@@ -30,6 +30,7 @@ impl ProverServiceServer {
         &self,
         request: ProveBlockRangeRequest,
     ) -> RpcResult<ProveBlockRangeResponse> {
+        let retry_failed = request.retry_failed;
         let mut proof_request = request.proof;
         let session_id = parse_session_id(&proof_request.session_id)?;
         proof_request.session_id = session_id.clone();
@@ -54,7 +55,11 @@ impl ProverServiceServer {
 
         let outcome = self
             .repo
-            .create_for_worker_queue(db_request, self.config.max_proof_retries)
+            .create_for_worker_queue(
+                db_request,
+                self.config.max_proof_retries,
+                retry_failed,
+            )
             .await
             .map_err(|e| match e {
                 CreateProofRequestError::IdCollision { id, field } => {
@@ -79,6 +84,16 @@ impl ProverServiceServer {
             })?;
 
         match outcome {
+            CreateProofRequestOutcome::RetryNotAllowed(id) => {
+                warn!(
+                    proof_request_id = %id,
+                    session_id = %session_id,
+                    "rejected ProveBlockRange: failed proof request retry was not authorized",
+                );
+                return Err(failed_precondition(format!(
+                    "session_id {session_id} already failed; set retry_failed to true to requeue it",
+                )));
+            }
             CreateProofRequestOutcome::RetryExhausted(id) => {
                 warn!(
                     proof_request_id = %id,
@@ -125,7 +140,7 @@ fn validate_intermediate_root_interval(
 ) -> RpcResult<()> {
     match api_proof_type {
         ApiProofType::Tee => return Ok(()),
-        ApiProofType::Compressed | ApiProofType::SnarkGroth16 => {}
+        ApiProofType::Compressed | ApiProofType::SnarkPlonk => {}
     }
 
     if let Some(interval) = intermediate_root_interval {
@@ -161,10 +176,10 @@ mod tests {
     }
 
     #[test]
-    fn test_proof_type_label_snark_groth16() {
+    fn test_proof_type_label_snark_plonk() {
         assert_eq!(
-            metrics::proof_type_label(ProofType::OpSuccinctSp1ClusterSnarkGroth16),
-            "snark_groth16"
+            metrics::proof_type_label(ProofType::OpSuccinctSp1ClusterSnarkPlonk),
+            "snark_plonk"
         );
     }
 
@@ -174,8 +189,8 @@ mod tests {
     }
 
     #[test]
-    fn test_api_proof_type_label_snark_groth16() {
-        assert_eq!(metrics::api_proof_type_label(ApiProofType::SnarkGroth16), "snark_groth16");
+    fn test_api_proof_type_label_snark_plonk() {
+        assert_eq!(metrics::api_proof_type_label(ApiProofType::SnarkPlonk), "snark_plonk");
     }
 
     #[test]

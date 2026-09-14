@@ -82,6 +82,7 @@ impl ProverServiceServer {
             api_proof_type: request.proof_type.into(),
             tee_kinds: request.tee_kinds.into_iter().map(Into::into).collect(),
             zk_vms: request.zk_vms.into_iter().map(Into::into).collect(),
+            zk_backends: request.zk_backends,
             lock_duration_seconds: resolve_lock_duration(
                 self.config.worker,
                 request.lock_duration_seconds,
