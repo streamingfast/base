@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 ARG FIREHOSE_ETHEREUM="latest"
-ARG RUST_VERSION=1.94
+ARG RUST_VERSION=1.95.0
 
 FROM public.ecr.aws/docker/library/rust:${RUST_VERSION}-trixie AS builder
 WORKDIR /app
