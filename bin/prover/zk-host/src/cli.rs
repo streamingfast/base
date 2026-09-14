@@ -1,23 +1,20 @@
 //! CLI definition for the ZK prover host worker binary.
 
-use std::{fmt, time::Duration};
+use std::time::Duration;
 
 use base_cli_utils::{LogConfig, RuntimeManager};
 use base_proof_worker::{
     DEFAULT_JOB_DISCOVERY_LOCK_DURATION_SECONDS, DEFAULT_JOB_DISCOVERY_MAX_CONCURRENT_JOBS,
 };
-use base_proof_zk_backend::{
-    SuccinctClusterBackendConfig, SuccinctNetworkBackendConfig, SuccinctRpcConfig,
-    SuccinctZkBackendConfig, SuccinctZkProverBuilder,
-};
+use base_proof_zk_backend::SuccinctZkProversConfig;
 use base_proof_zk_host::{
     DEFAULT_PROOF_GENERATOR_HEARTBEAT_LOCK_DURATION_SECONDS,
     DEFAULT_PROOF_GENERATOR_MAX_CONSECUTIVE_HEARTBEAT_FAILURES, ProofGeneratorHeartbeatConfig,
-    ZkHost, ZkHostConfig,
+    ZkBackend, ZkHost, ZkHostConfig,
 };
 use base_prover_service_client::{ProverServiceClientConfig, ProverWorkerClient};
-use clap::{Parser, ValueEnum};
-use eyre::{WrapErr, eyre};
+use clap::Parser;
+use eyre::WrapErr;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use url::Url;
@@ -57,69 +54,45 @@ struct WorkerArgs {
     #[arg(long, env = "PROVER_WORKER_ID")]
     worker_id: Option<String>,
 
-    /// Proving backend to run: `mock`, `dry-run`, `cluster`, or `network`.
-    #[arg(long, env = "ZK_BACKEND", value_enum)]
-    backend: ZkBackendArg,
-
-    /// Base consensus node RPC URL. Required for `ZK_BACKEND=dry-run`, `cluster`, or `network`.
-    #[arg(
-        long,
-        env = "BASE_CONSENSUS_ADDRESS",
-        required_if_eq_any([("backend", "dry-run"), ("backend", "cluster"), ("backend", "network")])
-    )]
+    /// Base consensus node RPC URL. Required for dry-run, cluster, or network backends.
+    #[arg(long, env = "BASE_CONSENSUS_ADDRESS")]
     base_consensus_address: Option<Url>,
 
-    /// L1 execution node RPC URL. Required for `ZK_BACKEND=dry-run`, `cluster`, or `network`.
-    #[arg(
-        long,
-        env = "L1_NODE_ADDRESS",
-        required_if_eq_any([("backend", "dry-run"), ("backend", "cluster"), ("backend", "network")])
-    )]
+    /// L1 execution node RPC URL. Required for dry-run, cluster, or network backends.
+    #[arg(long, env = "L1_NODE_ADDRESS")]
     l1_node_address: Option<Url>,
 
-    /// L1 beacon node RPC URL. Required for `ZK_BACKEND=dry-run`, `cluster`, or `network`.
-    #[arg(
-        long,
-        env = "L1_BEACON_ADDRESS",
-        required_if_eq_any([("backend", "dry-run"), ("backend", "cluster"), ("backend", "network")])
-    )]
+    /// L1 beacon node RPC URL. Required for dry-run, cluster, or network backends.
+    #[arg(long, env = "L1_BEACON_ADDRESS")]
     l1_beacon_address: Option<Url>,
 
-    /// L2 execution node RPC URL. Required for `ZK_BACKEND=dry-run`, `cluster`, or `network`.
-    #[arg(
-        long,
-        env = "L2_NODE_ADDRESS",
-        required_if_eq_any([("backend", "dry-run"), ("backend", "cluster"), ("backend", "network")])
-    )]
+    /// L2 execution node RPC URL. Required for dry-run, cluster, or network backends.
+    #[arg(long, env = "L2_NODE_ADDRESS")]
     l2_node_address: Option<Url>,
 
     /// Default sequence window for L1 head calculations.
     #[arg(long, env = "DEFAULT_SEQUENCE_WINDOW", default_value_t = 50)]
     default_sequence_window: u64,
 
-    /// SP1 cluster gRPC endpoint. Required for `ZK_BACKEND=cluster`.
-    #[arg(long, env = "SP1_CLUSTER_API_ENDPOINT", required_if_eq("backend", "cluster"))]
+    /// SP1 cluster gRPC endpoint. Enables the cluster backend when set with S3 settings.
+    #[arg(long, env = "SP1_CLUSTER_API_ENDPOINT")]
     sp1_cluster_api_endpoint: Option<String>,
 
     /// SP1 cluster proof timeout in hours.
     #[arg(long, env = "SP1_CLUSTER_TIMEOUT_HOURS", default_value_t = 24)]
     sp1_cluster_timeout_hours: u64,
 
-    /// S3 artifact store bucket for `ZK_BACKEND=cluster`.
-    #[arg(long, env = "CLI_S3_BUCKET", required_if_eq("backend", "cluster"))]
+    /// S3 artifact store bucket for the cluster backend.
+    #[arg(long, env = "CLI_S3_BUCKET")]
     cli_s3_bucket: Option<String>,
 
-    /// S3 artifact store region for `ZK_BACKEND=cluster`.
-    #[arg(long, env = "CLI_S3_REGION", required_if_eq("backend", "cluster"))]
+    /// S3 artifact store region for the cluster backend.
+    #[arg(long, env = "CLI_S3_REGION")]
     cli_s3_region: Option<String>,
 
     /// SP1 network requester private key, or KMS key ARN when `USE_KMS_REQUESTER=true`.
-    #[arg(
-        long,
-        env = "NETWORK_PRIVATE_KEY",
-        hide_env_values = true,
-        required_if_eq("backend", "network")
-    )]
+    /// Enables the network backend when set.
+    #[arg(long, env = "NETWORK_PRIVATE_KEY", hide_env_values = true)]
     network_private_key: Option<String>,
 
     /// Use the requester key as an AWS KMS ARN instead of a local private key.
@@ -187,114 +160,26 @@ struct WorkerArgs {
     proof_generator_max_consecutive_heartbeat_failures: u32,
 }
 
-/// ZK proving backend argument.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum ZkBackendArg {
-    /// Return placeholder proof bytes without an external backend.
-    Mock,
-    /// Run local SP1 execution and return dry-run stats without proof bytes.
-    #[value(alias = "dry_run", alias = "dryrun")]
-    DryRun,
-    /// Submit proofs to an SP1 cluster.
-    Cluster,
-    /// Submit proofs to the Succinct SP1 Network.
-    Network,
-}
-
-impl AsRef<str> for ZkBackendArg {
-    fn as_ref(&self) -> &str {
-        match self {
-            Self::Mock => "mock",
-            Self::DryRun => "dry_run",
-            Self::Cluster => "cluster",
-            Self::Network => "network",
-        }
-    }
-}
-
-impl fmt::Display for ZkBackendArg {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_ref())
-    }
-}
-
 impl WorkerArgs {
-    fn backend_config(&self) -> eyre::Result<SuccinctZkBackendConfig> {
-        match self.backend {
-            ZkBackendArg::Mock => Ok(SuccinctZkBackendConfig::Mock),
-            ZkBackendArg::DryRun => Ok(SuccinctZkBackendConfig::DryRun {
-                rpc: self.rpc_config()?,
-                range_cycle_limit: self.range_cycle_limit,
-            }),
-            ZkBackendArg::Cluster => {
-                Ok(SuccinctZkBackendConfig::Cluster(SuccinctClusterBackendConfig {
-                    rpc: self.rpc_config()?,
-                    cluster_rpc: Self::required_string(
-                        &self.sp1_cluster_api_endpoint,
-                        "SP1_CLUSTER_API_ENDPOINT",
-                    )?,
-                    s3_bucket: Self::required_string(&self.cli_s3_bucket, "CLI_S3_BUCKET")?,
-                    s3_region: Self::required_string(&self.cli_s3_region, "CLI_S3_REGION")?,
-                    timeout: Self::duration_from_hours(
-                        self.sp1_cluster_timeout_hours,
-                        "SP1_CLUSTER_TIMEOUT_HOURS",
-                    )?,
-                    range_cycle_limit: self.range_cycle_limit,
-                    range_gas_limit: self.range_gas_limit,
-                    aggregation_cycle_limit: self.aggregation_cycle_limit,
-                    aggregation_gas_limit: self.aggregation_gas_limit,
-                }))
-            }
-            ZkBackendArg::Network => {
-                Ok(SuccinctZkBackendConfig::Network(SuccinctNetworkBackendConfig {
-                    rpc: self.rpc_config()?,
-                    network_private_key: Self::required_string(
-                        &self.network_private_key,
-                        "NETWORK_PRIVATE_KEY",
-                    )?,
-                    use_kms_requester: self.use_kms_requester,
-                    timeout: Self::duration_from_hours(
-                        self.sp1_network_timeout_hours,
-                        "SP1_NETWORK_TIMEOUT_HOURS",
-                    )?,
-                    range_cycle_limit: self.range_cycle_limit,
-                    range_gas_limit: self.range_gas_limit,
-                    aggregation_cycle_limit: self.aggregation_cycle_limit,
-                    aggregation_gas_limit: self.aggregation_gas_limit,
-                }))
-            }
-        }
-    }
-
-    fn rpc_config(&self) -> eyre::Result<SuccinctRpcConfig> {
-        Ok(SuccinctRpcConfig {
-            base_consensus_rpc: Self::required_url(
-                &self.base_consensus_address,
-                "BASE_CONSENSUS_ADDRESS",
-            )?,
-            l1_rpc: Self::required_url(&self.l1_node_address, "L1_NODE_ADDRESS")?,
-            l1_beacon_rpc: Self::required_url(&self.l1_beacon_address, "L1_BEACON_ADDRESS")?,
-            l2_rpc: Self::required_url(&self.l2_node_address, "L2_NODE_ADDRESS")?,
+    fn backend_config(&self) -> SuccinctZkProversConfig {
+        SuccinctZkProversConfig {
+            base_consensus_rpc: self.base_consensus_address.clone(),
+            l1_rpc: self.l1_node_address.clone(),
+            l1_beacon_rpc: self.l1_beacon_address.clone(),
+            l2_rpc: self.l2_node_address.clone(),
             default_sequence_window: self.default_sequence_window,
-        })
-    }
-
-    fn required_url(value: &Option<Url>, env: &'static str) -> eyre::Result<Url> {
-        value.clone().ok_or_else(|| eyre!("{env} must be set for the selected ZK_BACKEND"))
-    }
-
-    fn required_string(value: &Option<String>, env: &'static str) -> eyre::Result<String> {
-        value
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| eyre!("{env} must be set for the selected ZK_BACKEND"))
-    }
-
-    fn duration_from_hours(hours: u64, env: &'static str) -> eyre::Result<Duration> {
-        let seconds = hours.checked_mul(3600).ok_or_else(|| eyre!("{env} is too large"))?;
-        Ok(Duration::from_secs(seconds))
+            cluster_rpc: self.sp1_cluster_api_endpoint.clone(),
+            cluster_timeout_hours: self.sp1_cluster_timeout_hours,
+            s3_bucket: self.cli_s3_bucket.clone(),
+            s3_region: self.cli_s3_region.clone(),
+            network_private_key: self.network_private_key.clone(),
+            use_kms_requester: self.use_kms_requester,
+            network_timeout_hours: self.sp1_network_timeout_hours,
+            range_cycle_limit: self.range_cycle_limit,
+            range_gas_limit: self.range_gas_limit,
+            aggregation_cycle_limit: self.aggregation_cycle_limit,
+            aggregation_gas_limit: self.aggregation_gas_limit,
+        }
     }
 }
 
@@ -318,31 +203,26 @@ impl WorkerArgs {
         let args = &self;
         info!(
             prover_service_endpoint = %args.prover_service_endpoint,
-            backend = %args.backend,
             "initializing zk prover host worker"
         );
 
-        let backend_config = args.backend_config()?;
-        let Some(prover) = SuccinctZkProverBuilder::new(backend_config)
+        let Some(provers) = args
+            .backend_config()
             .build_until_cancelled(&cancel)
             .await
-            .wrap_err("failed to initialize zk proving backend")?
+            .wrap_err("failed to initialize zk proving backends")?
         else {
-            info!(
-                backend = %args.backend,
-                "zk prover host worker initialization cancelled"
-            );
+            info!("zk prover host worker initialization cancelled");
             return Ok(());
         };
+        let mut backends: Vec<ZkBackend> = provers.keys().copied().collect();
+        backends.sort_unstable_by_key(|backend| backend.as_str());
 
         let client_config = ProverServiceClientConfig::new(args.prover_service_endpoint.clone())
             .with_request_timeout(Duration::from_secs(args.prover_service_request_timeout_secs));
         let Some(client) = Self::connect_prover_service_client(&client_config, &cancel).await?
         else {
-            info!(
-                backend = %args.backend,
-                "zk prover host worker startup cancelled"
-            );
+            info!("zk prover host worker startup cancelled");
             return Ok(());
         };
 
@@ -361,12 +241,12 @@ impl WorkerArgs {
             .with_job_discovery_lock_duration_seconds(args.job_discovery_lock_duration_seconds)
             .with_job_discovery_max_concurrent_jobs(args.job_discovery_max_concurrent_jobs)
             .with_proof_generator_heartbeat(heartbeat);
-        let host = ZkHost::new(client, prover, host_config);
+        let host = ZkHost::new(client, provers, host_config);
 
         info!(
             worker_id = %worker_id,
             prover_service_endpoint = %args.prover_service_endpoint,
-            backend = %args.backend,
+            ?backends,
             "starting zk prover host worker"
         );
         host.run_until_cancelled(cancel).await;

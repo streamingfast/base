@@ -4,8 +4,8 @@ use std::{fs, path::PathBuf};
 
 use alloy_primitives::hex;
 use anyhow::Result;
-use base_proof_succinct_client_utils::boot::BootInfoStruct;
 use base_proof_succinct_elfs::AGGREGATION_ELF;
+use base_proof_zk_utils::boot::BootInfoStruct;
 use clap::Parser;
 use sp1_sdk::{
     Elf, HashableKey, ProvingKey, SP1ProofWithPublicValues,
@@ -47,7 +47,9 @@ fn main() -> Result<()> {
             parse_aggregation_outputs(&proof_with_pv, &raw_pv, args.export_json.as_deref())?;
         }
         "stark" | "range" => parse_range_outputs(&mut proof_with_pv)?,
-        other => anyhow::bail!("Unknown type '{other}'. Use 'stark' or 'snark'."),
+        other => {
+            anyhow::bail!("Unknown type '{other}'. Use 'stark' or 'snark'.")
+        }
     }
 
     Ok(())
@@ -108,6 +110,7 @@ fn parse_range_outputs(proof: &mut SP1ProofWithPublicValues) -> Result<()> {
     println!("l2PreBlockNumber:  {}", boot_info.l2PreBlockNumber);
     println!("l2BlockNumber:     {}", boot_info.l2BlockNumber);
     println!("rollupConfigHash:  {}", boot_info.rollupConfigHash);
+    println!("scheduleId:        {}", boot_info.scheduleId);
     println!(
         "intermediateRoots: {} bytes ({} roots)",
         boot_info.intermediateRoots.len(),

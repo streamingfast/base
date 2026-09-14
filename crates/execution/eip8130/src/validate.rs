@@ -3,7 +3,7 @@
 
 use core::cmp::Ordering;
 
-use alloy_primitives::{Address, B256, Keccak256, U256};
+use alloy_primitives::{Address, B256, U256};
 use base_common_consensus::{Eip8130Constants, TxEip8130};
 use base_common_precompiles::NonceManagerStorage;
 
@@ -45,18 +45,12 @@ impl NonceValidator {
     /// Validates `tx`'s `(nonce_key, nonce_sequence)` for `account` (the resolved
     /// transaction sender).
     ///
-    /// `sender_signature_hash` is [`TxEip8130::sender_signature_hash`], taken as
-    /// a parameter because the earlier authenticate stage has already computed it
-    /// — recomputing it here (an RLP encode + keccak256) would be redundant work
-    /// on the nonce-free hot path. It is consulted only for the nonce-free
-    /// (`NONCE_KEY_MAX`) replay hash.
-    ///
     /// `protocol_nonce` is the account's current basic nonce, read by the caller
     /// from account state; it is consulted only for the protocol channel
     /// (`nonce_key == 0`). `storage` serves the 2D channels and the nonce-free
-    /// replay set. `now` (Unix seconds; block timestamp at inclusion, wall-clock
-    /// in the pool) bounds the nonce-free replay-set lookup and is unused for
-    /// sequence channels.
+    /// replay set. `now` (Unix **milliseconds**; `block.timestamp * 1000` at
+    /// inclusion, wall-clock in the pool) bounds the nonce-free replay-set lookup
+    /// and is unused for sequence channels.
     ///
     /// Returns [`NonceStatus::Ready`] when the transaction may execute now,
     /// [`NonceStatus::Buffered`] when a pool transaction is ahead of its channel,
@@ -64,7 +58,6 @@ impl NonceValidator {
     pub fn validate(
         tx: &TxEip8130,
         account: Address,
-        sender_signature_hash: B256,
         protocol_nonce: u64,
         storage: &NonceManagerStorage<'_>,
         mode: NonceMode,
@@ -72,11 +65,11 @@ impl NonceValidator {
     ) -> Result<NonceStatus, NonceError> {
         if tx.nonce_key == Eip8130Constants::NONCE_KEY_MAX {
             // Nonce-free: no sequence channel. The structural rules
-            // (nonce_sequence == 0, expiry window) are enforced upstream by
+            // (nonce_sequence == 0, validity window) are enforced upstream by
             // `Eip8130Signed::validate_timestamp`; the only stateful check is
             // that this logical transaction's replay hash is not already
             // recorded and unexpired.
-            let replay = Self::replay_hash(account, sender_signature_hash);
+            let replay = Self::replay_hash(tx, account);
             if storage.is_expiring_nonce_seen(replay, now)? {
                 return Err(NonceError::Replay);
             }
@@ -91,6 +84,17 @@ impl NonceValidator {
             storage.get_nonce(account, tx.nonce_key)?
         };
 
+        Self::validate_sequence(tx, channel, mode)
+    }
+
+    /// Validates a transaction against an already-loaded `channel`.
+    ///
+    /// Use [`Self::validate`] when the channel has not been loaded.
+    pub fn validate_sequence(
+        tx: &TxEip8130,
+        channel: u64,
+        mode: NonceMode,
+    ) -> Result<NonceStatus, NonceError> {
         match tx.nonce_sequence.cmp(&channel) {
             Ordering::Less => Err(NonceError::TooLow { channel, got: tx.nonce_sequence }),
             Ordering::Equal => Ok(NonceStatus::Ready),
@@ -103,19 +107,14 @@ impl NonceValidator {
         }
     }
 
-    /// The signature-invariant nonce-free replay hash,
-    /// `keccak256(account ‖ sender_signature_hash)`, matching the value the nonce
-    /// manager records in its expiring-nonce set.
+    /// The transaction's signature- and fee-invariant replay identifier.
     ///
     /// Public so the execution layer can recompute the identical key when it
     /// records the nonce via `check_and_mark_expiring_nonce` at block inclusion,
     /// rather than duplicating the derivation and risking divergence.
     #[must_use]
-    pub fn replay_hash(account: Address, sender_signature_hash: B256) -> B256 {
-        let mut hasher = Keccak256::new();
-        hasher.update(account.as_slice());
-        hasher.update(sender_signature_hash.as_slice());
-        hasher.finalize()
+    pub fn replay_hash(tx: &TxEip8130, account: Address) -> B256 {
+        tx.replay_id(account)
     }
 }
 
@@ -134,27 +133,23 @@ mod tests {
 
     /// Runs `validate` against a freshly-seeded nonce manager. `seed` may mutate
     /// the manager (e.g. advance a channel) before the (immutable) check.
+    ///
+    /// `now_secs` is the block timestamp in seconds (what the storage exposes);
+    /// the validity-window checks operate in milliseconds, so `validate` receives
+    /// `now_secs * 1000` to match the ring buffer's `block.timestamp * 1000`.
     fn check(
         tx: &TxEip8130,
         protocol_nonce: u64,
         mode: NonceMode,
-        now: u64,
+        now_secs: u64,
         seed: impl FnOnce(&mut NonceManagerStorage<'_>),
     ) -> Result<NonceStatus, NonceError> {
         let mut storage = HashMapStorageProvider::new(1);
-        storage.set_timestamp(U256::from(now));
+        storage.set_timestamp(U256::from(now_secs));
         StorageCtx::enter(&mut storage, |ctx| {
             let mut mgr = NonceManagerStorage::new(ctx);
             seed(&mut mgr);
-            NonceValidator::validate(
-                tx,
-                ACCOUNT,
-                tx.sender_signature_hash(),
-                protocol_nonce,
-                &mgr,
-                mode,
-                now,
-            )
+            NonceValidator::validate(tx, ACCOUNT, protocol_nonce, &mgr, mode, now_secs * 1_000)
         })
     }
 
@@ -211,6 +206,29 @@ mod tests {
     }
 
     #[test]
+    fn preloaded_channel_nonce_can_be_validated_directly() {
+        let ready = tx_with(U256::from(7), 3);
+        assert_eq!(
+            NonceValidator::validate_sequence(&ready, 3, NonceMode::Inclusion),
+            Ok(NonceStatus::Ready)
+        );
+        let stale = tx_with(U256::from(7), 2);
+        assert_eq!(
+            NonceValidator::validate_sequence(&stale, 3, NonceMode::Pool),
+            Err(NonceError::TooLow { channel: 3, got: 2 })
+        );
+        let future = tx_with(U256::from(7), 5);
+        assert_eq!(
+            NonceValidator::validate_sequence(&future, 3, NonceMode::Pool),
+            Ok(NonceStatus::Buffered { gap: 2 })
+        );
+        assert_eq!(
+            NonceValidator::validate_sequence(&future, 3, NonceMode::Inclusion),
+            Err(NonceError::TooHigh { channel: 3, got: 5 })
+        );
+    }
+
+    #[test]
     fn nonce_free_ready_when_replay_hash_unseen() {
         let tx = tx_with(Eip8130Constants::NONCE_KEY_MAX, 0);
         assert_eq!(check(&tx, 0, NonceMode::Pool, 1_000, |_| {}), Ok(NonceStatus::Ready));
@@ -218,12 +236,15 @@ mod tests {
 
     #[test]
     fn nonce_free_replay_is_rejected() {
-        let now = 1_000u64;
+        let now_secs = 1_000u64;
         let tx = tx_with(Eip8130Constants::NONCE_KEY_MAX, 0);
-        let replay = NonceValidator::replay_hash(ACCOUNT, tx.sender_signature_hash());
+        let replay = NonceValidator::replay_hash(&tx, ACCOUNT);
+        // `valid_before` is milliseconds and must fall in
+        // `(now_secs * 1000, now_secs * 1000 + NONCE_FREE_EXPIRY_WINDOW]`.
+        let valid_before = now_secs * 1_000 + 20_000;
         let seed = |mgr: &mut NonceManagerStorage<'_>| {
-            mgr.check_and_mark_expiring_nonce(replay, now + 20).unwrap();
+            mgr.check_and_mark_expiring_nonce(replay, valid_before).unwrap();
         };
-        assert_eq!(check(&tx, 0, NonceMode::Inclusion, now, seed), Err(NonceError::Replay));
+        assert_eq!(check(&tx, 0, NonceMode::Inclusion, now_secs, seed), Err(NonceError::Replay));
     }
 }

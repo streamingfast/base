@@ -8,11 +8,13 @@ use base_precompile_storage::{BasePrecompileError, Result, StorageCtx};
 /// The resolved sender, payer, and sender actor id are written to transient
 /// storage at [`Self::ADDRESS`] by the EIP-8130 execution layer at the start of
 /// transaction processing and cleared automatically at transaction end. The
-/// precompile only reads them back.
+/// precompile reads them without exposing TLOAD opcode gas because EIP-8130
+/// prices getter output separately.
 ///
 /// For any non-EIP-8130 transaction (where nothing is written) each getter falls
 /// back to `tx.origin`: [`Self::sender`] and [`Self::payer`] return the origin
-/// address and [`Self::sender_actor_id`] returns `bytes32(bytes20(tx.origin))`,
+/// address and [`Self::sender_actor_id`] returns
+/// `bytes32(uint256(uint160(tx.origin)))`,
 /// so callers observe the actual transaction originator uniformly across tx types.
 #[derive(Debug)]
 pub struct TxContextStorage<'a> {
@@ -42,7 +44,7 @@ impl<'a> TxContextStorage<'a> {
     /// Returns the resolved sender, falling back to `tx.origin` when unset
     /// (i.e. outside an EIP-8130 transaction).
     pub fn sender(&self) -> Result<Address> {
-        let raw = self.storage.tload(Self::ADDRESS, Self::SENDER_SLOT)?;
+        let raw = self.storage.tload_unmetered(Self::ADDRESS, Self::SENDER_SLOT)?;
         if raw.is_zero() {
             return Ok(self.storage.origin());
         }
@@ -52,38 +54,41 @@ impl<'a> TxContextStorage<'a> {
     /// Returns the resolved payer, falling back to `tx.origin` when unset
     /// (i.e. outside an EIP-8130 transaction).
     pub fn payer(&self) -> Result<Address> {
-        let raw = self.storage.tload(Self::ADDRESS, Self::PAYER_SLOT)?;
+        let raw = self.storage.tload_unmetered(Self::ADDRESS, Self::PAYER_SLOT)?;
         if raw.is_zero() {
             return Ok(self.storage.origin());
         }
         Ok(Address::from_word(B256::from(raw.to_be_bytes::<32>())))
     }
 
-    /// Returns the sender actor id, falling back to `bytes32(bytes20(tx.origin))`
-    /// when unset (i.e. outside an EIP-8130 transaction).
+    /// Returns the sender actor id, falling back to
+    /// `bytes32(uint256(uint160(tx.origin)))` when unset (i.e. outside an EIP-8130
+    /// transaction).
     pub fn sender_actor_id(&self) -> Result<B256> {
-        let raw = self.storage.tload(Self::ADDRESS, Self::SENDER_ACTOR_ID_SLOT)?;
+        let raw = self.storage.tload_unmetered(Self::ADDRESS, Self::SENDER_ACTOR_ID_SLOT)?;
         if raw.is_zero() {
             return Ok(Self::address_to_actor_id(self.storage.origin()));
         }
         Ok(B256::from(raw.to_be_bytes::<32>()))
     }
 
-    /// Derives the EOA actor id for `addr` as `bytes32(bytes20(addr))`: the 20
-    /// address bytes occupy the high-order bytes of the word, low 12 bytes zero
-    /// (left-aligned, matching the EIP-8130 Solidity cast — distinct from the
-    /// right-aligned EVM address word produced by [`Address::into_word`]).
+    /// Derives the EOA actor id for `addr` as `bytes32(uint256(uint160(addr)))`:
+    /// the 20 address bytes occupy the low-order bytes of the word, high 12 bytes
+    /// zero (right-aligned, matching the finalized `Keystore.ActorId.fromAddress`
+    /// — the same word produced by [`Address::into_word`]).
     fn address_to_actor_id(addr: Address) -> B256 {
         let mut word = [0u8; 32];
-        word[..20].copy_from_slice(addr.as_slice());
+        word[12..].copy_from_slice(addr.as_slice());
         B256::from(word)
     }
 
     /// Writes the resolved transaction context into transient storage.
     ///
     /// Intended for the EIP-8130 execution layer to call once at the start of
-    /// transaction processing. The values are cleared automatically when the
-    /// transaction's transient storage is reset.
+    /// transaction processing through the gas-free `JournalStorageProvider`.
+    /// These publication writes are covered by the protocol's intrinsic gas
+    /// schedule and must not expose TSTORE opcode charges. The values are
+    /// cleared automatically when the transaction's transient storage is reset.
     ///
     /// # Invariant
     /// In the EIP-8130 domain the resolved sender, payer, and actor id are always
@@ -155,9 +160,9 @@ mod tests {
     const SENDER_ACTOR_ID: B256 =
         b256!("0x3333333333333333333333333333333333333333333333333333333333333333");
     const ORIGIN: Address = address!("0x9999999999999999999999999999999999999999");
-    /// `bytes32(bytes20(ORIGIN))`: address left-aligned in the high 20 bytes.
+    /// `bytes32(uint256(uint160(ORIGIN)))`: address right-aligned in the low 20 bytes.
     const ORIGIN_ACTOR_ID: B256 =
-        b256!("0x9999999999999999999999999999999999999999000000000000000000000000");
+        b256!("0x0000000000000000000000009999999999999999999999999999999999999999");
 
     #[test]
     fn context_is_zero_when_origin_is_zero() {

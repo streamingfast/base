@@ -12,15 +12,24 @@ pub use discovery::AwsTargetGroupDiscovery;
 
 mod driver;
 pub use driver::{
-    DEFAULT_MAX_CONCURRENCY, DEFAULT_UNHEALTHY_REGISTRATION_WINDOW_SECS, DiscoveryResolution,
-    DriverConfig, INSTANCE_CACHE_TTL_CYCLES, RegisterableSigner, RegistrationDriver,
+    DEFAULT_MAX_CONCURRENCY, DiscoveryResolution, DriverConfig, INSTANCE_CACHE_TTL_CYCLES,
+    RegisterableSigner, RegistrationDriver,
 };
 
 mod error;
-pub use error::{RegistrarError, Result};
+pub use error::{HintError, HintResult, PlannerError, PlannerResult, RegistrarError, Result};
+
+mod hints;
+pub use hints::P384Hints;
 
 mod metrics;
 pub use metrics::RegistrarMetrics;
+
+mod cbor;
+pub use cbor::{CborItem, NitroCose, ParsedCoseSign1};
+
+mod planner;
+pub use planner::{AttestationPlanner, CertManagerKeys, PINNED_ROOT_CERT_HASH};
 
 mod prover;
 pub use prover::ProverClient;
@@ -38,7 +47,9 @@ mod traits;
 pub use traits::{EnclaveEndpointClient, InstanceDiscovery};
 
 mod types;
-pub use types::{InstanceHealthStatus, ProverInstance};
+pub use types::{
+    CertKind, CertPlan, InstanceHealthStatus, ProverInstance, RegistrationHints, RegistrationPlan,
+};
 
 #[cfg(test)]
 pub mod test_utils;

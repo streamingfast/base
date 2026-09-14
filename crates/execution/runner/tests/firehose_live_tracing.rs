@@ -1,12 +1,11 @@
 //! Regression test for Firehose tracing on the engine-tree live-block path.
 //!
-//! Base's live-path Firehose hooks live in `base_engine_tree`'s payload validator
-//! (`validate_block_with_state` → `execute_and_trace_block`) and are wired into the node through
-//! [`base_node_runner::BaseNode`]'s `BaseEngineValidatorBuilder` add-on. Blocks that a node has to
-//! *execute itself* when they arrive via `engine_newPayload` are routed into the Firehose tracer
-//! there. Those hooks have been dropped during upstream merges before, silently disabling
-//! live-block tracing while the historical/stage path kept working — a regression that compiled and
-//! passed every existing test.
+//! Blocks that a node has to *execute itself* when they arrive via `engine_newPayload` are routed
+//! into the Firehose tracer by reth's engine validator (`validate_block_with_state` →
+//! `execute_and_trace_block`), which installs the OP Stack hooks Base's EVM config selects through
+//! `reth_firehose::FirehoseLiveHooks`. Those hooks have been dropped during upstream merges before,
+//! silently disabling live-block tracing (or its OP-specific events) while the historical/stage
+//! path kept working — a regression that compiled and passed every existing test.
 //!
 //! ## Why two nodes
 //!
@@ -19,6 +18,13 @@
 //! If the dispatch into `execute_and_trace_block` is missing, no `FIRE BLOCK` lines are produced and
 //! the test fails.
 //!
+//! ## OP Stack hooks
+//!
+//! Each block carries the L1-info deposit and a transfer from a pre-funded account. The test checks
+//! the two events only the OP hooks produce: the deposit's nonce (deposit envelopes carry none, so
+//! without `OpPreTxAdjust` every deposit reports nonce 0) and the `BaseFeeVault` fee credit on the
+//! transfer (applied outside the EVM journal, so without `OpPostTxExtras` it is missing).
+//!
 //! It lives in its own integration-test binary because it installs a process-wide tracer;
 //! cargo/nextest run each integration binary in its own process, keeping the global tracer isolated
 //! from the rest of the suite. The tracer is global, but only the follower's
@@ -27,11 +33,12 @@
 use std::{sync::Arc, time::Duration};
 
 use alloy_eips::eip7685::Requests;
-use alloy_primitives::{B64, B256, Bytes};
+use alloy_primitives::{Address, B64, B256, Bytes, U256};
 use alloy_provider::Provider;
 use alloy_rpc_types::BlockNumberOrTag;
 use alloy_rpc_types_engine::PayloadAttributes;
-use base_common_consensus::BaseTxEnvelope;
+use base_common_consensus::{BaseTxEnvelope, Predeploys};
+use base_common_rpc_types::BaseTransactionRequest;
 use base_common_rpc_types_engine::BasePayloadAttributes;
 use base_execution_chainspec::BaseChainSpec;
 use base_execution_payload_builder::BasePayloadBuilderAttributes;
@@ -39,7 +46,11 @@ use base_node_runner::test_utils::{
     BLOCK_BUILD_DELAY_MS, BLOCK_TIME_SECONDS, GAS_LIMIT, L1_BLOCK_INFO_DEPOSIT_TX, LocalNode,
     NODE_STARTUP_DELAY_MS,
 };
-use base_test_utils::{DEVNET_CHAIN_ID, build_test_genesis};
+use base_firehose_tests::BaseFirehoseCapture;
+use base_test_utils::{Account, DEVNET_CHAIN_ID, build_test_genesis};
+use firehose_tracer::pb::sf::ethereum::r#type::v2::{
+    balance_change::Reason, transaction_trace::Type as TrxType,
+};
 use eyre::{Result, eyre};
 use reth_chainspec::EthChainSpec;
 use reth_provider::ChainSpecProvider;
@@ -63,7 +74,7 @@ async fn live_payload_validation_emits_firehose_blocks() -> Result<()> {
     // path's `is_tracer_initialized()` gate activates and routes execution through
     // `execute_and_trace_block`. The chain id matches the test genesis; the fork timestamps only
     // affect how block contents are mapped, not whether a block is emitted.
-    let buffer = reth_firehose::init_tracer_with_buffer(
+    let capture = BaseFirehoseCapture::install(
         DEVNET_CHAIN_ID,
         Some(0), // shanghai / canyon
         Some(0), // cancun / ecotone
@@ -107,7 +118,7 @@ async fn live_payload_validation_emits_firehose_blocks() -> Result<()> {
     seq_engine.update_forkchoice(genesis_hash, genesis_hash, None).await?;
     fol_engine.update_forkchoice(genesis_hash, genesis_hash, None).await?;
 
-    for _ in 0..PRODUCED_BLOCKS {
+    for block_index in 0..PRODUCED_BLOCKS {
         // Use the sequencer head as the parent for the next block.
         let parent = sequencer
             .provider()?
@@ -123,6 +134,13 @@ async fn live_payload_validation_emits_firehose_blocks() -> Result<()> {
         let eip_1559_params = ((base_fee_params.max_change_denominator as u64) << 32)
             | (base_fee_params.elasticity_multiplier as u64);
 
+        let (transfer, _) = Account::Alice.sign_txn_request(
+            BaseTransactionRequest::default()
+                .to(Account::Bob.address())
+                .value(U256::from(1))
+                .nonce(block_index),
+        )?;
+
         let attributes = BasePayloadBuilderAttributes::<BaseTxEnvelope>::try_new(
             parent_hash,
             BasePayloadAttributes {
@@ -133,13 +151,11 @@ async fn live_payload_validation_emits_firehose_blocks() -> Result<()> {
                     slot_number: None,
                     ..Default::default()
                 },
-                transactions: Some(vec![L1_BLOCK_INFO_DEPOSIT_TX]),
+                transactions: Some(vec![L1_BLOCK_INFO_DEPOSIT_TX, transfer]),
                 gas_limit: Some(GAS_LIMIT),
                 no_tx_pool: Some(true),
                 min_base_fee: Some(min_base_fee),
                 eip_1559_params: Some(B64::from(eip_1559_params)),
-                // Pre-`BaseTime` activation, so no millisecond component.
-                timestamp_millis_part: None,
             },
             3,
         )?;
@@ -179,32 +195,55 @@ async fn live_payload_validation_emits_firehose_blocks() -> Result<()> {
         fol_engine.update_forkchoice(parent_hash, new_block_hash, None).await?;
     }
 
-    // Collect the block numbers from every captured `FIRE BLOCK <num> ...` line.
-    let raw = buffer.get_bytes();
-    let text = String::from_utf8(raw).expect("captured tracer output is UTF-8");
-    let traced: Vec<u64> = text
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split(' ');
-            if parts.next()? != "FIRE" || parts.next()? != "BLOCK" {
-                return None;
-            }
-            parts.next()?.parse::<u64>().ok()
-        })
-        .collect();
-
+    let traced = capture.traced_block_numbers();
     assert!(
         !traced.is_empty(),
         "no FIRE BLOCK lines were emitted — the follower's live payload-validation path is not \
-         traced.\nCaptured tracer output:\n{text}"
+         traced.\nCaptured tracer output:\n{}",
+        capture.raw_text()
     );
 
     // Every produced block goes through the live `execute_and_trace_block` path. Require each to
-    // have been traced.
+    // have been traced exactly once.
     for number in 1..=PRODUCED_BLOCKS {
-        assert!(
-            traced.contains(&number),
-            "expected a FIRE BLOCK line for live block #{number}, got traced blocks {traced:?}"
+        let count = traced.iter().filter(|traced| **traced == number).count();
+        assert_eq!(count, 1, "expected one FIRE BLOCK line for live block #{number}, got {traced:?}");
+    }
+
+    for block in capture.blocks()? {
+        let [deposit, transfer] = block.transaction_traces.as_slice() else {
+            panic!(
+                "block #{} should hold the L1-info deposit and one transfer, got {} traces",
+                block.number,
+                block.transaction_traces.len()
+            );
+        };
+
+        // `OpPreTxAdjust`: the depositor sends one deposit per block, so its pre-execution nonce
+        // is the parent block number.
+        assert_eq!(deposit.r#type, TrxType::TrxTypeOptimismDeposit as i32);
+        assert_eq!(
+            deposit.nonce,
+            block.number - 1,
+            "deposit nonce in block #{} does not come from the depositor account",
+            block.number
+        );
+
+        // `OpPostTxExtras`: the base fee paid by the transfer is credited to the `BaseFeeVault`.
+        let base_fee_vault_credits: Vec<_> = transfer
+            .calls
+            .iter()
+            .flat_map(|call| &call.balance_changes)
+            .filter(|change| {
+                change.reason == Reason::RewardTransactionFee as i32 &&
+                    Address::from_slice(&change.address) == Predeploys::BASE_FEE_VAULT
+            })
+            .collect();
+        assert_eq!(
+            base_fee_vault_credits.len(),
+            1,
+            "transfer in block #{} should credit the BaseFeeVault exactly once",
+            block.number
         );
     }
 

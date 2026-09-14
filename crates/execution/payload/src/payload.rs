@@ -4,7 +4,10 @@ use std::{fmt::Debug, sync::Arc};
 
 use alloy_consensus::{Block, BlockHeader};
 use alloy_eips::{
-    eip1559::BaseFeeParams, eip2718::Decodable2718, eip4895::Withdrawals, eip7685::Requests,
+    eip1559::BaseFeeParams,
+    eip2718::{Decodable2718, Encodable2718},
+    eip4895::Withdrawals,
+    eip7685::Requests,
 };
 use alloy_primitives::{Address, B64, B256, Bytes, U256};
 use alloy_rpc_types_engine::{
@@ -13,7 +16,7 @@ use alloy_rpc_types_engine::{
 };
 use base_common_chains::Upgrades;
 use base_common_consensus::{
-    BasePrimitives, EIP1559ParamError, HoloceneExtraData, JovianExtraData,
+    BasePrimitives, EIP1559ParamError, HoloceneExtraData, JovianExtraData, decode_2718_canonical,
 };
 /// Re-export for use in downstream arguments.
 pub use base_common_rpc_types_engine::BasePayloadAttributes;
@@ -68,8 +71,6 @@ pub struct BasePayloadBuilderAttributes<T> {
     pub eip_1559_params: Option<B64>,
     /// Min base fee for the generated payload (only available post-Jovian)
     pub min_base_fee: Option<u64>,
-    /// The millisecond component of the payload timestamp.
-    pub timestamp_millis_part: Option<u16>,
 }
 
 impl<T> Default for BasePayloadBuilderAttributes<T> {
@@ -81,7 +82,6 @@ impl<T> Default for BasePayloadBuilderAttributes<T> {
             eip_1559_params: Default::default(),
             transactions: Default::default(),
             min_base_fee: Default::default(),
-            timestamp_millis_part: Default::default(),
         }
     }
 }
@@ -100,6 +100,7 @@ impl<T> BasePayloadBuilderAttributes<T> {
                     .then(|| self.payload_attributes.withdrawals.to_vec()),
                 parent_beacon_block_root: self.payload_attributes.parent_beacon_block_root,
                 slot_number: self.payload_attributes.slot_number,
+                target_gas_limit: None,
             },
             transactions: (!self.transactions.is_empty())
                 .then(|| self.transactions.iter().map(|tx| tx.encoded_bytes().clone()).collect()),
@@ -107,7 +108,6 @@ impl<T> BasePayloadBuilderAttributes<T> {
             gas_limit: self.gas_limit,
             eip_1559_params: self.eip_1559_params,
             min_base_fee: self.min_base_fee,
-            timestamp_millis_part: self.timestamp_millis_part,
         }
     }
 
@@ -142,22 +142,28 @@ impl<T> BasePayloadBuilderAttributes<T> {
     }
 }
 
-impl<T: Decodable2718 + Send + Sync + Debug + Unpin + 'static> BasePayloadBuilderAttributes<T> {
+impl<T: Decodable2718 + Encodable2718 + Send + Sync + Debug + Unpin + 'static>
+    BasePayloadBuilderAttributes<T>
+{
     /// Creates payload builder attributes for the given parent block and RPC payload attributes.
     pub fn try_new(
         parent: B256,
         attributes: BasePayloadAttributes,
         version: u8,
     ) -> Result<Self, alloy_rlp::Error> {
+        if attributes.payload_attributes.target_gas_limit.is_some() {
+            return Err(alloy_rlp::Error::Custom(
+                "targetGasLimit is not supported by Base payload attributes",
+            ));
+        }
+
         let id = attributes.payload_id(&parent, version);
 
         let transactions = attributes
             .transactions
             .unwrap_or_default()
             .into_iter()
-            .map(|data| {
-                Decodable2718::decode_2718_exact(data.as_ref()).map(|tx| WithEncoded::new(data, tx))
-            })
+            .map(|data| decode_2718_canonical(data.as_ref()).map(|tx| WithEncoded::new(data, tx)))
             .collect::<Result<_, _>>()?;
 
         let payload_attributes = EthPayloadBuilderAttributes {
@@ -179,7 +185,6 @@ impl<T: Decodable2718 + Send + Sync + Debug + Unpin + 'static> BasePayloadBuilde
             gas_limit: attributes.gas_limit,
             eip_1559_params: attributes.eip_1559_params,
             min_base_fee: attributes.min_base_fee,
-            timestamp_millis_part: attributes.timestamp_millis_part,
         })
     }
 }
@@ -224,7 +229,7 @@ impl<T> serde::Serialize for BasePayloadBuilderAttributes<T> {
 
 impl<'de, T> serde::Deserialize<'de> for BasePayloadBuilderAttributes<T>
 where
-    T: Decodable2718 + Send + Sync + Debug + Unpin + 'static,
+    T: Decodable2718 + Encodable2718 + Send + Sync + Debug + Unpin + 'static,
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -237,7 +242,7 @@ where
 
 impl<T> reth_payload_primitives::PayloadAttributes for BasePayloadBuilderAttributes<T>
 where
-    T: Clone + Decodable2718 + Send + Sync + Debug + Unpin + 'static,
+    T: Clone + Decodable2718 + Encodable2718 + Send + Sync + Debug + Unpin + 'static,
 {
     fn payload_id(&self, parent_hash: &B256) -> PayloadId {
         self.as_rpc_payload_attributes().payload_id(parent_hash, 3)
@@ -559,13 +564,13 @@ mod tests {
                 withdrawals: Some([].into()),
                 parent_beacon_block_root: b256!("0x8fe0193b9bf83cb7e5a08538e494fecc23046aab9a497af3704f4afdae3250ff").into(),
                 slot_number: None,
+                target_gas_limit: None,
             },
             transactions: Some([bytes!("7ef8f8a0dc19cfa777d90980e4875d0a548a881baaa3f83f14d1bc0d3038bc329350e54194deaddeaddeaddeaddeaddeaddeaddeaddead00019442000000000000000000000000000000000000158080830f424080b8a4440a5e20000f424000000000000000000000000300000000670d6d890000000000000125000000000000000000000000000000000000000000000000000000000000000700000000000000000000000000000000000000000000000000000000000000014bf9181db6e381d4384bbf69c48b0ee0eed23c6ca26143c6d2544f9d39997a590000000000000000000000007f83d659683caf2767fd3c720981d51f5bc365bc")].into()),
             no_tx_pool: None,
             gas_limit: Some(30000000),
             eip_1559_params: None,
             min_base_fee: None,
-            timestamp_millis_part: None,
         };
 
         // Reth's `PayloadId` should match op-geth's `PayloadId`. This fails
@@ -591,13 +596,13 @@ mod tests {
                 withdrawals: Some([].into()),
                 parent_beacon_block_root: b256!("0x8fe0193b9bf83cb7e5a08538e494fecc23046aab9a497af3704f4afdae3250ff").into(),
                 slot_number: None,
+                target_gas_limit: None,
             },
             transactions: Some([bytes!("7ef8f8a0dc19cfa777d90980e4875d0a548a881baaa3f83f14d1bc0d3038bc329350e54194deaddeaddeaddeaddeaddeaddeaddeaddead00019442000000000000000000000000000000000000158080830f424080b8a4440a5e20000f424000000000000000000000000300000000670d6d890000000000000125000000000000000000000000000000000000000000000000000000000000000700000000000000000000000000000000000000000000000000000000000000014bf9181db6e381d4384bbf69c48b0ee0eed23c6ca26143c6d2544f9d39997a590000000000000000000000007f83d659683caf2767fd3c720981d51f5bc365bc")].into()),
             no_tx_pool: None,
             gas_limit: Some(30000000),
             eip_1559_params: None,
             min_base_fee: Some(100),
-            timestamp_millis_part: None,
         };
 
         // Reth's `PayloadId` should match op-geth's `PayloadId`. This fails
@@ -622,19 +627,26 @@ mod tests {
     }
 
     #[test]
-    fn test_payload_builder_preserves_timestamp_millis_part() {
-        let attributes =
-            BasePayloadAttributes { timestamp_millis_part: Some(400), ..Default::default() };
+    fn test_payload_builder_rejects_target_gas_limit() {
+        let attributes = BasePayloadAttributes {
+            payload_attributes: PayloadAttributes {
+                target_gas_limit: Some(30_000_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
-        let builder = BasePayloadBuilderAttributes::<BaseTransactionSigned>::try_new(
+        let error = BasePayloadBuilderAttributes::<BaseTransactionSigned>::try_new(
             B256::ZERO,
             attributes,
             EngineApiMessageVersion::V3 as u8,
         )
-        .unwrap();
+        .expect_err("targetGasLimit must be rejected");
 
-        assert_eq!(builder.timestamp_millis_part, Some(400));
-        assert_eq!(builder.as_rpc_payload_attributes().timestamp_millis_part, Some(400));
+        assert_eq!(
+            error,
+            alloy_rlp::Error::Custom("targetGasLimit is not supported by Base payload attributes")
+        );
     }
 
     #[test]

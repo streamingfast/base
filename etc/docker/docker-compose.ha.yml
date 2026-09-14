@@ -6,7 +6,7 @@ x-sequencer-base: &sequencer-base
     args:
       PROFILE: "${CARGO_PROFILE:-dev}"
     target: base
-  entrypoint: /app/base
+  entrypoint: /app/base-entrypoint.sh
   depends_on:
     setup-l2:
       condition: service_completed_successfully
@@ -55,6 +55,7 @@ services:
       setup-conductor:
         condition: service_completed_successfully
     command:
+      - batcher
       - --l1-rpc-url
       - http://l1-el:${L1_HTTP_PORT}
       - --l2-rpc-url
@@ -104,9 +105,9 @@ services:
       - NODE_HEALTHCHECK_CL_RPC_PORT=${L2_SEQ1_CL_RPC_PORT}
       - OTEL_SERVICE_NAME=base-sequencer-1
     command:
-      - sequencer
       - --chain
       - dev
+      - sequencer
       - --execution-chain=/genesis/l2/genesis.json
       - --datadir=/data
       - --telemetry.sampling-ratio=1
@@ -213,9 +214,9 @@ services:
       - NODE_HEALTHCHECK_CL_RPC_PORT=${L2_SEQ2_CL_RPC_PORT}
       - OTEL_SERVICE_NAME=base-sequencer-2
     command:
-      - sequencer
       - --chain
       - dev
+      - sequencer
       - --execution-chain=/genesis/l2/genesis.json
       - --datadir=/data
       - --telemetry.sampling-ratio=1

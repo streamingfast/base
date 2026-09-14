@@ -53,7 +53,7 @@ impl UpgradeSignalMetrics {
     pub fn record_schedule(layer: UpgradeSignalMetricLayer, schedule: &UpgradeSignalSchedule) {
         Self::init();
         for signal in &schedule.signals {
-            Self::record_signal(layer, signal);
+            Self::record_signal(layer, schedule.l1_block_number, signal);
         }
     }
 
@@ -69,7 +69,11 @@ impl UpgradeSignalMetrics {
     }
 
     /// Records all metrics derived from a successfully read signal.
-    pub fn record_signal(layer: UpgradeSignalMetricLayer, signal: &UpgradeSignal) {
+    pub fn record_signal(
+        layer: UpgradeSignalMetricLayer,
+        l1_block_number: u64,
+        signal: &UpgradeSignal,
+    ) {
         Self::init();
         let layer = layer.label();
         let upgrade_id = signal.upgrade_id.contract_id().to_string();
@@ -78,44 +82,23 @@ impl UpgradeSignalMetrics {
             .set(signal.activation_timestamp as f64);
         Self::expected_protocol_version(layer, upgrade_id.clone())
             .set(Self::protocol_version_to_f64(signal.protocol_version));
-        Self::last_l1_read_block(layer, upgrade_id).set(signal.l1_block_number as f64);
+        Self::last_l1_read_block(layer, upgrade_id).set(l1_block_number as f64);
     }
 
-    /// Records a failed L1 read for one upgrade ID.
-    pub fn record_l1_read_error(layer: UpgradeSignalMetricLayer, upgrade_id: BaseUpgrade) {
+    /// Records failed L1 reads for all contract-backed upgrades.
+    pub fn record_l1_read_errors(layer: UpgradeSignalMetricLayer) {
         Self::init();
-        Self::l1_read_errors_total(layer.label(), upgrade_id.contract_id().to_string())
-            .increment(1);
-    }
-
-    /// Records a failed L1 read for one upgrade ID across all enabled layers.
-    pub fn record_l1_read_error_for_layers(
-        layers: &[UpgradeSignalMetricLayer],
-        upgrade_id: BaseUpgrade,
-    ) {
-        Self::init();
-        for layer in layers {
-            Self::record_l1_read_error(*layer, upgrade_id);
-        }
-    }
-
-    /// Records failed L1 reads for all configured upgrade IDs.
-    pub fn record_l1_read_errors(layer: UpgradeSignalMetricLayer, upgrade_ids: &[BaseUpgrade]) {
-        Self::init();
-        for upgrade_id in upgrade_ids {
+        for upgrade_id in BaseUpgrade::CONTRACT_VARIANTS {
             Self::l1_read_errors_total(layer.label(), upgrade_id.contract_id().to_string())
                 .increment(1);
         }
     }
 
-    /// Records failed L1 reads for all configured upgrade IDs across all enabled layers.
-    pub fn record_l1_read_errors_for_layers(
-        layers: &[UpgradeSignalMetricLayer],
-        upgrade_ids: &[BaseUpgrade],
-    ) {
+    /// Records failed L1 reads for all contract-backed upgrades across all enabled layers.
+    pub fn record_l1_read_errors_for_layers(layers: &[UpgradeSignalMetricLayer]) {
         Self::init();
         for layer in layers {
-            Self::record_l1_read_errors(*layer, upgrade_ids);
+            Self::record_l1_read_errors(*layer);
         }
     }
 
@@ -126,9 +109,18 @@ impl UpgradeSignalMetrics {
             .increment(1);
     }
 
-    /// Converts a protocol version to a metric gauge value.
+    /// Converts a packed-semver protocol version to a compact metric gauge value.
+    ///
+    /// Decoded as `major * 1_000_000 + minor * 1_000 + patch` so the gauge stays readable
+    /// (raw packed values exceed `f64` integer precision).
+    ///
+    /// Expects a contract-read packed semver value; non-semver inputs decode to garbage.
     pub fn protocol_version_to_f64(protocol_version: U256) -> f64 {
-        protocol_version.to_string().parse::<f64>().unwrap_or(-1.0)
+        let limbs = protocol_version.as_limbs();
+        let major = limbs[1] >> 32;
+        let minor = limbs[1] & u64::from(u32::MAX);
+        let patch = limbs[0] >> 32;
+        (major * 1_000_000 + minor * 1_000 + patch) as f64
     }
 }
 
@@ -137,7 +129,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn converts_protocol_version_to_metric_value() {
-        assert_eq!(UpgradeSignalMetrics::protocol_version_to_f64(U256::from(7)), 7.0);
+    fn converts_packed_semver_protocol_version_to_metric_value() {
+        let version = crate::UpgradeSignalDefaults::packed_protocol_version(1, 1, 0);
+        assert_eq!(UpgradeSignalMetrics::protocol_version_to_f64(version), 1_001_000.0);
     }
 }

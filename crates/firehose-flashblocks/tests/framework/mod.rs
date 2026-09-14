@@ -610,7 +610,10 @@ impl StateProofProvider for GenesisStateProvider {
 }
 
 impl HashedPostStateProvider for GenesisStateProvider {
-    fn hashed_post_state(&self, bundle: &revm::database::BundleState) -> HashedPostState {
+    fn hashed_post_state(
+        &self,
+        bundle: &revm::database::BundleState,
+    ) -> ProviderResult<HashedPostState> {
         self.0.hashed_post_state(bundle)
     }
 }

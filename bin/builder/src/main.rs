@@ -6,10 +6,14 @@
 use std::sync::Arc;
 
 use base_builder_cli::Args;
-use base_builder_core::{BuilderApiExtension, FlashblocksServiceBuilder};
+use base_builder_core::{
+    BuilderApiExtension, BuilderApiExtensionConfig, FlashblocksServiceBuilder,
+};
 use base_builder_metering::MeteringStoreExtension;
 use base_execution_cli::{Cli, StandardBaseRethNode};
 use base_node_runner::BaseNodeRunner;
+use base_observability_events::GlobalTransactionEventWriter;
+use base_shadow_indexer::{ShadowIndexerConfig, ShadowIndexerExtension};
 use base_txpool_rpc::{TxPoolRpcConfig, TxPoolRpcExtension};
 
 type BuilderCli = Cli<Args>;
@@ -26,28 +30,38 @@ fn main() {
 
     cli.run(|builder, builder_args| async move {
         let rollup_args = builder_args.rollup_args.clone();
-        let builder = StandardBaseRethNode::apply_initial_upgrade_signal_from_rollup_args(
-            builder,
-            &rollup_args,
-        )
-        .await?;
+        let builder =
+            StandardBaseRethNode::apply_initial_upgrade_signal(builder, &builder_args).await?;
 
         let metering_provider: base_builder_core::SharedMeteringProvider =
             Arc::new(builder_args.build_metering_store());
+        let transaction_events_enabled = builder_args.transaction_events.enabled;
+        GlobalTransactionEventWriter::init(
+            transaction_events_enabled.then(|| builder_args.transaction_events.writer_config()),
+        )?;
 
+        let accept_validity_transactions = builder_args.enable_experimental_validity_transactions;
+        let shadow_indexer_config = ShadowIndexerConfig::try_from(&builder_args.shadow_indexer)?;
+        let max_validity_predicates = builder_args.experimental_validity_max_predicates;
         let builder_config = builder_args
             .into_builder_config(Arc::clone(&metering_provider))
             .expect("Failed to convert rollup args to builder config");
         let da_config = builder_config.da_config.clone();
         let gas_limit_config = builder_config.gas_limit_config.clone();
+        let manifest_precheck_enabled = builder_config.manifest_precheck_enabled;
 
         let mut runner = BaseNodeRunner::new(rollup_args.clone())
             .with_da_config(da_config)
             .with_gas_limit_config(gas_limit_config)
-            .with_service_builder(FlashblocksServiceBuilder(builder_config));
+            .with_manifest_precheck_enabled(manifest_precheck_enabled)
+            .with_service_builder(FlashblocksServiceBuilder::new(builder_config));
         runner.install_ext::<MeteringStoreExtension>(metering_provider);
         runner.install_ext::<TxPoolRpcExtension>(TxPoolRpcConfig::default());
-        runner.install_ext::<BuilderApiExtension>(());
+        runner.install_ext::<BuilderApiExtension>(BuilderApiExtensionConfig::new(
+            accept_validity_transactions,
+            max_validity_predicates,
+        ));
+        runner.install_ext::<ShadowIndexerExtension>(shadow_indexer_config);
         StandardBaseRethNode::install_upgrade_signal_runtime_extension(&mut runner, &rollup_args)?;
         runner.add_started_callback(|| {
             base_cli_utils::register_version_metrics!();

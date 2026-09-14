@@ -31,6 +31,7 @@ where
 {
     config: Arc<RollupConfig>,
     engine_client: Arc<E>,
+    l1_provider: RootProvider,
     local_l2_provider: RootProvider<Base>,
     l2_source: RemoteL2Client,
     proofs_enabled: bool,
@@ -51,6 +52,8 @@ where
     pub engine_client: Arc<E>,
     /// Provider for reading local L2 state.
     pub local_l2_provider: RootProvider<Base>,
+    /// Provider used to check L2 block origins against canonical L1.
+    pub l1_provider: RootProvider,
     /// Source L2 client used to fetch payloads to follow.
     pub l2_source: RemoteL2Client,
     /// Optional RPC server configuration.
@@ -72,6 +75,7 @@ where
         Self {
             config: config.rollup_config,
             engine_client: config.engine_client,
+            l1_provider: config.l1_provider,
             local_l2_provider: config.local_l2_provider,
             l2_source: config.l2_source,
             rpc_builder: config.rpc_builder,
@@ -81,11 +85,25 @@ where
         }
     }
 
-    /// Starts the follow node.
+    /// Starts the follow node, creating a fresh cancellation token.
     pub async fn start(&self) -> Result<(), FollowError> {
-        let cancellation = CancellationToken::new();
-        let local =
-            Arc::new(LocalL2Client::new(self.local_l2_provider.clone(), Arc::clone(&self.config)));
+        self.start_with_cancellation(CancellationToken::new()).await
+    }
+
+    /// Starts the follow node, driven by an externally supplied cancellation token.
+    ///
+    /// Cancelling the token stops the follow runtime, which lets an embedding caller (e.g. the
+    /// unified binary running execution in-process) coordinate a clean shutdown across both
+    /// services. The follow node also stops on an internal [`ShutdownSignal`].
+    pub async fn start_with_cancellation(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<(), FollowError> {
+        let local = Arc::new(LocalL2Client::new(
+            self.local_l2_provider.clone(),
+            self.l1_provider.clone(),
+            Arc::clone(&self.config),
+        ));
         let latest = local
             .block_info(BlockNumberOrTag::Latest)
             .await?

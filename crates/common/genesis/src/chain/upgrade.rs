@@ -27,12 +27,27 @@ pub struct BaseUpgradeConfig {
     /// Active if `cobalt` != None && L2 block timestamp >= `Some(cobalt)`, inactive otherwise.
     #[cfg_attr(feature = "serde", serde(alias = "v3", skip_serializing_if = "Option::is_none"))]
     pub cobalt: Option<u64>,
+    /// `denim` sets the activation time for the Denim network upgrade.
+    /// Active if `denim` != None && L2 block timestamp >= `Some(denim)`, inactive otherwise.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub denim: Option<u64>,
+    /// `zenith` sets the activation time for the Zenith network upgrade.
+    /// Active if `zenith` != None && L2 block timestamp >= `Some(zenith)`, inactive otherwise.
+    #[cfg_attr(
+        feature = "serde",
+        serde(alias = "future", skip_serializing_if = "Option::is_none")
+    )]
+    pub zenith: Option<u64>,
 }
 
 impl BaseUpgradeConfig {
     /// Returns true if no Base-specific upgrades are configured.
     pub const fn is_empty(&self) -> bool {
-        self.azul.is_none() && self.beryl.is_none() && self.cobalt.is_none()
+        self.azul.is_none()
+            && self.beryl.is_none()
+            && self.cobalt.is_none()
+            && self.denim.is_none()
+            && self.zenith.is_none()
     }
 }
 
@@ -52,9 +67,14 @@ hardfork!(
     /// are contract-backed config upgrades that do not change EVM execution and therefore never
     /// enter the execution fork ladder.
     ///
-    /// [`Zombie`](BaseUpgrade::Zombie) is a permanently-off gate: it is a known upgrade identity
-    /// used to gate not-yet-ready features (checked like any other fork), but it is neither
-    /// contract-backed nor configurable and can never activate.
+    /// [`Denim`](BaseUpgrade::Denim) is the fourth Base-specific network upgrade. It is
+    /// unscheduled for now, but it is a first-class upgrade: contract-backed and part of the
+    /// execution fork ladder, so live chains can activate it once an activation time is
+    /// configured.
+    ///
+    /// [`Zenith`](BaseUpgrade::Zenith) is a hardfork for future experimental features. It is
+    /// genesis-configurable but not contract-backed, since the L1 upgrade-signal contract does
+    /// not yet recognise it.
     ///
     /// When building a list of upgrades for a chain, it's still expected to zip with
     /// [`EthereumHardfork`](alloy_hardforks::EthereumHardfork).
@@ -85,28 +105,29 @@ hardfork!(
         /// Jovian: Base network upgrade.
         Jovian,
         /// Azul: First Base-specific network upgrade.
-        #[default]
         Azul,
         /// Beryl: Second Base-specific network upgrade.
+        #[default]
         Beryl,
         /// Cobalt: Third Base-specific network upgrade.
         Cobalt,
-        /// Zombie: permanently-off gate used to keep not-yet-ready features disabled. Never
-        /// activates and is not contract-backed or configurable.
-        Zombie,
+        /// Denim: Fourth Base-specific network upgrade. Unscheduled for now.
+        Denim,
+        /// Zenith: hardfork for future experimental features.
+        Zenith,
     }
 );
 
 impl BaseUpgrade {
     /// Latest Base upgrade used by default.
-    pub const LATEST: Self = Self::Azul;
+    pub const LATEST: Self = Self::Beryl;
 
     /// The execution fork ladder, in activation order.
     ///
     /// These are the upgrades that participate in the reth/revm hardfork schedule. Excludes the
     /// contract-only [`Delta`](Self::Delta) and [`PectraBlobSchedule`](Self::PectraBlobSchedule)
-    /// upgrades and the [`Zombie`](Self::Zombie) gate, which do not change EVM execution.
-    pub const EXECUTION_VARIANTS: [Self; 12] = [
+    /// upgrades, and [`Zenith`](Self::Zenith), which does not yet change EVM execution.
+    pub const EXECUTION_VARIANTS: [Self; 13] = [
         Self::Bedrock,
         Self::Regolith,
         Self::Canyon,
@@ -119,14 +140,22 @@ impl BaseUpgrade {
         Self::Azul,
         Self::Beryl,
         Self::Cobalt,
+        Self::Denim,
     ];
 
     /// The contract-backed upgrade set, in activation order.
     ///
     /// These are the upgrades addressable by the L1 upgrade-signal contract and stored in the
-    /// genesis [`UpgradeConfig`]. Excludes block-activated [`Bedrock`](Self::Bedrock) and the
-    /// [`Zombie`](Self::Zombie) gate, which is never signaled or configured.
-    pub const CONTRACT_VARIANTS: [Self; 13] = [
+    /// genesis [`UpgradeConfig`]. Excludes block-activated [`Bedrock`](Self::Bedrock) and
+    /// [`Zenith`](Self::Zenith), which is activated via genesis config only until the L1
+    /// upgrade-signal contract is updated to recognise it.
+    ///
+    /// Order is load-bearing: `map_schedule` and `ScheduleId::pin` attribute onchain
+    /// schedule entries to hardforks *by position*, and the `ProtocolVersions` contract keys
+    /// upgrades by ascending append-only registration id with names kept offchain. This order MUST
+    /// match the contract's registration order — reordering silently misattributes every
+    /// activation timestamp. Only ever append.
+    pub const CONTRACT_VARIANTS: [Self; 14] = [
         Self::Regolith,
         Self::Canyon,
         Self::Delta,
@@ -140,6 +169,7 @@ impl BaseUpgrade {
         Self::Azul,
         Self::Beryl,
         Self::Cobalt,
+        Self::Denim,
     ];
 
     /// Returns true if this upgrade participates in the execution fork ladder.
@@ -149,9 +179,10 @@ impl BaseUpgrade {
 
     /// Returns true if this upgrade is contract-backed (i.e. signaled by the L1 upgrade-signal
     /// contract and stored in [`UpgradeConfig`]). False for block-activated
-    /// [`Bedrock`](Self::Bedrock) and the never-activating [`Zombie`](Self::Zombie) gate.
+    /// [`Bedrock`](Self::Bedrock) and for [`Zenith`](Self::Zenith), which is activated via
+    /// genesis config only until the L1 upgrade-signal contract is updated.
     pub const fn is_contract_backed(self) -> bool {
-        !matches!(self, Self::Bedrock | Self::Zombie)
+        !matches!(self, Self::Bedrock | Self::Zenith)
     }
 
     /// Returns this upgrade's index within [`EXECUTION_VARIANTS`](Self::EXECUTION_VARIANTS), or
@@ -170,7 +201,8 @@ impl BaseUpgrade {
             Self::Azul => 9,
             Self::Beryl => 10,
             Self::Cobalt => 11,
-            Self::Delta | Self::PectraBlobSchedule | Self::Zombie => return None,
+            Self::Denim => 12,
+            Self::Delta | Self::PectraBlobSchedule | Self::Zenith => return None,
         })
     }
 
@@ -195,7 +227,8 @@ impl BaseUpgrade {
             Self::Azul => "azul",
             Self::Beryl => "beryl",
             Self::Cobalt => "cobalt",
-            Self::Zombie => "zombie",
+            Self::Denim => "denim",
+            Self::Zenith => "zenith",
         }
     }
 
@@ -238,7 +271,8 @@ impl BaseUpgrade {
             "osaka" | "azul" | "baseazul" | "v1" => Self::Azul,
             "beryl" | "baseberyl" | "v2" => Self::Beryl,
             "cobalt" | "basecobalt" | "v3" => Self::Cobalt,
-            // Zombie is a permanently-off gate: even though `contract_id` emits "zombie", it is
+            "denim" | "basedenim" => Self::Denim,
+            // Zenith is not contract-backed: even though `contract_id` emits "zenith", it is
             // deliberately not resolvable here, so the L1 upgrade signal can never address it.
             _ => return None,
         };
@@ -252,6 +286,22 @@ impl BaseUpgrade {
             .filter(|b| !b.is_ascii_whitespace() && !matches!(b, b'_' | b'-'))
             .map(|b| b.to_ascii_lowercase() as char)
             .collect()
+    }
+
+    /// Returns the active upgrade at the given timestamp for the specified chain.
+    pub fn from_chain_and_timestamp(chain_id: u64, timestamp: u64) -> Option<Self> {
+        let mut config = UpgradeConfig::for_chain_id(chain_id)?;
+
+        if let Some(overrides) = RuntimeUpgradeRegistry::overrides(chain_id) {
+            config.apply_activation_overrides(&overrides);
+        }
+
+        Self::EXECUTION_VARIANTS.into_iter().rev().find(|&upgrade| {
+            upgrade == Self::Bedrock
+                || config
+                    .activation_timestamp(upgrade)
+                    .is_some_and(|activation| timestamp >= activation)
+        })
     }
 }
 
@@ -301,8 +351,11 @@ pub trait UpgradeActivationSink {
     ) -> Result<bool, Self::Error>;
 
     /// Finalizes the target after a batch of activations (e.g. recompute derived state).
-    fn finalize(&mut self) -> Result<(), Self::Error> {
-        Ok(())
+    ///
+    /// Returns `true` when the target committed the batch and `false` when it rejected the batch
+    /// without error.
+    fn finalize(&mut self) -> Result<bool, Self::Error> {
+        Ok(true)
     }
 }
 
@@ -336,9 +389,9 @@ impl UpgradeActivationOverrides {
 
     /// Sets the runtime activation override for a contract upgrade ID.
     pub fn set_activation(&mut self, upgrade_id: BaseUpgrade, activation: UpgradeActivation) {
-        // Zombie is a permanently-off gate: never store it as an override so the "Zombie is
-        // never stored as active" invariant holds at the write side, not just at consumers.
-        if matches!(upgrade_id, BaseUpgrade::Zombie) {
+        // Zenith is not contract-backed: it must never be set via the L1-signal-driven runtime
+        // override path. Its activation comes from genesis config only.
+        if matches!(upgrade_id, BaseUpgrade::Zenith) {
             return;
         }
         self.activations.insert(upgrade_id, activation);
@@ -355,6 +408,15 @@ impl UpgradeActivationOverrides {
     }
 }
 
+/// Versioned runtime upgrade activation overrides for one chain.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct RuntimeUpgradeRegistryEntry {
+    /// Runtime upgrade activation overrides.
+    pub overrides: UpgradeActivationOverrides,
+    /// Latest L1 block number whose schedule was applied to the overrides.
+    pub last_updated_block_number: Option<u64>,
+}
+
 /// Process-local runtime upgrade activation registry.
 ///
 /// The runtime upgrade signal treats the L1 contract as the authoritative source for these
@@ -368,37 +430,68 @@ pub struct RuntimeUpgradeRegistry;
 
 impl RuntimeUpgradeRegistry {
     /// Returns the global runtime upgrade activation registry.
-    fn registry() -> &'static RwLock<BTreeMap<u64, UpgradeActivationOverrides>> {
-        static REGISTRY: Once<RwLock<BTreeMap<u64, UpgradeActivationOverrides>>> = Once::new();
+    fn registry() -> &'static RwLock<BTreeMap<u64, RuntimeUpgradeRegistryEntry>> {
+        static REGISTRY: Once<RwLock<BTreeMap<u64, RuntimeUpgradeRegistryEntry>>> = Once::new();
         REGISTRY.call_once(|| RwLock::new(BTreeMap::new()))
     }
 
     /// Returns a registry read guard.
-    fn read_registry() -> RwLockReadGuard<'static, BTreeMap<u64, UpgradeActivationOverrides>> {
+    fn read_registry() -> RwLockReadGuard<'static, BTreeMap<u64, RuntimeUpgradeRegistryEntry>> {
         Self::registry().read()
     }
 
     /// Returns a registry write guard.
-    fn write_registry() -> RwLockWriteGuard<'static, BTreeMap<u64, UpgradeActivationOverrides>> {
+    fn write_registry() -> RwLockWriteGuard<'static, BTreeMap<u64, RuntimeUpgradeRegistryEntry>> {
         Self::registry().write()
     }
 
     /// Returns the runtime activation override for a chain and contract upgrade ID.
     pub fn activation(chain_id: u64, upgrade_id: BaseUpgrade) -> Option<UpgradeActivation> {
-        Self::read_registry().get(&chain_id).and_then(|overrides| overrides.activation(upgrade_id))
+        Self::read_registry()
+            .get(&chain_id)
+            .and_then(|entry| entry.overrides.activation(upgrade_id))
     }
 
     /// Returns all runtime activation overrides for a chain.
     pub fn overrides(chain_id: u64) -> Option<UpgradeActivationOverrides> {
-        Self::read_registry().get(&chain_id).cloned()
+        Self::read_registry().get(&chain_id).map(|entry| entry.overrides.clone())
     }
 
-    /// Replaces all runtime activation overrides for a chain.
-    pub fn replace_overrides(chain_id: u64, overrides: UpgradeActivationOverrides) {
-        Self::write_registry().insert(chain_id, overrides);
+    /// Returns the latest L1 block number whose schedule was applied for a chain.
+    pub fn last_updated_block_number(chain_id: u64) -> Option<u64> {
+        Self::read_registry().get(&chain_id).and_then(|entry| entry.last_updated_block_number)
     }
 
-    /// Clears all runtime activation overrides for a chain.
+    /// Replaces all runtime activation overrides unless their L1 block predates stored state.
+    ///
+    /// The ordering check and replacement happen under one write lock so concurrent refreshes
+    /// cannot overwrite a newer schedule with an older one. Returns `true` when the overrides were
+    /// replaced and `false` when a stale schedule was rejected.
+    pub fn replace_overrides(
+        chain_id: u64,
+        l1_block_number: u64,
+        overrides: UpgradeActivationOverrides,
+    ) -> bool {
+        let mut registry = Self::write_registry();
+        if registry
+            .get(&chain_id)
+            .and_then(|entry| entry.last_updated_block_number)
+            .is_some_and(|last_updated| l1_block_number < last_updated)
+        {
+            return false;
+        }
+
+        registry.insert(
+            chain_id,
+            RuntimeUpgradeRegistryEntry {
+                overrides,
+                last_updated_block_number: Some(l1_block_number),
+            },
+        );
+        true
+    }
+
+    /// Clears all runtime activation overrides and their L1 block watermark for a chain.
     pub fn clear_chain(chain_id: u64) {
         Self::write_registry().remove(&chain_id);
     }
@@ -406,23 +499,60 @@ impl RuntimeUpgradeRegistry {
     /// Removes one runtime activation override for a chain and contract upgrade ID.
     pub fn remove_activation_override(chain_id: u64, upgrade_id: BaseUpgrade) -> bool {
         let mut registry = Self::write_registry();
-        let Some(overrides) = registry.get_mut(&chain_id) else {
+        let Some(entry) = registry.get_mut(&chain_id) else {
             return false;
         };
 
-        overrides.remove_activation(upgrade_id)
+        entry.overrides.remove_activation(upgrade_id)
     }
 
     /// Sets one runtime activation override for a chain and contract upgrade ID.
     pub fn set_activation(chain_id: u64, upgrade_id: BaseUpgrade, activation: UpgradeActivation) {
         let mut registry = Self::write_registry();
-        let overrides = registry.entry(chain_id).or_default();
-        overrides.set_activation(upgrade_id, activation)
+        let entry = registry.entry(chain_id).or_default();
+        entry.overrides.set_activation(upgrade_id, activation)
     }
 
     /// Sets one runtime timestamp activation override for a chain and contract upgrade ID.
     pub fn set_activation_timestamp(chain_id: u64, upgrade_id: BaseUpgrade, timestamp: u64) {
         Self::set_activation(chain_id, upgrade_id, UpgradeActivation::Timestamp(timestamp))
+    }
+
+    /// Activates Zenith for a chain via the runtime registry, bypassing the normal
+    /// override block, for the lifetime of the returned test guard.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use = "the guard must be held for the duration of the test activation"]
+    pub fn activate_zenith_for_testing(chain_id: u64, timestamp: u64) -> impl Drop {
+        struct ZenithActivationGuard {
+            chain_id: u64,
+            previous: Option<UpgradeActivation>,
+            remove_chain_if_empty: bool,
+        }
+
+        impl Drop for ZenithActivationGuard {
+            fn drop(&mut self) {
+                let mut registry = RuntimeUpgradeRegistry::write_registry();
+                let entry = registry.entry(self.chain_id).or_default();
+                if let Some(previous) = self.previous {
+                    entry.overrides.activations.insert(BaseUpgrade::Zenith, previous);
+                } else {
+                    entry.overrides.activations.remove(&BaseUpgrade::Zenith);
+                }
+                if self.remove_chain_if_empty && entry.overrides.is_empty() {
+                    registry.remove(&self.chain_id);
+                }
+            }
+        }
+
+        let mut registry = Self::write_registry();
+        let remove_chain_if_empty = !registry.contains_key(&chain_id);
+        let entry = registry.entry(chain_id).or_default();
+        let previous = entry.overrides.activation(BaseUpgrade::Zenith);
+        entry
+            .overrides
+            .activations
+            .insert(BaseUpgrade::Zenith, UpgradeActivation::Timestamp(timestamp));
+        ZenithActivationGuard { chain_id, previous, remove_chain_if_empty }
     }
 
     /// Sets one runtime override that clears a chain upgrade activation.
@@ -519,6 +649,66 @@ impl Display for UpgradeConfig {
 }
 
 impl UpgradeConfig {
+    /// Base Mainnet upgrade schedule used by [`BaseUpgrade::from_chain_and_timestamp`].
+    ///
+    /// This schedule lives here because `base-common-chains` already depends on this crate;
+    /// importing its `ChainConfig` would create a circular crate dependency.
+    pub const BASE_MAINNET: Self = Self {
+        regolith_time: Some(1_686_789_347),
+        canyon_time: Some(1_704_992_401),
+        delta_time: Some(1_708_560_000),
+        ecotone_time: Some(1_710_374_401),
+        fjord_time: Some(1_720_627_201),
+        granite_time: Some(1_726_070_401),
+        holocene_time: Some(1_736_445_601),
+        pectra_blob_schedule_time: None,
+        isthmus_time: Some(1_746_806_401),
+        jovian_time: Some(1_764_691_201),
+        base: BaseUpgradeConfig {
+            azul: Some(1_779_991_200),
+            beryl: Some(1_782_410_400),
+            cobalt: None,
+            denim: None,
+            zenith: None,
+        },
+    };
+
+    /// Base Sepolia upgrade schedule used by [`BaseUpgrade::from_chain_and_timestamp`].
+    ///
+    /// This schedule lives here because `base-common-chains` already depends on this crate;
+    /// importing its `ChainConfig` would create a circular crate dependency.
+    pub const BASE_SEPOLIA: Self = Self {
+        regolith_time: Some(1_695_768_288),
+        canyon_time: Some(1_699_981_200),
+        delta_time: Some(1_703_203_200),
+        ecotone_time: Some(1_708_534_800),
+        fjord_time: Some(1_716_998_400),
+        granite_time: Some(1_723_478_400),
+        holocene_time: Some(1_732_633_200),
+        pectra_blob_schedule_time: Some(1_742_486_400),
+        isthmus_time: Some(1_744_905_600),
+        jovian_time: Some(1_763_568_001),
+        base: BaseUpgradeConfig {
+            azul: Some(1_776_708_000),
+            beryl: Some(1_781_805_600),
+            cobalt: None,
+            denim: None,
+            zenith: None,
+        },
+    };
+
+    /// Returns the upgrade schedule for a chain ID.
+    ///
+    /// This function is used by [`BaseUpgrade::from_chain_and_timestamp`] to determine the
+    /// upgrade schedule for a given chain ID.
+    pub const fn for_chain_id(chain_id: u64) -> Option<Self> {
+        match chain_id {
+            8453 => Some(Self::BASE_MAINNET),
+            84532 => Some(Self::BASE_SEPOLIA),
+            _ => None,
+        }
+    }
+
     /// Clears all timestamp-based upgrade activation times.
     pub fn clear_activation_timestamps(&mut self) {
         self.regolith_time = None;
@@ -537,9 +727,8 @@ impl UpgradeConfig {
     /// Clears a timestamp-based activation time by contract upgrade ID.
     pub const fn clear_activation_timestamp(&mut self, upgrade_id: BaseUpgrade) {
         match upgrade_id {
-            // Bedrock is block-activated and Zombie is a permanently-off gate; neither has a
-            // timestamp slot.
-            BaseUpgrade::Bedrock | BaseUpgrade::Zombie => {}
+            // Bedrock is block-activated; it has no timestamp slot.
+            BaseUpgrade::Bedrock => {}
             BaseUpgrade::Regolith => self.regolith_time = None,
             BaseUpgrade::Canyon => self.canyon_time = None,
             BaseUpgrade::Delta => self.delta_time = None,
@@ -553,6 +742,8 @@ impl UpgradeConfig {
             BaseUpgrade::Azul => self.base.azul = None,
             BaseUpgrade::Beryl => self.base.beryl = None,
             BaseUpgrade::Cobalt => self.base.cobalt = None,
+            BaseUpgrade::Denim => self.base.denim = None,
+            BaseUpgrade::Zenith => self.base.zenith = None,
         }
     }
 
@@ -576,8 +767,8 @@ impl UpgradeConfig {
     /// Returns the activation for a timestamp-based contract upgrade ID.
     pub const fn activation(&self, upgrade_id: BaseUpgrade) -> UpgradeActivation {
         let timestamp = match upgrade_id {
-            // Bedrock is block-activated; Zombie is a permanently-off gate that never activates.
-            BaseUpgrade::Bedrock | BaseUpgrade::Zombie => None,
+            // Bedrock is block-activated; it has no timestamp slot.
+            BaseUpgrade::Bedrock => None,
             BaseUpgrade::Regolith => self.regolith_time,
             BaseUpgrade::Canyon => self.canyon_time,
             BaseUpgrade::Delta => self.delta_time,
@@ -591,6 +782,8 @@ impl UpgradeConfig {
             BaseUpgrade::Azul => self.base.azul,
             BaseUpgrade::Beryl => self.base.beryl,
             BaseUpgrade::Cobalt => self.base.cobalt,
+            BaseUpgrade::Denim => self.base.denim,
+            BaseUpgrade::Zenith => self.base.zenith,
         };
 
         UpgradeActivation::from_timestamp(timestamp)
@@ -604,9 +797,8 @@ impl UpgradeConfig {
     /// Sets a timestamp-based activation time by contract upgrade ID.
     pub const fn set_activation_timestamp(&mut self, upgrade_id: BaseUpgrade, timestamp: u64) {
         match upgrade_id {
-            // Bedrock is block-activated and Zombie is a permanently-off gate; neither can be
-            // scheduled by timestamp, so setting one is a no-op.
-            BaseUpgrade::Bedrock | BaseUpgrade::Zombie => {}
+            // Bedrock is block-activated; setting a timestamp for it is a no-op.
+            BaseUpgrade::Bedrock => {}
             BaseUpgrade::Regolith => self.regolith_time = Some(timestamp),
             BaseUpgrade::Canyon => self.canyon_time = Some(timestamp),
             BaseUpgrade::Delta => self.delta_time = Some(timestamp),
@@ -620,27 +812,21 @@ impl UpgradeConfig {
             BaseUpgrade::Azul => self.base.azul = Some(timestamp),
             BaseUpgrade::Beryl => self.base.beryl = Some(timestamp),
             BaseUpgrade::Cobalt => self.base.cobalt = Some(timestamp),
+            BaseUpgrade::Denim => self.base.denim = Some(timestamp),
+            BaseUpgrade::Zenith => self.base.zenith = Some(timestamp),
         }
     }
 
-    /// Returns an iterator of upgrade names -> their activation times (if scheduled.)
-    pub fn iter(&self) -> impl Iterator<Item = (&'static str, Option<u64>)> {
-        [
-            ("Regolith", self.regolith_time),
-            ("Canyon", self.canyon_time),
-            ("Delta", self.delta_time),
-            ("Ecotone", self.ecotone_time),
-            ("Fjord", self.fjord_time),
-            ("Granite", self.granite_time),
-            ("Holocene", self.holocene_time),
-            ("Pectra Blob Schedule", self.pectra_blob_schedule_time),
-            ("Isthmus", self.isthmus_time),
-            ("Jovian", self.jovian_time),
-            ("Azul", self.base.azul),
-            ("Beryl", self.base.beryl),
-            ("Cobalt", self.base.cobalt),
-        ]
-        .into_iter()
+    /// Returns an iterator of contract-backed upgrades -> their activation times (if scheduled),
+    /// in [`BaseUpgrade::CONTRACT_VARIANTS`] order.
+    ///
+    /// Derived from `CONTRACT_VARIANTS` (the single source of ordering) via the exhaustive
+    /// [`activation_timestamp`](Self::activation_timestamp) match, so this can never drift from the
+    /// registration order the schedule id and metrics rely on.
+    pub fn iter(&self) -> impl Iterator<Item = (BaseUpgrade, Option<u64>)> + '_ {
+        BaseUpgrade::CONTRACT_VARIANTS
+            .iter()
+            .map(move |&upgrade| (upgrade, self.activation_timestamp(upgrade)))
     }
 }
 
@@ -754,24 +940,23 @@ mod tests {
             pectra_blob_schedule_time: Some(8),
             isthmus_time: Some(9),
             jovian_time: Some(10),
-            base: BaseUpgradeConfig { azul: Some(11), beryl: Some(12), cobalt: Some(13) },
+            base: BaseUpgradeConfig {
+                azul: Some(11),
+                beryl: Some(12),
+                cobalt: Some(13),
+                denim: Some(14),
+                zenith: None,
+            },
         };
 
-        let mut iter = upgrades.iter();
-        assert_eq!(iter.next(), Some(("Regolith", Some(1))));
-        assert_eq!(iter.next(), Some(("Canyon", Some(2))));
-        assert_eq!(iter.next(), Some(("Delta", Some(3))));
-        assert_eq!(iter.next(), Some(("Ecotone", Some(4))));
-        assert_eq!(iter.next(), Some(("Fjord", Some(5))));
-        assert_eq!(iter.next(), Some(("Granite", Some(6))));
-        assert_eq!(iter.next(), Some(("Holocene", Some(7))));
-        assert_eq!(iter.next(), Some(("Pectra Blob Schedule", Some(8))));
-        assert_eq!(iter.next(), Some(("Isthmus", Some(9))));
-        assert_eq!(iter.next(), Some(("Jovian", Some(10))));
-        assert_eq!(iter.next(), Some(("Azul", Some(11))));
-        assert_eq!(iter.next(), Some(("Beryl", Some(12))));
-        assert_eq!(iter.next(), Some(("Cobalt", Some(13))));
-        assert_eq!(iter.next(), None);
+        // iter() yields entries in CONTRACT_VARIANTS order with each variant's activation time.
+        let expected: Vec<(BaseUpgrade, Option<u64>)> = BaseUpgrade::CONTRACT_VARIANTS
+            .iter()
+            .enumerate()
+            .map(|(index, &upgrade)| (upgrade, Some(index as u64 + 1)))
+            .collect();
+
+        assert_eq!(upgrades.iter().collect::<Vec<_>>(), expected);
     }
 
     #[test]
@@ -783,21 +968,23 @@ mod tests {
         upgrades.set_activation_timestamp(BaseUpgrade::Azul, 3);
         upgrades.set_activation_timestamp(BaseUpgrade::Beryl, 5);
         upgrades.set_activation_timestamp(BaseUpgrade::Cobalt, 6);
-        // Zombie is a permanently-off gate: setting a timestamp is a no-op, it stays Never.
-        upgrades.set_activation_timestamp(BaseUpgrade::Zombie, u64::MAX);
+        upgrades.set_activation_timestamp(BaseUpgrade::Denim, 8);
+        upgrades.set_activation_timestamp(BaseUpgrade::Zenith, 7);
 
         assert_eq!(upgrades.regolith_time, Some(1));
         assert_eq!(upgrades.pectra_blob_schedule_time, Some(2));
         assert_eq!(upgrades.base.azul, Some(3));
         assert_eq!(upgrades.base.beryl, Some(5));
         assert_eq!(upgrades.base.cobalt, Some(6));
-        assert_eq!(upgrades.activation(BaseUpgrade::Zombie), UpgradeActivation::Never);
+        assert_eq!(upgrades.base.denim, Some(8));
+        assert_eq!(upgrades.activation(BaseUpgrade::Zenith), UpgradeActivation::Timestamp(7));
 
         upgrades.clear_activation_timestamp(BaseUpgrade::Azul);
         assert_eq!(upgrades.base.azul, None);
         assert_eq!(upgrades.base.beryl, Some(5));
         assert_eq!(upgrades.base.cobalt, Some(6));
-        assert_eq!(upgrades.activation(BaseUpgrade::Zombie), UpgradeActivation::Never);
+        assert_eq!(upgrades.base.denim, Some(8));
+        assert_eq!(upgrades.activation(BaseUpgrade::Zenith), UpgradeActivation::Timestamp(7));
 
         upgrades.clear_activation_timestamps();
 
@@ -807,7 +994,11 @@ mod tests {
 
 #[cfg(test)]
 mod runtime_tests {
+    use spin::Mutex;
+
     use super::*;
+
+    static RUNTIME_REGISTRY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn runtime_registry_tracks_timestamp_and_never_overrides() {
@@ -817,14 +1008,14 @@ mod runtime_tests {
         RuntimeUpgradeRegistry::set_activation_timestamp(chain_id, BaseUpgrade::Azul, 42);
         RuntimeUpgradeRegistry::clear_activation_timestamp(chain_id, BaseUpgrade::Beryl);
         RuntimeUpgradeRegistry::set_activation_timestamp(chain_id, BaseUpgrade::Cobalt, 84);
-        // Zombie is permanently off: the registry drops the write, so it is never stored.
-        RuntimeUpgradeRegistry::set_activation_timestamp(chain_id, BaseUpgrade::Zombie, u64::MAX);
+        // Zenith is not contract-backed: the registry drops the write, so it is never stored.
+        RuntimeUpgradeRegistry::set_activation_timestamp(chain_id, BaseUpgrade::Zenith, u64::MAX);
 
         assert_eq!(
             RuntimeUpgradeRegistry::activation(chain_id, BaseUpgrade::Azul),
             Some(UpgradeActivation::Timestamp(42))
         );
-        assert_eq!(RuntimeUpgradeRegistry::activation(chain_id, BaseUpgrade::Zombie), None);
+        assert_eq!(RuntimeUpgradeRegistry::activation(chain_id, BaseUpgrade::Zenith), None);
         assert_eq!(
             RuntimeUpgradeRegistry::activation(chain_id, BaseUpgrade::Beryl),
             Some(UpgradeActivation::Never)
@@ -845,16 +1036,102 @@ mod runtime_tests {
         overrides.clear_activation_timestamp(BaseUpgrade::Canyon);
         overrides.set_activation_timestamp(BaseUpgrade::Azul, 42);
         overrides.set_activation_timestamp(BaseUpgrade::Cobalt, 84);
-        // Even an explicit override cannot activate the permanently-off Zombie gate. The write
-        // side drops it entirely, so it is never even stored as an override.
-        overrides.set_activation_timestamp(BaseUpgrade::Zombie, u64::MAX);
-        assert_eq!(overrides.activation(BaseUpgrade::Zombie), None);
+        // Even an explicit override cannot activate Zenith, since it is not contract-backed.
+        // The write side drops it entirely, so it is never even stored as an override.
+        overrides.set_activation_timestamp(BaseUpgrade::Zenith, u64::MAX);
+        assert_eq!(overrides.activation(BaseUpgrade::Zenith), None);
 
         upgrades.apply_activation_overrides(&overrides);
 
         assert_eq!(upgrades.canyon_time, None);
         assert_eq!(upgrades.base.azul, Some(42));
         assert_eq!(upgrades.base.cobalt, Some(84));
-        assert_eq!(upgrades.activation(BaseUpgrade::Zombie), UpgradeActivation::Never);
+        assert_eq!(upgrades.activation(BaseUpgrade::Zenith), UpgradeActivation::Never);
+    }
+
+    #[test]
+    fn known_chains_resolve_activation_boundaries() {
+        let _guard = RUNTIME_REGISTRY_TEST_LOCK.lock();
+        RuntimeUpgradeRegistry::clear_chain(8453);
+        RuntimeUpgradeRegistry::clear_chain(84532);
+        for (chain_id, config) in
+            [(8453, UpgradeConfig::BASE_MAINNET), (84532, UpgradeConfig::BASE_SEPOLIA)]
+        {
+            let mut previous = BaseUpgrade::Bedrock;
+
+            for upgrade in BaseUpgrade::EXECUTION_VARIANTS {
+                let Some(activation) = config.activation_timestamp(upgrade) else {
+                    continue;
+                };
+
+                if activation > 0 {
+                    assert_eq!(
+                        BaseUpgrade::from_chain_and_timestamp(chain_id, activation - 1),
+                        Some(previous),
+                        "chain {chain_id} immediately before {upgrade:?}",
+                    );
+                }
+
+                assert_eq!(
+                    BaseUpgrade::from_chain_and_timestamp(chain_id, activation),
+                    Some(upgrade),
+                    "chain {chain_id} at {upgrade:?} activation",
+                );
+
+                previous = upgrade;
+            }
+        }
+    }
+
+    #[test]
+    fn activation_boundaries_respect_overrides() {
+        let _guard = RUNTIME_REGISTRY_TEST_LOCK.lock();
+        RuntimeUpgradeRegistry::clear_chain(8453);
+        RuntimeUpgradeRegistry::clear_chain(84532);
+        const CHAIN_ID: u64 = 8453;
+
+        let beryl = UpgradeConfig::BASE_MAINNET.base.beryl.unwrap();
+        let cobalt = beryl + 100;
+
+        RuntimeUpgradeRegistry::set_activation_timestamp(CHAIN_ID, BaseUpgrade::Cobalt, cobalt);
+
+        assert_eq!(
+            BaseUpgrade::from_chain_and_timestamp(CHAIN_ID, cobalt - 1),
+            Some(BaseUpgrade::Beryl)
+        );
+        assert_eq!(
+            BaseUpgrade::from_chain_and_timestamp(CHAIN_ID, cobalt),
+            Some(BaseUpgrade::Cobalt)
+        );
+
+        RuntimeUpgradeRegistry::clear_chain(CHAIN_ID);
+        RuntimeUpgradeRegistry::clear_activation_timestamp(CHAIN_ID, BaseUpgrade::Beryl);
+
+        assert_eq!(
+            BaseUpgrade::from_chain_and_timestamp(CHAIN_ID, u64::MAX),
+            Some(BaseUpgrade::Azul),
+        );
+
+        RuntimeUpgradeRegistry::clear_chain(CHAIN_ID);
+    }
+
+    #[test]
+    fn unknown_chains_do_not_resolve() {
+        for chain_id in [1, 10, 9_999_999] {
+            assert_eq!(BaseUpgrade::from_chain_and_timestamp(chain_id, u64::MAX), None);
+        }
+    }
+
+    #[test]
+    fn far_future_resolves_latest_scheduled_upgrade() {
+        let _guard = RUNTIME_REGISTRY_TEST_LOCK.lock();
+        RuntimeUpgradeRegistry::clear_chain(8453);
+        RuntimeUpgradeRegistry::clear_chain(84532);
+        for chain_id in [8453, 84532] {
+            assert_eq!(
+                BaseUpgrade::from_chain_and_timestamp(chain_id, u64::MAX),
+                Some(BaseUpgrade::Beryl)
+            );
+        }
     }
 }

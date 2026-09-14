@@ -1106,8 +1106,10 @@ where
                         return;
                     }
                 };
-            let hashed = provider.hashed_post_state(&bundle);
-            match provider.state_root(hashed) {
+            match provider
+                .hashed_post_state(&bundle)
+                .and_then(|hashed| provider.state_root(hashed))
+            {
                 Ok(root) => {
                     if let Ok(mut slot) = result_for_task.lock() {
                         *slot = Some(root);
@@ -1480,8 +1482,10 @@ where
             )
         })?;
         let provider = &db.database.0;
-        let hashed = provider.hashed_post_state(&db.bundle_state);
-        provider.state_root(hashed).map_err(|e| Box::new(e).into())
+        provider
+            .hashed_post_state(&db.bundle_state)
+            .and_then(|hashed| provider.state_root(hashed))
+            .map_err(|e| Box::new(e).into())
     }
 
     /// Builds the [`PendingFinalEmission`] for block N's final flashblock when the

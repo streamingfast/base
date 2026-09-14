@@ -42,12 +42,11 @@ use reth_node_core::{
 use reth_node_metrics as _;
 use reth_rpc_server_types::{LenientRpcModuleValidator, RpcModuleValidator};
 pub use standard_node::{
-    MeteringArgs, RpcStandardNodeArgs, StandardBaseRethNode, StandardNodeArgs,
+    MeteringArgs, RpcStandardNodeArgs, ShadowIndexerArgs, StandardBaseRethNode, StandardNodeArgs,
 };
 mod upgrade_signal;
 pub use upgrade_signal::{
     ExecutionUpgradeSignal, ExecutionUpgradeSignalConfig, ExecutionUpgradeSignalRuntimeExtension,
-    ExecutionUpgradeSignalRuntimeRefresher,
 };
 
 /// The main base-reth cli interface.

@@ -1,32 +1,25 @@
 //! The [`BatchEncoder`] implementation.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    fmt,
-    sync::Arc,
-};
+use std::{collections::VecDeque, fmt, sync::Arc};
 
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::B256;
 use base_common_consensus::{BaseBlock, BaseTxEnvelope};
 use base_common_genesis::RollupConfig;
-use base_comp::{
-    BatchComposer, ChannelOut, CompressionAlgo, CompressorType, Config, ShadowCompressor,
-};
-use base_protocol::{Batch, BatchType, ChannelId, Frame, SingleBatch, SpanBatch};
+use base_protocol::{BlockInfo, ChannelId};
 use rand::{RngCore, SeedableRng, rngs::SmallRng};
 use tracing::{debug, warn};
 
 use crate::{
-    BatchPipeline, BatchSubmission, BatcherMetrics, DaType, EncoderConfig, ReorgError, StepError,
-    StepResult, SubmissionId,
-    channel::{OpenChannel, PendingRef, ReadyChannel},
+    ArtifactId, BatchComposer, BatchPipeline, BatchSubmission, BatcherMetrics, Channel,
+    ChannelAddOutcome, ChannelCloseReason, DaEgress, DaType, DerivationReconciliation,
+    EncoderConfig, EncoderConfigError, ReorgError, StepError, StepResult, SubmissionId,
 };
 
 /// The batcher encoding pipeline state machine.
 ///
-/// Transforms L2 blocks into L1 submission frames. No async, no I/O. The caller
-/// drives the encoder synchronously via the [`BatchPipeline`] trait.
+/// Transforms L2 blocks into calldata or blob L1 submissions. No async, no I/O.
+/// The caller drives the encoder synchronously via the [`BatchPipeline`] trait.
 pub struct BatchEncoder {
     /// The rollup configuration.
     rollup_config: Arc<RollupConfig>,
@@ -34,42 +27,22 @@ pub struct BatchEncoder {
     config: EncoderConfig,
     /// Current L1 head block number (for channel duration tracking).
     l1_head: u64,
-    /// L2 blocks waiting to be encoded. Pruned when all their frames are confirmed.
+    /// Buffered L2 blocks above the latest observed safe head.
     blocks: VecDeque<BaseBlock>,
-    /// Index into `blocks`: next block not yet fed into the current channel.
+    /// Index into `blocks`: next block not yet appended to the writable channel tail.
     block_cursor: usize,
-    /// Hash of the last block's header (or `B256::ZERO` if empty). Used for reorg detection.
-    tip: B256,
-    /// The channel currently being built. `None` between channels.
-    current_channel: Option<OpenChannel>,
-    /// Channels that are full and have frames ready to drain.
-    ready_channels: VecDeque<ReadyChannel>,
-    /// In-flight submissions: id -> reference into `ready_channels`.
-    pending: HashMap<SubmissionId, PendingRef>,
+    /// Hash of the last accepted block or safe-head anchor.
+    tip: Option<B256>,
+    /// Append-only channel FIFO. At most its tail may remain open.
+    channels: VecDeque<Channel>,
+    /// Streaming DA artifact builder and immutable submission ledger.
+    egress: DaEgress,
     /// Next submission id counter.
     next_id: u64,
     /// Per-instance RNG for generating unique channel IDs.
     rng: SmallRng,
-    /// Accumulated (`SingleBatch`, `sequence_number`) pairs when operating in
-    /// [`BatchType::Span`] mode. Blocks are collected here during `step()` and
-    /// flushed as a single [`SpanBatch`] when a span-batch or channel boundary is reached.
-    span_accumulator: Vec<(SingleBatch, u64)>,
-    /// Running sum of the estimated raw (uncompressed) byte size of all blocks currently
-    /// in `span_accumulator`. Incremented by [`Self::SPAN_BATCH_PER_BLOCK_OVERHEAD`] plus raw
-    /// transaction bytes for each block pushed in `step()`, and reset to zero when the
-    /// accumulator is drained. Avoids an O(N·M) re-scan of the accumulator on every step.
-    span_raw_bytes: usize,
-    /// Estimated DA bytes for blocks currently staged in `span_accumulator`.
-    span_da_backlog_bytes: u64,
-    /// L1 head block number when the first block was accumulated into the current span
-    /// (Span mode only). Used by `check_channel_timeout()` to detect when the span has
-    /// been open too long and must be flushed, since `current_channel` is `None` between
-    /// span flushes. Cleared when the accumulator is written into a channel.
-    span_opened_at_l1: Option<u64>,
-    /// Driver-controlled override that forces [`DaType::Blob`] on every emitted
-    /// submission, regardless of the configured `da_type`. Toggled by the driver
-    /// when DA-backlog throttling activates and `force_blobs_when_throttling` is
-    /// set. No-op when the configured `da_type` is already [`DaType::Blob`].
+    /// When throttling requests it, emit blobs even if `da_type` is calldata.
+    /// No-op when blob DA is already configured.
     blob_override: bool,
     /// Fatal error observed from trait methods that cannot return [`StepError`].
     deferred_step_error: Option<StepError>,
@@ -82,45 +55,39 @@ impl fmt::Debug for BatchEncoder {
             .field("blocks_len", &self.blocks.len())
             .field("block_cursor", &self.block_cursor)
             .field("tip", &self.tip)
-            .field("current_channel", &self.current_channel)
-            .field("ready_channels", &self.ready_channels.len())
-            .field("pending", &self.pending.len())
+            .field("channels", &self.channels.len())
+            .field("egress_artifacts", &self.egress.artifacts().len())
             .field("next_id", &self.next_id)
-            .field("span_accumulator_len", &self.span_accumulator.len())
-            .field("span_raw_bytes", &self.span_raw_bytes)
-            .field("span_da_backlog_bytes", &self.span_da_backlog_bytes)
-            .field("span_opened_at_l1", &self.span_opened_at_l1)
             .finish_non_exhaustive()
     }
 }
 
 impl BatchEncoder {
-    /// Approximate bytes of per-block overhead when encoding as part of a [`SpanBatch`].
-    /// Accounts for the fixed fields carried per singular batch (parent hash, epoch number,
-    /// epoch hash, timestamp) plus RLP framing. Used for span accumulator size estimation.
-    pub const SPAN_BATCH_PER_BLOCK_OVERHEAD: usize = 50;
-
-    /// Create a new [`BatchEncoder`].
-    pub fn new(rollup_config: Arc<RollupConfig>, config: EncoderConfig) -> Self {
-        Self {
+    /// Creates a [`BatchEncoder`] after validating all structural limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EncoderConfigError`] when `config` would violate an encoder or
+    /// derivation invariant.
+    pub fn new(
+        rollup_config: Arc<RollupConfig>,
+        config: EncoderConfig,
+    ) -> Result<Self, EncoderConfigError> {
+        config.validate()?;
+        Ok(Self {
             rollup_config,
             config,
             l1_head: 0,
             blocks: VecDeque::new(),
             block_cursor: 0,
-            tip: B256::ZERO,
-            current_channel: None,
-            ready_channels: VecDeque::new(),
-            pending: HashMap::new(),
+            tip: None,
+            channels: VecDeque::new(),
+            egress: DaEgress::new(),
             next_id: 0,
             rng: SmallRng::from_os_rng(),
-            span_accumulator: Vec::new(),
-            span_raw_bytes: 0,
-            span_da_backlog_bytes: 0,
-            span_opened_at_l1: None,
             blob_override: false,
             deferred_step_error: None,
-        }
+        })
     }
 
     /// Estimate the DA bytes represented by non-deposit transactions in `block`.
@@ -134,244 +101,74 @@ impl BatchEncoder {
             .sum()
     }
 
-    /// Step the encoder until idle, force-close the current channel, and return
-    /// all frames from every available submission.
-    ///
-    /// Convenience wrapper for tests and one-shot batch pipelines that have
-    /// already added all blocks via [`BatchPipeline::add_block`] and want all
-    /// output frames in a single call.
+    /// Steps until idle, flushes the writable channel, and drains all ready submissions.
     ///
     /// # Errors
     ///
-    /// Returns the first [`StepError`] encountered during encoding. On error the
-    /// encoder state is left as-is; previously ready submissions remain available
-    /// via [`BatchPipeline::next_submission`].
-    pub fn encode_and_drain(&mut self) -> Result<Vec<Arc<Frame>>, StepError> {
+    /// Returns the first [`StepError`]. Submissions prepared before the error remain
+    /// available through [`BatchPipeline::next_submission`].
+    pub fn encode_and_drain(&mut self) -> Result<Vec<BatchSubmission>, StepError> {
         loop {
             match self.step()? {
                 StepResult::Idle => break,
-                StepResult::BlockEncoded | StepResult::SpanFlushed | StepResult::ChannelClosed => {}
+                StepResult::BlockEncoded | StepResult::ChannelClosed => {}
             }
         }
-        self.close_current_channel("force")?;
-        let mut frames = Vec::new();
+
+        self.flush_channels()?;
+
+        let mut submissions = Vec::new();
         while let Some(sub) = self.next_submission() {
-            frames.extend(sub.frames);
+            submissions.push(sub);
         }
-        Ok(frames)
+
+        Ok(submissions)
     }
 
-    /// Build a span batch from the current accumulator.
-    fn build_span_batch(&self) -> Result<SpanBatch, StepError> {
-        let chain_id = self.rollup_config.l2_chain_id.id();
-        let mut span_batch = SpanBatch {
-            chain_id,
-            genesis_timestamp: self.rollup_config.genesis.l2_time,
-            ..Default::default()
-        };
-        let total = self.span_accumulator.len();
-
-        for (single, seq_num) in &self.span_accumulator {
-            span_batch
-                .append_singular_batch(single.clone(), *seq_num)
-                .map_err(|source| StepError::SpanBatchBuildFailed { blocks: total, source })?;
-        }
-
-        Ok(span_batch)
-    }
-
-    /// Reset span accumulator counters after the accumulator has been flushed.
-    fn clear_span_accumulator(&mut self) {
-        self.span_accumulator.clear();
-        self.span_raw_bytes = 0;
-        self.span_da_backlog_bytes = 0;
-        self.span_opened_at_l1 = None;
-    }
-
-    /// Flush the span accumulator into the current channel without closing it.
-    ///
-    /// Returns `Ok(true)` when there is no accumulator to flush or the flush succeeds.
-    /// Returns `Ok(false)` when an existing channel should be closed before retrying.
-    /// Returns an error when the span cannot fit in a fresh channel.
-    fn flush_span_accumulator_to_channel(&mut self) -> Result<bool, StepError> {
-        if self.config.batch_type != BatchType::Span || self.span_accumulator.is_empty() {
-            return Ok(true);
-        }
-
-        let total = self.span_accumulator.len();
-        let span_batch = self.build_span_batch()?;
-        let opened_new_channel = self.current_channel.is_none();
-
-        if opened_new_channel {
-            self.open_new_channel(self.block_cursor.saturating_sub(total));
-        }
-
-        let add_result = self
-            .current_channel
-            .as_mut()
-            .expect("channel exists after optional open_new_channel")
-            .out
-            .add_batch(Batch::Span(span_batch));
-
-        match add_result {
-            Ok(()) => {
-                if let Some(open) = self.current_channel.as_mut() {
-                    open.blocks_added += total;
-                    open.da_backlog_bytes += self.span_da_backlog_bytes;
-                }
-                self.clear_span_accumulator();
-                Ok(true)
-            }
-            Err(source) => {
-                warn!(
-                    error = %source,
-                    total,
-                    opened_new_channel,
-                    "failed to add span batch to channel; blocks preserved in accumulator"
-                );
-                if opened_new_channel {
-                    if self.current_channel.take().is_some() {
-                        BatcherMetrics::channel_closed_total(BatcherMetrics::REASON_DISCARD)
-                            .increment(1);
-                    }
-                    return Err(StepError::SpanBatchRejectedByEmptyChannel {
-                        blocks: total,
-                        source,
-                    });
-                }
-                Ok(false)
-            }
-        }
-    }
-
-    /// Close the currently open channel, drain its frames, and push it to `ready_channels`.
-    fn close_open_channel(&mut self, close_reason: &'static str) {
-        let Some(mut open) = self.current_channel.take() else {
-            return;
+    /// Close the writable channel.
+    fn close_current_channel(&mut self, close_reason: ChannelCloseReason) -> Result<(), StepError> {
+        let Some(channel) = self.channels.back_mut().filter(|channel| channel.is_open()) else {
+            return Ok(());
         };
 
-        // Capture stats before flushing so we can record metrics after draining.
-        let input_bytes = open.out.input_bytes();
-        let opened_at_l1 = open.opened_at_l1;
-        let blocks_added = open.blocks_added;
-
-        // Flush and close the compressor.
-        let _ = open.out.flush();
-        open.out.close();
-
-        let channel_id = open.out.id;
-
-        // Drain all frames from the channel.
-        let mut frames = Vec::new();
-        while open.out.ready_bytes() > 0 {
-            match open.out.output_frame(self.config.max_frame_size) {
-                Ok(frame) => frames.push(Arc::new(frame)),
-                Err(e) => {
-                    warn!(error = %e, "failed to output frame during channel close");
-                    break;
-                }
-            }
+        if channel.is_empty() {
+            return Ok(());
         }
 
-        // block_range records a high-water mark into the current blocks deque.
-        // The start is always 0; only .end is used (as prune_count in confirm()).
-        // Ranges across concurrent channels are intentionally overlapping at
-        // creation — confirm() uses saturating_sub adjustments so that whichever
-        // channel confirms first pops the correct prefix of the deque, and
-        // subsequent confirmations find their .end adjusted to 0 and are no-ops.
-        // This correctly handles out-of-order confirmations without double-pruning.
-        let encoded_block_end = open.block_start.saturating_add(blocks_added);
-        let block_range = 0..encoded_block_end;
-        let encoded_block_range = open.block_start..encoded_block_end;
-        let frame_count = frames.len();
-        let duration_blocks = self.l1_head.saturating_sub(opened_at_l1);
-        let compressed_bytes: usize = frames.iter().map(|f| f.data.len()).sum();
-        let closed_da_backlog_bytes = u64::try_from(compressed_bytes).unwrap_or(u64::MAX);
+        let input_bytes = channel.input_bytes();
+        let opened_l1_block = channel.opened_l1_block();
+        let blocks_added = channel.blocks_added();
+        let channel_id = channel.id();
+        channel.close()?;
+
+        let frames_emitted = channel.frame_count();
+        let duration_blocks = self.l1_head.saturating_sub(opened_l1_block);
+        let compressed_bytes = channel.compressed_bytes();
 
         debug!(
             channel_id = ?channel_id,
-            frame_count = %frame_count,
-            block_range_start = %block_range.start,
-            block_range_end = %block_range.end,
-            encoded_block_range_start = %encoded_block_range.start,
-            encoded_block_range_end = %encoded_block_range.end,
-            close_reason = %close_reason,
+            frames_emitted = %frames_emitted,
+            encoded_block_range_start = %channel.block_range().start,
+            encoded_block_range_end = %channel.block_range().end,
+            close_reason = %close_reason.metric_label(),
             duration_blocks = %duration_blocks,
             input_bytes = %input_bytes,
             compressed_bytes = %compressed_bytes,
             "closed channel"
         );
 
-        // Emit close counter and channel lifetime / compression ratio histograms.
-        BatcherMetrics::channel_closed_total(close_reason).increment(1);
+        // Close metrics.
+        BatcherMetrics::channel_closed_total(close_reason.metric_label()).increment(1);
         BatcherMetrics::channel_duration_blocks().record(duration_blocks as f64);
         BatcherMetrics::l2_blocks_per_channel().record(blocks_added as f64);
-        BatcherMetrics::input_bytes(BatcherMetrics::STAGE_CLOSED).set(input_bytes as f64);
-        BatcherMetrics::output_bytes().set(compressed_bytes as f64);
         BatcherMetrics::input_bytes_total().increment(input_bytes);
-        BatcherMetrics::output_bytes_total().increment(closed_da_backlog_bytes);
-        BatcherMetrics::channel_num_frames().set(frame_count as f64);
+        BatcherMetrics::output_bytes_total().increment(compressed_bytes);
         if input_bytes > 0 {
             let ratio = compressed_bytes as f64 / input_bytes as f64;
             BatcherMetrics::channel_compression_ratio().record(ratio);
         }
-        // All frames from this channel are now pending submission.
-        BatcherMetrics::pending_frames().increment(frame_count as f64);
 
-        self.ready_channels.push_back(ReadyChannel {
-            id: channel_id,
-            frames,
-            cursor: 0,
-            block_range,
-            encoded_block_range,
-            da_backlog_bytes: closed_da_backlog_bytes,
-            pending_confirmations: 0,
-            confirmed_count: 0,
-            first_confirmed_l1_block: None,
-            last_confirmed_l1_block: None,
-        });
-    }
-
-    /// Close the current channel, drain its frames, and push it to `ready_channels`.
-    ///
-    /// In [`BatchType::Span`] mode any pending accumulator is first flushed as a
-    /// [`SpanBatch`] into the currently open channel. If both the channel and the
-    /// accumulator are empty the call is a no-op.
-    ///
-    /// `close_reason` is recorded as the `reason` label on the
-    /// `batcher_channel_closed_total` counter.
-    fn close_current_channel(&mut self, close_reason: &'static str) -> Result<(), StepError> {
-        if !self.try_flush_span_or_close(close_reason)? {
-            return Ok(());
-        }
-
-        self.close_open_channel(close_reason);
         Ok(())
-    }
-
-    /// Flush the span accumulator or close the current channel so the next step can retry.
-    fn try_flush_span_or_close(&mut self, close_reason: &'static str) -> Result<bool, StepError> {
-        let had_open_channel = self.current_channel.is_some();
-        if self.flush_span_accumulator_to_channel()? {
-            return Ok(true);
-        }
-
-        self.close_or_discard_after_failed_span_flush(had_open_channel, close_reason);
-        Ok(false)
-    }
-
-    /// Close a pre-existing channel or discard a channel opened by a failed span flush.
-    fn close_or_discard_after_failed_span_flush(
-        &mut self,
-        had_open_channel: bool,
-        close_reason: &'static str,
-    ) {
-        if had_open_channel {
-            self.close_open_channel(close_reason);
-        } else if self.current_channel.is_some() {
-            BatcherMetrics::channel_closed_total(BatcherMetrics::REASON_DISCARD).increment(1);
-            self.current_channel = None;
-        }
     }
 
     /// Store a fatal encoding error so the next [`BatchPipeline::step`] reports it.
@@ -392,21 +189,21 @@ impl BatchEncoder {
         }
     }
 
-    /// Create a new open channel with a random `ChannelId`.
+    /// Opens a channel for the next queued block.
+    ///
+    /// `block_start` anchors its buffered block range; the current L1 head starts
+    /// its close deadline.
     fn open_new_channel(&mut self, block_start: usize) {
         let mut id = ChannelId::default();
         self.rng.fill_bytes(&mut id);
-
-        let compressor_config = Config {
-            target_output_size: self.config.target_frame_size as u64,
-            kind: CompressorType::Shadow,
-            compression_algo: CompressionAlgo::Brotli10,
-            approx_compr_ratio: self.config.approx_compr_ratio,
-        };
-        let compressor = ShadowCompressor::from(compressor_config);
-
-        let channel_out = ChannelOut::new(id, Arc::clone(&self.rollup_config), compressor);
-
+        let channel = Channel::new(
+            id,
+            Arc::clone(&self.rollup_config),
+            &self.config,
+            block_start,
+            self.l1_head,
+        )
+        .expect("BatchEncoder validates its channel configuration at construction");
         debug!(
             channel_id = ?id,
             block_start = %block_start,
@@ -414,43 +211,23 @@ impl BatchEncoder {
             "opened new channel"
         );
         BatcherMetrics::channel_opened_total().increment(1);
-
-        self.current_channel = Some(OpenChannel {
-            out: channel_out,
-            block_start,
-            opened_at_l1: self.l1_head,
-            blocks_added: 0,
-            da_backlog_bytes: 0,
-        });
+        self.channels.push_back(channel);
     }
 
-    /// Check if the current channel (or span accumulator) has timed out and close it if so.
+    /// Closes the writable channel if its duration has elapsed.
+    ///
+    /// Called from both [`BatchPipeline::step`] and [`BatchPipeline::advance_l1_head`],
+    /// so closure does not depend on another L2 block arriving.
     fn check_channel_timeout(&mut self) -> Result<bool, StepError> {
-        // Apply the safety margin so channels are closed `sub_safety_margin` L1 blocks
-        // before the configured `max_channel_duration`, ensuring frames land well within
-        // the protocol's `channel_timeout` inclusion window.
-        let effective_duration =
-            self.config.max_channel_duration.saturating_sub(self.config.sub_safety_margin);
-
-        let should_close = if let Some(ref open) = self.current_channel {
-            self.l1_head.saturating_sub(open.opened_at_l1) >= effective_duration
-        } else if self.config.batch_type == BatchType::Span {
-            // In Span mode there is no open channel between size-based flushes; instead
-            // we track the L1 head at which the first block was accumulated. If the
-            // accumulator is non-empty and the effective duration has elapsed, flush it.
-            self.span_opened_at_l1
-                .map(|opened_at| {
-                    !self.span_accumulator.is_empty()
-                        && self.l1_head.saturating_sub(opened_at) >= effective_duration
-                })
-                .unwrap_or(false)
-        } else {
-            false
-        };
+        // Same deadline for closing an open channel and releasing a closed partial tail.
+        let should_close = self
+            .channels
+            .back()
+            .is_some_and(|channel| channel.is_open() && channel.deadline_due(self.l1_head));
 
         if should_close {
             debug!(l1_head = %self.l1_head, "channel timed out, closing");
-            self.close_current_channel("timeout")?;
+            self.close_current_channel(ChannelCloseReason::Timeout)?;
         }
 
         Ok(should_close)
@@ -458,39 +235,74 @@ impl BatchEncoder {
 
     /// Returns the conservative protocol channel timeout used for confirmation windows.
     fn confirmation_channel_timeout(&self) -> u64 {
-        let pre_granite = self.rollup_config.channel_timeout(0);
-        let post_granite = self.rollup_config.channel_timeout(u64::MAX);
-        match (pre_granite, post_granite) {
-            (0, timeout) | (timeout, 0) => timeout,
-            (pre, post) => pre.min(post),
-        }
+        EncoderConfig::confirmation_channel_timeout(&self.rollup_config)
     }
 
-    /// Drops confirmed-too-late channels and rewinds encoding to republish their blocks.
-    fn invalidate_ready_channel(
+    /// Invalidates one channel and every atomic artifact or submission dependency.
+    fn invalidate_channel(
         &mut self,
-        chan_idx: usize,
+        channel_idx: usize,
         observed_l1_block: u64,
         channel_timeout: u64,
     ) {
-        if chan_idx >= self.ready_channels.len() {
+        let Some(channel) = self.channels.get(channel_idx) else {
             return;
+        };
+        let expired_channel_id = channel.id();
+        let first_confirmed_l1_block = channel.first_confirmed_l1_block();
+        let last_confirmed_l1_block = channel.last_confirmed_l1_block();
+        let mut affected_channels = vec![expired_channel_id];
+        let mut affected_artifacts = Vec::<ArtifactId>::new();
+
+        // Blobs and transactions are atomic. Expand replay until every channel
+        // contributing to an affected artifact or submission is included.
+        loop {
+            let channel_count = affected_channels.len();
+            let artifact_count = affected_artifacts.len();
+
+            for artifact in self.egress.artifacts() {
+                if artifact.channel_ids().iter().any(|id| affected_channels.contains(id))
+                    || affected_artifacts.contains(&artifact.id())
+                {
+                    if !affected_artifacts.contains(&artifact.id()) {
+                        affected_artifacts.push(artifact.id());
+                    }
+                    for channel_id in artifact.channel_ids() {
+                        if !affected_channels.contains(channel_id) {
+                            affected_channels.push(*channel_id);
+                        }
+                    }
+                }
+            }
+
+            self.egress.extend_with_submission_artifacts(&mut affected_artifacts);
+
+            if let Some(replay_idx) =
+                self.channels.iter().position(|channel| affected_channels.contains(&channel.id()))
+            {
+                for channel in self.channels.iter().skip(replay_idx) {
+                    if !affected_channels.contains(&channel.id()) {
+                        affected_channels.push(channel.id());
+                    }
+                }
+            }
+
+            if affected_channels.len() == channel_count
+                && affected_artifacts.len() == artifact_count
+            {
+                break;
+            }
         }
 
-        let channel = &self.ready_channels[chan_idx];
-        let channel_id = channel.id;
-        let first_confirmed_l1_block = channel.first_confirmed_l1_block;
-        let last_confirmed_l1_block = channel.last_confirmed_l1_block;
-        let replay_from = channel.encoded_block_range.start;
-        let removed_pending_frames: usize = self
-            .ready_channels
+        let replay_idx = self
+            .channels
             .iter()
-            .skip(chan_idx)
-            .map(|channel| channel.frames.len().saturating_sub(channel.cursor))
-            .sum();
+            .position(|channel| affected_channels.contains(&channel.id()))
+            .unwrap_or(channel_idx);
+        let replay_from = self.channels[replay_idx].block_range().start;
 
         warn!(
-            channel_id = ?channel_id,
+            channel_id = ?expired_channel_id,
             first_confirmed_l1_block = ?first_confirmed_l1_block,
             last_confirmed_l1_block = ?last_confirmed_l1_block,
             observed_l1_block = %observed_l1_block,
@@ -499,47 +311,149 @@ impl BatchEncoder {
             "confirmed channel exceeded derivation timeout, replaying blocks"
         );
 
-        self.ready_channels.truncate(chan_idx);
-        self.pending.retain(|_, pending| pending.channel_idx < chan_idx);
-        self.current_channel = None;
-        self.span_accumulator.clear();
-        self.span_raw_bytes = 0;
-        self.span_da_backlog_bytes = 0;
-        self.span_opened_at_l1 = None;
+        BatcherMetrics::channel_replay_total().increment(1);
+        self.egress.invalidate_artifacts(&affected_artifacts);
+        BatcherMetrics::pending_frames().set(self.egress.artifacts().ready_frame_count() as f64);
+        self.channels.truncate(replay_idx);
         self.block_cursor = self.block_cursor.min(replay_from);
-
-        if removed_pending_frames > 0 {
-            BatcherMetrics::pending_frames().decrement(removed_pending_frames as f64);
-        }
     }
 
-    /// Invalidates the first ready channel whose confirmation window has expired.
-    fn invalidate_expired_ready_channels(&mut self) {
+    /// Invalidates the first channel whose derivation confirmation window expired.
+    fn invalidate_expired_channels(&mut self) {
         let channel_timeout = self.confirmation_channel_timeout();
-        let Some(chan_idx) = self.ready_channels.iter().position(|channel| {
-            channel
-                .first_confirmed_l1_block
-                .is_some_and(|first| first.saturating_add(channel_timeout) < self.l1_head)
+        let Some(channel_idx) = self.channels.iter().position(|channel| {
+            let Some(first) = channel.first_confirmed_l1_block() else {
+                return false;
+            };
+            let inclusion_span =
+                channel.last_confirmed_l1_block().unwrap_or(first).saturating_sub(first);
+            if inclusion_span > channel_timeout {
+                return true;
+            }
+
+            let incomplete = !self.egress.channel_fully_confirmed(channel);
+            incomplete && self.l1_head > first.saturating_add(channel_timeout)
         }) else {
             return;
         };
 
-        self.invalidate_ready_channel(chan_idx, self.l1_head, channel_timeout);
+        self.invalidate_channel(channel_idx, self.l1_head, channel_timeout);
+    }
+
+    /// Rebase all block-queue-relative offsets after pruning a prefix from `blocks`.
+    fn rebase_after_block_prune(&mut self, prune_count: usize) {
+        self.block_cursor = self.block_cursor.saturating_sub(prune_count);
+        for channel in &mut self.channels {
+            channel.rebase_after_prune(prune_count);
+        }
+    }
+
+    /// Prune buffered blocks at or below the reported safe L2 head.
+    fn prune_safe(&mut self, safe_l2: BlockInfo) -> bool {
+        // Validate the safe head against the buffered chain before mutating state.
+        let Some(oldest) = self.blocks.front() else {
+            self.tip = Some(safe_l2.hash);
+            return true;
+        };
+
+        let oldest_number = oldest.header.number;
+        let next_safe = safe_l2.number + 1;
+        if next_safe < oldest_number {
+            return false;
+        }
+
+        let prune_count = (next_safe - oldest_number) as usize;
+        if prune_count > self.blocks.len() {
+            return false;
+        }
+
+        if prune_count == 0 {
+            return oldest.header.parent_hash == safe_l2.hash;
+        }
+        if self.blocks[prune_count - 1].header.hash_slow() != safe_l2.hash {
+            return false;
+        }
+
+        debug!(
+            prune_count,
+            safe_l2_number = safe_l2.number,
+            "pruning safe blocks from input queue"
+        );
+
+        // Remove channels fully covered by the safe head. Stable artifact IDs
+        // require no positional rebasing.
+        let channels_to_prune = self
+            .channels
+            .iter()
+            .take_while(|channel| channel.block_range().end <= prune_count)
+            .count();
+        if channels_to_prune > 0 {
+            let channel_ids: Vec<_> =
+                self.channels.iter().take(channels_to_prune).map(Channel::id).collect();
+            self.channels.drain(..channels_to_prune);
+            self.egress.prune_channels(&channel_ids);
+            BatcherMetrics::pending_frames()
+                .set(self.egress.artifacts().ready_frame_count() as f64);
+        }
+
+        // Remove the safe block prefix and rebase every remaining block-relative offset.
+        self.blocks.drain(..prune_count);
+        self.rebase_after_block_prune(prune_count);
+        if self.blocks.is_empty() {
+            self.tip = Some(safe_l2.hash);
+        }
+
+        BatcherMetrics::pending_blocks().decrement(prune_count as f64);
+        true
+    }
+
+    /// Returns whether derivation passed a fully confirmed channel without making its tail safe.
+    fn is_derivation_stalled(&self, current_l1: u64, safe_l2: BlockInfo) -> bool {
+        self.channels.iter().any(|channel| {
+            if !self.egress.channel_fully_confirmed(channel) {
+                return false;
+            }
+
+            let Some(last_inclusion) = channel.last_confirmed_l1_block() else {
+                return false;
+            };
+            if current_l1 <= last_inclusion {
+                return false;
+            }
+
+            channel
+                .block_range()
+                .end
+                .checked_sub(1)
+                .and_then(|last_block_index| self.blocks.get(last_block_index))
+                .is_some_and(|last_block| safe_l2.number < last_block.header.number)
+        })
+    }
+
+    /// Closes the writable tail and makes retained partial channel output eligible for framing.
+    fn flush_channels(&mut self) -> Result<(), StepError> {
+        self.close_current_channel(ChannelCloseReason::Flush)?;
+        for channel in &mut self.channels {
+            channel.release_at(self.l1_head);
+        }
+        Ok(())
     }
 }
 
 impl BatchPipeline for BatchEncoder {
     fn add_block(&mut self, block: BaseBlock) -> Result<(), (ReorgError, Box<BaseBlock>)> {
-        if !self.blocks.is_empty() && block.header.parent_hash != self.tip {
+        if let Some(expected) = self.tip
+            && block.header.parent_hash != expected
+        {
             return Err((
-                ReorgError::ParentMismatch { expected: self.tip, got: block.header.parent_hash },
+                ReorgError::ParentMismatch { expected, got: block.header.parent_hash },
                 Box::new(block),
             ));
         }
 
         let number = block.header.number;
         let hash = block.header.hash_slow();
-        self.tip = hash;
+        self.tip = Some(hash);
         self.blocks.push_back(block);
         BatcherMetrics::pending_blocks().increment(1.0);
 
@@ -549,390 +463,177 @@ impl BatchPipeline for BatchEncoder {
     }
 
     fn step(&mut self) -> Result<StepResult, StepError> {
+        // One transition: deferred error, timeout close, or one queued block.
         if let Some(error) = self.deferred_step_error.take() {
             return Err(error);
         }
 
-        // Check for channel timeout first.
         if self.check_channel_timeout()? {
             return Ok(StepResult::ChannelClosed);
         }
 
-        // If there are no blocks to encode, we're idle.
         if self.block_cursor >= self.blocks.len() {
-            if self.config.batch_type == BatchType::Span
-                && let Some(max_blocks_per_span_batch) = self.config.max_blocks_per_span_batch
-                && self.span_accumulator.len() >= max_blocks_per_span_batch
-            {
-                if !self.try_flush_span_or_close("size_full")? {
-                    return Ok(StepResult::ChannelClosed);
-                }
-                return Ok(StepResult::SpanFlushed);
-            }
-
             return Ok(StepResult::Idle);
         }
 
-        // Get the block at the cursor.
         let block = &self.blocks[self.block_cursor];
         let block_da_backlog_bytes = Self::block_da_backlog_bytes(block);
 
-        // Convert block to a SingleBatch. Failure here is fatal: skipping the block
-        // would produce a gap in the L2 block sequence submitted to L1.
-        let (single_batch, l1_info) = BatchComposer::block_to_single_batch(block)
+        // Composition failure is fatal: skipping the block would gap the L2 sequence.
+        let single_batch = BatchComposer::block_to_single_batch(block)
             .map_err(|source| StepError::CompositionFailed { cursor: self.block_cursor, source })?;
 
-        match self.config.batch_type {
-            BatchType::Span => {
-                // In Span mode blocks are accumulated in memory; the span batch is
-                // written to the channel only when a span-batch or channel boundary is reached.
-                let seq_num = l1_info.sequence_number();
-                // Maintain a running byte counter so the size check below is O(1) per
-                // step rather than O(N·M) over the entire accumulator.
-                let block_raw_bytes = Self::SPAN_BATCH_PER_BLOCK_OVERHEAD
-                    + single_batch.transactions.iter().map(|tx| tx.len()).sum::<usize>();
-                self.span_raw_bytes += block_raw_bytes;
-                self.span_da_backlog_bytes += block_da_backlog_bytes;
-                self.span_accumulator.push((single_batch, seq_num));
+        if !self.channels.back().is_some_and(Channel::is_open) {
+            self.open_new_channel(self.block_cursor);
+        }
+
+        let channel = self.channels.back_mut().expect("channel exists after open_new_channel");
+        let outcome = channel.add_batch(&single_batch, block_da_backlog_bytes)?;
+
+        match outcome {
+            accepted @ (ChannelAddOutcome::Accepted | ChannelAddOutcome::TargetReached) => {
+                // Cursor advances only after accept, so a later reject retries this block.
                 self.block_cursor += 1;
-
-                // Track the L1 head at which the first block of this span was accumulated.
-                // `check_channel_timeout()` uses this to detect when the span has been open
-                // too long even though `current_channel` is None between flushes.
-                if self.span_opened_at_l1.is_none() {
-                    self.span_opened_at_l1 = Some(self.l1_head);
+                if accepted == ChannelAddOutcome::TargetReached {
+                    self.close_current_channel(ChannelCloseReason::SoftTarget)?;
+                    Ok(StepResult::ChannelClosed)
+                } else {
+                    Ok(StepResult::BlockEncoded)
                 }
-
-                // Estimate the compressed size of the accumulated span batch and close
-                // the channel when it would exceed the configured size budget. This mirrors
-                // the reference batcher's `SpanChannelOut`, which triggers closure based on estimated
-                // compressed size rather than waiting for a timeout.
-                //
-                // Each block contributes fixed-field overhead plus its raw transaction bytes.
-                // The compressed estimate uses the same ratio as the ShadowCompressor so that
-                // the size trigger fires at roughly the same threshold as Single mode.
-                let compressed_estimate =
-                    (self.span_raw_bytes as f64 * self.config.approx_compr_ratio) as usize;
-                let size_target =
-                    self.config.target_frame_size.saturating_mul(self.config.target_num_frames);
-
-                debug!(
-                    block_cursor = self.block_cursor,
-                    blocks_len = self.blocks.len(),
-                    span_accumulator_len = self.span_accumulator.len(),
-                    span_raw_bytes = self.span_raw_bytes,
-                    compressed_estimate,
-                    size_target,
-                    "accumulated block for span batch"
-                );
-
-                if let Some(max_blocks_per_span_batch) = self.config.max_blocks_per_span_batch
-                    && self.span_accumulator.len() >= max_blocks_per_span_batch
-                {
-                    debug!(
-                        span_len = self.span_accumulator.len(),
-                        max_blocks_per_span_batch,
-                        "span accumulator reached max block count, flushing span batch"
-                    );
-                    if !self.try_flush_span_or_close("size_full")? {
-                        return Ok(StepResult::ChannelClosed);
-                    }
-                    return Ok(StepResult::BlockEncoded);
-                }
-
-                if compressed_estimate >= size_target {
-                    debug!(
-                        span_len = self.span_accumulator.len(),
-                        compressed_estimate, size_target, "span accumulator full, closing channel"
-                    );
-                    self.close_current_channel("size_full")?;
-                    return Ok(StepResult::ChannelClosed);
-                }
-
-                Ok(StepResult::BlockEncoded)
             }
-            BatchType::Single => {
-                // Ensure a channel is open.
-                if self.current_channel.is_none() {
-                    self.open_new_channel(self.block_cursor);
+            ChannelAddOutcome::Rejected(limit) => {
+                // Empty channel: this block cannot fit anywhere. Discard and fail.
+                if channel.is_empty() {
+                    self.channels.pop_back();
+                    BatcherMetrics::channel_closed_total(BatcherMetrics::REASON_DISCARD)
+                        .increment(1);
+                    return Err(StepError::BlockExceedsChannelLimit {
+                        cursor: self.block_cursor,
+                        limit,
+                    });
                 }
 
-                // Try to add the batch to the current channel.
-                let batch = Batch::Single(single_batch);
-                let open = self.current_channel.as_mut().unwrap();
-                Ok(match open.out.add_batch(batch) {
-                    Ok(()) => {
-                        open.blocks_added += 1;
-                        open.da_backlog_bytes += block_da_backlog_bytes;
-                        BatcherMetrics::input_bytes(BatcherMetrics::STAGE_ADDED)
-                            .set(open.out.input_bytes() as f64);
-                        self.block_cursor += 1;
-
-                        debug!(
-                            block_cursor = self.block_cursor,
-                            blocks_len = self.blocks.len(),
-                            "encoded block into channel"
-                        );
-
-                        StepResult::BlockEncoded
-                    }
-                    Err(e) => {
-                        // Channel is full (ExceedsMaxRlpBytesPerChannel or compression full).
-                        // Close the current channel and the caller will retry on the next step.
-                        debug!(error = %e, "channel rejected batch, closing");
-                        self.close_current_channel("size_full")?;
-                        StepResult::ChannelClosed
-                    }
-                })
+                // Close what we have; next step retries this block in a new channel.
+                debug!(%limit, "channel reached a protocol size limit, closing");
+                self.close_current_channel(ChannelCloseReason::ProtocolLimit)?;
+                Ok(StepResult::ChannelClosed)
             }
         }
     }
 
     fn next_submission(&mut self) -> Option<BatchSubmission> {
-        // The driver may have set `blob_override` to force blob submissions
-        // while DA throttling is active. When set, frames are emitted as blobs
-        // even though the configured `da_type` is calldata. The override is a
-        // no-op when the configured `da_type` is already blob.
         let effective_da_type = if self.blob_override && self.config.da_type == DaType::Calldata {
             DaType::Blob
         } else {
             self.config.da_type
         };
-        // Find the first ready channel with unsubmitted frames.
-        for (chan_idx, channel) in self.ready_channels.iter_mut().enumerate() {
-            if channel.cursor < channel.frames.len() {
-                let frame_start = channel.cursor;
-                // Pack up to `target_num_frames` frames into a single L1 transaction.
-                let available = channel.frames.len() - frame_start;
-                let frame_count = if effective_da_type == DaType::Calldata {
-                    if let Some(max_size) = self.config.max_l1_tx_size_bytes {
-                        // For calldata, accumulate frames until the next frame would push
-                        // the total calldata size over `max_l1_tx_size_bytes`.
-                        // Each frame serialises as: 1 (DERIVATION_VERSION_0) + 16 (channel
-                        // id) + 2 (frame number) + 4 (data length) + data + 1 (is_last).
-                        let mut total = 0usize;
-                        let mut n = 0usize;
-                        for frame in channel.frames[frame_start..].iter().take(available) {
-                            if n >= self.config.target_num_frames {
-                                break;
-                            }
-                            let frame_size = 24 + frame.data.len();
-                            if n > 0 && total + frame_size > max_size {
-                                break;
-                            }
-                            if n == 0 && frame_size > max_size {
-                                warn!(
-                                    frame_size,
-                                    max_l1_tx_size_bytes = max_size,
-                                    "frame exceeds max_l1_tx_size_bytes; submitting anyway"
-                                );
-                            }
-                            total += frame_size;
-                            n += 1;
-                        }
-                        n.max(1)
-                    } else {
-                        available.min(self.config.target_num_frames).max(1)
-                    }
-                } else {
-                    available.min(self.config.target_num_frames).max(1)
-                };
-                // Clone the Arcs (pointer copies, not deep copies of frame data).
-                let frames: Vec<_> =
-                    channel.frames[frame_start..frame_start + frame_count].to_vec();
+        let id = SubmissionId(self.next_id);
+        let submission = self.egress.next_submission(
+            &mut self.channels,
+            effective_da_type,
+            self.l1_head,
+            self.config.max_blobs_per_tx,
+            id,
+        )?;
 
-                let id = SubmissionId(self.next_id);
-                self.next_id += 1;
+        self.next_id += 1;
+        let frame_count = submission.frame_count();
+        let blob_count = submission.blob_count();
+        BatcherMetrics::pending_frames().set(self.egress.artifacts().ready_frame_count() as f64);
+        debug!(
+            id = %id.0,
+            frame_count = %frame_count,
+            blob_count = %blob_count,
+            "dequeued DA artifacts for submission"
+        );
 
-                channel.cursor += frame_count;
-                channel.pending_confirmations += 1;
+        Some(submission)
+    }
 
-                self.pending
-                    .insert(id, PendingRef { channel_idx: chan_idx, frame_start, frame_count });
-
-                // Frames move from pending → in-flight; decrement the pending gauge.
-                BatcherMetrics::pending_frames().decrement(frame_count as f64);
-                debug!(
-                    id = %id.0,
-                    frame_count = %frame_count,
-                    frame_start = %frame_start,
-                    "dequeued frames for submission"
-                );
-
-                return Some(BatchSubmission {
-                    id,
-                    channel_id: channel.id,
-                    da_type: effective_da_type,
-                    frames,
-                });
-            }
-        }
-
-        None
+    fn has_ready_submission(&self) -> bool {
+        let effective_da_type = if self.blob_override && self.config.da_type == DaType::Calldata {
+            DaType::Blob
+        } else {
+            self.config.da_type
+        };
+        self.egress.has_ready_submission(&self.channels, effective_da_type, self.l1_head)
     }
 
     fn confirm(&mut self, id: SubmissionId, l1_block: u64) {
-        let Some(pending_ref) = self.pending.remove(&id) else {
-            warn!(id = ?id, "confirm called for unknown submission id");
+        let Some(channel_ids) = self.egress.confirm(id) else {
+            debug!(id = ?id, "ignoring confirmation for untracked submission");
             return;
         };
 
-        let chan_idx = pending_ref.channel_idx;
-        if chan_idx >= self.ready_channels.len() {
-            warn!(id = ?id, chan_idx = %chan_idx, "confirm: channel index out of bounds; submission lost");
-            return;
-        }
-
-        let channel_timeout = self.confirmation_channel_timeout();
-        let channel = &mut self.ready_channels[chan_idx];
-        channel.pending_confirmations = channel.pending_confirmations.saturating_sub(1);
-        channel.confirmed_count += pending_ref.frame_count;
-        channel.first_confirmed_l1_block =
-            Some(channel.first_confirmed_l1_block.map_or(l1_block, |first| first.min(l1_block)));
-        channel.last_confirmed_l1_block =
-            Some(channel.last_confirmed_l1_block.map_or(l1_block, |last| last.max(l1_block)));
-
-        let first_confirmed_l1_block =
-            channel.first_confirmed_l1_block.expect("first confirmed block was just set");
-        let timeout_block = first_confirmed_l1_block.saturating_add(channel_timeout);
-        let timed_out_by_late_confirmation = timeout_block < l1_block;
-        let channel_incomplete = channel.confirmed_count < channel.frames.len();
-        let timed_out_by_l1_head = channel_incomplete && timeout_block < self.l1_head;
-        if timed_out_by_late_confirmation || timed_out_by_l1_head {
-            let observed_l1_block =
-                if timed_out_by_late_confirmation { l1_block } else { self.l1_head };
-            self.invalidate_ready_channel(chan_idx, observed_l1_block, channel_timeout);
-            return;
-        }
-
-        // Check if all frames are confirmed and none are in-flight.
-        if channel.confirmed_count >= channel.frames.len() && channel.pending_confirmations == 0 {
-            let block_range = channel.block_range.clone();
-
-            debug!(
-                channel_id = ?channel.id,
-                block_range_start = %block_range.start,
-                block_range_end = %block_range.end,
-                "channel fully confirmed, pruning blocks"
-            );
-
-            BatcherMetrics::channel_fully_submitted_total().increment(1);
-
-            // Remove the channel.
-            self.ready_channels.remove(chan_idx);
-
-            // Adjust channel_idx for all pending refs pointing to channels after this one.
-            for pending in self.pending.values_mut() {
-                if pending.channel_idx > chan_idx {
-                    pending.channel_idx -= 1;
-                }
+        for channel_id in channel_ids {
+            if let Some(channel) =
+                self.channels.iter_mut().find(|channel| channel.id() == channel_id)
+            {
+                channel.record_confirmation(l1_block);
             }
-
-            // Prune confirmed blocks from the deque.
-            let prune_count = block_range.end;
-            if prune_count > 0 {
-                self.blocks.drain(..prune_count);
-                self.block_cursor = self.block_cursor.saturating_sub(prune_count);
-                BatcherMetrics::pending_blocks().decrement(prune_count as f64);
-
-                debug!(prune_count = %prune_count, "pruned confirmed blocks from encoder queue");
-
-                // Adjust the high-water mark for all remaining channels.
-                // block_range.start is always 0 and unused in prune logic.
-                for ch in &mut self.ready_channels {
-                    ch.block_range.end = ch.block_range.end.saturating_sub(prune_count);
-                    ch.encoded_block_range.start =
-                        ch.encoded_block_range.start.saturating_sub(prune_count);
-                    ch.encoded_block_range.end =
-                        ch.encoded_block_range.end.saturating_sub(prune_count);
-                }
+            if self
+                .channels
+                .iter()
+                .find(|channel| channel.id() == channel_id)
+                .is_some_and(|channel| self.egress.channel_fully_confirmed(channel))
+            {
+                debug!(channel_id = ?channel_id, "channel fully confirmed");
+                BatcherMetrics::channel_fully_submitted_total().increment(1);
             }
         }
     }
 
     fn requeue(&mut self, id: SubmissionId) {
-        // Invariant: each `ReadyChannel` owns its own frame cursor. This
-        // encoder keeps at most one `current_channel` open at a time; when it
-        // closes (by size or timeout) it moves to `ready_channels` as the
-        // newest entry. `pending_ref.channel_idx` therefore always points to
-        // a specific, independent slot in `ready_channels`. Resetting the
-        // cursor on that slot does not affect any other channel and FIFO
-        // ordering across channels is preserved by construction.
-        let Some(pending_ref) = self.pending.remove(&id) else {
-            warn!(id = ?id, "requeue called for unknown submission id");
+        let Some(frame_count) = self.egress.requeue(id) else {
+            debug!(id = ?id, "ignoring retry for untracked submission");
             return;
         };
 
-        let chan_idx = pending_ref.channel_idx;
-        if chan_idx >= self.ready_channels.len() {
-            warn!(id = ?id, chan_idx = %chan_idx, "requeue: channel index out of bounds; submission lost");
-            return;
-        }
-
-        let channel = &mut self.ready_channels[chan_idx];
-        channel.pending_confirmations = channel.pending_confirmations.saturating_sub(1);
-        // Rewind cursor to the first frame of the requeued submission so all frames
-        // in the batch are retried together.
-        if pending_ref.frame_start < channel.cursor {
-            channel.cursor = pending_ref.frame_start;
-        }
-        // Frames are back in pending state; re-increment the gauge.
-        BatcherMetrics::pending_frames().increment(pending_ref.frame_count as f64);
+        BatcherMetrics::pending_frames().set(self.egress.artifacts().ready_frame_count() as f64);
 
         debug!(
             id = ?id,
-            frame_start = %pending_ref.frame_start,
-            frame_count = %pending_ref.frame_count,
-            "requeued submission frames back to pending"
+            frame_count = %frame_count,
+            "submission frames ready for retry"
         );
     }
 
-    fn force_close_channel(&mut self) {
-        debug!("force-closing current channel");
-        if self.deferred_step_error.is_some() {
-            return;
-        }
-        if let Err(error) = self.close_current_channel("force") {
-            self.defer_step_error(error, "force_close_channel");
-        }
+    fn flush(&mut self) -> Result<(), StepError> {
+        debug!("flushing channel pipeline");
+        self.flush_channels()
     }
 
     fn advance_l1_head(&mut self, l1_block: u64) {
-        if l1_block <= self.l1_head {
-            return;
+        let advanced = l1_block > self.l1_head;
+        if advanced {
+            self.l1_head = l1_block;
         }
-        self.l1_head = l1_block;
+
         if self.deferred_step_error.is_some() {
             return;
         }
-        if let Err(error) = self.check_channel_timeout() {
+
+        if advanced && let Err(error) = self.check_channel_timeout() {
             self.defer_step_error(error, "advance_l1_head");
         }
-        self.invalidate_expired_ready_channels();
+
+        self.invalidate_expired_channels();
     }
 
     fn reset(&mut self) {
         warn!(
             pending_blocks = %self.blocks.len(),
-            ready_channels = %self.ready_channels.len(),
-            in_pending = %self.pending.len(),
+            channels = %self.channels.len(),
+            in_pending = %self.egress.pending_submission_count(),
             "resetting encoder pipeline (reorg or explicit reset)"
         );
         self.blocks.clear();
         self.block_cursor = 0;
-        self.tip = B256::ZERO;
-        self.current_channel = None;
-        self.ready_channels.clear();
-        self.pending.clear();
-        self.span_accumulator.clear();
-        self.span_raw_bytes = 0;
-        self.span_da_backlog_bytes = 0;
-        self.span_opened_at_l1 = None;
+        self.tip = None;
+        self.channels.clear();
+        self.egress.reset();
         self.deferred_step_error = None;
-        // Intentionally not resetting `next_id`: keeping it monotonically
-        // increasing across resets means post-reset submissions can never
-        // share an ID with any pre-reset in-flight submission, eliminating
-        // stale-confirm silent corruption.
+        // Keep `next_id` monotonic across reset so stale confirms cannot collide.
         self.rng = SmallRng::from_os_rng();
 
         // Zero out state gauges — all buffered data has been discarded.
@@ -940,54 +641,31 @@ impl BatchPipeline for BatchEncoder {
         BatcherMetrics::pending_frames().set(0.0);
     }
 
-    fn prune_safe(&mut self, safe_l2_number: u64) {
-        // Count how many leading blocks are both safe (number <= safe_l2_number) and
-        // already past the encoding cursor (index < block_cursor). We must not prune
-        // blocks that haven't been fed into a channel yet or we'd silently skip them.
-        let prune_count = self
-            .blocks
-            .iter()
-            .take(self.block_cursor)
-            .take_while(|b| b.header.number <= safe_l2_number)
-            .count();
-
-        if prune_count == 0 {
-            return;
+    fn reconcile_derivation(
+        &mut self,
+        safe_l2: BlockInfo,
+        current_l1: Option<u64>,
+    ) -> DerivationReconciliation {
+        if !self.prune_safe(safe_l2) {
+            return DerivationReconciliation::SafeHeadMismatch;
         }
-
-        debug!(prune_count, safe_l2_number, "pruning safe blocks from input queue");
-
-        self.blocks.drain(..prune_count);
-        self.block_cursor -= prune_count;
-        BatcherMetrics::pending_blocks().decrement(prune_count as f64);
-
-        // Adjust block_range high-water marks in ready channels so that confirm()
-        // does not over-prune later. This mirrors the adjustment in confirm().
-        for ch in &mut self.ready_channels {
-            ch.block_range.end = ch.block_range.end.saturating_sub(prune_count);
-            ch.encoded_block_range.start = ch.encoded_block_range.start.saturating_sub(prune_count);
-            ch.encoded_block_range.end = ch.encoded_block_range.end.saturating_sub(prune_count);
+        if current_l1.is_some_and(|current_l1| self.is_derivation_stalled(current_l1, safe_l2)) {
+            return DerivationReconciliation::StalledChannel;
         }
+        DerivationReconciliation::Consistent
     }
 
     fn da_backlog_bytes(&self) -> u64 {
-        let pending_blocks = self
-            .blocks
+        let pending_blocks: u64 =
+            self.blocks.iter().skip(self.block_cursor).map(Self::block_da_backlog_bytes).sum();
+        let channels: u64 = self
+            .channels
             .iter()
-            .skip(self.block_cursor)
-            .map(Self::block_da_backlog_bytes)
-            .fold(0u64, u64::saturating_add);
-        let open_channel = self.current_channel.as_ref().map_or(0, |open| open.da_backlog_bytes);
-        let ready_channels = self
-            .ready_channels
-            .iter()
-            .map(|channel| channel.da_backlog_bytes)
-            .fold(0u64, u64::saturating_add);
+            .filter(|channel| !self.egress.channel_fully_confirmed(channel))
+            .map(Channel::da_backlog_bytes)
+            .sum();
 
-        pending_blocks
-            .saturating_add(self.span_da_backlog_bytes)
-            .saturating_add(open_channel)
-            .saturating_add(ready_channels)
+        pending_blocks + channels
     }
 
     fn set_blob_override(&mut self, active: bool) {
@@ -1006,12 +684,11 @@ mod tests {
     use alloy_consensus::{BlockBody, Header, SignableTransaction, TxLegacy};
     use alloy_primitives::{Bytes, Sealed, Signature};
     use base_common_consensus::{BaseTxEnvelope, TxDeposit};
-    use base_common_genesis::ChainGenesis;
-    use base_comp::BatchComposeError;
-    use base_protocol::{BatchReader, L1BlockInfoBedrock, L1BlockInfoTx};
+    use base_protocol::{Frame, L1BlockInfoBedrock, L1BlockInfoTx};
     use rstest::rstest;
 
     use super::*;
+    use crate::{BatchComposeError, ChannelLimit, SubmissionPayload};
 
     fn make_deposit_tx() -> BaseTxEnvelope {
         let calldata = L1BlockInfoTx::Bedrock(L1BlockInfoBedrock::default()).encode_calldata();
@@ -1040,6 +717,35 @@ mod tests {
         }
     }
 
+    fn make_block_with_user_tx_bytes(
+        parent_hash: B256,
+        payload_len: usize,
+        seed: u64,
+    ) -> BaseBlock {
+        let mut state = seed;
+        let input: Vec<u8> = (0..payload_len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        let signed = TxLegacy { input: Bytes::from(input), ..Default::default() }
+            .into_signed(Signature::test_signature());
+        BaseBlock {
+            header: Header { parent_hash, ..Default::default() },
+            body: BlockBody {
+                transactions: vec![make_deposit_tx(), BaseTxEnvelope::Legacy(signed)],
+                ..Default::default()
+            },
+        }
+    }
+
+    fn make_block_with_large_user_tx(parent_hash: B256, seed: u64) -> BaseBlock {
+        make_block_with_user_tx_bytes(parent_hash, 200_000, seed)
+    }
+
     fn make_user_tx_chain(len: usize) -> Vec<BaseBlock> {
         let mut parent_hash = B256::ZERO;
         (0..len)
@@ -1052,16 +758,19 @@ mod tests {
             .collect()
     }
 
-    fn make_block_at(parent_hash: B256, number: u64, timestamp: u64) -> BaseBlock {
-        let mut block = make_block(parent_hash);
-        block.header.number = number;
-        block.header.timestamp = timestamp;
-        block
-    }
-
     fn default_encoder() -> BatchEncoder {
         let rollup_config = Arc::new(RollupConfig::default());
-        BatchEncoder::new(rollup_config, EncoderConfig::default())
+        BatchEncoder::new(rollup_config, EncoderConfig::default()).expect("valid default config")
+    }
+
+    #[test]
+    fn new_rejects_invalid_config() {
+        let config = EncoderConfig { max_blobs_per_tx: 0, ..EncoderConfig::default() };
+
+        assert!(matches!(
+            BatchEncoder::new(Arc::new(RollupConfig::default()), config),
+            Err(EncoderConfigError::MaxBlobsPerTxZero)
+        ));
     }
 
     fn encoder_with_confirmation_timeout(channel_timeout: u64) -> BatchEncoder {
@@ -1071,13 +780,13 @@ mod tests {
             ..RollupConfig::default()
         });
         let config = EncoderConfig {
+            da_type: DaType::Calldata,
             max_frame_size: 32,
-            target_frame_size: 32,
-            target_num_frames: 1,
+            max_blobs_per_tx: 1,
             max_channel_duration: 1000,
             ..EncoderConfig::default()
         };
-        BatchEncoder::new(rollup_config, config)
+        BatchEncoder::new(rollup_config, config).expect("valid test config")
     }
 
     fn drain_submissions(encoder: &mut BatchEncoder) -> Vec<BatchSubmission> {
@@ -1086,6 +795,10 @@ mod tests {
             submissions.push(submission);
         }
         submissions
+    }
+
+    fn has_open_channel(encoder: &BatchEncoder) -> bool {
+        encoder.channels.back().is_some_and(Channel::is_open)
     }
 
     #[test]
@@ -1124,36 +837,80 @@ mod tests {
         assert_eq!(result, StepResult::Idle);
     }
 
+    fn tiny_frame_encoder() -> BatchEncoder {
+        let config = EncoderConfig {
+            max_frame_size: Frame::ENCODED_OVERHEAD + 1,
+            ..EncoderConfig::default()
+        };
+        BatchEncoder::new(Arc::new(RollupConfig::default()), config)
+            .expect("valid tiny-frame config")
+    }
+
     #[test]
-    fn test_confirm_prunes_blocks() {
-        let mut encoder = default_encoder();
+    fn test_step_retries_rejected_block_after_protocol_limit_close() {
+        let mut encoder = tiny_frame_encoder();
+        let first = make_block_with_user_tx_bytes(B256::ZERO, 30_000, 1);
+        let second = make_block_with_user_tx_bytes(first.header.hash_slow(), 30_000, 2);
+        encoder.add_block(first).unwrap();
+        encoder.add_block(second).unwrap();
 
-        // Add a block.
-        let block1 = make_block(B256::ZERO);
-        encoder.add_block(block1).unwrap();
+        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
+        assert_eq!(encoder.block_cursor, 1);
+        assert_eq!(encoder.channels.len(), 1);
+        assert!(has_open_channel(&encoder));
 
-        // Step to encode the block.
-        let result = encoder.step().unwrap();
-        assert_eq!(result, StepResult::BlockEncoded);
+        assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
+        assert_eq!(encoder.block_cursor, 1, "rejected block stays at the cursor");
+        assert_eq!(encoder.channels.len(), 1);
+        assert!(!has_open_channel(&encoder));
+        assert!(encoder.channels[0].terminal_pending());
 
-        // Close the channel by stepping when idle (force close via advance_l1_head).
-        encoder.advance_l1_head(100);
+        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
+        assert_eq!(encoder.block_cursor, 2);
+        assert_eq!(encoder.channels.len(), 2);
+        assert!(has_open_channel(&encoder));
+        assert_eq!(encoder.channels[1].blocks_added(), 1);
+    }
 
-        // The channel should have been closed due to timeout.
-        assert!(encoder.current_channel.is_none());
+    #[test]
+    fn test_step_discards_block_that_exceeds_empty_channel() {
+        let mut encoder = tiny_frame_encoder();
+        encoder.add_block(make_block_with_user_tx_bytes(B256::ZERO, 100_000, 1)).unwrap();
 
-        // Get the submission.
-        let sub = encoder.next_submission();
-        assert!(sub.is_some());
-        let sub = sub.unwrap();
-        let sub_id = sub.id;
-
-        // Confirm the submission.
-        encoder.confirm(sub_id, 100);
-
-        // Blocks should be pruned.
-        assert!(encoder.blocks.is_empty());
+        let err = encoder.step().unwrap_err();
+        assert!(matches!(
+            err,
+            StepError::BlockExceedsChannelLimit {
+                cursor: 0,
+                limit: ChannelLimit::FrameCount { .. }
+            }
+        ));
+        assert!(encoder.channels.is_empty());
         assert_eq!(encoder.block_cursor, 0);
+    }
+
+    #[test]
+    fn test_safe_head_prunes_fully_confirmed_blocks() {
+        let mut encoder = default_encoder();
+        let blocks = make_user_tx_chain(2);
+        let safe_l2 = BlockInfo::from(&blocks[0]);
+        for block in blocks {
+            encoder.add_block(block).unwrap();
+            assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
+        }
+        encoder.flush().unwrap();
+        for submission in drain_submissions(&mut encoder) {
+            encoder.confirm(submission.id, 100);
+        }
+
+        assert_eq!(encoder.channels.len(), 1);
+        assert_eq!(encoder.blocks.len(), 2, "confirmation keeps blocks buffered");
+
+        assert!(encoder.prune_safe(safe_l2));
+        assert_eq!(encoder.channels.len(), 1);
+        assert_eq!(encoder.blocks.len(), 1);
+        assert_eq!(encoder.blocks[0].header.number, 1);
+        assert_eq!(encoder.block_cursor, 1);
     }
 
     #[test]
@@ -1170,11 +927,9 @@ mod tests {
 
         assert!(encoder.blocks.is_empty());
         assert_eq!(encoder.block_cursor, 0);
-        assert_eq!(encoder.tip, B256::ZERO);
-        assert!(encoder.current_channel.is_none());
-        assert!(encoder.ready_channels.is_empty());
-        assert!(encoder.pending.is_empty());
-        assert_eq!(encoder.next_id, 0);
+        assert_eq!(encoder.tip, None);
+        assert!(encoder.channels.is_empty());
+        assert_eq!(encoder.egress.pending_submission_count(), 0);
     }
 
     #[test]
@@ -1204,12 +959,12 @@ mod tests {
         }
 
         assert_eq!(encoder.block_cursor, 3);
-        assert!(encoder.current_channel.is_some());
+        assert!(has_open_channel(&encoder));
         assert_eq!(encoder.da_backlog_bytes(), queued_backlog);
 
-        encoder.force_close_channel();
-        assert!(encoder.current_channel.is_none());
-        assert!(!encoder.ready_channels.is_empty());
+        encoder.flush().unwrap();
+        assert!(!has_open_channel(&encoder));
+        assert!(!encoder.channels.is_empty());
         assert!(encoder.da_backlog_bytes() > 0);
 
         let mut submissions = Vec::new();
@@ -1226,38 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn test_da_backlog_counts_span_blocks_before_flush() {
-        let config = EncoderConfig {
-            batch_type: BatchType::Span,
-            target_frame_size: EncoderConfig::MAX_BLOB_FRAME_SIZE,
-            max_channel_duration: 1000,
-            ..EncoderConfig::default()
-        };
-        let mut encoder = BatchEncoder::new(Arc::new(RollupConfig::default()), config);
-        for block in make_user_tx_chain(3) {
-            encoder.add_block(block).unwrap();
-        }
-
-        let queued_backlog = encoder.da_backlog_bytes();
-        assert!(queued_backlog > 0);
-
-        for _ in 0..3 {
-            assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
-        }
-
-        assert_eq!(encoder.block_cursor, 3);
-        assert!(encoder.current_channel.is_none());
-        assert_eq!(encoder.span_accumulator.len(), 3);
-        assert_eq!(encoder.da_backlog_bytes(), queued_backlog);
-
-        encoder.force_close_channel();
-        assert!(encoder.span_accumulator.is_empty());
-        assert!(!encoder.ready_channels.is_empty());
-        assert!(encoder.da_backlog_bytes() > 0);
-    }
-
-    #[test]
-    fn test_requeue_rewinds_cursor() {
+    fn test_requeue_marks_frames_ready() {
         let mut encoder = default_encoder();
 
         let block = make_block(B256::ZERO);
@@ -1293,20 +1017,20 @@ mod tests {
         encoder.step().unwrap();
 
         // Channel should exist.
-        assert!(encoder.current_channel.is_some());
+        assert!(has_open_channel(&encoder));
 
         // Advance L1 head past max_channel_duration (default 2).
         encoder.advance_l1_head(3);
 
         // Channel should be closed now.
-        assert!(encoder.current_channel.is_none());
-        assert!(!encoder.ready_channels.is_empty());
+        assert!(!has_open_channel(&encoder));
+        assert!(!encoder.channels.is_empty());
     }
 
     /// `advance_l1_head` must be monotonic: a call with a value ≤ the current `l1_head`
     /// must be silently ignored. Without this guard, an out-of-order confirmation
     /// (possible when `max_pending_transactions` > 1) could decrease `l1_head`, making
-    /// channel timeout checks produce artificially small deltas and stalling force-close.
+    /// channel timeout checks produce artificially small deltas and stall timeout closure.
     #[test]
     fn test_advance_l1_head_ignores_non_monotonic_update() {
         let mut encoder = default_encoder();
@@ -1318,20 +1042,17 @@ mod tests {
 
         // Advance past the timeout threshold so the channel closes.
         encoder.advance_l1_head(3);
-        assert!(encoder.current_channel.is_none(), "channel should have timed out at l1_head=3");
+        assert!(!has_open_channel(&encoder), "channel should have timed out at l1_head=3");
 
         // Now encode another block so a new channel opens.
         // Parent hash must chain from the first block's hash (= current tip).
         encoder.add_block(make_block(block_hash)).unwrap();
         encoder.step().unwrap();
-        assert!(encoder.current_channel.is_some(), "new channel should be open");
+        assert!(has_open_channel(&encoder), "new channel should be open");
 
         // A non-monotonic (backward) call must not decrease l1_head.
         encoder.advance_l1_head(1);
-        assert!(
-            encoder.current_channel.is_some(),
-            "backward advance_l1_head must not close the channel"
-        );
+        assert!(has_open_channel(&encoder), "backward advance_l1_head must not close the channel");
     }
 
     // --- Reorg / stale-confirmation tests ---
@@ -1343,8 +1064,8 @@ mod tests {
     // before the reset could match a fresh post-reset submission with the same ID.
 
     /// Get a submission into the in-flight state (pending but not yet confirmed),
-    /// then call `reset()`. A subsequent `confirm()` for the stale ID must be a no-op:
-    /// the block must not be pruned and the pending map must remain empty.
+    /// then call `reset()`. A subsequent `confirm()` for the stale ID must be a no-op
+    /// and the pending map must remain empty.
     #[test]
     fn test_stale_confirm_after_reset_is_noop() {
         let mut encoder = default_encoder();
@@ -1359,7 +1080,7 @@ mod tests {
 
         // Simulate a reorg: driver calls reset() after clearing in_flight.
         encoder.reset();
-        assert!(encoder.pending.is_empty());
+        assert_eq!(encoder.egress.pending_submission_count(), 0);
         // next_id is preserved across reset so post-reset IDs can never collide
         // with pre-reset in-flight IDs.
         assert_eq!(encoder.next_id, 1);
@@ -1370,11 +1091,11 @@ mod tests {
         // Nothing to prune: blocks were already cleared by reset().
         assert!(encoder.blocks.is_empty());
         // pending is still empty — the confirm was a no-op.
-        assert!(encoder.pending.is_empty());
+        assert_eq!(encoder.egress.pending_submission_count(), 0);
     }
 
     /// Same as above but for `requeue()`: a stale requeue after reset must not
-    /// rewind the cursor on any channel, because the channel no longer exists.
+    /// alter any channel, because the channel no longer exists.
     #[test]
     fn test_stale_requeue_after_reset_is_noop() {
         let mut encoder = default_encoder();
@@ -1392,8 +1113,8 @@ mod tests {
         // Stale requeue must not panic or corrupt state.
         encoder.requeue(stale_id);
 
-        assert!(encoder.ready_channels.is_empty());
-        assert!(encoder.pending.is_empty());
+        assert!(encoder.channels.is_empty());
+        assert_eq!(encoder.egress.pending_submission_count(), 0);
     }
 
     /// `reset()` must not reset `next_id`. Post-reorg submissions must receive IDs
@@ -1423,10 +1144,23 @@ mod tests {
         let post_reorg_sub = encoder.next_submission().unwrap();
         assert_eq!(post_reorg_sub.id.0, 1, "post-reorg ID must not collide with pre-reorg ID 0");
 
-        // Verify the post-reorg confirm works correctly.
-        assert_eq!(encoder.ready_channels[0].pending_confirmations, 1);
+        // Verify the post-reorg confirmation updates the immutable artifact.
+        assert!(
+            encoder
+                .egress
+                .artifacts()
+                .iter()
+                .all(|artifact| { artifact.state() == crate::ArtifactState::Pending })
+        );
         encoder.confirm(post_reorg_sub.id, 201);
-        assert!(encoder.blocks.is_empty(), "post-reorg blocks should be pruned on confirm");
+        assert!(
+            encoder
+                .egress
+                .artifacts()
+                .iter()
+                .all(|artifact| artifact.state() == crate::ArtifactState::Confirmed)
+        );
+        assert_eq!(encoder.blocks.len(), 1, "confirmation keeps the post-reorg block buffered");
     }
 
     // --- sub_safety_margin tests ---
@@ -1444,97 +1178,471 @@ mod tests {
     ) {
         let config =
             EncoderConfig { max_channel_duration, sub_safety_margin, ..EncoderConfig::default() };
-        let mut encoder = BatchEncoder::new(Arc::new(RollupConfig::default()), config);
+        let mut encoder =
+            BatchEncoder::new(Arc::new(RollupConfig::default()), config).expect("valid config");
 
         encoder.add_block(make_block(B256::ZERO)).unwrap();
         encoder.step().unwrap();
-        assert!(encoder.current_channel.is_some());
+        assert!(has_open_channel(&encoder));
 
         encoder.advance_l1_head(below);
-        assert!(
-            encoder.current_channel.is_some(),
-            "channel must stay open before effective timeout"
-        );
+        assert!(has_open_channel(&encoder), "channel must stay open before effective timeout");
 
         encoder.advance_l1_head(at_threshold);
-        assert!(encoder.current_channel.is_none(), "channel must close at effective timeout");
-        assert!(!encoder.ready_channels.is_empty());
+        assert!(!has_open_channel(&encoder), "channel must close at effective timeout");
+        assert!(!encoder.channels.is_empty());
+        assert!(encoder.has_ready_submission(), "timeout must release the partial blob");
     }
 
-    // --- target_num_frames tests ---
+    // --- max_blobs_per_tx tests ---
 
-    /// With `target_num_frames = 2`, a channel whose frames span multiple entries must be
-    /// packed two-per-submission. After one submission, a single confirm must credit both
-    /// frames and trigger block pruning.
+    /// Small frames are packed together instead of wasting one blob per frame.
     #[test]
-    fn test_target_num_frames_packs_multiple_frames() {
-        let config = EncoderConfig {
-            // Small frame size so two blocks produce at least two frames.
-            max_frame_size: 32,
-            target_frame_size: 32,
-            target_num_frames: 2,
-            max_channel_duration: 2,
-            sub_safety_margin: 0,
-            ..EncoderConfig::default()
+    fn test_packs_multiple_frames_into_one_blob() {
+        let config =
+            EncoderConfig { max_frame_size: 32, max_blobs_per_tx: 2, ..EncoderConfig::default() };
+        let mut encoder =
+            BatchEncoder::new(Arc::new(RollupConfig::default()), config).expect("valid config");
+
+        encoder.add_block(make_block_with_user_tx(B256::ZERO)).unwrap();
+        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
+        encoder.flush().unwrap();
+
+        let submission = encoder.next_submission().expect("multi-frame submission");
+        assert!(submission.frame_count() > 2);
+        let SubmissionPayload::Blobs(blobs) = submission.payload() else {
+            panic!("expected blob submission");
         };
-        let mut encoder = BatchEncoder::new(Arc::new(RollupConfig::default()), config);
-
-        // Add a block and force-close the channel so we have frames to submit.
-        let b1 = make_block(B256::ZERO);
-        let b1_hash = b1.header.hash_slow();
-        encoder.add_block(b1).unwrap();
-        encoder.step().unwrap();
-
-        // Add a second block chained from the first.
-        encoder.add_block(make_block(b1_hash)).unwrap();
-        encoder.step().unwrap();
-
-        // Force close.
-        encoder.advance_l1_head(100);
-        assert!(encoder.current_channel.is_none());
-
-        let Some(sub) = encoder.next_submission() else {
-            // If the channel produced only 1 frame (data fits in one blob),
-            // skip the multi-frame assertion — the test still validates single-frame path.
-            return;
-        };
-
-        // Each submission must contain between 1 and target_num_frames frames.
-        assert!(!sub.frames.is_empty() && sub.frames.len() <= 2);
+        assert_eq!(blobs.len(), 1);
+        encoder.confirm(submission.id, 1);
+        assert!(encoder.egress.channel_fully_confirmed(&encoder.channels[0]));
     }
 
-    /// A single requeue on a multi-frame submission must rewind the cursor to the start
-    /// of the entire submission, so all frames in the batch are retried together.
     #[test]
-    fn test_requeue_multi_frame_rewinds_to_frame_start() {
+    fn test_flush_releases_tail_from_closed_channel() {
+        let config = EncoderConfig { compressed_size_target: Some(1), ..EncoderConfig::default() };
+        let mut encoder =
+            BatchEncoder::new(Arc::new(RollupConfig::default()), config).expect("valid config");
+
+        encoder.add_block(make_block_with_user_tx(B256::ZERO)).unwrap();
+        assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
+        assert!(
+            !encoder.has_ready_submission(),
+            "size-closed partial blob must wait even when the input queue is empty"
+        );
+
+        encoder.flush().unwrap();
+
+        assert!(encoder.has_ready_submission(), "explicit flush must release the partial blob");
+        assert!(encoder.next_submission().is_some());
+    }
+
+    #[test]
+    fn test_size_closed_tail_keeps_its_original_timeout() {
         let config = EncoderConfig {
-            max_frame_size: 32,
-            target_frame_size: 32,
-            // Request up to 3 frames per submission but realistically we may get fewer.
-            target_num_frames: 3,
-            max_channel_duration: 2,
-            sub_safety_margin: 0,
+            compressed_size_target: Some(1),
+            max_channel_duration: 5,
             ..EncoderConfig::default()
         };
-        let mut encoder = BatchEncoder::new(Arc::new(RollupConfig::default()), config);
+        let mut encoder =
+            BatchEncoder::new(Arc::new(RollupConfig::default()), config).expect("valid config");
+        encoder.advance_l1_head(10);
 
-        encoder.add_block(make_block(B256::ZERO)).unwrap();
-        encoder.step().unwrap();
-        encoder.advance_l1_head(100);
+        let first = make_block_with_user_tx(B256::ZERO);
+        let second = make_block_with_user_tx(first.header.hash_slow());
+        encoder.add_block(first).unwrap();
+        encoder.add_block(second).unwrap();
 
-        let Some(sub) = encoder.next_submission() else { return };
+        assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
+        assert!(!encoder.channels[0].deadline_due(14));
+        assert!(encoder.channels[0].deadline_due(15));
+
+        encoder.advance_l1_head(12);
+        assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
+        assert!(encoder.channels[0].deadline_due(15));
+        assert!(!encoder.channels[1].deadline_due(16));
+        assert!(encoder.channels[1].deadline_due(17));
+
+        encoder.advance_l1_head(14);
+        assert!(
+            !encoder.has_ready_submission(),
+            "size-closed tails must remain held before the oldest channel timeout"
+        );
+
+        encoder.advance_l1_head(15);
+        let submission = encoder.next_submission().expect("oldest channel timeout releases FIFO");
+        encoder.requeue(submission.id);
+        assert!(
+            encoder.has_ready_submission(),
+            "requeue must preserve an already-reached release deadline"
+        );
+    }
+
+    #[test]
+    fn test_open_channel_emits_full_blob_without_closing() {
+        let config = EncoderConfig {
+            compressed_size_target: None,
+            max_channel_duration: 100,
+            ..EncoderConfig::default()
+        };
+        let mut encoder =
+            BatchEncoder::new(Arc::new(RollupConfig::default()), config).expect("valid config");
+
+        let mut parent_hash = B256::ZERO;
+        // Brotli may retain one 4 MiB window before exposing output. Feed
+        // enough incompressible input to exercise emission without flushes.
+        for seed in 1..=32 {
+            let block = make_block_with_large_user_tx(parent_hash, seed);
+            parent_hash = block.header.hash_slow();
+            encoder.add_block(block).unwrap();
+            assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
+            if encoder.has_ready_submission() {
+                break;
+            }
+        }
+        assert!(has_open_channel(&encoder), "full blob emission must not close the channel");
+        assert!(
+            encoder.has_ready_submission(),
+            "Brotli emitted {} compressed bytes with {} bytes available",
+            encoder.channels[0].compressed_bytes(),
+            encoder.channels[0].available_output()
+        );
+
+        let submission = encoder.next_submission().expect("open channel produced a full blob");
+        let SubmissionPayload::Blobs(blobs) = submission.payload() else {
+            panic!("expected blob submission");
+        };
+        assert!(!blobs.is_empty());
+        for blob in blobs {
+            assert!(blob.frames().iter().all(|frame| !frame.is_last));
+            assert_eq!(
+                blob.frames()
+                    .iter()
+                    .map(|frame| Frame::ENCODED_OVERHEAD + frame.data.len())
+                    .sum::<usize>()
+                    + EncoderConfig::BLOB_DERIVATION_PREFIX_SIZE,
+                EncoderConfig::BLOB_MAX_DATA_SIZE
+            );
+        }
+    }
+
+    #[test]
+    fn test_packs_adjacent_channels_across_blob_boundary() {
+        let config = EncoderConfig {
+            compressed_size_target: Some(1),
+            max_blobs_per_tx: 6,
+            ..EncoderConfig::default()
+        };
+        let mut encoder =
+            BatchEncoder::new(Arc::new(RollupConfig::default()), config).expect("valid config");
+        let first = make_block_with_large_user_tx(B256::ZERO, 1);
+        let second = make_block_with_large_user_tx(first.header.hash_slow(), 2);
+        encoder.add_block(first).unwrap();
+        encoder.add_block(second).unwrap();
+
+        assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
+        let first_channel_id = encoder.channels[0].id();
+        let first_submission = encoder.next_submission().expect("full first blob");
+        let SubmissionPayload::Blobs(first_blobs) = first_submission.payload() else {
+            panic!("expected blob submission");
+        };
+        assert_eq!(first_blobs.len(), 1);
+        assert_eq!(
+            first_blobs[0]
+                .frames()
+                .iter()
+                .map(|frame| Frame::ENCODED_OVERHEAD + frame.data.len())
+                .sum::<usize>()
+                + EncoderConfig::BLOB_DERIVATION_PREFIX_SIZE,
+            EncoderConfig::BLOB_MAX_DATA_SIZE
+        );
+        assert!(encoder.next_submission().is_none(), "partial tail must wait for more data");
+
+        assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
+        let second_channel_id = encoder.channels[1].id();
+        let second_submission = encoder.next_submission().expect("cross-channel packed blobs");
+        let SubmissionPayload::Blobs(blobs) = second_submission.payload() else {
+            panic!("expected blob submission");
+        };
+        let first_blob_channel_ids: Vec<_> =
+            blobs[0].frames().iter().map(|frame| frame.id).collect();
+        assert!(first_blob_channel_ids.contains(&first_channel_id));
+        assert!(first_blob_channel_ids.contains(&second_channel_id));
+        assert!(
+            encoder
+                .egress
+                .pending_artifacts(second_submission.id)
+                .expect("pending submission")
+                .iter()
+                .filter_map(|id| {
+                    encoder.egress.artifacts().iter().find(|artifact| artifact.id() == *id)
+                })
+                .any(|artifact| {
+                    artifact.channel_ids().contains(&first_channel_id)
+                        && artifact.channel_ids().contains(&second_channel_id)
+                }),
+            "one immutable artifact must track both channels"
+        );
+
+        encoder.requeue(second_submission.id);
+        assert!(
+            encoder
+                .egress
+                .artifacts()
+                .iter()
+                .any(|artifact| artifact.state() == crate::ArtifactState::Ready),
+            "requeue must restore the immutable cross-channel artifact"
+        );
+        let retry = encoder.next_submission().expect("cross-channel retry");
+
+        encoder.confirm(first_submission.id, 1);
+        encoder.confirm(retry.id, 1);
+        assert!(encoder.egress.channel_fully_confirmed(&encoder.channels[0]));
+        assert!(!encoder.egress.channel_fully_confirmed(&encoder.channels[1]));
+
+        encoder.flush().unwrap();
+        let tail = encoder.next_submission().expect("flushed second-channel tail");
+        encoder.confirm(tail.id, 1);
+
+        assert!(
+            encoder.channels.iter().all(|channel| encoder.egress.channel_fully_confirmed(channel))
+        );
+    }
+
+    #[test]
+    fn test_safe_prune_preserves_pending_range_from_packed_next_channel() {
+        let config = EncoderConfig {
+            compressed_size_target: Some(1),
+            max_blobs_per_tx: 6,
+            ..EncoderConfig::default()
+        };
+        let mut encoder =
+            BatchEncoder::new(Arc::new(RollupConfig::default()), config).expect("valid config");
+        let mut first = make_block_with_large_user_tx(B256::ZERO, 1);
+        first.header.number = 0;
+        let safe_l2 = BlockInfo::from(&first);
+        let mut second = make_block_with_large_user_tx(first.header.hash_slow(), 2);
+        second.header.number = 1;
+        encoder.add_block(first).unwrap();
+        encoder.add_block(second).unwrap();
+
+        assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
+        let first_submission = encoder.next_submission().expect("first full blob");
+        assert!(encoder.next_submission().is_none());
+        assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
+        let packed_submission = encoder.next_submission().expect("cross-channel submission");
+        let packed_artifact_id =
+            encoder.egress.pending_artifacts(packed_submission.id).expect("pending submission")[0];
+        let packed_artifact = encoder
+            .egress
+            .artifacts()
+            .iter()
+            .find(|artifact| artifact.id() == packed_artifact_id)
+            .expect("packed artifact");
+        assert!(
+            packed_artifact.channel_ids().contains(&encoder.channels[0].id())
+                && packed_artifact.channel_ids().contains(&encoder.channels[1].id())
+        );
+
+        // The safe head proves that the shared L1 blob landed even if its
+        // submission receipt has not reached the batcher yet.
+        assert!(encoder.prune_safe(safe_l2));
+        assert_eq!(encoder.channels.len(), 1);
+        assert!(encoder.egress.pending_artifacts(first_submission.id).is_none());
+        let remaining_id = encoder.channels[0].id();
+        let packed_artifact = encoder
+            .egress
+            .artifacts()
+            .iter()
+            .find(|artifact| artifact.id() == packed_artifact_id)
+            .expect("mixed artifact retained for remaining channel");
+        assert_eq!(packed_artifact.channel_ids(), &[remaining_id]);
+
+        encoder.confirm(packed_submission.id, 10);
+        assert!(!encoder.egress.channel_fully_confirmed(&encoder.channels[0]));
+
+        encoder.flush().unwrap();
+        let tail = encoder.next_submission().expect("flushed remaining channel tail");
+        encoder.confirm(tail.id, 10);
+
+        assert!(encoder.egress.channel_fully_confirmed(&encoder.channels[0]));
+    }
+
+    #[test]
+    fn test_timeout_replay_includes_earlier_channel_from_packed_blob() {
+        let rollup_config = Arc::new(RollupConfig {
+            channel_timeout: 2,
+            granite_channel_timeout: 2,
+            ..RollupConfig::default()
+        });
+        let config = EncoderConfig {
+            compressed_size_target: Some(1),
+            max_blobs_per_tx: 1,
+            max_channel_duration: 1000,
+            ..EncoderConfig::default()
+        };
+        let mut encoder = BatchEncoder::new(rollup_config, config).expect("valid config");
+        let mut first = make_block_with_large_user_tx(B256::ZERO, 1);
+        first.header.number = 0;
+        let mut second = make_block_with_large_user_tx(first.header.hash_slow(), 2);
+        second.header.number = 1;
+        encoder.add_block(first).unwrap();
+        encoder.add_block(second).unwrap();
+
+        assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
+        let _first_submission = encoder.next_submission().expect("first full blob");
+        assert!(encoder.next_submission().is_none());
+        assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
+        let packed_submission = encoder.next_submission().expect("cross-channel blob");
+        let packed_artifact = encoder
+            .egress
+            .pending_artifacts(packed_submission.id)
+            .expect("pending submission")
+            .iter()
+            .filter_map(|id| {
+                encoder.egress.artifacts().iter().find(|artifact| artifact.id() == *id)
+            })
+            .find(|artifact| artifact.channel_ids().len() == 2)
+            .expect("cross-channel artifact");
+        assert!(
+            packed_artifact.channel_ids().contains(&encoder.channels[0].id())
+                && packed_artifact.channel_ids().contains(&encoder.channels[1].id())
+        );
+        let final_submission = encoder.next_submission().expect("second-channel tail");
+
+        encoder.confirm(final_submission.id, 1);
+        encoder.advance_l1_head(1);
+        encoder.advance_l1_head(4);
+
+        assert!(encoder.channels.is_empty());
+        assert_eq!(encoder.egress.pending_submission_count(), 0);
+        assert_eq!(encoder.block_cursor, 0);
+        assert_eq!(encoder.blocks.len(), 2);
+    }
+
+    #[test]
+    fn test_timeout_replay_discards_entire_channel_suffix() {
+        let rollup_config = Arc::new(RollupConfig {
+            channel_timeout: 2,
+            granite_channel_timeout: 2,
+            ..RollupConfig::default()
+        });
+        let config = EncoderConfig {
+            compressed_size_target: Some(1),
+            max_blobs_per_tx: 6,
+            max_channel_duration: 1000,
+            ..EncoderConfig::default()
+        };
+        let mut encoder = BatchEncoder::new(rollup_config, config).expect("valid config");
+
+        let mut first = make_block_with_large_user_tx(B256::ZERO, 1);
+        first.header.number = 0;
+        let mut second = make_block_with_large_user_tx(first.header.hash_slow(), 2);
+        second.header.number = 1;
+        let mut third = make_block_with_large_user_tx(second.header.hash_slow(), 3);
+        third.header.number = 2;
+
+        encoder.add_block(first).unwrap();
+        assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
+        encoder.flush().unwrap();
+        let first_channel_id = encoder.channels[0].id();
+        for submission in drain_submissions(&mut encoder) {
+            encoder.confirm(submission.id, 1);
+        }
+        assert!(encoder.egress.channel_fully_confirmed(&encoder.channels[0]));
+
+        encoder.add_block(second).unwrap();
+        assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
+        let second_channel_id = encoder.channels[1].id();
+        let second_submission = encoder.next_submission().expect("second channel blob");
+        encoder.confirm(second_submission.id, 1);
+        assert!(!encoder.egress.channel_fully_confirmed(&encoder.channels[1]));
+
+        encoder.add_block(third).unwrap();
+        assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
+        assert_eq!(encoder.channels.len(), 3);
+
+        encoder.advance_l1_head(4);
+
+        assert_eq!(encoder.channels.len(), 1);
+        assert_eq!(encoder.channels[0].id(), first_channel_id);
+        assert!(
+            encoder
+                .egress
+                .artifacts()
+                .iter()
+                .all(|artifact| { !artifact.channel_ids().contains(&second_channel_id) })
+        );
+        assert_eq!(encoder.block_cursor, 1);
+    }
+
+    #[test]
+    fn test_max_blobs_per_tx_limits_transaction_not_channel() {
+        let config = EncoderConfig { max_blobs_per_tx: 1, ..EncoderConfig::default() };
+        let mut encoder =
+            BatchEncoder::new(Arc::new(RollupConfig::default()), config).expect("valid config");
+        encoder.add_block(make_block_with_large_user_tx(B256::ZERO, 1)).unwrap();
+        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
+        encoder.flush().unwrap();
+
+        let submissions = drain_submissions(&mut encoder);
+        assert!(submissions.len() >= 2, "one channel should span multiple transactions");
+        assert!(submissions.iter().all(|submission| submission.blob_count() == 1));
+        assert_eq!(encoder.channels.len(), 1, "transaction cuts must not split channels");
+    }
+
+    /// A requeue makes every frame in the submission ready again.
+    #[test]
+    fn test_requeue_multi_frame_marks_submission_ready() {
+        let config =
+            EncoderConfig { max_frame_size: 32, max_blobs_per_tx: 3, ..EncoderConfig::default() };
+        let mut encoder =
+            BatchEncoder::new(Arc::new(RollupConfig::default()), config).expect("valid config");
+
+        encoder.add_block(make_block_with_user_tx(B256::ZERO)).unwrap();
+        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
+        encoder.flush().unwrap();
+
+        let sub = encoder.next_submission().expect("multi-frame submission");
         let id = sub.id;
-        let submitted_frame_count = sub.frames.len();
+        let submitted_frame_count = sub.frame_count();
+        assert!(submitted_frame_count > 1);
 
         encoder.requeue(id);
 
-        // Cursor must be rewound — a fresh next_submission must return the same frames.
-        let resub = encoder.next_submission();
-        assert!(resub.is_some(), "requeued frames must be available again");
+        let resub = encoder.next_submission().expect("requeued submission");
         assert_eq!(
-            resub.unwrap().frames.len(),
+            resub.frame_count(),
             submitted_frame_count,
             "requeued submission must contain the same number of frames"
+        );
+    }
+
+    #[test]
+    fn test_requeue_does_not_resubmit_confirmed_frames() {
+        let mut encoder = encoder_with_confirmation_timeout(100);
+        encoder.add_block(make_block_with_user_tx(B256::ZERO)).unwrap();
+        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
+        encoder.flush().unwrap();
+
+        let first = encoder.next_submission().unwrap();
+        let second = encoder.next_submission().unwrap();
+
+        encoder.requeue(first.id);
+        encoder.confirm(second.id, 1);
+        assert_eq!(
+            encoder.egress.artifacts().iter().map(crate::DaArtifact::state).collect::<Vec<_>>(),
+            vec![crate::ArtifactState::Ready, crate::ArtifactState::Confirmed]
+        );
+
+        let retry = encoder.next_submission().unwrap();
+        assert!(Arc::ptr_eq(
+            retry.first_frame().expect("retry frame"),
+            first.first_frame().expect("original frame")
+        ));
+        assert_eq!(
+            encoder.egress.artifacts().iter().map(crate::DaArtifact::state).collect::<Vec<_>>(),
+            vec![crate::ArtifactState::Pending, crate::ArtifactState::Confirmed]
         );
     }
 
@@ -1544,9 +1652,9 @@ mod tests {
 
         encoder.add_block(make_block_with_user_tx(B256::ZERO)).unwrap();
         assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
-        encoder.force_close_channel();
+        encoder.flush().unwrap();
 
-        let original_channel_id = encoder.ready_channels[0].id;
+        let original_channel_id = encoder.channels[0].id();
         let submissions = drain_submissions(&mut encoder);
         assert!(
             submissions.len() >= 2,
@@ -1555,33 +1663,125 @@ mod tests {
         );
 
         encoder.confirm(submissions[0].id, 1);
+        encoder.advance_l1_head(1);
         assert_eq!(encoder.blocks.len(), 1, "partial confirmation must not prune blocks");
 
         encoder.confirm(submissions[1].id, 4);
+        encoder.advance_l1_head(4);
         assert_eq!(encoder.blocks.len(), 1, "timed-out confirmation must preserve blocks");
         assert_eq!(encoder.block_cursor, 0, "encoder must rewind to replay the block");
-        assert!(encoder.ready_channels.is_empty(), "old channel must be discarded");
-        assert!(encoder.pending.is_empty(), "stale in-flight tail submissions must be forgotten");
+        assert!(encoder.channels.is_empty(), "old channel must be discarded");
+        assert_eq!(
+            encoder.egress.pending_submission_count(),
+            0,
+            "stale in-flight tail submissions must be forgotten"
+        );
 
         for submission in submissions.iter().skip(2) {
-            encoder.confirm(submission.id, 4);
+            encoder.confirm(submission.id, 3);
         }
         assert_eq!(encoder.blocks.len(), 1, "stale late confirmations must be no-ops");
 
         assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
-        encoder.force_close_channel();
+        encoder.flush().unwrap();
 
         let replay_submissions = drain_submissions(&mut encoder);
         assert!(!replay_submissions.is_empty(), "replay must emit a fresh channel");
         assert_ne!(
-            replay_submissions[0].channel_id, original_channel_id,
+            replay_submissions[0].first_frame().expect("replay frame").id,
+            original_channel_id,
             "replay must use a fresh channel id"
         );
 
         for submission in replay_submissions {
             encoder.confirm(submission.id, 5);
         }
-        assert!(encoder.blocks.is_empty(), "fresh replay should prune after timely confirmation");
+        assert_eq!(
+            encoder.blocks.len(),
+            1,
+            "timely confirmation keeps the replayed block buffered"
+        );
+        let safe_l2 = BlockInfo::from(&encoder.blocks[0]);
+        assert!(encoder.prune_safe(safe_l2));
+        assert!(encoder.blocks.is_empty());
+    }
+
+    #[test]
+    fn test_timely_confirmed_channel_waits_for_safe_head() {
+        let mut encoder = encoder_with_confirmation_timeout(2);
+        encoder.add_block(make_block_with_user_tx(B256::ZERO)).unwrap();
+        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
+        encoder.flush().unwrap();
+
+        for submission in drain_submissions(&mut encoder) {
+            encoder.confirm(submission.id, 1);
+            encoder.advance_l1_head(1);
+        }
+        encoder.advance_l1_head(100);
+
+        assert_eq!(encoder.channels.len(), 1);
+        assert!(encoder.egress.channel_fully_confirmed(&encoder.channels[0]));
+        assert_eq!(encoder.block_cursor, 1);
+    }
+
+    #[test]
+    fn test_fully_confirmed_channel_requires_replay_after_derivation_passes_inclusion() {
+        let mut encoder = encoder_with_confirmation_timeout(2);
+        let mut block = make_block_with_user_tx(B256::ZERO);
+        block.header.number = 101;
+        let block_hash = block.header.hash_slow();
+        encoder.add_block(block).unwrap();
+        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
+        encoder.flush().unwrap();
+
+        for submission in drain_submissions(&mut encoder) {
+            encoder.confirm(submission.id, 1_000);
+        }
+
+        let previous_safe_l2 = BlockInfo { number: 100, ..Default::default() };
+        assert_eq!(
+            encoder.reconcile_derivation(previous_safe_l2, None),
+            DerivationReconciliation::Consistent,
+            "providers without a derivation cursor cannot prove the channel stalled",
+        );
+        assert_eq!(
+            encoder.reconcile_derivation(previous_safe_l2, Some(1_000)),
+            DerivationReconciliation::Consistent,
+            "the current L1 block may still be processing",
+        );
+        assert_eq!(
+            encoder.reconcile_derivation(previous_safe_l2, Some(1_001)),
+            DerivationReconciliation::StalledChannel,
+            "passing the last inclusion without making the channel safe requires replay",
+        );
+        assert_eq!(
+            encoder.reconcile_derivation(
+                BlockInfo { hash: block_hash, number: 101, ..Default::default() },
+                Some(1_001),
+            ),
+            DerivationReconciliation::Consistent,
+            "a safe head covering the channel does not require replay",
+        );
+    }
+
+    #[test]
+    fn test_descending_confirmations_replay_expired_channel() {
+        let mut encoder = encoder_with_confirmation_timeout(2);
+        encoder.add_block(make_block_with_user_tx(B256::ZERO)).unwrap();
+        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
+        encoder.flush().unwrap();
+
+        let submissions = drain_submissions(&mut encoder);
+        assert!(submissions.len() >= 2);
+
+        encoder.confirm(submissions[0].id, 100);
+        encoder.advance_l1_head(100);
+        encoder.confirm(submissions[1].id, 90);
+        encoder.advance_l1_head(90);
+
+        assert!(encoder.channels.is_empty());
+        assert_eq!(encoder.egress.pending_submission_count(), 0);
+        assert_eq!(encoder.block_cursor, 0);
     }
 
     #[test]
@@ -1590,7 +1790,7 @@ mod tests {
 
         encoder.add_block(make_block_with_user_tx(B256::ZERO)).unwrap();
         assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
-        encoder.force_close_channel();
+        encoder.flush().unwrap();
 
         let submissions = drain_submissions(&mut encoder);
         assert!(
@@ -1604,8 +1804,12 @@ mod tests {
 
         assert_eq!(encoder.blocks.len(), 1, "expired channel must preserve blocks");
         assert_eq!(encoder.block_cursor, 0, "expired channel must rewind for replay");
-        assert!(encoder.ready_channels.is_empty(), "expired channel must be discarded");
-        assert!(encoder.pending.is_empty(), "stale tail submissions must be forgotten");
+        assert!(encoder.channels.is_empty(), "expired channel must be discarded");
+        assert_eq!(
+            encoder.egress.pending_submission_count(),
+            0,
+            "stale tail submissions must be forgotten"
+        );
 
         for submission in submissions.iter().skip(1) {
             encoder.confirm(submission.id, 4);
@@ -1681,506 +1885,6 @@ mod tests {
         assert_eq!(encoder.blocks.len(), 1);
     }
 
-    // --- Span batch tests ---
-
-    /// A [`BatchEncoder`] in Span mode with a tiny `target_frame_size` so the very first
-    /// accumulated block exceeds the compressed-size threshold and triggers `ChannelClosed`.
-    fn span_encoder_tiny_target() -> BatchEncoder {
-        let config = EncoderConfig {
-            batch_type: BatchType::Span,
-            target_frame_size: 1,
-            max_frame_size: EncoderConfig::MAX_BLOB_FRAME_SIZE,
-            ..EncoderConfig::default()
-        };
-        BatchEncoder::new(Arc::new(RollupConfig::default()), config)
-    }
-
-    /// In Span mode, `step()` returns `BlockEncoded` for multiple blocks without
-    /// opening a channel — blocks accumulate in the span accumulator until the size
-    /// threshold or timeout fires.
-    #[test]
-    fn test_span_batch_accumulates_blocks_without_channel() {
-        let config = EncoderConfig {
-            batch_type: BatchType::Span,
-            target_frame_size: EncoderConfig::MAX_BLOB_FRAME_SIZE, // large: size won't trigger
-            max_channel_duration: 1000,
-            ..EncoderConfig::default()
-        };
-        let mut encoder = BatchEncoder::new(Arc::new(RollupConfig::default()), config);
-
-        let b1 = make_block(B256::ZERO);
-        let b1_hash = b1.header.hash_slow();
-        encoder.add_block(b1).unwrap();
-        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
-
-        // No channel opened — blocks are in the span accumulator.
-        assert!(encoder.current_channel.is_none());
-        assert_eq!(encoder.span_accumulator.len(), 1);
-        assert!(encoder.span_opened_at_l1.is_some(), "span_opened_at_l1 must be set");
-
-        let b2 = make_block(b1_hash);
-        let b2_hash = b2.header.hash_slow();
-        encoder.add_block(b2).unwrap();
-        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
-        assert!(encoder.current_channel.is_none());
-        assert_eq!(encoder.span_accumulator.len(), 2);
-
-        let b3 = make_block(b2_hash);
-        encoder.add_block(b3).unwrap();
-        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
-        assert!(encoder.current_channel.is_none());
-        assert_eq!(encoder.span_accumulator.len(), 3);
-
-        // No submissions available until channel is closed.
-        assert!(encoder.next_submission().is_none());
-    }
-
-    /// When the estimated compressed size of the span accumulator exceeds
-    /// `target_frame_size * target_num_frames`, `step()` returns `ChannelClosed`
-    /// and a submission is immediately available.
-    #[test]
-    fn test_span_batch_size_threshold_triggers_close() {
-        let mut encoder = span_encoder_tiny_target();
-
-        let block = make_block(B256::ZERO);
-        encoder.add_block(block).unwrap();
-
-        // The first block's overhead alone exceeds target_frame_size=1.
-        assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
-
-        // Accumulator must be flushed.
-        assert!(encoder.span_accumulator.is_empty());
-        assert!(encoder.span_opened_at_l1.is_none());
-
-        // A submission must be immediately available.
-        let sub = encoder.next_submission();
-        assert!(sub.is_some(), "span batch should produce a submission after size-based close");
-    }
-
-    #[test]
-    fn test_span_batch_max_blocks_flushes_without_closing_channel() {
-        let rollup_config = Arc::new(RollupConfig::default());
-        let config = EncoderConfig {
-            batch_type: BatchType::Span,
-            target_frame_size: EncoderConfig::MAX_BLOB_FRAME_SIZE, // large: size won't trigger
-            max_frame_size: EncoderConfig::MAX_BLOB_FRAME_SIZE,
-            max_channel_duration: 1000,
-            max_blocks_per_span_batch: Some(2),
-            ..EncoderConfig::default()
-        };
-        let mut encoder = BatchEncoder::new(Arc::clone(&rollup_config), config);
-
-        let first = make_block(B256::ZERO);
-        let first_hash = first.header.hash_slow();
-        let second = make_block(first_hash);
-        let second_hash = second.header.hash_slow();
-        let third = make_block(second_hash);
-        let third_hash = third.header.hash_slow();
-        let fourth = make_block(third_hash);
-
-        encoder.add_block(first).unwrap();
-        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
-        assert!(encoder.ready_channels.is_empty());
-        assert_eq!(encoder.span_accumulator.len(), 1);
-
-        encoder.add_block(second).unwrap();
-        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
-        assert!(encoder.span_accumulator.is_empty());
-        assert!(encoder.span_opened_at_l1.is_none());
-        assert!(encoder.current_channel.is_some());
-        assert!(encoder.ready_channels.is_empty());
-        assert!(encoder.next_submission().is_none());
-
-        encoder.add_block(third).unwrap();
-        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
-        assert_eq!(encoder.span_accumulator.len(), 1);
-
-        encoder.add_block(fourth).unwrap();
-        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
-        assert!(encoder.span_accumulator.is_empty());
-        assert!(encoder.current_channel.is_some());
-        assert!(encoder.ready_channels.is_empty());
-
-        encoder.force_close_channel();
-
-        let submission = encoder.next_submission().expect("submission should be available");
-        let channel_data = submission
-            .frames
-            .iter()
-            .flat_map(|frame| frame.data.iter().copied())
-            .collect::<Vec<_>>();
-        let mut reader = BatchReader::new(
-            channel_data,
-            RollupConfig::MAX_RLP_BYTES_PER_CHANNEL_FJORD as usize,
-            true,
-        );
-        let decoded = reader.next_batch(rollup_config.as_ref()).expect("decoded span batch");
-        let Batch::Span(span_batch) = decoded else {
-            panic!("expected span batch");
-        };
-        assert_eq!(span_batch.batches.len(), 2);
-
-        let decoded = reader.next_batch(rollup_config.as_ref()).expect("decoded second span batch");
-        let Batch::Span(span_batch) = decoded else {
-            panic!("expected span batch");
-        };
-        assert_eq!(span_batch.batches.len(), 2);
-        assert!(reader.next_batch(rollup_config.as_ref()).is_none());
-    }
-
-    #[test]
-    fn test_span_batch_failed_flush_closes_current_channel_then_retries() {
-        let config = EncoderConfig {
-            batch_type: BatchType::Span,
-            target_frame_size: EncoderConfig::MAX_BLOB_FRAME_SIZE,
-            max_frame_size: EncoderConfig::MAX_BLOB_FRAME_SIZE,
-            max_channel_duration: 1000,
-            max_blocks_per_span_batch: Some(2),
-            ..EncoderConfig::default()
-        };
-        let mut encoder = BatchEncoder::new(Arc::new(RollupConfig::default()), config);
-
-        encoder.block_cursor = 3;
-        encoder.span_accumulator = vec![
-            (SingleBatch { timestamp: 1, ..Default::default() }, 0),
-            (SingleBatch { timestamp: 2, ..Default::default() }, 1),
-        ];
-        encoder.span_raw_bytes = 2 * BatchEncoder::SPAN_BATCH_PER_BLOCK_OVERHEAD;
-        encoder.span_opened_at_l1 = Some(0);
-        encoder.open_new_channel(0);
-
-        let open = encoder.current_channel.as_mut().expect("channel should be open");
-        open.out.add_batch(Batch::Single(SingleBatch::default())).expect("single batch fits");
-        open.out.rlp_length = RollupConfig::MAX_RLP_BYTES_PER_CHANNEL_BEDROCK;
-        open.blocks_added = 1;
-
-        assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
-        assert!(encoder.current_channel.is_none());
-        assert_eq!(encoder.ready_channels[0].encoded_block_range, 0..1);
-        assert_eq!(encoder.span_accumulator.len(), 2);
-
-        assert_eq!(encoder.step().unwrap(), StepResult::SpanFlushed);
-        let open = encoder.current_channel.as_ref().expect("fresh channel should be open");
-        assert_eq!(open.block_start, 1);
-        assert_eq!(open.blocks_added, 2);
-        assert!(encoder.span_accumulator.is_empty());
-    }
-
-    #[test]
-    fn test_span_batch_unbuildable_accumulator_returns_step_error() {
-        let config = EncoderConfig {
-            batch_type: BatchType::Span,
-            max_blocks_per_span_batch: Some(2),
-            ..EncoderConfig::default()
-        };
-        let mut encoder = BatchEncoder::new(Arc::new(RollupConfig::default()), config);
-        encoder.block_cursor = 2;
-        encoder.span_accumulator = vec![
-            (SingleBatch { timestamp: 1, ..Default::default() }, 0),
-            (
-                SingleBatch {
-                    timestamp: 2,
-                    transactions: vec![Bytes::from_static(b"not-a-valid-transaction")],
-                    ..Default::default()
-                },
-                1,
-            ),
-        ];
-
-        let err = encoder.step().expect_err("invalid span accumulator should halt");
-
-        assert!(matches!(err, StepError::SpanBatchBuildFailed { blocks: 2, .. }));
-        assert!(encoder.current_channel.is_none());
-        assert_eq!(encoder.span_accumulator.len(), 2);
-    }
-
-    #[test]
-    fn test_force_close_defers_span_flush_error_to_next_step() {
-        let config = EncoderConfig {
-            batch_type: BatchType::Span,
-            max_blocks_per_span_batch: Some(2),
-            ..EncoderConfig::default()
-        };
-        let mut encoder = BatchEncoder::new(Arc::new(RollupConfig::default()), config);
-        encoder.block_cursor = 2;
-        encoder.span_accumulator = vec![
-            (SingleBatch { timestamp: 1, ..Default::default() }, 0),
-            (
-                SingleBatch {
-                    timestamp: 2,
-                    transactions: vec![Bytes::from_static(b"not-a-valid-transaction")],
-                    ..Default::default()
-                },
-                1,
-            ),
-        ];
-
-        encoder.force_close_channel();
-
-        assert!(encoder.deferred_step_error.is_some());
-        let err = encoder.step().expect_err("deferred span flush error should halt");
-        assert!(matches!(err, StepError::SpanBatchBuildFailed { blocks: 2, .. }));
-        assert!(encoder.deferred_step_error.is_none());
-    }
-
-    #[test]
-    fn test_advance_l1_head_defers_span_flush_error_to_next_step() {
-        let config = EncoderConfig {
-            batch_type: BatchType::Span,
-            max_channel_duration: 1,
-            ..EncoderConfig::default()
-        };
-        let mut encoder = BatchEncoder::new(Arc::new(RollupConfig::default()), config);
-        encoder.block_cursor = 2;
-        encoder.span_opened_at_l1 = Some(0);
-        encoder.span_accumulator = vec![
-            (SingleBatch { timestamp: 1, ..Default::default() }, 0),
-            (
-                SingleBatch {
-                    timestamp: 2,
-                    transactions: vec![Bytes::from_static(b"not-a-valid-transaction")],
-                    ..Default::default()
-                },
-                1,
-            ),
-        ];
-
-        encoder.advance_l1_head(1);
-
-        assert!(encoder.deferred_step_error.is_some());
-        assert_eq!(encoder.l1_head, 1);
-        encoder.advance_l1_head(2);
-        assert_eq!(
-            encoder.l1_head, 2,
-            "L1 head updates should be retained while a step error is deferred"
-        );
-        let err = encoder.step().expect_err("deferred timeout flush error should halt");
-        assert!(matches!(err, StepError::SpanBatchBuildFailed { blocks: 2, .. }));
-        assert!(encoder.deferred_step_error.is_none());
-    }
-
-    #[test]
-    fn test_deferred_step_error_keeps_first_error() {
-        let config = EncoderConfig { batch_type: BatchType::Span, ..EncoderConfig::default() };
-        let mut encoder = BatchEncoder::new(Arc::new(RollupConfig::default()), config);
-        encoder.span_accumulator = vec![
-            (SingleBatch { timestamp: 1, ..Default::default() }, 0),
-            (
-                SingleBatch {
-                    timestamp: 2,
-                    transactions: vec![Bytes::from_static(b"not-a-valid-transaction")],
-                    ..Default::default()
-                },
-                1,
-            ),
-        ];
-        let first =
-            encoder.build_span_batch().expect_err("first invalid span accumulator should fail");
-        encoder.span_accumulator.push((
-            SingleBatch {
-                timestamp: 3,
-                transactions: vec![Bytes::from_static(b"also-not-a-valid-transaction")],
-                ..Default::default()
-            },
-            2,
-        ));
-        let second =
-            encoder.build_span_batch().expect_err("second invalid span accumulator should fail");
-
-        encoder.defer_step_error(first, "force_close_channel");
-        encoder.defer_step_error(second, "advance_l1_head");
-
-        let err = encoder.step().expect_err("first deferred error should halt");
-        assert!(matches!(err, StepError::SpanBatchBuildFailed { blocks: 2, .. }));
-    }
-
-    /// Span batches encode their timestamp relative to the rollup genesis timestamp.
-    #[test]
-    fn test_span_batch_uses_rollup_genesis_timestamp() {
-        let genesis_l2_time = 1_000_000;
-        let block_time = 2;
-        let rollup_config = Arc::new(RollupConfig {
-            genesis: ChainGenesis { l2_time: genesis_l2_time, ..Default::default() },
-            block_time,
-            ..Default::default()
-        });
-        let config = EncoderConfig {
-            batch_type: BatchType::Span,
-            target_frame_size: EncoderConfig::MAX_BLOB_FRAME_SIZE,
-            max_frame_size: EncoderConfig::MAX_BLOB_FRAME_SIZE,
-            max_channel_duration: 1000,
-            ..EncoderConfig::default()
-        };
-        let mut encoder = BatchEncoder::new(Arc::clone(&rollup_config), config);
-
-        let first = make_block_at(B256::ZERO, 1, genesis_l2_time + block_time);
-        let first_hash = first.header.hash_slow();
-        let second = make_block_at(first_hash, 2, genesis_l2_time + 2 * block_time);
-
-        encoder.add_block(first).unwrap();
-        encoder.add_block(second).unwrap();
-        let frames = encoder.encode_and_drain().expect("span frames");
-        assert!(!frames.is_empty(), "span encoding must produce frames");
-
-        let channel_data =
-            frames.iter().flat_map(|frame| frame.data.iter().copied()).collect::<Vec<_>>();
-        let mut reader = BatchReader::new(
-            channel_data,
-            RollupConfig::MAX_RLP_BYTES_PER_CHANNEL_FJORD as usize,
-            true,
-        );
-        let decoded = reader.next_batch(rollup_config.as_ref()).expect("decoded span batch");
-        let Batch::Span(span_batch) = decoded else {
-            panic!("expected span batch");
-        };
-
-        assert_eq!(span_batch.batches.len(), 2);
-        assert_eq!(span_batch.batches[0].timestamp, genesis_l2_time + block_time);
-        assert_eq!(span_batch.batches[1].timestamp, genesis_l2_time + 2 * block_time);
-        assert!(reader.next_batch(rollup_config.as_ref()).is_none());
-    }
-
-    /// In Span mode, `advance_l1_head` flushes the accumulator when the effective
-    /// duration (`max_channel_duration - sub_safety_margin`) has elapsed. The accumulator
-    /// must be preserved one step before the threshold and empty exactly at it.
-    #[rstest]
-    #[case(5, 0, 4, 5)] // no margin; full duration=5
-    #[case(10, 4, 5, 6)] // effective = 10-4 = 6
-    fn test_span_batch_timeout(
-        #[case] max_channel_duration: u64,
-        #[case] sub_safety_margin: u64,
-        #[case] below: u64,
-        #[case] at_threshold: u64,
-    ) {
-        let config = EncoderConfig {
-            batch_type: BatchType::Span,
-            target_frame_size: EncoderConfig::MAX_BLOB_FRAME_SIZE, // large: size won't trigger
-            max_frame_size: EncoderConfig::MAX_BLOB_FRAME_SIZE,
-            max_channel_duration,
-            sub_safety_margin,
-            ..EncoderConfig::default()
-        };
-        let mut encoder = BatchEncoder::new(Arc::new(RollupConfig::default()), config);
-
-        encoder.add_block(make_block(B256::ZERO)).unwrap();
-        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
-        assert!(encoder.current_channel.is_none());
-        assert_eq!(encoder.span_accumulator.len(), 1);
-        assert_eq!(encoder.span_opened_at_l1, Some(0));
-
-        encoder.advance_l1_head(below);
-        assert_eq!(encoder.span_accumulator.len(), 1, "accumulator must survive before timeout");
-        assert!(encoder.ready_channels.is_empty());
-
-        encoder.advance_l1_head(at_threshold);
-        assert!(encoder.span_accumulator.is_empty(), "accumulator must be flushed at timeout");
-        assert!(encoder.span_opened_at_l1.is_none());
-        assert!(!encoder.ready_channels.is_empty(), "a ready channel must exist after flush");
-        assert!(
-            encoder.next_submission().is_some(),
-            "should have a submission after timeout flush"
-        );
-    }
-
-    /// End-to-end span batch path: add a block, trigger size-based close,
-    /// get submission, confirm, and verify blocks are pruned.
-    #[test]
-    fn test_span_batch_end_to_end() {
-        let mut encoder = span_encoder_tiny_target();
-
-        let b1 = make_block(B256::ZERO);
-        encoder.add_block(b1).unwrap();
-        assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
-
-        let sub = encoder.next_submission().expect("submission must be available");
-        let sub_id = sub.id;
-
-        // Blocks must NOT be pruned until the submission is confirmed.
-        assert!(!encoder.blocks.is_empty());
-
-        encoder.confirm(sub_id, 10);
-
-        // After confirmation blocks must be pruned.
-        assert!(encoder.blocks.is_empty());
-        assert_eq!(encoder.block_cursor, 0);
-    }
-
-    /// `reset()` in Span mode must clear both the accumulator and `span_opened_at_l1`.
-    #[test]
-    fn test_span_batch_reset_clears_span_state() {
-        let config = EncoderConfig {
-            batch_type: BatchType::Span,
-            target_frame_size: EncoderConfig::MAX_BLOB_FRAME_SIZE, // large: size won't trigger
-            max_channel_duration: 1000,
-            ..EncoderConfig::default()
-        };
-        let mut encoder = BatchEncoder::new(Arc::new(RollupConfig::default()), config);
-
-        let block = make_block(B256::ZERO);
-        encoder.add_block(block).unwrap();
-        encoder.step().unwrap();
-
-        assert_eq!(encoder.span_accumulator.len(), 1);
-        assert!(encoder.span_opened_at_l1.is_some());
-
-        encoder.reset();
-
-        assert!(encoder.span_accumulator.is_empty());
-        assert!(encoder.span_opened_at_l1.is_none());
-    }
-
-    /// Multiple successive Span channels work correctly: each block immediately triggers
-    /// a size-based close (with tiny target), and each channel is confirmed and pruned
-    /// independently.
-    #[test]
-    fn test_span_batch_multiple_channels() {
-        let mut encoder = span_encoder_tiny_target();
-
-        // First block → size threshold → first channel closed.
-        let b1 = make_block(B256::ZERO);
-        let b1_hash = b1.header.hash_slow();
-        encoder.add_block(b1).unwrap();
-        assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
-        assert_eq!(encoder.ready_channels.len(), 1);
-
-        // Second block → size threshold → second channel closed.
-        let b2 = make_block(b1_hash);
-        encoder.add_block(b2).unwrap();
-        assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
-        assert_eq!(encoder.ready_channels.len(), 2);
-
-        // Confirm first channel — its block is pruned.
-        let sub1 = encoder.next_submission().expect("ch1 must have a submission");
-        let id1 = sub1.id;
-        encoder.confirm(id1, 10);
-        assert_eq!(encoder.ready_channels.len(), 1);
-
-        // Confirm second channel — its block is pruned.
-        let sub2 = encoder.next_submission().expect("ch2 must have a submission");
-        let id2 = sub2.id;
-        encoder.confirm(id2, 11);
-        assert_eq!(encoder.ready_channels.len(), 0);
-        assert!(encoder.blocks.is_empty());
-    }
-
-    /// A span-mode requeue rewinds the cursor on the ready channel just as in Single mode.
-    #[test]
-    fn test_span_batch_requeue_rewinds_cursor() {
-        let mut encoder = span_encoder_tiny_target();
-
-        let block = make_block(B256::ZERO);
-        encoder.add_block(block).unwrap();
-        assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
-
-        let sub = encoder.next_submission().unwrap();
-        let sub_id = sub.id;
-
-        encoder.requeue(sub_id);
-
-        let resub = encoder.next_submission();
-        assert!(resub.is_some(), "requeued span frames must be available again");
-    }
-
     // --- prune_safe tests ---
 
     fn make_numbered_block(parent_hash: B256, number: u64) -> BaseBlock {
@@ -2195,8 +1899,7 @@ mod tests {
         }
     }
 
-    /// `prune_safe` must drain leading blocks whose number is <= the safe head
-    /// and that have already been encoded (index < `block_cursor`).
+    /// `prune_safe` drains the buffered prefix through the matching safe head.
     #[test]
     fn test_prune_safe_drains_encoded_blocks() {
         let mut encoder = default_encoder();
@@ -2218,18 +1921,44 @@ mod tests {
         assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
         assert_eq!(encoder.block_cursor, 3);
 
-        // Prune blocks 1 and 2 (safe head = 2).
-        encoder.prune_safe(2);
+        assert!(encoder.prune_safe(BlockInfo { hash: b2_hash, number: 2, ..Default::default() }));
 
         assert_eq!(encoder.blocks.len(), 1, "only block 3 should remain");
         assert_eq!(encoder.blocks[0].header.number, 3);
         assert_eq!(encoder.block_cursor, 1, "cursor must be adjusted by prune count");
     }
 
-    /// `prune_safe` must not prune blocks that have not yet been encoded
-    /// (index >= `block_cursor`), even if their number is below the safe head.
     #[test]
-    fn test_prune_safe_does_not_prune_unencoded_blocks() {
+    fn test_prune_safe_rebases_open_channel() {
+        let mut encoder = default_encoder();
+        for block in make_user_tx_chain(2) {
+            encoder.add_block(block).unwrap();
+        }
+
+        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
+        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
+
+        let safe_l2 = BlockInfo::from(&encoder.blocks[0]);
+        assert!(encoder.prune_safe(safe_l2));
+
+        let remaining_safe_l2 = BlockInfo::from(&encoder.blocks[0]);
+        let open = encoder.channels.back().unwrap();
+        assert_eq!(open.block_range(), 0..1);
+        assert_eq!(open.blocks_added(), 1);
+        assert_eq!(encoder.blocks.len(), 1);
+
+        encoder.flush().unwrap();
+        for submission in drain_submissions(&mut encoder) {
+            encoder.confirm(submission.id, 1);
+        }
+        assert_eq!(encoder.blocks.len(), 1, "confirmation keeps the remaining block buffered");
+        assert!(encoder.prune_safe(remaining_safe_l2));
+        assert!(encoder.blocks.is_empty());
+    }
+
+    /// Safe-head pruning includes unencoded blocks and clamps the cursor to zero.
+    #[test]
+    fn test_prune_safe_prunes_unencoded_blocks() {
         let mut encoder = default_encoder();
 
         let b1 = make_numbered_block(B256::ZERO, 1);
@@ -2237,112 +1966,76 @@ mod tests {
         encoder.add_block(b1).unwrap();
 
         let b2 = make_numbered_block(b1_hash, 2);
+        let b2_hash = b2.header.hash_slow();
         encoder.add_block(b2).unwrap();
 
         // Encode only block 1 (cursor = 1).
         assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
         assert_eq!(encoder.block_cursor, 1);
 
-        // Prune with safe_l2_number = 5 — block 2 is below safe head but not encoded.
-        encoder.prune_safe(5);
+        assert!(encoder.prune_safe(BlockInfo { hash: b2_hash, number: 2, ..Default::default() }));
 
-        assert_eq!(encoder.blocks.len(), 1, "block 2 must not be pruned (not yet encoded)");
-        assert_eq!(encoder.blocks[0].header.number, 2);
-        assert_eq!(encoder.block_cursor, 0, "cursor adjusted after pruning block 1");
-    }
-
-    /// `prune_safe` with a safe head below all block numbers is a no-op.
-    #[test]
-    fn test_prune_safe_noop_when_below_all_blocks() {
-        let mut encoder = default_encoder();
-
-        let b1 = make_numbered_block(B256::ZERO, 10);
-        encoder.add_block(b1).unwrap();
-        encoder.step().unwrap();
-
-        encoder.prune_safe(5);
-
-        assert_eq!(encoder.blocks.len(), 1, "no blocks should be pruned");
-        assert_eq!(encoder.block_cursor, 1, "cursor must be unchanged");
-    }
-
-    /// `prune_safe` on an empty encoder is a no-op.
-    #[test]
-    fn test_prune_safe_noop_when_empty() {
-        let mut encoder = default_encoder();
-        encoder.prune_safe(100);
         assert!(encoder.blocks.is_empty());
         assert_eq!(encoder.block_cursor, 0);
+        assert!(encoder.channels.is_empty());
     }
 
-    /// `prune_safe` must adjust `block_range.end` on ready channels so that
-    /// a subsequent `confirm()` does not over-prune.
     #[test]
-    fn test_prune_safe_adjusts_ready_channel_block_ranges() {
+    fn test_prune_safe_rejects_inconsistent_chain() {
         let mut encoder = default_encoder();
+        assert!(encoder.prune_safe(BlockInfo { number: 1, ..Default::default() }));
 
-        let b1 = make_numbered_block(B256::ZERO, 1);
-        let b1_hash = b1.header.hash_slow();
-        encoder.add_block(b1).unwrap();
-
-        let b2 = make_numbered_block(b1_hash, 2);
-        encoder.add_block(b2).unwrap();
-
-        // Encode both blocks.
+        encoder.add_block(make_numbered_block(B256::ZERO, 3)).unwrap();
         encoder.step().unwrap();
-        encoder.step().unwrap();
-        assert_eq!(encoder.block_cursor, 2);
 
-        // Close the channel so we get a ready channel with block_range 0..2.
-        encoder.advance_l1_head(100);
-        assert!(!encoder.ready_channels.is_empty());
-        assert_eq!(encoder.ready_channels[0].block_range.end, 2);
-
-        // Prune block 1 (safe head = 1).
-        encoder.prune_safe(1);
+        assert!(!encoder.prune_safe(BlockInfo {
+            hash: B256::repeat_byte(1),
+            number: 2,
+            ..Default::default()
+        }));
+        assert!(encoder.prune_safe(BlockInfo { number: 2, ..Default::default() }));
+        assert!(!encoder.prune_safe(BlockInfo {
+            hash: B256::repeat_byte(1),
+            number: 3,
+            ..Default::default()
+        }));
+        assert!(!encoder.prune_safe(BlockInfo { number: 4, ..Default::default() }));
+        assert!(!encoder.prune_safe(BlockInfo { number: 1, ..Default::default() }));
         assert_eq!(encoder.blocks.len(), 1);
-        assert_eq!(encoder.block_cursor, 1);
-
-        // The ready channel's block_range.end must be adjusted.
-        assert_eq!(
-            encoder.ready_channels[0].block_range.end, 1,
-            "block_range.end must be reduced by prune count"
-        );
-
-        // Confirm the channel — should prune the remaining block.
-        let sub = encoder.next_submission().unwrap();
-        encoder.confirm(sub.id, 101);
-        assert!(encoder.blocks.is_empty(), "confirm after prune_safe must finish pruning");
     }
 
-    /// `encode_and_drain` steps until idle, force-closes, and returns all frames.
+    /// `encode_and_drain` steps until idle, flushes, and returns all submissions.
     #[test]
-    fn test_encode_and_drain_returns_frames() {
+    fn test_encode_and_drain_returns_submissions() {
         let mut encoder = default_encoder();
         encoder.add_block(make_block_with_user_tx(B256::ZERO)).expect("add block");
-        let frames = encoder.encode_and_drain().expect("encode_and_drain");
-        assert!(!frames.is_empty(), "encode_and_drain must return at least one frame");
+        let submissions = encoder.encode_and_drain().expect("encode_and_drain");
+        assert!(!submissions.is_empty(), "encode_and_drain must return a submission");
+        assert!(submissions.iter().all(|submission| submission.frame_count() > 0));
+    }
+
+    #[test]
+    fn test_encode_and_drain_releases_already_closed_tails() {
+        let config = EncoderConfig { compressed_size_target: Some(1), ..EncoderConfig::default() };
+        let mut encoder =
+            BatchEncoder::new(Arc::new(RollupConfig::default()), config).expect("valid config");
+        let first = make_block_with_user_tx(B256::ZERO);
+        let second = make_block_with_user_tx(first.header.hash_slow());
+        encoder.add_block(first).expect("add first block");
+        encoder.add_block(second).expect("add second block");
+
+        let submissions = encoder.encode_and_drain().expect("encode_and_drain");
+
+        assert!(!submissions.is_empty(), "drain must release size-closed channel tails");
+        assert!(!encoder.has_ready_submission(), "drain must consume every released tail");
     }
 
     /// `encode_and_drain` with no blocks added returns empty (Idle immediately).
     #[test]
     fn test_encode_and_drain_no_blocks_returns_empty() {
         let mut encoder = default_encoder();
-        let frames = encoder.encode_and_drain().expect("encode_and_drain");
-        assert!(frames.is_empty(), "no blocks → encode_and_drain must return empty");
-    }
-
-    /// `encode_and_drain` in Span mode accumulates and drains frames correctly.
-    #[test]
-    fn test_encode_and_drain_span_mode() {
-        let rollup_config = Arc::new(RollupConfig::default());
-        let config = EncoderConfig { batch_type: BatchType::Span, ..EncoderConfig::default() };
-        let mut encoder = BatchEncoder::new(rollup_config, config);
-        encoder.add_block(make_block_with_user_tx(B256::ZERO)).expect("add block 1");
-        let hash = make_block_with_user_tx(B256::ZERO).header.hash_slow();
-        encoder.add_block(make_block_with_user_tx(hash)).expect("add block 2");
-        let frames = encoder.encode_and_drain().expect("encode_and_drain span");
-        assert!(!frames.is_empty(), "span encode_and_drain must produce frames");
+        let submissions = encoder.encode_and_drain().expect("encode_and_drain");
+        assert!(submissions.is_empty(), "no blocks must produce no submissions");
     }
 
     /// Encoding with a small `max_frame_size` fragments a multi-block channel
@@ -2351,7 +2044,7 @@ mod tests {
     fn frame_fragmentation_with_small_frame_size() {
         let rollup_config = Arc::new(RollupConfig::default());
         let config = EncoderConfig { max_frame_size: 80, ..EncoderConfig::default() };
-        let mut encoder = BatchEncoder::new(rollup_config, config);
+        let mut encoder = BatchEncoder::new(rollup_config, config).expect("valid config");
 
         // Add 5 L2 blocks with a user tx in each to produce non-trivial payload.
         let mut parent = B256::ZERO;
@@ -2361,113 +2054,55 @@ mod tests {
             encoder.add_block(block).expect("add block");
         }
 
-        let frames = encoder.encode_and_drain().expect("encode_and_drain");
+        let submissions = encoder.encode_and_drain().expect("encode_and_drain");
+        let frame_count = submissions.iter().map(BatchSubmission::frame_count).sum::<usize>();
         assert!(
-            frames.len() >= 3,
-            "expected at least 3 frames with max_frame_size=80, got {}",
-            frames.len()
+            frame_count >= 3,
+            "expected at least 3 frames with max_frame_size=80, got {frame_count}"
         );
     }
 
-    /// `max_l1_tx_size_bytes` limits the calldata submission size for calldata DA.
-    ///
-    /// With a very small limit, only one frame (at minimum) is included per submission
-    /// even when multiple frames are available.
+    /// Calldata submissions carry exactly one derivation frame.
     #[test]
-    fn calldata_max_l1_tx_size_limits_submission() {
+    fn calldata_submits_one_frame_per_transaction() {
         let rollup_config = Arc::new(RollupConfig::default());
-        // Use a tiny max_frame_size to generate multiple small frames and
-        // a max_l1_tx_size_bytes of 0 to force a single-frame submission each time.
         let config = EncoderConfig {
             da_type: DaType::Calldata,
-            target_num_frames: 1, // required for calldata
             max_frame_size: 100,
-            target_frame_size: 100,
-            max_l1_tx_size_bytes: Some(0), // smaller than any real frame; always warns
             ..EncoderConfig::default()
         };
-        let mut encoder = BatchEncoder::new(rollup_config, config);
-
-        let block = make_block_with_user_tx(B256::ZERO);
-        encoder.add_block(block).expect("add block");
-        encoder.encode_and_drain().expect("encode_and_drain");
-
-        // With max_l1_tx_size_bytes=0 every frame exceeds the limit, but we still get
-        // at least one submission (the .max(1) ensures we never stall).
-        let sub = encoder.next_submission();
-        // All frames were already drained by encode_and_drain; submissions were emitted
-        // during drain. The key property is that no panic occurred and the encoder
-        // handled the oversized-frame case gracefully.
-        let _ = sub; // may be None if all frames came out during encode_and_drain
-    }
-
-    /// When `max_l1_tx_size_bytes` is large enough to hold all frames, all frames in a
-    /// calldata channel are packed into a single submission (bounded by `target_num_frames`).
-    #[test]
-    fn calldata_max_l1_tx_size_no_op_when_large() {
-        let rollup_config = Arc::new(RollupConfig::default());
-        // Use a small frame size to generate multiple frames, but a large tx size limit.
-        let config = EncoderConfig {
-            da_type: DaType::Calldata,
-            target_num_frames: 1, // required for calldata
-            max_frame_size: 100,
-            target_frame_size: 100,
-            max_l1_tx_size_bytes: Some(1_000_000),
-            ..EncoderConfig::default()
-        };
-        let mut encoder = BatchEncoder::new(rollup_config, config);
+        let mut encoder = BatchEncoder::new(rollup_config, config).expect("valid config");
 
         let block = make_block_with_user_tx(B256::ZERO);
         encoder.add_block(block).expect("add block");
 
-        // Run until idle, force-close, and drain submissions.
+        // Run until idle, flush, and drain submissions.
         loop {
             if encoder.step().expect("step") == StepResult::Idle {
                 break;
             }
         }
-        encoder.force_close_channel();
+        encoder.flush().unwrap();
 
-        // Each submission contains exactly 1 frame (target_num_frames=1).
+        // The calldata transaction format carries one derivation frame.
         let mut count = 0;
         while let Some(sub) = encoder.next_submission() {
-            assert_eq!(sub.frames.len(), 1, "calldata submission must have exactly 1 frame");
+            assert_eq!(sub.frame_count(), 1, "calldata submission must have exactly 1 frame");
             count += 1;
         }
         assert!(count >= 1, "expected at least one submission");
     }
 
-    /// `max_l1_tx_size_bytes` is a no-op for blob DA; submissions are not affected.
+    /// A retry preserves the exact artifact produced while blob override was active.
     #[test]
-    fn blob_da_ignores_max_l1_tx_size_bytes() {
-        let rollup_config = Arc::new(RollupConfig::default());
-        let config = EncoderConfig {
-            da_type: DaType::Blob,
-            target_num_frames: 1,
-            max_l1_tx_size_bytes: Some(1), // would cut every tx if applied to blobs
-            ..EncoderConfig::default()
-        };
-        let mut encoder = BatchEncoder::new(rollup_config, config);
-
-        let block = make_block_with_user_tx(B256::ZERO);
-        encoder.add_block(block).expect("add block");
-        let frames = encoder.encode_and_drain().expect("encode_and_drain");
-        assert!(!frames.is_empty(), "blob DA must still produce frames despite tiny size limit");
-    }
-
-    /// `set_blob_override(true)` flips a calldata-configured encoder to emit
-    /// blob-typed submissions. Clearing the override restores calldata.
-    #[test]
-    fn blob_override_flips_calldata_submissions_to_blob() {
+    fn blob_override_retry_preserves_immutable_blob_artifact() {
         let rollup_config = Arc::new(RollupConfig::default());
         let config = EncoderConfig {
             da_type: DaType::Calldata,
-            target_num_frames: 1,
             max_frame_size: 200,
-            target_frame_size: 200,
             ..EncoderConfig::default()
         };
-        let mut encoder = BatchEncoder::new(rollup_config, config);
+        let mut encoder = BatchEncoder::new(rollup_config, config).expect("valid config");
 
         encoder.add_block(make_block_with_user_tx(B256::ZERO)).expect("add block");
         loop {
@@ -2475,16 +2110,16 @@ mod tests {
                 break;
             }
         }
-        encoder.force_close_channel();
+        encoder.flush().unwrap();
 
         encoder.set_blob_override(true);
         let sub = encoder.next_submission().expect("submission while override active");
-        assert_eq!(sub.da_type, DaType::Blob, "override must flip da_type to Blob");
+        assert_eq!(sub.da_type(), DaType::Blob, "override must flip da_type to Blob");
         encoder.requeue(sub.id);
 
         encoder.set_blob_override(false);
         let sub = encoder.next_submission().expect("submission after override cleared");
-        assert_eq!(sub.da_type, DaType::Calldata, "configured calldata da_type must return");
+        assert_eq!(sub.da_type(), DaType::Blob, "retry must preserve the original DA artifact");
     }
 
     /// `set_blob_override(true)` is a no-op for blob-configured encoders —
@@ -2493,13 +2128,13 @@ mod tests {
     fn blob_override_is_noop_for_blob_configured_encoder() {
         let rollup_config = Arc::new(RollupConfig::default());
         let config = EncoderConfig { da_type: DaType::Blob, ..EncoderConfig::default() };
-        let mut encoder = BatchEncoder::new(rollup_config, config);
+        let mut encoder = BatchEncoder::new(rollup_config, config).expect("valid config");
 
         encoder.add_block(make_block_with_user_tx(B256::ZERO)).expect("add block");
-        encoder.encode_and_drain().expect("encode_and_drain");
+        while encoder.step().expect("step") != StepResult::Idle {}
+        encoder.flush().unwrap();
         encoder.set_blob_override(true);
-        // No assertion on next_submission — drain already consumed everything.
-        // The contract is just that the override does not corrupt state.
-        assert!(encoder.next_submission().is_none());
+        let submission = encoder.next_submission().expect("blob submission");
+        assert_eq!(submission.da_type(), DaType::Blob);
     }
 }

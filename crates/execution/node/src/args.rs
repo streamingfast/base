@@ -7,7 +7,9 @@ use std::{
     time::Duration,
 };
 
+use alloy_primitives::Address;
 use base_execution_trie::{MdbxProofsStorageOptions, RocksdbProofsStorageOptions};
+use base_execution_txpool::{DEFAULT_PAYMENT_LIMIT, DEFAULT_SIGNATURE_LIMIT};
 use base_upgrade_signal::{UpgradeSignalArgs, UpgradeSignalL1RpcArgs};
 use clap::{ArgAction, ValueEnum, builder::ArgPredicate};
 
@@ -128,6 +130,7 @@ pub struct ProofsHistoryRocksdbArgs {
     /// `RocksDB` block cache size in `MiB`.
     #[arg(
         long = "proofs-history.rocksdb.block-cache-size-mib",
+        alias = "proofs.rocksdb.block-cache-size-mib",
         value_name = "PROOFS_HISTORY_ROCKSDB_BLOCK_CACHE_SIZE_MIB",
         default_value_t = DEFAULT_ROCKSDB_BLOCK_CACHE_SIZE_MIB,
         value_parser = clap::value_parser!(u64).range(1..),
@@ -138,6 +141,7 @@ pub struct ProofsHistoryRocksdbArgs {
     /// Bytes-per-sync threshold in `MiB`. Set 0 to disable.
     #[arg(
         long = "proofs-history.rocksdb.bytes-per-sync-mib",
+        alias = "proofs.rocksdb.bytes-per-sync-mib",
         value_name = "PROOFS_HISTORY_ROCKSDB_BYTES_PER_SYNC_MIB",
         default_value_t = DEFAULT_ROCKSDB_BYTES_PER_SYNC_MIB,
         hide = true
@@ -147,6 +151,7 @@ pub struct ProofsHistoryRocksdbArgs {
     /// Readahead size in `MiB` for compaction input reads. Set 0 to disable.
     #[arg(
         long = "proofs-history.rocksdb.compaction-readahead-size-mib",
+        alias = "proofs.rocksdb.compaction-readahead-size-mib",
         value_name = "PROOFS_HISTORY_ROCKSDB_COMPACTION_READAHEAD_SIZE_MIB",
         default_value_t = DEFAULT_ROCKSDB_COMPACTION_READAHEAD_SIZE_MIB,
         hide = true
@@ -156,6 +161,7 @@ pub struct ProofsHistoryRocksdbArgs {
     /// Number of L0 files that triggers compaction.
     #[arg(
         long = "proofs-history.rocksdb.level-zero-file-num-compaction-trigger",
+        alias = "proofs.rocksdb.level-zero-file-num-compaction-trigger",
         value_name = "PROOFS_HISTORY_ROCKSDB_LEVEL_ZERO_FILE_NUM_COMPACTION_TRIGGER",
         default_value_t = DEFAULT_ROCKSDB_LEVEL_ZERO_FILE_NUM_COMPACTION_TRIGGER,
         value_parser = clap::value_parser!(i32).range(1..),
@@ -166,6 +172,7 @@ pub struct ProofsHistoryRocksdbArgs {
     /// Number of L0 files that triggers write slowdown. Set 0 to disable slowdown.
     #[arg(
         long = "proofs-history.rocksdb.level-zero-slowdown-writes-trigger",
+        alias = "proofs.rocksdb.level-zero-slowdown-writes-trigger",
         value_name = "PROOFS_HISTORY_ROCKSDB_LEVEL_ZERO_SLOWDOWN_WRITES_TRIGGER",
         default_value_t = DEFAULT_ROCKSDB_LEVEL_ZERO_SLOWDOWN_WRITES_TRIGGER,
         value_parser = clap::value_parser!(i32).range(0..),
@@ -176,6 +183,7 @@ pub struct ProofsHistoryRocksdbArgs {
     /// Number of L0 files that stops writes.
     #[arg(
         long = "proofs-history.rocksdb.level-zero-stop-writes-trigger",
+        alias = "proofs.rocksdb.level-zero-stop-writes-trigger",
         value_name = "PROOFS_HISTORY_ROCKSDB_LEVEL_ZERO_STOP_WRITES_TRIGGER",
         default_value_t = DEFAULT_ROCKSDB_LEVEL_ZERO_STOP_WRITES_TRIGGER,
         value_parser = clap::value_parser!(i32).range(1..),
@@ -186,6 +194,7 @@ pub struct ProofsHistoryRocksdbArgs {
     /// Maximum `RocksDB` background jobs for proof history.
     #[arg(
         long = "proofs-history.rocksdb.max-background-jobs",
+        alias = "proofs.rocksdb.max-background-jobs",
         value_name = "PROOFS_HISTORY_ROCKSDB_MAX_BACKGROUND_JOBS",
         default_value_t = DEFAULT_ROCKSDB_MAX_BACKGROUND_JOBS,
         value_parser = clap::value_parser!(i32).range(1..),
@@ -196,6 +205,7 @@ pub struct ProofsHistoryRocksdbArgs {
     /// Maximum subcompactions per compaction.
     #[arg(
         long = "proofs-history.rocksdb.max-subcompactions",
+        alias = "proofs.rocksdb.max-subcompactions",
         value_name = "PROOFS_HISTORY_ROCKSDB_MAX_SUBCOMPACTIONS",
         default_value_t = DEFAULT_ROCKSDB_MAX_SUBCOMPACTIONS,
         value_parser = clap::value_parser!(u32).range(1..),
@@ -206,6 +216,7 @@ pub struct ProofsHistoryRocksdbArgs {
     /// Maximum total WAL size in `MiB`.
     #[arg(
         long = "proofs-history.rocksdb.max-total-wal-size-mib",
+        alias = "proofs.rocksdb.max-total-wal-size-mib",
         value_name = "PROOFS_HISTORY_ROCKSDB_MAX_TOTAL_WAL_SIZE_MIB",
         value_parser = clap::value_parser!(u64).range(1..),
         hide = true
@@ -215,6 +226,7 @@ pub struct ProofsHistoryRocksdbArgs {
     /// Maximum write buffers per proof-history column family.
     #[arg(
         long = "proofs-history.rocksdb.max-write-buffer-number",
+        alias = "proofs.rocksdb.max-write-buffer-number",
         value_name = "PROOFS_HISTORY_ROCKSDB_MAX_WRITE_BUFFER_NUMBER",
         default_value_t = DEFAULT_ROCKSDB_MAX_WRITE_BUFFER_NUMBER,
         value_parser = clap::value_parser!(i32).range(1..),
@@ -225,6 +237,7 @@ pub struct ProofsHistoryRocksdbArgs {
     /// Base target SST file size in `MiB`.
     #[arg(
         long = "proofs-history.rocksdb.target-file-size-base-mib",
+        alias = "proofs.rocksdb.target-file-size-base-mib",
         value_name = "PROOFS_HISTORY_ROCKSDB_TARGET_FILE_SIZE_BASE_MIB",
         default_value_t = DEFAULT_ROCKSDB_TARGET_FILE_SIZE_BASE_MIB,
         value_parser = clap::value_parser!(u64).range(1..),
@@ -235,6 +248,7 @@ pub struct ProofsHistoryRocksdbArgs {
     /// Write buffer size per proof-history column family in `MiB`.
     #[arg(
         long = "proofs-history.rocksdb.write-buffer-size-mib",
+        alias = "proofs.rocksdb.write-buffer-size-mib",
         value_name = "PROOFS_HISTORY_ROCKSDB_WRITE_BUFFER_SIZE_MIB",
         default_value_t = DEFAULT_ROCKSDB_WRITE_BUFFER_SIZE_MIB,
         value_parser = clap::value_parser!(u64).range(1..),
@@ -245,6 +259,7 @@ pub struct ProofsHistoryRocksdbArgs {
     /// Enable direct I/O for `RocksDB` flush and compaction.
     #[arg(
         long = "proofs-history.rocksdb.direct-io-for-flush-and-compaction",
+        alias = "proofs.rocksdb.direct-io-for-flush-and-compaction",
         default_value_t = true,
         action = ArgAction::Set,
         hide = true
@@ -316,6 +331,12 @@ fn mib_to_usize(size_mib: u64) -> usize {
     usize::try_from(size_mib.saturating_mul(MIB)).unwrap_or(usize::MAX)
 }
 
+/// Provides access to shared rollup arguments.
+pub trait HasRollupArgs {
+    /// Returns the shared rollup arguments.
+    fn rollup_args(&self) -> &RollupArgs;
+}
+
 /// Parameters for rollup configuration
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
 #[command(next_help_heading = "Rollup")]
@@ -327,17 +348,6 @@ pub struct RollupArgs {
     /// Disable transaction pool gossip
     #[arg(long = "rollup.disable-tx-pool-gossip")]
     pub disable_txpool_gossip: bool,
-
-    /// By default the pending block equals the latest block
-    /// to save resources and not leak txs from the tx-pool,
-    /// this flag enables computing of the pending block
-    /// from the tx-pool instead.
-    ///
-    /// If `compute_pending_block` is not enabled, the payload builder
-    /// will use the payload attributes from the latest block. Note
-    /// that this flag is not yet functional.
-    #[arg(long = "rollup.compute-pending-block")]
-    pub compute_pending_block: bool,
 
     /// enables discovery v4 if provided
     #[arg(long = "rollup.discovery.v4", default_value = "false")]
@@ -362,13 +372,36 @@ pub struct RollupArgs {
     /// Maximum number of inflight EIP-7702 delegated account transactions per sender in the
     /// txpool. Reth defaults to 1, which prevents delegated accounts from submitting multiple
     /// transactions within a block (e.g. buy + approve in a single Flashblock).
-    #[arg(long = "rollup.txpool-max-inflight-delegated-slots", default_value_t = 1)]
+    ///
+    /// We raise the default to 4 (matching the EIP-8130 sender cap). Delegated code can move the
+    /// account's balance mid-block, so a queued tx can become insolvent before the next canonical
+    /// update; but that case fails fast — revm rejects on the pre-execution balance check before
+    /// running any delegated code — so the only cost of a small cap is bounded (linear in the cap)
+    /// mempool memory and cheap wasted pre-checks per account per block.
+    #[arg(long = "rollup.txpool-max-inflight-delegated-slots", default_value_t = 4)]
     pub max_inflight_delegated_slots: usize,
+
+    /// Maximum inflight EIP-8130 transactions per non-locked sender account.
+    #[arg(long = "rollup.mempool-sender-limit", default_value_t = DEFAULT_SIGNATURE_LIMIT)]
+    pub mempool_sender_limit: u32,
+
+    /// Maximum inflight EIP-8130 transactions per count-limited payer account.
+    #[arg(long = "rollup.mempool-payer-limit", default_value_t = DEFAULT_PAYMENT_LIMIT)]
+    pub mempool_payer_limit: u32,
+
+    /// Additional operator-trusted delegation targets for balance-bounded locked payers.
+    ///
+    /// This is local, non-consensus mempool policy and may intentionally differ between nodes.
+    /// Only configure implementations whose locked mode prevents ETH outflows other than the gas
+    /// they sponsor; an unsafe target weakens this node's aggregate payer-balance admission bound.
+    #[arg(long = "rollup.mempool-trusted-delegation-targets", value_delimiter = ',')]
+    pub mempool_trusted_delegation_targets: Vec<Address>,
 
     /// If true, initialize external-proofs exex to save and serve trie nodes to provide proofs
     /// faster.
     #[arg(
         long = "proofs-history",
+        visible_alias = "proofs",
         value_name = "PROOFS_HISTORY",
         default_value_ifs([
             ("proofs-history.storage-path", ArgPredicate::IsPresent, "true")
@@ -377,11 +410,20 @@ pub struct RollupArgs {
     pub proofs_history: bool,
 
     /// The path to the storage DB for proofs history.
-    #[arg(long = "proofs-history.storage-path", value_name = "PROOFS_HISTORY_STORAGE_PATH")]
+    #[arg(
+        long = "proofs-history.storage-path",
+        visible_alias = "proofs.storage-path",
+        value_name = "PROOFS_HISTORY_STORAGE_PATH"
+    )]
     pub proofs_history_storage_path: Option<PathBuf>,
 
     /// The on-disk database backend for proofs history.
-    #[arg(long = "proofs-history.db", value_name = "PROOFS_HISTORY_DB", default_value = "mdbx")]
+    #[arg(
+        long = "proofs-history.db",
+        visible_alias = "proofs.db",
+        value_name = "PROOFS_HISTORY_DB",
+        default_value = "mdbx"
+    )]
     pub proofs_history_db: ProofsHistoryDbBackend,
 
     /// Runtime tuning options for the `RocksDB` proofs history backend.
@@ -399,6 +441,7 @@ pub struct RollupArgs {
     /// Must be greater than 12 hours of blocks based on 2 seconds block time.
     #[arg(
         long = "proofs-history.window",
+        visible_alias = "proofs.window",
         default_value_t = DEFAULT_PROOFS_HISTORY_WINDOW_BLOCKS,
         value_name = "PROOFS_HISTORY_WINDOW",
         value_parser = clap::value_parser!(u64).range((TWELVE_HOURS_IN_BLOCKS + 1)..)
@@ -419,6 +462,7 @@ pub struct RollupArgs {
     /// CLI: `--proofs-history.prune-interval 10m`
     #[arg(
         long = "proofs-history.prune-interval",
+        visible_alias = "proofs.prune-interval",
         value_name = "PROOFS_HISTORY_PRUNE_INTERVAL",
         default_value = "15s",
         value_parser = humantime::parse_duration
@@ -436,6 +480,7 @@ pub struct RollupArgs {
     /// CLI: `--proofs-history.verification-interval 100`
     #[arg(
         long = "proofs-history.verification-interval",
+        visible_alias = "proofs.verification-interval",
         value_name = "PROOFS_HISTORY_VERIFICATION_INTERVAL",
         default_value_t = 0
     )]
@@ -450,17 +495,25 @@ pub struct RollupArgs {
     pub upgrade_signal_l1_rpc: UpgradeSignalL1RpcArgs,
 }
 
+impl HasRollupArgs for RollupArgs {
+    fn rollup_args(&self) -> &RollupArgs {
+        self
+    }
+}
+
 impl Default for RollupArgs {
     fn default() -> Self {
         Self {
             sequencer: None,
             disable_txpool_gossip: false,
-            compute_pending_block: false,
             discovery_v4: false,
             sequencer_headers: Vec::new(),
             min_suggested_priority_fee: 1_000_000,
             txpool_ordering: TxpoolOrdering::default(),
-            max_inflight_delegated_slots: 1,
+            max_inflight_delegated_slots: 4,
+            mempool_sender_limit: DEFAULT_SIGNATURE_LIMIT,
+            mempool_payer_limit: DEFAULT_PAYMENT_LIMIT,
+            mempool_trusted_delegation_targets: Vec::new(),
             proofs_history: false,
             proofs_history_storage_path: None,
             proofs_history_db: ProofsHistoryDbBackend::default(),
@@ -490,19 +543,16 @@ mod tests {
     }
 
     #[test]
+    fn rollup_args_provides_itself() {
+        let args = RollupArgs::default();
+        assert!(std::ptr::eq(args.rollup_args(), &args));
+    }
+
+    #[test]
     fn test_parse_rollup_default_args() {
         let default_args = RollupArgs::default();
         let args = CommandParser::<RollupArgs>::parse_from(["reth"]).args;
         assert_eq!(args, default_args);
-    }
-
-    #[test]
-    fn test_parse_rollup_compute_pending_block_args() {
-        let expected_args = RollupArgs { compute_pending_block: true, ..Default::default() };
-        let args =
-            CommandParser::<RollupArgs>::parse_from(["reth", "--rollup.compute-pending-block"])
-                .args;
-        assert_eq!(args, expected_args);
     }
 
     #[test]
@@ -538,14 +588,12 @@ mod tests {
     fn test_parse_rollup_many_args() {
         let expected_args = RollupArgs {
             disable_txpool_gossip: true,
-            compute_pending_block: true,
             sequencer: Some("http://host:port".into()),
             ..Default::default()
         };
         let args = CommandParser::<RollupArgs>::parse_from([
             "reth",
             "--rollup.disable-tx-pool-gossip",
-            "--rollup.compute-pending-block",
             "--rollup.sequencer-http",
             "http://host:port",
         ])
@@ -554,15 +602,56 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_max_inflight_delegated_slots() {
-        let expected_args = RollupArgs { max_inflight_delegated_slots: 4, ..Default::default() };
+    fn test_parse_max_inflight_delegated_slots_default() {
+        let args = CommandParser::<RollupArgs>::parse_from(["reth"]).args;
+        assert_eq!(args.max_inflight_delegated_slots, 4);
+        assert_eq!(
+            args.max_inflight_delegated_slots,
+            RollupArgs::default().max_inflight_delegated_slots
+        );
+    }
+
+    #[test]
+    fn test_parse_max_inflight_delegated_slots_override() {
+        let expected_args = RollupArgs { max_inflight_delegated_slots: 7, ..Default::default() };
         let args = CommandParser::<RollupArgs>::parse_from([
             "reth",
             "--rollup.txpool-max-inflight-delegated-slots",
-            "4",
+            "7",
         ])
         .args;
         assert_eq!(args, expected_args);
+    }
+
+    #[test]
+    fn test_parse_mempool_limits_default() {
+        let args = CommandParser::<RollupArgs>::parse_from(["reth"]).args;
+        assert_eq!(args.mempool_sender_limit, DEFAULT_SIGNATURE_LIMIT);
+        assert_eq!(args.mempool_payer_limit, DEFAULT_PAYMENT_LIMIT);
+        assert!(args.mempool_trusted_delegation_targets.is_empty());
+    }
+
+    #[test]
+    fn test_parse_mempool_limits() {
+        let args = CommandParser::<RollupArgs>::parse_from([
+            "reth",
+            "--rollup.mempool-sender-limit",
+            "8",
+            "--rollup.mempool-payer-limit",
+            "16",
+            "--rollup.mempool-trusted-delegation-targets",
+            "0x0000000000000000000000000000000000000001,0x0000000000000000000000000000000000000002",
+        ])
+        .args;
+        assert_eq!(args.mempool_sender_limit, 8);
+        assert_eq!(args.mempool_payer_limit, 16);
+        assert_eq!(
+            args.mempool_trusted_delegation_targets,
+            vec![
+                "0x0000000000000000000000000000000000000001".parse::<Address>().unwrap(),
+                "0x0000000000000000000000000000000000000002".parse::<Address>().unwrap(),
+            ]
+        );
     }
 
     #[test]
@@ -600,15 +689,12 @@ mod tests {
             "reth",
             "--upgrade-signal.contract",
             "0x0000000000000000000000000000000000000001",
-            "--upgrade-signal.upgrade-id",
-            "azul",
             "--upgrade-signal.l1-rpc",
             "http://localhost:8545",
         ])
         .args;
 
         assert_eq!(args.upgrade_signal.contract_address, Some(contract));
-        assert_eq!(args.upgrade_signal.upgrade_ids, ["azul"]);
         assert_eq!(
             args.upgrade_signal_l1_rpc.upgrade_signal_l1_rpc.as_ref().map(|url| url.as_str()),
             Some("http://localhost:8545/")
@@ -626,6 +712,28 @@ mod tests {
         let args =
             CommandParser::<RollupArgs>::parse_from(["reth", "--proofs-history.db", "v2"]).args;
         assert_eq!(args.proofs_history_db, ProofsHistoryDbBackend::Rocksdb);
+    }
+
+    #[test]
+    fn test_parse_proofs_short_aliases() {
+        let args = CommandParser::<RollupArgs>::parse_from([
+            "reth",
+            "--proofs",
+            "--proofs.db",
+            "rocksdb",
+            "--proofs.storage-path",
+            "/tmp/proofs",
+            "--proofs.window",
+            "86400",
+        ])
+        .args;
+        assert!(args.proofs_history);
+        assert_eq!(args.proofs_history_db, ProofsHistoryDbBackend::Rocksdb);
+        assert_eq!(
+            args.proofs_history_storage_path.as_deref(),
+            Some(std::path::Path::new("/tmp/proofs"))
+        );
+        assert_eq!(args.proofs_history_window, 86400);
     }
 
     #[test]

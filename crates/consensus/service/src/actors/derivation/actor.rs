@@ -20,7 +20,7 @@ use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 use crate::{
     CancellableContext, DerivationActorRequest, DerivationEngineClient, DerivationState,
     DerivationStateMachine, DerivationStateTransitionError, DerivationStateUpdate, Metrics,
-    NodeActor, actors::derivation::L2Finalizer,
+    NodeActor, ResetReason, actors::derivation::L2Finalizer,
 };
 
 /// The [`NodeActor`] for the derivation sub-routine.
@@ -103,6 +103,19 @@ where
 
     fn publish_derivation_origin(&self) {
         self.derivation_origin_tx.send_replace(self.pipeline.origin());
+    }
+
+    /// Sends a finalized L2 block to the engine when the retained finalized L1 signal makes one
+    /// eligible.
+    async fn try_finalize_pending(&mut self) -> Result<(), DerivationError> {
+        if let Some(l2_block_number) = self.finalizer.try_finalize_pending() {
+            self.engine_client
+                .send_finalized_l2_block(l2_block_number)
+                .await
+                .map_err(|e| DerivationError::Sender(Box::new(e)))?;
+        }
+
+        Ok(())
     }
 
     /// Handles a [`Signal`] received over the derivation signal receiver channel.
@@ -197,18 +210,28 @@ where
                                     )
                                     .await?;
                             } else {
+                                let reason = if matches!(&e, ResetError::ReorgDetected(..)) {
+                                    ResetReason::DerivationL1Reorg
+                                } else {
+                                    ResetReason::DerivationPipeline
+                                };
                                 if let ResetError::ReorgDetected(expected, new) = e {
                                     warn!(
                                         target: "derivation",
-                                        "L1 reorg detected! Expected: {expected} | New: {new}"
+                                        %expected,
+                                        %new,
+                                        "L1 reorg detected"
                                     );
 
                                     Metrics::l1_reorg_count().increment(1);
                                 }
-                                self.engine_client.reset_engine_forkchoice().await.map_err(|e| {
-                                    error!(target: "derivation", ?e, "Failed to send reset request");
-                                    DerivationError::Sender(Box::new(e))
-                                })?;
+                                self.engine_client
+                                    .reset_engine_forkchoice(reason)
+                                    .await
+                                    .map_err(|e| {
+                                        error!(target: "derivation", ?e, "Failed to send reset request");
+                                        DerivationError::Sender(Box::new(e))
+                                    })?;
                                 self.derivation_state_machine
                                     .update(&DerivationStateUpdate::SignalNeeded)?;
                                 return Err(DerivationError::Yield);
@@ -240,8 +263,10 @@ where
                 self.derivation_state_machine.update(&DerivationStateUpdate::SignalProcessed)?;
             }
             DerivationActorRequest::ProcessFinalizedL1Block(finalized_l1_block) => {
-                // Attempt to finalize the block. If successful, notify engine.
-                if let Some(l2_block_number) = self.finalizer.try_finalize_next(*finalized_l1_block)
+                // Retain the signal even when no derived L2 blocks are currently queued. The
+                // finalizer will retry it after derivation rebuilds the safe head.
+                if let Some(l2_block_number) =
+                    self.finalizer.process_finalized_l1_block(*finalized_l1_block)
                 {
                     self.engine_client
                         .send_finalized_l2_block(l2_block_number)
@@ -281,6 +306,11 @@ where
                 self.derivation_state_machine
                     .update(&DerivationStateUpdate::NewAttributesConfirmed(safe_head))?;
 
+                // A reset clears derived candidates, but the finalized L1 signal is retained.
+                // Retry after the rebuilt safe head is confirmed, matching op-node's
+                // safe-derived finalization trigger.
+                self.try_finalize_pending().await?;
+
                 self.attempt_derivation().await?;
             }
             DerivationActorRequest::ProcessEngineSyncCompletionRequest(safe_head) => {
@@ -306,6 +336,12 @@ where
                     .update(&DerivationStateUpdate::ELSyncCompleted(safe_head))?;
 
                 self.attempt_derivation().await?;
+            }
+            #[cfg(test)]
+            DerivationActorRequest::CurrentStateRequest(result_tx) => {
+                if result_tx.send(self.derivation_state_machine.current_state()).is_err() {
+                    warn!(target: "derivation", "failed to return derivation state to test observer");
+                }
             }
         }
 

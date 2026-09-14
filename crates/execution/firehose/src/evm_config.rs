@@ -1,8 +1,8 @@
 //! OP Stack [`ConfigureEvm`] wrapper that routes the staged-sync batch executor through
 //! [`reth_firehose::FirehoseBlockExecutor`] with OP chain hooks installed.
 //!
-//! The live engine-API path installs [`crate::OpPreTxAdjust`] / [`crate::OpPostTxExtras`]
-//! explicitly at the validator call site, so it does not rely on this wrapper.
+//! The live engine-API path runs through reth's engine validator, which installs the hooks this
+//! wrapper selects through [`reth_firehose::FirehoseLiveHooks`].
 //!
 //! ## Why this wrapper exists
 //!
@@ -17,14 +17,13 @@ use alloy_evm::block::BlockExecutor;
 use alloy_primitives::Sealable;
 use base_common_consensus::BasePrimitives;
 use base_common_evm::{BaseEvmFactory, BaseTransaction};
-use reth_errors::BlockExecutionError;
 use reth_evm::{
     ConfigureEngineEvm, ConfigureEvm, EvmEnvFor, ExecutionCtxFor, TransactionEnvMut,
-    execute::Executor,
+    execute::{BlockExecutionError, Executor},
 };
 use reth_firehose::{
-    ChainHooks, FirehoseBlockExecutor, FirehoseBlockTracer, FirehoseWrappedExecutor,
-    mapper::SignatureFields,
+    ChainHooks, FirehoseBlockExecutor, FirehoseBlockTracer, FirehoseLiveHooks,
+    FirehoseWrappedExecutor, mapper::SignatureFields,
 };
 use reth_primitives_traits::{
     Block as BlockTrait, BlockBody, BlockTy, NodePrimitives, RecoveredBlock, TxTy,
@@ -96,9 +95,9 @@ where
 /// Thin wrapper around any [`ConfigureEvm`] that overrides [`ConfigureEvm::batch_executor`]
 /// to construct a [`FirehoseBlockExecutor`] carrying [`OpChainHooks`].
 ///
-/// All other methods delegate to the inner config unchanged, so the live engine-API path
-/// (which builds its EVM via `evm_with_env_and_inspector` directly and installs the hooks
-/// at the validator call site) remains unaffected.
+/// All other methods delegate to the inner config unchanged. The live engine-API path picks up
+/// [`OpPreTxAdjust`] / [`OpPostTxExtras`] through this type's
+/// [`reth_firehose::FirehoseLiveHooks`] implementation.
 #[derive(Clone, Debug)]
 pub struct OpFirehoseEvmConfig<F> {
     /// The wrapped EVM configuration.
@@ -183,6 +182,18 @@ where
     ) -> impl Executor<DB, Primitives = Self::Primitives, Error = BlockExecutionError> {
         FirehoseBlockExecutor::new_with_chain_hooks(self.inner.clone(), db, OpChainHooks)
     }
+}
+
+impl<F> FirehoseLiveHooks for OpFirehoseEvmConfig<F>
+where
+    Self: ConfigureEvm<
+            BlockExecutorFactory: alloy_evm::block::BlockExecutorFactory<
+                EvmFactory = BaseEvmFactory,
+            >,
+        >,
+{
+    type PreTxAdjust = OpPreTxAdjust;
+    type PostTxExtras = OpPostTxExtras;
 }
 
 impl<F, ExecutionData> ConfigureEngineEvm<ExecutionData> for OpFirehoseEvmConfig<F>

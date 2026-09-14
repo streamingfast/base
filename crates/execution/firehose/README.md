@@ -31,4 +31,4 @@ This crate is that wrapper for Base / OP Stack.
 | Path                          | Where hooks are installed                                 |
 | ----------------------------- | --------------------------------------------------------- |
 | Staged sync (pipeline)        | `OpFirehoseEvmConfig::batch_executor` in this crate       |
-| Engine API (live)             | `execute_and_trace_block` in `base-engine-tree/validator.rs` — explicit `FirehoseWrappedExecutor::with_hooks(..., OpPreTxAdjust, OpPostTxExtras)` |
+| Engine API (live)             | reth's engine validator (`execute_and_trace_block`), using the hooks `OpFirehoseEvmConfig` selects through `reth_firehose::FirehoseLiveHooks` |

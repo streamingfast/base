@@ -40,8 +40,8 @@ base-node-core.workspace = true
 base-txpool-rpc.workspace = true
 base-flashblocks.workspace = true
 base-node-runner.workspace = true
+base-observability-events.workspace = true
 base-common-chains.workspace = true
-base-common-genesis.workspace = true
 base-execution-evm.workspace = true
 base-tx-forwarding.workspace = true
 base-txpool-tracing.workspace = true
@@ -50,6 +50,8 @@ base-execution-trie.workspace = true
 base-execution-eip8130-rpc-node.workspace = true
 base-bundle-extension.workspace = true
 base-proofs-extension.workspace = true
+base-shadow-indexer.workspace = true
+base-shadow-indexer-db.workspace = true
 base-execution-chainspec.workspace = true
 base-execution-consensus.workspace = true
 base-upgrade-signal = { workspace = true, features = ["metrics"] }
@@ -67,7 +69,6 @@ serde_json.workspace = true
 jsonrpsee = { workspace = true, features = ["server"] }
 reqwest = { workspace = true, features = ["json", "stream"] }
 alloy-eips.workspace = true
-alloy-provider.workspace = true
 secp256k1.workspace = true
 tokio-stream.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
@@ -79,6 +80,7 @@ base-common-consensus = { workspace = true, features = ["reth"] }
 
 [dev-dependencies]
 alloy-primitives.workspace = true
+base-common-genesis.workspace = true
 rstest.workspace = true
 tempfile.workspace = true
 axum = { workspace = true, features = ["tokio", "http1"] }
@@ -118,7 +120,6 @@ serde = [
 	"alloy-eips/serde",
 	"base-common-chains/serde",
 	"base-common-consensus/serde",
-	"base-common-genesis/serde",
 	"base-execution-chainspec/serde",
 	"reth-network/serde",
 	"secp256k1/serde",

@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use base_prover_service_protocol::{
-    ProofResult, SessionType, SnarkGroth16ProofRequest, ZkProofRequest,
+    ProofResult, SessionType, SnarkPlonkProofRequest, ZkBackend, ZkProofRequest,
 };
 use thiserror::Error;
 
@@ -11,8 +11,8 @@ use thiserror::Error;
 pub enum ZkProofRequestKind {
     /// Request for a compressed ZK proof.
     Compressed(ZkProofRequest),
-    /// Request for a Groth16 SNARK proof.
-    SnarkGroth16(SnarkGroth16ProofRequest),
+    /// Request for a PLONK SNARK proof.
+    SnarkPlonk(SnarkPlonkProofRequest),
 }
 
 impl ZkProofRequestKind {
@@ -20,7 +20,7 @@ impl ZkProofRequestKind {
     pub const fn start_block_number(&self) -> u64 {
         match self {
             Self::Compressed(request) => request.start_block_number,
-            Self::SnarkGroth16(request) => request.proof.start_block_number,
+            Self::SnarkPlonk(request) => request.proof.start_block_number,
         }
     }
 
@@ -28,7 +28,15 @@ impl ZkProofRequestKind {
     pub const fn number_of_blocks_to_prove(&self) -> u64 {
         match self {
             Self::Compressed(request) => request.number_of_blocks_to_prove,
-            Self::SnarkGroth16(request) => request.proof.number_of_blocks_to_prove,
+            Self::SnarkPlonk(request) => request.proof.number_of_blocks_to_prove,
+        }
+    }
+
+    /// Returns the proving backend selected for this request.
+    pub const fn zk_backend(&self) -> ZkBackend {
+        match self {
+            Self::Compressed(request) => request.zk_backend,
+            Self::SnarkPlonk(request) => request.proof.zk_backend,
         }
     }
 }
@@ -66,6 +74,12 @@ pub enum ZkProverError {
         /// Backend proving session identifier.
         backend_session_id: String,
     },
+    /// The proving backend selected by the request is not configured on this host.
+    #[error("zk backend {backend} is not configured on this host")]
+    UnsupportedBackend {
+        /// Backend requested by the proof job.
+        backend: ZkBackend,
+    },
     /// The proving backend failed to produce a proof.
     #[error("zk proving backend failed")]
     Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
@@ -94,7 +108,7 @@ pub trait ZkProver: Send + Sync + std::fmt::Debug {
     /// assigns the session id (e.g. the SP1 Network) cannot, and document the deviation.
     async fn submit_next(
         &self,
-        _request: &SnarkGroth16ProofRequest,
+        _request: &SnarkPlonkProofRequest,
         _request_session_id: &str,
         _completed_backend_session_id: &str,
     ) -> Result<String, ZkProverError> {
@@ -112,36 +126,9 @@ pub trait ZkProver: Send + Sync + std::fmt::Debug {
     ) -> Result<ProofResult, ZkProverError>;
 }
 
-/// Placeholder [`ZkProver`] that always reports proving as unimplemented.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct UnimplementedZkProver;
-
-#[async_trait]
-impl ZkProver for UnimplementedZkProver {
-    async fn submit(
-        &self,
-        _request: &ZkProofRequest,
-        _request_session_id: &str,
-    ) -> Result<String, ZkProverError> {
-        Err(ZkProverError::Unimplemented)
-    }
-
-    async fn poll(&self, _backend_session_id: &str) -> Result<ZkSessionState, ZkProverError> {
-        Err(ZkProverError::Unimplemented)
-    }
-
-    async fn download(
-        &self,
-        _session_type: SessionType,
-        _backend_session_id: &str,
-    ) -> Result<ProofResult, ZkProverError> {
-        Err(ZkProverError::Unimplemented)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use base_prover_service_protocol::ZkVm;
+    use base_prover_service_protocol::{ZkBackend, ZkVm};
 
     use super::*;
 
@@ -152,7 +139,9 @@ mod tests {
             sequence_window: None,
             l1_head: None,
             intermediate_root_interval: None,
+            schedule_l2_block_number: None,
             zk_vm: ZkVm::Sp1,
+            zk_backend: ZkBackend::Cluster,
         }
     }
 
@@ -162,22 +151,11 @@ mod tests {
         assert_eq!(compressed.start_block_number(), 100);
         assert_eq!(compressed.number_of_blocks_to_prove(), 5);
 
-        let snark = ZkProofRequestKind::SnarkGroth16(SnarkGroth16ProofRequest {
+        let snark = ZkProofRequestKind::SnarkPlonk(SnarkPlonkProofRequest {
             proof: zk_request(),
             prover_address: alloy_primitives::Address::ZERO,
         });
         assert_eq!(snark.start_block_number(), 100);
         assert_eq!(snark.number_of_blocks_to_prove(), 5);
-    }
-
-    #[tokio::test]
-    async fn unimplemented_prover_reports_unimplemented() {
-        let prover = UnimplementedZkProver;
-        let error = prover
-            .submit(&zk_request(), "session-1")
-            .await
-            .expect_err("stub prover should not produce a proof");
-
-        assert!(matches!(error, ZkProverError::Unimplemented));
     }
 }

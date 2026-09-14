@@ -5,7 +5,7 @@
 //! `base-system-tests` boots a genuine L1 (Docker reth + lighthouse) and a genuine in-process L2
 //! (builder + sequencer consensus + batcher + follower client + validator consensus). The follower
 //! client executes every block it receives through `engine_newPayload`, which is exactly the path
-//! `base_engine_tree`'s payload validator routes into the Firehose tracer. Installing a
+//! reth's engine validator routes into the Firehose tracer. Installing a
 //! buffer-backed global tracer before the stack starts therefore captures real `FIRE BLOCK` output
 //! for real Base-specific transactions — B-20 precompile calls included — without a separate
 //! prestate fixture that has to be hand-maintained.

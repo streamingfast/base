@@ -4,6 +4,7 @@ use alloy_evm::precompiles::PrecompilesMap;
 use alloy_primitives::Address;
 use base_common_chains::BaseUpgradeExt;
 use base_common_genesis::BaseUpgrade;
+use base_precompile_storage::StorageFeatures;
 use revm::{
     context::Cfg,
     context_interface::ContextTr,
@@ -16,7 +17,7 @@ use revm::{
 use crate::{
     ActivationAdminConfig, ActivationRegistry, B20Factory, BasePrecompileSpec, BerylLookup,
     NonceManager, NoopPrecompileCallObserver, PolicyRegistryPrecompile, PrecompileCallObserver,
-    TxContext, bls12_381, bn254_pair,
+    TxContext, UpgradeGatedStorageFeatures, bls12_381, bn254_pair,
 };
 
 /// Base precompile provider.
@@ -48,9 +49,10 @@ impl<S: BasePrecompileSpec> BasePrecompiles<S> {
             BaseUpgrade::Jovian => Self::jovian(),
             BaseUpgrade::Azul => Self::azul(),
             BaseUpgrade::Beryl => Self::beryl(),
-            // Zombie is a placeholder that never activates; it tracks the latest precompile set so
-            // it evolves with the newest hardfork (keep it grouped with the latest arm).
-            BaseUpgrade::Cobalt | BaseUpgrade::Zombie => Self::cobalt(),
+            // Denim is unscheduled and Zenith is a placeholder that never activates; both track
+            // the latest precompile set so they evolve with the newest hardfork (keep them
+            // grouped with the latest arm).
+            BaseUpgrade::Cobalt | BaseUpgrade::Denim | BaseUpgrade::Zenith => Self::cobalt(),
             upgrade => panic!("unsupported Base precompile upgrade: {upgrade}"),
         };
 
@@ -74,6 +76,11 @@ impl<S: BasePrecompileSpec> BasePrecompiles<S> {
     /// Returns the activation registry admin address.
     pub const fn activation_admin_address(&self) -> Option<Address> {
         self.activation_admin_address
+    }
+
+    /// Returns the persistent-storage features selected by this Base upgrade.
+    pub fn storage_features(&self) -> StorageFeatures {
+        UpgradeGatedStorageFeatures::from_upgrade(self.spec.upgrade())
     }
 
     /// Converts a Base upgrade into its Ethereum precompile spec.
@@ -204,15 +211,28 @@ impl<S: BasePrecompileSpec> BasePrecompiles<S> {
         // EIP-8130 precompiles alike — uses plain `install`; none is observed, by
         // design, since metrics are scoped to the B-20 token call path.
         if self.spec.upgrade() >= BaseUpgrade::Beryl {
-            B20Factory::install_with_observer(&mut precompiles, observer.clone());
-            BerylLookup::install_with_observer(&mut precompiles, observer.clone());
-            PolicyRegistryPrecompile::install_with_observer(&mut precompiles, observer.clone());
+            B20Factory::install_with_observer(
+                &mut precompiles,
+                self.spec.upgrade(),
+                observer.clone(),
+            );
+            BerylLookup::install_with_observer(
+                &mut precompiles,
+                self.spec.upgrade(),
+                observer.clone(),
+            );
+            PolicyRegistryPrecompile::install_with_observer(
+                &mut precompiles,
+                self.spec.upgrade(),
+                observer.clone(),
+            );
             ActivationRegistry::install_with_observer(
                 &mut precompiles,
                 ActivationAdminConfig::new(
                     self.activation_admin_address,
                     self.spec.upgrade() >= BaseUpgrade::Cobalt,
                 ),
+                self.spec.upgrade(),
                 observer,
             );
         }
@@ -273,6 +293,7 @@ mod tests {
 
     use alloy_primitives::{Address, B256};
     use base_common_genesis::BaseUpgrade;
+    use base_precompile_storage::StorageFeatures;
     use revm::{
         precompile::{Precompiles, bls12_381_const, bn254, modexp, secp256r1},
         primitives::eip7823,
@@ -567,6 +588,16 @@ mod tests {
         assert_eq!(precompiles.get(&B20FactoryStorage::ADDRESS).is_some(), expected);
         assert_eq!(precompiles.get(&token).is_some(), expected);
         assert!(precompiles.get(&Address::repeat_byte(0x42)).is_none());
+    }
+
+    #[rstest]
+    #[case::beryl(BaseUpgrade::Beryl, StorageFeatures::Legacy)]
+    #[case::cobalt(BaseUpgrade::Cobalt, StorageFeatures::Cobalt)]
+    fn storage_features_activate_at_cobalt(
+        #[case] spec: BaseUpgrade,
+        #[case] expected: StorageFeatures,
+    ) {
+        assert_eq!(BasePrecompiles::new_with_spec(spec).storage_features(), expected);
     }
 
     #[test]

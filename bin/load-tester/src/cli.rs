@@ -1,13 +1,6 @@
 //! CLI argument parsing and execution for the load tester binary.
 
-use std::{
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::{num::NonZeroU64, path::PathBuf, time::Duration};
 
 use alloy_network::{EthereumWallet, TransactionBuilder};
 use alloy_primitives::{Address, U256, utils::format_ether};
@@ -16,15 +9,15 @@ use alloy_rpc_types::{BlockNumberOrTag, TransactionRequest};
 use alloy_signer_local::PrivateKeySigner;
 use base_cli_utils::RuntimeManager;
 use base_load_tests::{
-    AccountPool, BaselineError, FundedAccount, LoadRunner, LoadTestDisplay, MetricsSummary,
-    QueryProvider, RealTokenSetup, ReceiptCoverage, Result as LoadResult, RpcProviders,
-    RpcResultExt, TestConfig, create_wallet_provider,
+    AccountPool, BaselineError, DEFAULT_MAX_GAS_PRICE, FundedAccount, LoadRunner, LoadTestDisplay,
+    LoadTestDisplayConfig, LoadTestRunHooks, LoadTestRunOptions, MetricsSummary, QueryProvider,
+    ReceiptCoverage, Result as LoadResult, RpcProviders, RpcResultExt, TestConfig,
+    create_wallet_provider,
 };
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use eyre::{Result, bail};
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 /// Accounts to derive and check per batch during rescue.
@@ -35,9 +28,6 @@ const RESCUE_CONCURRENCY: usize = 32;
 
 /// Default number of accounts to scan during rescue.
 const DEFAULT_RESCUE_SCAN_COUNT: usize = 1000;
-
-/// Default maximum gas price (1000 gwei).
-const DEFAULT_MAX_GAS_PRICE: u128 = 1_000_000_000_000;
 
 /// The Base load tester CLI.
 #[derive(Parser, Clone, Debug)]
@@ -90,6 +80,18 @@ struct LoadArgs {
     #[arg(long)]
     recover_real_tokens: bool,
 
+    /// Skip draining native ETH balances back to the funder account.
+    #[arg(long)]
+    skip_drain: bool,
+
+    /// Benchmark-only directory for the ready/start handshake before measured submission.
+    #[arg(long, value_name = "DIR", requires = "block_gas_limit")]
+    separate_setup: Option<PathBuf>,
+
+    /// Block gas limit used for in-flight inventory sizing instead of the latest RPC block.
+    #[arg(long, requires = "separate_setup")]
+    block_gas_limit: Option<NonZeroU64>,
+
     /// Load test YAML configuration.
     #[arg(value_name = "CONFIG")]
     config: PathBuf,
@@ -122,7 +124,7 @@ enum Command {
 }
 
 async fn run_load_test(args: LoadArgs) -> Result<()> {
-    let mp = LoadTestDisplay::init_tracing();
+    let multi_progress = LoadTestDisplay::init_tracing()?;
     let mode = LoadMode::from_args(&args);
     let config_path = args.config;
 
@@ -131,11 +133,12 @@ async fn run_load_test(args: LoadArgs) -> Result<()> {
     }
 
     let test_config = TestConfig::load(&config_path)?;
+    let skip_drain = args.skip_drain || test_config.skip_drain;
 
-    let query_rpc = test_config
-        .query_rpc
-        .clone()
-        .unwrap_or_else(|| test_config.primary_submission_rpc().expect("validated config").clone());
+    let query_rpc = match test_config.query_rpc.clone() {
+        Some(query_rpc) => query_rpc,
+        None => test_config.primary_submission_rpc()?.clone(),
+    };
     let client = RpcProviders::query(query_rpc.clone())?;
     let rpc_chain_id = if test_config.chain_id.is_none() {
         Some(client.get_chain_id().await.rpc("chain id")?)
@@ -143,10 +146,10 @@ async fn run_load_test(args: LoadArgs) -> Result<()> {
         None
     };
 
-    let load_config = {
-        let cfg = test_config.to_load_config(rpc_chain_id)?;
-        if args.continuous { cfg.with_continuous() } else { cfg }
-    };
+    // Continuous mode is applied by LoadTestExecutor from LoadTestRunOptions.
+    let mut load_config = test_config.to_load_config(rpc_chain_id)?;
+    load_config.separate_setup = args.separate_setup;
+    load_config.block_gas_limit = args.block_gas_limit.map(NonZeroU64::get);
 
     let funding_key = TestConfig::funder_key()?;
 
@@ -157,6 +160,10 @@ async fn run_load_test(args: LoadArgs) -> Result<()> {
                 "Re-deriving {} accounts from config and draining to funder...",
                 load_config.account_count
             );
+            if skip_drain {
+                println!("Skipping drain due to --skip-drain.");
+                return Ok(());
+            }
             let runner = LoadRunner::new(load_config)?;
             match runner.drain_accounts(funding_key).await {
                 Ok(drained) => println!("Drained {} ETH back to funder.", format_ether(drained)),
@@ -189,9 +196,15 @@ async fn run_load_test(args: LoadArgs) -> Result<()> {
                 }
                 Err(e) => bail!("real-token recovery failed: {e}"),
             }
-            match runner.drain_accounts(funding_key).await {
-                Ok(drained) => println!("Drained {} ETH back to funder.", format_ether(drained)),
-                Err(e) => bail!("drain failed: {e}"),
+            if skip_drain {
+                println!("Skipping drain due to --skip-drain.");
+            } else {
+                match runner.drain_accounts(funding_key).await {
+                    Ok(drained) => {
+                        println!("Drained {} ETH back to funder.", format_ether(drained))
+                    }
+                    Err(e) => bail!("drain failed: {e}"),
+                }
             }
             return Ok(());
         }
@@ -213,59 +226,47 @@ async fn run_load_test(args: LoadArgs) -> Result<()> {
         query_rpc,
         load_config.chain_id
     );
-    let duration_display =
-        load_config.duration.map_or_else(|| "continuous".to_string(), |d| format!("{d:?}"));
+    let duration_display = if args.continuous {
+        "continuous".to_string()
+    } else {
+        load_config.duration.map_or_else(|| "continuous".to_string(), |d| format!("{d:?}"))
+    };
+    let target_gps_display = load_config
+        .target_gps
+        .map_or_else(|| "unbounded".to_string(), |gps| format!("{gps} gas/s"));
     println!(
-        "Target: {} GPS | Duration: {} | Accounts: {}",
-        load_config.target_gps, duration_display, load_config.account_count
+        "Target cap: {} | Duration: {} | Accounts: {}",
+        target_gps_display, duration_display, load_config.account_count
     );
     println!();
 
-    let funding_amount = test_config.parse_funding_amount()?;
-    let swap_token_amount = test_config.parse_swap_token_amount()?;
-    let b20_mint_amount = test_config.parse_b20_mint_amount()?;
-    let real_token_setup = test_config.parse_real_token_setup(load_config.chain_id)?;
-
-    let config_summary = test_config.to_summary();
-    let mut runner = LoadRunner::new(load_config.clone())?;
-    runner.set_config_summary(config_summary.clone());
-
-    if let Some(recovery_message) = runner.recovery_message() {
-        println!("{recovery_message}");
-        println!();
+    let display_duration = if args.continuous { None } else { load_config.duration };
+    let output = base_load_tests::LoadTestExecutor::run_prepared(
+        test_config,
+        load_config,
+        funding_key,
+        LoadTestRunOptions {
+            continuous: args.continuous,
+            install_signal_handler: true,
+            skip_drain,
+        },
+        LoadTestRunHooks {
+            display: multi_progress.map(|multi_progress| LoadTestDisplayConfig {
+                multi_progress,
+                duration: display_duration,
+            }),
+            before_cleanup: present_load_test_summary,
+        },
+    )
+    .await?;
+    if let Some(error) = output.run_error {
+        return Err(error.into());
     }
 
-    // Install signal handling before any long-running work so shutdown can
-    // stop the run loop and still drain funded accounts.
-    let stop_flag = runner.stop_flag();
-    install_signal_handler(stop_flag);
+    Ok(())
+}
 
-    let run_result = run_test_phases(
-        &mut runner,
-        &funding_key,
-        SetupAmounts {
-            funding: funding_amount,
-            swap_token: swap_token_amount,
-            b20_mint: b20_mint_amount,
-        },
-        real_token_setup.as_ref(),
-        &mp,
-        load_config.duration,
-    )
-    .await;
-
-    let (summary, run_err) = match run_result {
-        Ok(summary) => (summary, None),
-        Err(e) => {
-            let summary = MetricsSummary {
-                config: Some(config_summary),
-                error: Some(e.to_string()),
-                ..Default::default()
-            };
-            (summary, Some(e))
-        }
-    };
-
+fn present_load_test_summary(summary: &MetricsSummary) {
     if summary.error.is_none() || summary.throughput.total_submitted > 0 {
         println!();
         println!("=== Results ===");
@@ -274,17 +275,60 @@ async fn run_load_test(args: LoadArgs) -> Result<()> {
         }
         let tp = &summary.throughput;
         println!("TPS: {:.2} | GPS: {:.0}", tp.tps, tp.gps);
+        let pacing = &summary.pacing;
+        let target_gps = summary
+            .config
+            .as_ref()
+            .and_then(|config| config.target_gps)
+            .map_or_else(|| "unbounded".to_string(), |target| target.to_string());
+        println!(
+            "Pacing: target_gps={}  offered_gps={:.0}  achieved_gps={:.0}",
+            target_gps, pacing.offered_gps, tp.gps
+        );
+        println!(
+            "Depth: mean/floor={:.2}x  blocks={}  under_floor={}  max_gas={}  max_queued_gas={}",
+            pacing.mean_depth_to_floor_ratio,
+            pacing.blocks_observed,
+            pacing.blocks_under_floor,
+            pacing.max_depth_gas,
+            pacing.max_queued_gas,
+        );
+        println!(
+            "Shortfalls: capacity={}  presign={}  rpc={}  chain={}",
+            pacing.capacity_limited_cycles,
+            pacing.presign_starved_cycles,
+            pacing.rpc_bound_cycles,
+            pacing.chain_bound_cycles
+        );
+        println!(
+            "Refill Sources: canonical={}  flashblock={}  safety={}",
+            pacing.canonical_cycles, pacing.flashblock_cycles, pacing.safety_cycles
+        );
+        println!(
+            "Block Fill: mean={:.1}%  load_test_estimated={:.1}%",
+            pacing.mean_block_fill_ratio * 100.0,
+            pacing.mean_our_block_ratio * 100.0
+        );
+        println!(
+            "Refill Lag: p50={:.1?}  p95={:.1?}  p99={:.1?}  max={:.1?}",
+            pacing.refill_lag.p50,
+            pacing.refill_lag.p95,
+            pacing.refill_lag.p99,
+            pacing.refill_lag.max
+        );
+        println!(
+            "Cycle Work: plan_p95={:.1?}  submit_p95={:.1?}",
+            pacing.plan_time.p95, pacing.submit_time.p95
+        );
+        println!(
+            "Availability Lag: p50={:.1?}  p95={:.1?}  max={:.1?}",
+            pacing.availability_lag.p50, pacing.availability_lag.p95, pacing.availability_lag.max
+        );
         let bl = &summary.block_latency;
         println!(
             "Block Latency:       min={:.1?}  p50={:.1?}  mean={:.1?}  p95={:.1?}  p99={:.1?}  max={:.1?}",
             bl.min, bl.p50, bl.mean, bl.p95, bl.p99, bl.max
         );
-        let fb = &summary.flashblocks_latency;
-        println!(
-            "FB Latency:          min={:.1?}  p50={:.1?}  mean={:.1?}  p95={:.1?}  p99={:.1?}  max={:.1?}  (n={})",
-            fb.min, fb.p50, fb.mean, fb.p95, fb.p99, fb.max, fb.count
-        );
-
         println!();
         println!(
             "Totals: Submitted={} | Confirmed={} | Failed={} | Reverted={} | Success={:.1}%",
@@ -295,6 +339,12 @@ async fn run_load_test(args: LoadArgs) -> Result<()> {
             summary.throughput.success_rate()
         );
         println!("Gas: total={}  avg/tx={}", summary.gas.total_gas, summary.gas.avg_gas);
+        if pacing.undrained_transactions > 0 {
+            println!(
+                "Undrained inventory: transactions={}  gas={}",
+                pacing.undrained_transactions, pacing.undrained_gas
+            );
+        }
         let rc: &ReceiptCoverage = &summary.receipt_coverage;
         if !rc.is_complete() {
             println!(
@@ -330,92 +380,6 @@ async fn run_load_test(args: LoadArgs) -> Result<()> {
             Err(e) => eprintln!("Warning: failed to serialize results: {e}"),
         }
     }
-
-    // Brief cooldown so in-flight load-test transactions can land and
-    // mempool state settles before we query balances for the drain.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    if runner.needs_b20_setup() {
-        println!("Burning remaining B-20 tokens...");
-        match runner.teardown_b20_tokens().await {
-            Ok(()) => println!("B-20 teardown complete."),
-            Err(e) => eprintln!("Warning: B-20 teardown failed: {e}"),
-        }
-    }
-
-    println!();
-    println!("Draining accounts back to funder...");
-    match runner.drain_accounts(funding_key).await {
-        Ok(drained) => println!("Drained {} ETH back to funder.", format_ether(drained)),
-        Err(e) => eprintln!("Warning: drain failed: {e}"),
-    }
-
-    if let Some(e) = run_err {
-        return Err(e.into());
-    }
-
-    Ok(())
-}
-
-struct SetupAmounts {
-    funding: U256,
-    swap_token: U256,
-    b20_mint: U256,
-}
-
-/// Runs funding, token setup, and the load test loop, returning the metrics summary.
-async fn run_test_phases(
-    runner: &mut LoadRunner,
-    funding_key: &PrivateKeySigner,
-    amounts: SetupAmounts,
-    real_token_setup: Option<&RealTokenSetup>,
-    mp: &indicatif::MultiProgress,
-    duration: Option<Duration>,
-) -> LoadResult<MetricsSummary> {
-    if runner.txpool_node_count() > 0 {
-        println!("Clearing txpool sender transactions...");
-        let removed = runner.clear_txpools().await?;
-        println!("Txpool clearing complete. Removed {removed} transaction(s).");
-    }
-
-    println!("Funding test accounts...");
-    runner.fund_accounts(funding_key.clone(), amounts.funding).await?;
-    println!("Accounts funded.");
-
-    if let Some(setup) = real_token_setup {
-        println!("Preparing real-token swap balances...");
-        runner.setup_real_tokens(setup).await?;
-        println!("Real-token swap balances prepared.");
-    } else if !runner.collect_swap_tokens().is_empty() {
-        println!("Distributing swap tokens...");
-        runner.setup_swap_tokens(funding_key.clone(), amounts.swap_token).await?;
-        println!("Swap tokens distributed.");
-    }
-
-    if runner.needs_b20_setup() {
-        println!("Setting up B-20 tokens...");
-        runner.setup_b20_tokens(amounts.b20_mint).await?;
-        println!("B-20 tokens ready.");
-    }
-    println!();
-
-    println!("Running load test...");
-
-    let display = LoadTestDisplay::new(mp, duration);
-    runner.set_display(display);
-
-    runner.run().await
-}
-
-fn install_signal_handler(stop_flag: Arc<AtomicBool>) {
-    let cancel = CancellationToken::new();
-    RuntimeManager::install_signal_handler(cancel.clone());
-
-    tokio::spawn(async move {
-        cancel.cancelled().await;
-        eprintln!("\nReceived signal, stopping gracefully.");
-        stop_flag.store(true, Ordering::SeqCst);
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -689,7 +653,12 @@ async fn rescue_await_drained_balances(
     }
 
     if !pending_accounts.is_empty() {
-        warn!(accounts = ?pending_accounts, "some rescue balances did not settle within timeout");
+        let sample: Vec<_> = pending_accounts.iter().take(3).copied().collect();
+        warn!(
+            pending_account_count = pending_accounts.len(),
+            pending_account_sample = ?sample,
+            "some rescue balances did not settle within timeout"
+        );
     }
 
     Ok(())

@@ -6,11 +6,11 @@ use std::{
 };
 
 use async_trait::async_trait;
-use base_proof_succinct_client_utils::client::DEFAULT_INTERMEDIATE_ROOT_INTERVAL;
 use base_proof_succinct_proof_utils::get_range_elf_embedded;
 use base_proof_zk_host::{ZkProver, ZkProverError, ZkSessionState};
+use base_proof_zk_utils::client::DEFAULT_INTERMEDIATE_ROOT_INTERVAL;
 use base_prover_service_protocol::{
-    ExecutionStats, ProofResult, SessionType, SnarkGroth16ProofRequest, SnarkGroth16ProofResult,
+    ExecutionStats, ProofResult, SessionType, SnarkPlonkProofRequest, SnarkPlonkProofResult,
     ZkProofRequest, ZkProofResult, ZkVm,
 };
 use sp1_sdk::{
@@ -71,6 +71,7 @@ impl DryRunZkProver {
     pub async fn build_until_cancelled(
         rpc: SuccinctRpcConfig,
         range_cycle_limit: u64,
+        witness_provider: Option<OpSuccinctWitnessProvider>,
         cancel: &CancellationToken,
     ) -> Result<Option<Arc<dyn ZkProver>>, SuccinctZkProverBuildError> {
         let base_consensus_url = rpc.base_consensus_rpc.as_str().to_owned();
@@ -78,9 +79,16 @@ impl DryRunZkProver {
         let default_sequence_window = rpc.default_sequence_window;
 
         info!(backend = "dry_run", "using local SP1 dry-run backend");
-        let Some(provider) = SuccinctZkProverBuilder::build_witness_provider(rpc, cancel).await?
-        else {
-            return Ok(None);
+        let provider = match witness_provider {
+            Some(provider) => provider,
+            None => {
+                let Some(provider) =
+                    SuccinctZkProverBuilder::build_witness_provider(rpc, cancel).await?
+                else {
+                    return Ok(None);
+                };
+                provider
+            }
         };
 
         Ok(Some(Arc::new(Self::new(
@@ -164,7 +172,7 @@ impl DryRunZkProver {
         );
 
         let witness_start = std::time::Instant::now();
-        let stdin = self
+        let stdin = match self
             .provider
             .generate_witness(WitnessParams {
                 start_block,
@@ -178,29 +186,33 @@ impl DryRunZkProver {
                     L1HeadSource::Pinned,
                 ),
                 intermediate_root_interval,
+                schedule_l2_block_number: request.schedule_l2_block_number,
             })
             .await
-            .map_err(|e| {
+        {
+            Ok(stdin) => stdin,
+            Err(e) => {
                 error!(
                     start_block = start_block,
                     end_block = end_block,
                     error = %e,
                     "dry-run witness generation failed"
                 );
-                backend_error!("witness generation failed: {e}")
-            })?;
+                return Err(backend_error!("witness generation failed: {e}"));
+            }
+        };
         let witness_generation_ms =
             u64::try_from(witness_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         let mut execution_stats =
             Self::execute_range_program(stdin, self.range_cycle_limit).await?;
+        // Histogram latency is recorded in the provider; this field keeps the dry-run API contract.
         execution_stats.witness_generation_ms = witness_generation_ms;
 
         info!(
             request_session_id = %request_session_id,
             total_instruction_cycles = execution_stats.total_instruction_cycles,
             total_sp1_gas = execution_stats.total_sp1_gas,
-            witness_generation_ms = witness_generation_ms,
             execution_ms = execution_stats.execution_ms,
             tracked_sections = execution_stats.cycle_tracker.len(),
             "dry-run SP1 execution completed"
@@ -254,7 +266,7 @@ impl DryRunZkProver {
             ProofResult::Compressed(proof) => proof.execution_stats,
             _ => return Err(backend_error!("dry-run range result had unexpected proof type")),
         };
-        let result = ProofResult::SnarkGroth16(SnarkGroth16ProofResult {
+        let result = ProofResult::SnarkPlonk(SnarkPlonkProofResult {
             proof: ZkProofResult { zk_vm: ZkVm::Sp1, proof: Vec::new().into(), execution_stats },
         });
         store.insert(backend_session_id.clone(), result);
@@ -284,7 +296,7 @@ impl ZkProver for DryRunZkProver {
 
     async fn submit_next(
         &self,
-        _request: &SnarkGroth16ProofRequest,
+        _request: &SnarkPlonkProofRequest,
         request_session_id: &str,
         completed_backend_session_id: &str,
     ) -> Result<String, ZkProverError> {
@@ -325,7 +337,7 @@ impl ZkProver for DryRunZkProver {
 mod tests {
     use std::{collections::HashMap, sync::Mutex};
 
-    use base_prover_service_protocol::{ProofResult, SnarkGroth16ProofResult, ZkProofResult, ZkVm};
+    use base_prover_service_protocol::{ProofResult, SnarkPlonkProofResult, ZkProofResult, ZkVm};
 
     use super::{DRY_RUN_SNARK_PREFIX, DRY_RUN_STARK_PREFIX, DryRunZkProver};
 
@@ -356,7 +368,7 @@ mod tests {
         assert_eq!(snark_id, snark_key(session));
         let guard = store.lock().unwrap();
         assert!(!guard.contains_key(&stark_key(session)), "range result should be consumed");
-        assert!(matches!(guard.get(&snark_key(session)), Some(ProofResult::SnarkGroth16(_))));
+        assert!(matches!(guard.get(&snark_key(session)), Some(ProofResult::SnarkPlonk(_))));
     }
 
     #[test]
@@ -364,7 +376,7 @@ mod tests {
         let session = "session-1";
         let store = Mutex::new(HashMap::from([(
             snark_key(session),
-            ProofResult::SnarkGroth16(SnarkGroth16ProofResult { proof: empty_proof() }),
+            ProofResult::SnarkPlonk(SnarkPlonkProofResult { proof: empty_proof() }),
         )]));
 
         let snark_id =

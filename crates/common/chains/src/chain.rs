@@ -79,7 +79,7 @@ impl EthereumHardforks for ChainUpgrades {
 }
 
 impl Upgrades for ChainUpgrades {
-    fn upgrade_activation(&self, fork: BaseUpgrade) -> ForkCondition {
+    fn fork_condition(&self, fork: BaseUpgrade) -> ForkCondition {
         self[fork]
     }
 }
@@ -120,8 +120,8 @@ impl Index<EthereumHardfork> for ChainUpgrades {
 #[cfg(test)]
 mod tests {
     use BaseUpgrade::{
-        Azul, Bedrock, Beryl, Canyon, Cobalt, Ecotone, Fjord, Granite, Holocene, Isthmus, Jovian,
-        Regolith, Zombie,
+        Azul, Bedrock, Beryl, Canyon, Cobalt, Denim, Ecotone, Fjord, Granite, Holocene, Isthmus,
+        Jovian, Regolith, Zenith,
     };
     use alloy_hardforks::EthereumHardfork;
 
@@ -176,7 +176,8 @@ mod tests {
             ForkCondition::Timestamp(ChainConfig::mainnet().beryl_timestamp.unwrap())
         );
         assert_eq!(base_mainnet_forks[Cobalt], ForkCondition::Never);
-        assert_eq!(base_mainnet_forks[Zombie], ForkCondition::Never);
+        assert_eq!(base_mainnet_forks[Denim], ForkCondition::Never);
+        assert_eq!(base_mainnet_forks[Zenith], ForkCondition::Never);
     }
 
     #[test]
@@ -215,7 +216,7 @@ mod tests {
             ForkCondition::Timestamp(ChainConfig::sepolia().isthmus_timestamp)
         );
         assert_eq!(
-            base_sepolia_forks.upgrade_activation(Jovian),
+            base_sepolia_forks.fork_condition(Jovian),
             ForkCondition::Timestamp(ChainConfig::sepolia().jovian_timestamp)
         );
         assert_eq!(
@@ -227,7 +228,8 @@ mod tests {
             ForkCondition::Timestamp(ChainConfig::sepolia().beryl_timestamp.unwrap())
         );
         assert_eq!(base_sepolia_forks[Cobalt], ForkCondition::Never);
-        assert_eq!(base_sepolia_forks[Zombie], ForkCondition::Never);
+        assert_eq!(base_sepolia_forks[Denim], ForkCondition::Never);
+        assert_eq!(base_sepolia_forks[Zenith], ForkCondition::Never);
     }
 
     #[test]
@@ -311,13 +313,25 @@ mod tests {
     }
 
     #[test]
-    fn is_zombie_active_at_timestamp() {
+    fn is_zenith_active_at_timestamp() {
         let base_mainnet_forks = ChainUpgrades::mainnet();
-        assert!(!base_mainnet_forks.is_zombie_active_at_timestamp(0));
-        assert!(!base_mainnet_forks.is_zombie_active_at_timestamp(u64::MAX));
+        assert!(!base_mainnet_forks.is_zenith_active_at_timestamp(0));
+        assert!(!base_mainnet_forks.is_zenith_active_at_timestamp(u64::MAX));
 
         let devnet_forks = ChainUpgrades::devnet();
-        assert!(!devnet_forks.is_zombie_active_at_timestamp(0));
+        assert!(!devnet_forks.is_zenith_active_at_timestamp(0));
+    }
+
+    #[test]
+    fn is_denim_active_at_timestamp() {
+        // Denim is unscheduled on all built-in chains.
+        let base_mainnet_forks = ChainUpgrades::mainnet();
+        assert!(!base_mainnet_forks.is_denim_active_at_timestamp(0));
+        assert!(!base_mainnet_forks.is_denim_active_at_timestamp(u64::MAX));
+
+        let devnet_forks = ChainUpgrades::devnet();
+        assert!(!devnet_forks.is_denim_active_at_timestamp(0));
+        assert!(!devnet_forks.is_denim_active_at_timestamp(u64::MAX));
     }
 
     #[test]
@@ -354,7 +368,7 @@ mod tests {
             let _ = base_mainnet_forks.ethereum_fork_activation(*ethereum_upgrade);
         }
         for base_upgrade in BaseUpgrade::VARIANTS {
-            let _ = base_mainnet_forks.upgrade_activation(*base_upgrade);
+            let _ = base_mainnet_forks.fork_condition(*base_upgrade);
         }
     }
 }

@@ -3,7 +3,6 @@
 use alloc::vec::Vec;
 
 use alloy_eips::{
-    Decodable2718,
     eip1559::BaseFeeParams,
     eip2718::{Eip2718Result, WithEncoded},
 };
@@ -11,7 +10,7 @@ use alloy_primitives::{B64, B256, Bytes, keccak256};
 use alloy_rlp::{Encodable, Result};
 use alloy_rpc_types_engine::{PayloadAttributes, PayloadId};
 use base_common_consensus::{
-    BaseTxEnvelope, EIP1559ParamError, HoloceneExtraData, JovianExtraData,
+    BaseTxEnvelope, EIP1559ParamError, HoloceneExtraData, JovianExtraData, decode_2718_canonical,
 };
 use sha2::Digest;
 
@@ -50,18 +49,6 @@ pub struct BasePayloadAttributes {
     /// Prior to Jovian activation, this field should always be [None].
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
     pub min_base_fee: Option<u64>,
-    /// The millisecond component of the payload timestamp.
-    ///
-    /// Prior to the future `BaseTime` activation, this field should always be [None].
-    #[cfg_attr(
-        feature = "serde",
-        serde(
-            default,
-            skip_serializing_if = "Option::is_none",
-            with = "alloy_serde::quantity::opt"
-        )
-    )]
-    pub timestamp_millis_part: Option<u16>,
 }
 
 impl BasePayloadAttributes {
@@ -115,10 +102,6 @@ impl BasePayloadAttributes {
             hasher.update(min_base_fee.to_be_bytes());
         }
 
-        if let Some(timestamp_millis_part) = self.timestamp_millis_part {
-            hasher.update(timestamp_millis_part.to_be_bytes());
-        }
-
         let mut out = hasher.finalize();
         out[0] = payload_version;
         PayloadId::new(out[..8].try_into().expect("sufficient length"))
@@ -164,10 +147,7 @@ impl BasePayloadAttributes {
     ///
     /// This iterator will be empty if there are no transactions in the attributes.
     pub fn decoded_transactions(&self) -> impl Iterator<Item = Eip2718Result<BaseTxEnvelope>> + '_ {
-        self.transactions
-            .iter()
-            .flatten()
-            .map(|tx_bytes| BaseTxEnvelope::decode_2718_exact(tx_bytes.as_ref()))
+        self.transactions.iter().flatten().map(|tx_bytes| decode_2718_canonical(tx_bytes.as_ref()))
     }
 
     /// Returns iterator over decoded transactions with their original encoded bytes.
@@ -231,10 +211,37 @@ mod test {
     use alloc::vec;
     use core::str::FromStr;
 
-    use alloy_primitives::{Address, B256, FixedBytes, address, b64, b256, bytes};
+    use alloy_consensus::{SignableTransaction, TxEip1559};
+    use alloy_eips::Encodable2718;
+    use alloy_primitives::{
+        Address, B256, Bytes, FixedBytes, Signature, address, b64, b256, bytes,
+    };
     use alloy_rpc_types_engine::PayloadAttributes;
 
     use super::*;
+
+    #[test]
+    fn decoded_transactions_reject_non_canonical_encoding() {
+        let encoded = TxEip1559 {
+            chain_id: 8453,
+            nonce: 1,
+            gas_limit: 21_000,
+            max_fee_per_gas: 2,
+            max_priority_fee_per_gas: 1,
+            to: Address::ZERO.into(),
+            value: Default::default(),
+            access_list: Default::default(),
+            input: Default::default(),
+        }
+        .into_signed(Signature::test_signature())
+        .encoded_2718();
+        let attributes = BasePayloadAttributes {
+            transactions: Some(vec![Bytes::copy_from_slice(&encoded[1..])]),
+            ..Default::default()
+        };
+
+        assert!(attributes.decoded_transactions().next().unwrap().is_err());
+    }
 
     #[test]
     fn test_payload_id_parity_op_geth() {
@@ -252,13 +259,13 @@ mod test {
                 withdrawals: Some([].into()),
                 parent_beacon_block_root: b256!("0x8fe0193b9bf83cb7e5a08538e494fecc23046aab9a497af3704f4afdae3250ff").into(),
                 slot_number: None,
+                target_gas_limit: None,
             },
             transactions: Some([bytes!("7ef8f8a0dc19cfa777d90980e4875d0a548a881baaa3f83f14d1bc0d3038bc329350e54194deaddeaddeaddeaddeaddeaddeaddeaddead00019442000000000000000000000000000000000000158080830f424080b8a4440a5e20000f424000000000000000000000000300000000670d6d890000000000000125000000000000000000000000000000000000000000000000000000000000000700000000000000000000000000000000000000000000000000000000000000014bf9181db6e381d4384bbf69c48b0ee0eed23c6ca26143c6d2544f9d39997a590000000000000000000000007f83d659683caf2767fd3c720981d51f5bc365bc")].into()),
             no_tx_pool: None,
             gas_limit: Some(30000000),
             eip_1559_params: None,
             min_base_fee: None,
-            timestamp_millis_part: None,
         };
 
         // Reth's `PayloadId` should match op-geth's `PayloadId`. This fails
@@ -287,13 +294,13 @@ mod test {
                 withdrawals: Some([].into()),
                 parent_beacon_block_root: b256!("0x8fe0193b9bf83cb7e5a08538e494fecc23046aab9a497af3704f4afdae3250ff").into(),
                 slot_number: None,
+                target_gas_limit: None,
             },
             transactions: Some([bytes!("7ef8f8a0dc19cfa777d90980e4875d0a548a881baaa3f83f14d1bc0d3038bc329350e54194deaddeaddeaddeaddeaddeaddeaddeaddead00019442000000000000000000000000000000000000158080830f424080b8a4440a5e20000f424000000000000000000000000300000000670d6d890000000000000125000000000000000000000000000000000000000000000000000000000000000700000000000000000000000000000000000000000000000000000000000000014bf9181db6e381d4384bbf69c48b0ee0eed23c6ca26143c6d2544f9d39997a590000000000000000000000007f83d659683caf2767fd3c720981d51f5bc365bc")].into()),
             no_tx_pool: None,
             gas_limit: Some(30000000),
             eip_1559_params: None,
             min_base_fee: Some(100),
-            timestamp_millis_part: None,
         };
 
         // Reth's `PayloadId` should match op-geth's `PayloadId`. This fails
@@ -308,6 +315,23 @@ mod test {
     }
 
     #[test]
+    fn test_payload_id_commits_forced_transactions() {
+        let parent = B256::ZERO;
+        let first = BasePayloadAttributes {
+            transactions: Some(vec![bytes!("01")]),
+            no_tx_pool: Some(true),
+            ..Default::default()
+        };
+        let second = BasePayloadAttributes {
+            transactions: Some(vec![bytes!("02")]),
+            no_tx_pool: Some(true),
+            ..Default::default()
+        };
+
+        assert_ne!(first.payload_id(&parent, 3), second.payload_id(&parent, 3));
+    }
+
+    #[test]
     fn test_serde_roundtrip_attributes_pre_holocene() {
         let attributes = BasePayloadAttributes {
             payload_attributes: PayloadAttributes {
@@ -317,68 +341,19 @@ mod test {
                 withdrawals: Default::default(),
                 parent_beacon_block_root: Some(B256::ZERO),
                 slot_number: None,
+                target_gas_limit: None,
             },
             transactions: Some(vec![b"hello".to_vec().into()]),
             no_tx_pool: Some(true),
             gas_limit: Some(42),
             eip_1559_params: None,
             min_base_fee: None,
-            timestamp_millis_part: None,
         };
 
         let ser = serde_json::to_string(&attributes).unwrap();
         let de: BasePayloadAttributes = serde_json::from_str(&ser).unwrap();
 
         assert_eq!(attributes, de);
-    }
-
-    #[test]
-    fn test_serde_roundtrip_timestamp_millis_part() {
-        let attributes =
-            BasePayloadAttributes { timestamp_millis_part: Some(200), ..Default::default() };
-
-        let val = serde_json::to_value(&attributes).unwrap();
-        assert_eq!(val.get("timestampMillisPart").unwrap(), "0xc8");
-
-        let de: BasePayloadAttributes = serde_json::from_value(val).unwrap();
-        assert_eq!(attributes, de);
-    }
-
-    #[test]
-    fn test_payload_id_commits_timestamp_millis_part() {
-        let parent = B256::ZERO;
-        let without_millis = BasePayloadAttributes::default();
-        let with_millis =
-            BasePayloadAttributes { timestamp_millis_part: Some(200), ..Default::default() };
-
-        assert_ne!(without_millis.payload_id(&parent, 3), with_millis.payload_id(&parent, 3));
-    }
-
-    #[test]
-    fn test_payload_id_unchanged_without_timestamp_millis_part() {
-        const PAYLOAD_VERSION: u8 = 3;
-
-        let expected =
-            PayloadId::new(FixedBytes::<8>::from_str("0x03d2dae446d2a86a").unwrap().into());
-        let parent = b256!("0x3533bf30edaf9505d0810bf475cbe4e5f4b9889904b9845e83efdeab4e92eb1e");
-        let attrs = BasePayloadAttributes {
-            payload_attributes: PayloadAttributes {
-                timestamp: 1728933301,
-                prev_randao: b256!("0x9158595abbdab2c90635087619aa7042bbebe47642dfab3c9bfb934f6b082765"),
-                suggested_fee_recipient: address!("0x4200000000000000000000000000000000000011"),
-                withdrawals: Some([].into()),
-                parent_beacon_block_root: b256!("0x8fe0193b9bf83cb7e5a08538e494fecc23046aab9a497af3704f4afdae3250ff").into(),
-                slot_number: None,
-            },
-            transactions: Some([bytes!("7ef8f8a0dc19cfa777d90980e4875d0a548a881baaa3f83f14d1bc0d3038bc329350e54194deaddeaddeaddeaddeaddeaddeaddeaddead00019442000000000000000000000000000000000000158080830f424080b8a4440a5e20000f424000000000000000000000000300000000670d6d890000000000000125000000000000000000000000000000000000000000000000000000000000000700000000000000000000000000000000000000000000000000000000000000014bf9181db6e381d4384bbf69c48b0ee0eed23c6ca26143c6d2544f9d39997a590000000000000000000000007f83d659683caf2767fd3c720981d51f5bc365bc")].into()),
-            no_tx_pool: None,
-            gas_limit: Some(30000000),
-            eip_1559_params: None,
-            min_base_fee: None,
-            timestamp_millis_part: None,
-        };
-
-        assert_eq!(attrs.payload_id(&parent, PAYLOAD_VERSION), expected);
     }
 
     #[test]
@@ -391,13 +366,13 @@ mod test {
                 withdrawals: Default::default(),
                 parent_beacon_block_root: Some(B256::ZERO),
                 slot_number: None,
+                target_gas_limit: None,
             },
             transactions: Some(vec![b"hello".to_vec().into()]),
             no_tx_pool: Some(true),
             gas_limit: Some(42),
             eip_1559_params: Some(b64!("0000dead0000beef")),
             min_base_fee: None,
-            timestamp_millis_part: None,
         };
 
         let ser = serde_json::to_string(&attributes).unwrap();
@@ -434,13 +409,13 @@ mod test {
                 withdrawals: Default::default(),
                 parent_beacon_block_root: Some(B256::ZERO),
                 slot_number: None,
+                target_gas_limit: None,
             },
             transactions: Some(vec![b"hello".to_vec().into()]),
             no_tx_pool: Some(true),
             gas_limit: Some(42),
             eip_1559_params: Some(b64!("0000dead0000beef")),
             min_base_fee: None,
-            timestamp_millis_part: None,
         };
 
         let ser = serde_json::to_string(&attributes).unwrap();
@@ -459,13 +434,13 @@ mod test {
                 withdrawals: Default::default(),
                 parent_beacon_block_root: Some(B256::ZERO),
                 slot_number: None,
+                target_gas_limit: None,
             },
             transactions: Some(vec![b"hello".to_vec().into()]),
             no_tx_pool: Some(true),
             gas_limit: Some(42),
             eip_1559_params: None,
             min_base_fee: Some(1),
-            timestamp_millis_part: None,
         };
 
         let ser = serde_json::to_string(&attributes).unwrap();

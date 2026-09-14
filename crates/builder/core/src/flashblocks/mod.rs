@@ -1,13 +1,19 @@
 //! Flashblocks builder types.
 
 mod best_txs;
-pub use best_txs::BestFlashblocksTxs;
+pub use best_txs::{
+    BestFlashblocksTxs, ParkableBestPayloadTransactions, ParkablePayloadTransactions,
+    PayloadTransactionInvalidated,
+};
+
+mod predicate_index;
+pub use predicate_index::{ParkedPredicateIndex, ValidityPredicateKey};
+
+mod deadline;
+pub use deadline::PayloadJobDeadline;
 
 mod generator;
-pub use generator::{
-    BlockCell, BlockPayloadJob, BlockPayloadJobGenerator, BuildArguments, ResolvePayload,
-    WaitForValue,
-};
+pub use generator::{BlockPayloadJob, BlockPayloadJobGenerator, BuildArguments, ResolvePayload};
 
 mod traits;
 pub use traits::PayloadBuilder;

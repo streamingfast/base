@@ -1,12 +1,16 @@
 //! Transaction types for Base chains.
 
+mod canonical;
+pub use canonical::decode_2718_canonical;
+
 mod deposit;
 pub use deposit::{DepositTransaction, TxDeposit};
 
 mod eip8130;
 pub use eip8130::{
-    AccountChange, ActorChange, ActorChangeType, Call, ConfigChange, CreateEntry, Delegation,
-    Eip8130Constants, Eip8130Contracts, Eip8130Signed, InitialActor, Scope, TxEip8130,
+    AccountChange, AccountChangeChannel, Call, ChangeType, CreateEntry, Delegation,
+    Eip8130Constants, Eip8130Contracts, Eip8130Signed, Eip8130StaticError, Eip8130TimestampError,
+    InitialActor, Scope, SignedAccountChanges, SignedChange, TxEip8130,
 };
 
 mod tx_type;

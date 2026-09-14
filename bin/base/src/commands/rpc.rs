@@ -8,7 +8,7 @@ use base_consensus_cli::{
 };
 use base_execution_chainspec::BaseChainSpec;
 use base_execution_cli::{ExecutionNodeArgs, chainspec::chain_value_parser};
-use base_upgrade_signal::{UpgradeSignalRuntimeValidation, UpgradeSignalStartupMode};
+use base_upgrade_signal::UpgradeSignalStartupMode;
 use clap::Args;
 use reth_cli_runner::CliRunner;
 use tokio_util::sync::CancellationToken;
@@ -68,10 +68,6 @@ impl RpcCommand {
         let mut rollup_config = consensus_args.load_rollup_config()?;
 
         CliRunner::try_default_runtime()?.run_command_until_exit(|ctx| async move {
-            let upgrade_signal_runtime_validation =
-                UpgradeSignalRuntimeValidation::with_activation_admin_address(
-                    execution_chain.activation_admin_address,
-                );
             execution
                 .standard
                 .rollup_args
@@ -79,7 +75,6 @@ impl RpcCommand {
                 .apply_startup_to_sinks(
                     &execution.standard.rollup_args.upgrade_signal_l1_rpc,
                     "integrated startup",
-                    upgrade_signal_runtime_validation,
                     execution_chain.chain().id(),
                     Arc::make_mut(&mut execution_chain),
                     &mut rollup_config,
@@ -111,7 +106,6 @@ impl RpcCommand {
                 ConsensusNodeStartOptions::new(rollup_config)
                     .with_overrides(ConsensusNodeOverrides::embedded_execution(
                         l2_engine_rpc,
-                        upgrade_signal_runtime_validation,
                         upgrade_signal_l1_rpc,
                     ))
                     .with_cancellation(consensus_cancellation.clone())
@@ -159,17 +153,11 @@ pub(super) fn engine_ipc_url(path: &str) -> eyre::Result<Url> {
 mod tests {
     use std::process::Command;
 
-    use base_common_genesis::BaseUpgrade;
     use base_consensus_cli::ConsensusNodeConfigArgs;
-    use base_execution_chainspec::{BaseChainSpec, BaseChainSpecBuilder};
-    use base_upgrade_signal::UpgradeSignalRuntimeValidation;
+    use base_execution_chainspec::BaseChainSpec;
     use clap::Parser;
 
-    use crate::{
-        cli::BaseCli,
-        commands::BaseCommand,
-        config::{BuiltInChain, ChainArg},
-    };
+    use crate::{cli::BaseCli, commands::BaseCommand, config::ChainArg};
 
     const RPC_FORWARDING_ENDPOINT_ENV: &str = "OP_RETH_SEQUENCER_HTTP";
     const RPC_FORWARDING_ENDPOINT_ENV_CHILD_TEST: &str =
@@ -209,8 +197,6 @@ mod tests {
             "rpc",
             "--upgrade-signal.contract",
             "0x0000000000000000000000000000000000000001",
-            "--upgrade-signal.upgrade-id",
-            "azul",
         ]));
 
         let BaseCommand::Rpc(rpc) = cli.command else {
@@ -226,7 +212,6 @@ mod tests {
                 .map(|address| address.to_string()),
             Some("0x0000000000000000000000000000000000000001".to_string())
         );
-        assert_eq!(rpc.execution.standard.rollup_args.upgrade_signal.upgrade_ids, ["azul"]);
     }
 
     #[test]
@@ -296,27 +281,12 @@ mod tests {
     }
 
     #[test]
-    fn consensus_runtime_validation_uses_execution_activation_admin() {
-        let execution_chain = BaseChainSpecBuilder::base_mainnet()
-            .optional_activation_admin_address(None)
-            .without_fork(BaseUpgrade::Beryl)
-            .build();
-
-        let validation = UpgradeSignalRuntimeValidation::with_activation_admin_address(
-            execution_chain.activation_admin_address,
-        );
-
-        assert!(validation.require_activation_admin_for_beryl);
-        assert_eq!(validation.activation_admin_address, None);
-    }
-
-    #[test]
     fn parses_devnet_unified_client_args() {
         let cli = BaseCli::parse_from([
             "base",
-            "rpc",
             "--chain",
             "dev",
+            "rpc",
             "--execution-chain",
             "dev",
             "--datadir=/data",
@@ -378,7 +348,7 @@ mod tests {
             "-vvv",
         ]);
 
-        assert!(matches!(cli.chain, ChainArg::BuiltIn(BuiltInChain::Dev)));
+        assert!(matches!(cli.chain, Some(ChainArg::BuiltIn(ref name)) if name == "dev"));
         let BaseCommand::Rpc(rpc) = cli.command else {
             panic!("expected rpc command");
         };
@@ -567,8 +537,10 @@ mod tests {
             "base",
             "rpc",
             "--enable-metering",
-            "--metering.execution-time-us",
-            "5000000",
+            "--metering.target-flashblocks-per-block",
+            "4",
+            "--metering.gas-limit",
+            "30000000",
         ]));
 
         let BaseCommand::Rpc(rpc) = cli.command else {
@@ -578,7 +550,7 @@ mod tests {
         let launch_config = rpc.execution.into_launch_config(BaseChainSpec::devnet().into());
 
         assert!(launch_config.standard.metering.enable_metering);
-        assert_eq!(launch_config.standard.metering.metering_execution_time_us, Some(5_000_000));
+        assert_eq!(launch_config.standard.metering.metering_gas_limit, Some(30_000_000));
     }
 
     #[test]
