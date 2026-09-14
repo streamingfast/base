@@ -8,6 +8,10 @@
   selects the OP hooks it installs (`OpPreTxAdjust`, `OpPostTxExtras`) through
   `reth_firehose::FirehoseLiveHooks`.
 
+* Bumped `firehose-tracer`, `firehose-tracer-test` and `firehose-tracer-prestate` to `5.4.2`, which
+  builds with alloy-genesis 2.3. `base-firehose-prestate` also carries the Denim upgrade timestamp
+  into generated fixtures.
+
 ### Fixed
 
 * Live-traced blocks now pass the state-root task its execution updates, run transactions in block

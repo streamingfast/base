@@ -9543,9 +9543,9 @@ checksum = "9844ddc3a6e533d62bba727eb6c28b5d360921d5175e9ff0f1e621a5c590a4d5"
 
 [[package]]
 name = "firehose-tracer"
-version = "5.4.1"
+version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68617cc0fb3d0dfb49cbe29f3e05969fcabf93fcecaa1e0fda577c7c6c95494c"
+checksum = "e9adcf31369936f33026953c2601276b356fef9a4428b7dd03e9ab010cd8b4e8"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -9566,9 +9566,9 @@ dependencies = [
 
 [[package]]
 name = "firehose-tracer-prestate"
-version = "5.4.1"
+version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16514d9d18486c39ec541467d6c2d792d57d74a363b44442dc5ed850632c8fd1"
+checksum = "8536a2c1a21e4168e197a7bb831b0f879718b5d51f78575ed501e2936f33cc19"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -9591,9 +9591,9 @@ dependencies = [
 
 [[package]]
 name = "firehose-tracer-test"
-version = "5.4.1"
+version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "875f72c331b8b8bb3211030a9a44850c72439a7037a07e65f56c02d50f64ca69"
+checksum = "7e5028ed593f33bdee615ed7ee170370ff2b8cb4f2419472b0a6762918b70221"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",

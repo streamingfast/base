@@ -614,13 +614,13 @@ governor = "0.7"
 # Firehose tracer (defined by the streamingfast reth fork, release/base-2.x branch).
 reth-firehose = { git = "https://github.com/streamingfast/reth.git", tag = "base-v2.5.2.3-fh3.1" }
 reth-firehose-tests = { git = "https://github.com/streamingfast/reth.git", tag = "base-v2.5.2.3-fh3.1" }
-firehose-tracer = "5.4.1"
+firehose-tracer = "5.4.2"
 
 # Shared tracing-regression framework (capture / invariants / projection / golden).
-firehose-tracer-test = "5.4.1"
+firehose-tracer-test = "5.4.2"
 
 # Chain-agnostic generator for replayable Firehose prestate fixtures.
-firehose-tracer-prestate = "5.4.1"
+firehose-tracer-prestate = "5.4.2"
 
 [patch.crates-io]
 # SF fork of alloy-evm that routes system calls (EIP-4788, EIP-2935, etc.) through the
