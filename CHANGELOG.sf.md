@@ -1,8 +1,8 @@
-## Unreleased
+## v1.3.2-fh3.1
 
 ### Changed
 
-* Rebased on upstream Base `v1.3.2` and `streamingfast/reth` `release/base-2.x` (Base's reth fork
+* Rebased on upstream Base `v1.3.2` and `streamingfast/reth` `base-v2.5.2.3-fh3.1` (Base's reth fork
   `base-v2.5.2.3` plus Firehose). Upstream removed Base's own engine validator, so live
   `engine_newPayload` blocks are now traced by reth's engine validator. `OpFirehoseEvmConfig`
   selects the OP hooks it installs (`OpPreTxAdjust`, `OpPostTxExtras`) through
