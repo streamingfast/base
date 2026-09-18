@@ -7,10 +7,6 @@ pub(super) fn parse_address(s: &str, field: &str) -> Result<Address> {
         .map_err(|e| BaselineError::Config(format!("invalid {field} address '{s}': {e}")))
 }
 
-pub(super) fn parse_amount(s: &str, field: &str) -> Result<U256> {
-    s.parse::<U256>().map_err(|e| BaselineError::Config(format!("invalid {field} '{s}': {e}")))
-}
-
 pub(super) fn validate_swap_amounts(min: U256, max: U256, tx_type: &str) -> Result<()> {
     if min > max {
         return Err(BaselineError::Config(format!(

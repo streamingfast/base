@@ -209,6 +209,24 @@ impl Eip8130Executor {
 
         let ctx = evm.ctx_mut();
         let chain_id = ctx.cfg().chain_id();
+
+        // Consensus-critical cross-chain-replay guard. The sender and payer
+        // signature hashes commit to the transaction body's *embedded* `chain_id`,
+        // not the local chain, so a signature produced for another chain verifies
+        // bit-for-bit when the identical bytes are executed here. `validate_static`
+        // rejects a chain-id mismatch at pool admission, but block inclusion
+        // (direct build / Engine delivery / singular-batch derivation, which
+        // preserves the original raw bytes) bypasses the pool. The equality MUST be
+        // enforced here — the enshrined pipeline is the only choke point every
+        // inclusion path shares — so a foreign-chain envelope cannot advance the
+        // sender's nonce or charge their balance locally. Unlike ordinary typed
+        // transactions, the 8130 path bypasses revm's
+        // `validate_against_state_and_deduct_caller` (see the L1BlockInfo refresh
+        // below), so it does not inherit that path's chain-id check.
+        if signed.tx().chain_id != chain_id {
+            return Err(BaseTransactionError::eip8130("chain id mismatch").into());
+        }
+
         let spec = ctx.cfg().spec();
         // Consensus-critical: a clamped timestamp would silently shift the expiry
         // validation in the authorizer and nonce validator, so reject rather than
@@ -819,7 +837,7 @@ impl Eip8130Executor {
                 .resolve_actor_config(sender, sender_actor_id)
                 .map_err(BaseTransactionError::eip8130)?
                 .scope;
-            let policy_gated = actor_scope & Eip8130Constants::SCOPE_POLICY != 0;
+            let policy_gated = Eip8130Constants::sender_is_policy_gated(actor_scope);
             let policy_target = if policy_gated {
                 acc.get_policy_manager(sender, sender_actor_id)
                     .map_err(BaseTransactionError::eip8130)?
@@ -990,8 +1008,7 @@ impl Eip8130Executor {
             // 2. Install the deferred account-*code* effects (created-account
             //    bytecode, delegation indicator) the apply step surfaced.
             if let Some(created) = &applied_tx.applied.created {
-                sctx.set_code(created.address, Bytecode::new_raw(created.code.clone()))
-                    .map_err(BaseTransactionError::eip8130)?;
+                Self::install_created_code(sctx, created.address, &created.code)?;
             }
             if let Some(delegation) = &applied_tx.applied.delegation {
                 delegation.install(sctx).map_err(BaseTransactionError::eip8130)?;
@@ -1039,7 +1056,7 @@ impl Eip8130Executor {
                     NonceValidator::validate_sequence(tx, current_nonce, NonceMode::Inclusion)
                         .map_err(BaseTransactionError::eip8130)?;
                     nonce_mgr
-                        .increment_nonce_from_current(sender, nonce_key, current_nonce)
+                        .increment_nonce(sender, nonce_key)
                         .map_err(BaseTransactionError::eip8130)?;
                     (current_nonce == 0, false)
                 };
@@ -1048,7 +1065,15 @@ impl Eip8130Executor {
             //    delegation owner change was supplied. A zero target deliberately
             //    clears the sender's delegation and must not be overwritten with
             //    `DEFAULT_ACCOUNT`.
-            let sender_auto_delegated = if has_explicit_delegation {
+            // A create installs the account's own runtime, so it must never be
+            // auto-delegated to `DEFAULT_ACCOUNT`. `apply_create` rejects empty
+            // runtimes, so a created sender is never code-less here and
+            // `auto_delegate_codeless_sender` would already no-op; gating on the
+            // create explicitly keeps that invariant local rather than relying on
+            // the emptiness check, and matches the `sender_auto_delegated`
+            // intrinsic-gas classifier's own suppression on a create entry.
+            let has_create = applied_tx.applied.created.is_some();
+            let sender_auto_delegated = if has_explicit_delegation || has_create {
                 false
             } else {
                 Self::auto_delegate_codeless_sender(sctx, sender)?
@@ -1678,15 +1703,44 @@ impl Eip8130Executor {
                 }
             }
         }
-        if let Some((address, code)) = created_effect {
-            sctx.set_code(address, Bytecode::new_raw(code))
-                .map_err(BaseTransactionError::eip8130)?;
+        if let Some((address, code)) = &created_effect {
+            Self::install_created_code(sctx, *address, code)?;
         }
         let has_explicit_delegation = delegation_effect.is_some();
         if let Some(delegation) = delegation_effect {
             delegation.install(sctx).map_err(BaseTransactionError::eip8130)?;
         }
         Ok(has_explicit_delegation)
+    }
+
+    /// Installs a created account's runtime code, enforcing the CREATE2 collision
+    /// rule the reference contract gets for free from a real deploy: the
+    /// destination must be empty (no code, zero nonce). The account info is read
+    /// from the real journal (not the config overlay), so block inclusion
+    /// enforces what mempool admission checks separately — an inclusion path that
+    /// bypasses the pool cannot overwrite preexisting third-party code.
+    ///
+    /// The runtime is already validated non-empty, `<= MAX_CODE_SIZE`, and not
+    /// `0xEF`-prefixed by [`AccountChangeApplier::apply_create`], so
+    /// [`Bytecode::new_raw_checked`] never errors here; the fallible constructor
+    /// is used anyway so any future gap surfaces as a validity error rather than
+    /// a panic on transaction-controlled bytes.
+    fn install_created_code(
+        sctx: StorageCtx<'_>,
+        address: Address,
+        code: &Bytes,
+    ) -> Result<(), BaseTransactionError> {
+        let occupied = sctx
+            .with_account_info(address, |info| Ok(!info.is_empty_code_hash() || info.nonce != 0))
+            .map_err(BaseTransactionError::eip8130)?;
+        if occupied {
+            return Err(BaseTransactionError::eip8130(
+                "create destination already has code or a non-zero nonce",
+            ));
+        }
+        let bytecode =
+            Bytecode::new_raw_checked(code.clone()).map_err(BaseTransactionError::eip8130)?;
+        sctx.set_code(address, bytecode).map_err(BaseTransactionError::eip8130)
     }
 
     /// Auto-delegates a code-less sender to [`Eip8130Contracts::DEFAULT_ACCOUNT`]
@@ -1703,20 +1757,6 @@ impl Eip8130Executor {
             .with_account_info(sender, |info| Ok(info.is_empty_code_hash()))
             .map_err(BaseTransactionError::eip8130)?;
         if is_codeless {
-            // Same guard as an explicit delegation's `DelegationEffect::install`:
-            // empty code on a keystore-established account (e.g. an imported
-            // account whose delegation was later cleared, or an EIP-6780
-            // same-transaction `SELFDESTRUCT`) is not proof of a key-backed EOA,
-            // so it must not be auto-delegated to `DEFAULT_ACCOUNT` as if it were
-            // one. Fail closed, mirroring `ApplyError::ContractEstablishedCodeless`.
-            let contract_established = AccountConfigurationStorage::new(sctx)
-                .is_contract_established(sender)
-                .map_err(BaseTransactionError::eip8130)?;
-            if contract_established {
-                return Err(BaseTransactionError::eip8130(
-                    ApplyError::ContractEstablishedCodeless { account: sender },
-                ));
-            }
             let target = Eip8130Contracts::DEFAULT_ACCOUNT;
             sctx.set_code(sender, Bytecode::new_eip7702(target))
                 .map_err(BaseTransactionError::eip8130)?;
@@ -1937,34 +1977,80 @@ mod tests {
         assert!(outcome.state.contains_key(&BENEFICIARY));
     }
 
+    /// Cross-chain-replay guard: an EIP-8130 envelope signed for a foreign chain
+    /// must be rejected at inclusion, not just at pool admission. The sender and
+    /// payer signature hashes commit to the transaction's embedded `chain_id`, so
+    /// the same bytes verify on any chain; only `Eip8130Executor::execute`'s
+    /// chain-id equality check stops it from advancing the nonce or charging the
+    /// balance locally. Regression for the txpool-only `validate_static` gate.
     #[test]
-    fn auto_delegate_skips_contract_established_codeless_sender() {
-        // Auto-delegation carries the same `FLAG_CONTRACT_ESTABLISHED` guard as an
-        // explicit `DelegationEffect::install`: a plain codeless EOA is delegated
-        // to `DEFAULT_ACCOUNT`, but a keystore-established codeless account (e.g.
-        // an imported account whose delegation was cleared) must fail closed.
+    fn foreign_chain_id_is_rejected_at_inclusion() {
+        let key = signing_key(0xa1);
+        let sender = eoa_address(&key);
+        let mut tx = base_tx();
+        tx.chain_id = 1;
+        let signed = eoa_signed(tx, &key);
+        assert_eq!(signed.tx().chain_id, 1);
+
+        let initial_balance = U256::from(10u64).pow(U256::from(18u64));
+        let mut evm = evm_with(initial_balance, sender);
+        assert_eq!(evm.ctx().cfg().chain_id(), CHAIN_ID);
+
+        let err = evm.transact_raw(into_base_tx(&signed)).unwrap_err();
+        let EVMError::Transaction(BaseTransactionError::Eip8130(reason)) = err else {
+            panic!("foreign-chain 8130 tx must be rejected as a validity error, got {err:?}");
+        };
+        assert!(reason.contains("chain id mismatch"), "unexpected reason: {reason}");
+    }
+
+    /// The chain-id guard rejects only mismatches: an envelope whose embedded
+    /// `chain_id` equals the local chain still executes normally.
+    #[test]
+    fn matching_chain_id_still_executes() {
+        let key = signing_key(0xa2);
+        let sender = eoa_address(&key);
+        let mut tx = base_tx();
+        tx.chain_id = CHAIN_ID;
+        let signed = eoa_signed(tx, &key);
+
+        let initial_balance = U256::from(10u64).pow(U256::from(18u64));
+        let mut evm = evm_with(initial_balance, sender);
+        let outcome =
+            evm.transact_raw(into_base_tx(&signed)).expect("local-chain 8130 tx should execute");
+
+        assert!(outcome.result.is_success());
+        let sender_acc = outcome.state.get(&sender).expect("sender in state");
+        assert_eq!(sender_acc.info.nonce, 1);
+        assert!(sender_acc.info.balance < initial_balance);
+    }
+
+    #[test]
+    fn auto_delegate_codeless_sender_delegates_to_default_account() {
+        // A codeless sender is auto-delegated to `DEFAULT_ACCOUNT` so it can
+        // dispatch its calls; a sender that already has code is left untouched.
         let plain = address!("0x00000000000000000000000000000000000000c1");
-        let established = address!("0x00000000000000000000000000000000000000c2");
+        let coded = address!("0x00000000000000000000000000000000000000c2");
         let mut provider = HashMapStorageProvider::new(CHAIN_ID);
         StorageCtx::enter(&mut provider, |ctx| {
-            // A non-established codeless sender is auto-delegated.
             assert!(
                 Eip8130Executor::auto_delegate_codeless_sender(ctx, plain).unwrap(),
-                "plain codeless EOA must be auto-delegated"
+                "codeless EOA must be auto-delegated"
             );
-
-            // Mark a codeless account keystore-established: auto-delegation must
-            // reject it rather than resurrect it as a DEFAULT_ACCOUNT delegate.
-            let mut acc = AccountConfigurationStorage::new(ctx);
-            let mut state = acc.get_account_state(established).unwrap();
-            state.flags = Eip8130Constants::FLAG_CONTRACT_ESTABLISHED;
-            acc.set_account_state(established, state).unwrap();
-            let err = Eip8130Executor::auto_delegate_codeless_sender(ctx, established).unwrap_err();
+            ctx.set_code(coded, Bytecode::new_raw(Bytes::from_static(&[0x60, 0x00]))).unwrap();
             assert!(
-                err.to_string().contains("contract-established"),
-                "expected ContractEstablishedCodeless, got: {err}"
+                !Eip8130Executor::auto_delegate_codeless_sender(ctx, coded).unwrap(),
+                "a sender with code must not be auto-delegated"
             );
         });
+
+        assert_eq!(
+            provider
+                .get_account_info(plain)
+                .and_then(|info| info.code.as_ref())
+                .and_then(Bytecode::eip7702_address),
+            Some(Eip8130Contracts::DEFAULT_ACCOUNT),
+            "codeless sender must delegate to DEFAULT_ACCOUNT"
+        );
     }
 
     #[test]
@@ -2496,7 +2582,7 @@ mod tests {
                 payload: authorize_change_data(
                     session_actor,
                     Eip8130Constants::K1_AUTHENTICATOR,
-                    Eip8130Constants::SCOPE_SENDER | Eip8130Constants::SCOPE_POLICY,
+                    Eip8130Constants::SCOPE_POLICY,
                     0,
                     &policy_data,
                 ),
@@ -2953,8 +3039,9 @@ mod tests {
         Eip8130Signed::new(tx, Bytes::from(auth), Bytes::new())
     }
 
-    /// Seeds a policy-gated `SENDER | PAYER` k1 actor for `account`,
-    /// authorized to the `signer` key and gated to `target`, then commits it.
+    /// Seeds a policy-gated k1 actor for `account`, authorized to the `signer`
+    /// key and gated to `target`, then commits it. POLICY-only (plus payer/nonce
+    /// grants): OPERATOR would override POLICY and leave the sender ungated.
     fn seed_gated_sender(
         evm: &mut BaseEvm<InMemoryDB, NoOpInspector, PrecompilesMap>,
         account: Address,
@@ -2969,19 +3056,18 @@ mod tests {
             let mut provider = JournalStorageProvider::new(internals, Address::ZERO);
             StorageCtx::enter(&mut provider, |sctx| {
                 let mut acc = AccountConfigurationStorage::new(sctx);
-                acc.actor_config
+                acc.actors
                     .at_mut(&actor_id)
                     .at_mut(&account)
                     .write(pack_actor(
                         Eip8130Constants::K1_AUTHENTICATOR,
-                        Eip8130Constants::SCOPE_SENDER
+                        Eip8130Constants::SCOPE_POLICY
                             | Eip8130Constants::SCOPE_SELF_PAYER
-                            | Eip8130Constants::SCOPE_NONCE
-                            | Eip8130Constants::SCOPE_POLICY,
+                            | Eip8130Constants::SCOPE_NONCE,
                         0,
                     ))
                     .unwrap();
-                acc.policy_manager.at_mut(&actor_id).at_mut(&account).write(target).unwrap();
+                acc.set_policy(account, actor_id, target, B256::ZERO).unwrap();
             });
         }
         let state = evm.ctx_mut().journal_mut().finalize();
@@ -3087,7 +3173,7 @@ mod tests {
         // address must authorize and be *included* through the full
         // `Eip8130Executor::execute` pipeline — not just the unit-level
         // `authorize_and_apply`. Before the fix this returned
-        // `BaseTransactionError::Eip8130("...NotBound")` and was rejected at every
+        // `BaseTransactionError::Eip8130("...AuthenticatorMismatch")` and was rejected at every
         // flashblock. Non-empty runtime code mirrors the on-chain account.
         let key = signing_key(0xc1);
         let (derived, signed) = counterfactual_create_signed(&key, bytes!("00"), Vec::new());
@@ -3103,6 +3189,73 @@ mod tests {
         assert_eq!(created.info.nonce, 1, "create sender nonce bumped");
         assert!(!created.info.is_empty_code_hash(), "created account has code");
         assert!(created.info.balance < initial_balance, "self-paid create charged");
+    }
+
+    /// Asserts a counterfactual create with `code` is rejected at inclusion with
+    /// an `Eip8130` validity error whose reason contains `reason`, and that no
+    /// balance is charged (the transaction is not included). Never panics — the
+    /// point of the create-safety gate is that transaction-controlled runtimes
+    /// surface as clean rejections rather than executor panics.
+    fn assert_create_rejected(byte: u8, code: Bytes, reason: &str) {
+        let key = signing_key(byte);
+        let (derived, signed) = counterfactual_create_signed(&key, code, Vec::new());
+        let mut evm = evm_with(U256::from(10u64).pow(U256::from(18u64)), derived);
+        let err = evm.transact_raw(into_base_tx(&signed)).unwrap_err();
+        let EVMError::Transaction(BaseTransactionError::Eip8130(got)) = err else {
+            panic!("expected an Eip8130 validity rejection, got {err:?}");
+        };
+        assert!(got.contains(reason), "reason {got:?} does not contain {reason:?}");
+    }
+
+    #[test]
+    fn create_rejects_oversized_runtime() {
+        // EIP-170: a runtime larger than MAX_CODE_SIZE would be rejected by the
+        // reference contract's CREATE2 deploy; the enshrined path must reject it
+        // too rather than install oversized code at inclusion.
+        let code = Bytes::from(vec![0x00u8; Eip8130Constants::MAX_CODE_SIZE + 1]);
+        assert_create_rejected(0xb1, code, "MAX_CODE_SIZE");
+    }
+
+    #[test]
+    fn create_rejects_leading_ef_runtime() {
+        // EIP-3541: deployed code may not begin with 0xEF.
+        assert_create_rejected(0xb2, bytes!("ef00"), "0xEF");
+    }
+
+    #[test]
+    fn create_rejects_malformed_eip7702_runtime() {
+        // The 3-byte 0xEF0100 prefix is a malformed EIP-7702 designator that
+        // previously panicked `Bytecode::new_raw` (InvalidLength) when installed
+        // as create runtime. It must now be a clean EIP-3541 rejection.
+        assert_create_rejected(0xb3, bytes!("ef0100"), "0xEF");
+    }
+
+    #[test]
+    fn create_rejects_full_eip7702_designator_runtime() {
+        // A canonical 23-byte 0xEF0100||target designator must not be accepted as
+        // create runtime (it would silently become an EIP-7702 delegation from a
+        // Create-only transaction); EIP-3541 rejects it.
+        let mut designator = vec![0xEF, 0x01, 0x00];
+        designator.extend_from_slice(Address::repeat_byte(0x42).as_slice());
+        assert_create_rejected(0xb4, Bytes::from(designator), "0xEF");
+    }
+
+    #[test]
+    fn create_rejects_overwriting_existing_code() {
+        // CREATE2 collision: the reference contract's deploy reverts when the
+        // destination already holds code. The enshrined path installs runtime
+        // directly, so it must reject a create whose derived address already has
+        // preexisting (non-8130) bytecode instead of overwriting it.
+        let key = signing_key(0xb5);
+        let (derived, signed) = counterfactual_create_signed(&key, bytes!("6001"), Vec::new());
+        let mut evm = evm_with(U256::from(10u64).pow(U256::from(18u64)), derived);
+        seed_account_code(&mut evm, derived, Bytes::from_static(&[0xfe, 0xfe, 0xfe]));
+
+        let err = evm.transact_raw(into_base_tx(&signed)).unwrap_err();
+        let EVMError::Transaction(BaseTransactionError::Eip8130(got)) = err else {
+            panic!("expected an Eip8130 validity rejection, got {err:?}");
+        };
+        assert!(got.contains("already has code"), "unexpected reason: {got}");
     }
 
     #[test]

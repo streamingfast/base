@@ -45,11 +45,7 @@ pub(crate) struct RpcCommand {
 
 impl RpcCommand {
     /// Runs the `rpc` flavor.
-    pub(crate) fn run(
-        self,
-        resolved_chain: ResolvedChainConfig,
-        metrics_enabled: bool,
-    ) -> eyre::Result<()> {
+    pub(crate) fn run(self, resolved_chain: ResolvedChainConfig) -> eyre::Result<()> {
         let Self { execution_chain, execution, consensus } = self;
         let mut execution_chain = match execution_chain {
             Some(chain) => chain,
@@ -81,12 +77,6 @@ impl RpcCommand {
                 )
                 .await?;
 
-            if metrics_enabled {
-                CliMetrics::init_rollup_config(&rollup_config);
-            }
-            let _upgrade_countdown_metrics = metrics_enabled
-                .then(|| CliMetrics::spawn_upgrade_countdown_recorder(rollup_config.clone()));
-
             let upgrade_signal_l1_rpc =
                 execution.standard.rollup_args.upgrade_signal_l1_rpc.upgrade_signal_l1_rpc.clone();
             let execution = execution
@@ -96,6 +86,12 @@ impl RpcCommand {
             let l2_engine_rpc = engine_ipc_url(execution.auth_ipc_path())?;
             let task_executor = ctx.task_executor.clone();
             let launched = execution.launch_default(ctx).await?;
+            // Execution launch installs the shared reth recorder. The standalone metrics flag
+            // controls a separate endpoint, not emission into this recorder.
+            CliMetrics::init_rollup_config(&rollup_config);
+            let _upgrade_countdown_metrics =
+                CliMetrics::spawn_upgrade_countdown_recorder(rollup_config.clone());
+
             let handle = launched.handle;
             // Keep the execution node handle alive until both services have coordinated shutdown.
             let execution_node = handle.node;
@@ -383,8 +379,8 @@ mod tests {
             launch_config.standard.rpc.rollup_args.sequencer.as_deref(),
             Some("http://localhost:8545")
         );
-        assert!(!launch_config.standard.enable_tx_forwarding);
-        assert!(launch_config.standard.builder_rpc_urls.is_empty());
+        assert!(!launch_config.standard.rpc.enable_tx_forwarding);
+        assert!(launch_config.standard.rpc.builder_rpc_urls.is_empty());
     }
 
     #[test]
@@ -537,10 +533,8 @@ mod tests {
             "base",
             "rpc",
             "--enable-metering",
-            "--metering.target-flashblocks-per-block",
-            "4",
-            "--metering.gas-limit",
-            "30000000",
+            "--metering.metered-opcodes",
+            "SSTORE",
         ]));
 
         let BaseCommand::Rpc(rpc) = cli.command else {
@@ -550,16 +544,44 @@ mod tests {
         let launch_config = rpc.execution.into_launch_config(BaseChainSpec::devnet().into());
 
         assert!(launch_config.standard.metering.enable_metering);
-        assert_eq!(launch_config.standard.metering.metering_gas_limit, Some(30_000_000));
+        assert_eq!(
+            launch_config.standard.metering.metering_metered_opcodes,
+            vec!["SSTORE".to_string()]
+        );
     }
 
     #[test]
-    fn rejects_rpc_tx_forwarding_args() {
+    fn parses_rpc_validity_forwarding_args() {
+        let cli = BaseCli::parse_from(rpc_args(&[
+            "base",
+            "rpc",
+            "--enable-tx-forwarding",
+            "--builder-rpc-urls",
+            "http://localhost:8545",
+            "--enable-experimental-validity-transactions",
+            "--experimental-validity-max-predicates",
+            "8",
+        ]));
+
+        let BaseCommand::Rpc(rpc) = cli.command else {
+            panic!("expected rpc command");
+        };
+
+        let launch_config = rpc.execution.into_launch_config(BaseChainSpec::devnet().into());
+
+        assert!(launch_config.standard.rpc.enable_tx_forwarding);
+        assert!(launch_config.standard.rpc.enable_experimental_validity_transactions);
+        assert_eq!(launch_config.standard.rpc.experimental_validity_max_predicates, 8);
+        assert_eq!(launch_config.standard.rpc.builder_rpc_urls.len(), 1);
+    }
+
+    #[test]
+    fn rpc_tx_forwarding_requires_builder_urls() {
         let err = BaseCli::try_parse_from(rpc_args(&["base", "rpc", "--enable-tx-forwarding"]))
             .unwrap_err();
 
         let rendered = err.to_string();
-        assert!(rendered.contains("--enable-tx-forwarding"));
+        assert!(rendered.contains("--builder-rpc-urls"));
     }
 
     #[test]

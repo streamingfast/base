@@ -1,14 +1,15 @@
 use std::{fmt, path::Path, time::Duration};
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 use alloy_signer_local::PrivateKeySigner;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as SerdeError};
 use url::Url;
 
 use super::{
-    parsing::{parse_address, parse_amount, validate_swap_amounts},
+    parsing::validate_swap_amounts,
     precompile::PrecompileTarget,
     real_token::{RealTokenSetupConfig, parse_real_token_setup},
+    validity::ValidityConfig,
 };
 use crate::{
     metrics::ConfigSummary,
@@ -85,6 +86,9 @@ pub struct TestConfig {
     /// Test duration (e.g., "30s", "5m", "1h").
     pub duration: Option<String>,
 
+    /// Optional measured canonical block window size.
+    pub measurement_blocks: Option<u64>,
+
     /// Optional gas/s target used to size each block's mempool floor.
     #[serde(default)]
     pub target_gps: Option<u64>,
@@ -119,7 +123,7 @@ pub struct TestConfig {
 
     /// Address of the precompile looper contract (required when using iterations > 1).
     #[serde(default)]
-    pub looper_contract: Option<String>,
+    pub looper_contract: Option<Address>,
 
     /// Amount of each swap token to distribute to each sender (in wei, as string).
     /// Only used when swap transaction types are configured.
@@ -142,6 +146,11 @@ pub struct TestConfig {
     /// re-funded via deposit rather than reclaimed.
     #[serde(default)]
     pub skip_drain: bool,
+
+    /// Validity (conditional) transaction workload. When `ratio` is `0.0`
+    /// (the default), no validity transactions are submitted.
+    #[serde(default)]
+    pub validity: ValidityConfig,
 }
 
 impl Default for TestConfig {
@@ -162,6 +171,7 @@ impl Default for TestConfig {
             max_concurrent_submit_requests: None,
             batch_size: default_batch_size(),
             duration: Some("60s".to_string()),
+            measurement_blocks: None,
             target_gps: Some(20_000_000),
             block_time: default_block_time(),
             seed: 12345,
@@ -173,6 +183,7 @@ impl Default for TestConfig {
             b20_mint_amount: default_b20_mint_amount(),
             real_token_setup: None,
             skip_drain: false,
+            validity: ValidityConfig::default(),
         }
     }
 }
@@ -193,6 +204,7 @@ impl fmt::Debug for TestConfig {
             .field("max_concurrent_submit_requests", &self.max_concurrent_submit_requests)
             .field("batch_size", &self.batch_size)
             .field("duration", &self.duration)
+            .field("measurement_blocks", &self.measurement_blocks)
             .field("target_gps", &self.target_gps)
             .field("block_time", &self.block_time)
             .field("seed", &self.seed)
@@ -204,6 +216,7 @@ impl fmt::Debug for TestConfig {
             .field("b20_mint_amount", &self.b20_mint_amount)
             .field("real_token_setup", &self.real_token_setup)
             .field("skip_drain", &self.skip_drain)
+            .field("validity", &self.validity)
             .finish()
     }
 }
@@ -252,16 +265,22 @@ pub enum TxTypeConfig {
     /// ERC20 token transfer (requires deployed contract).
     Erc20 {
         /// ERC20 contract address.
-        contract: String,
+        contract: Address,
     },
 
     /// Storage-heavy contract write (requires deployed contract).
     Storage {
         /// Storage-writer contract address.
-        contract: String,
+        contract: Address,
         /// Number of storage slots to write per transaction.
         #[serde(default = "default_storage_slots_per_tx")]
         slots_per_tx: u32,
+    },
+
+    /// Deterministic `DoubleCounter` `increment()` call.
+    DoubleCounter {
+        /// `DoubleCounter` contract address.
+        contract: Address,
     },
 
     /// Precompile call.
@@ -282,26 +301,26 @@ pub enum TxTypeConfig {
     /// Uniswap V3 style swap.
     UniswapV3 {
         /// Router contract address.
-        router: String,
+        router: Address,
         /// Input token address.
-        token_in: String,
+        token_in: Address,
         /// Output token address.
-        token_out: String,
+        token_out: Address,
         /// Fee tier (default 3000 = 0.3%).
         #[serde(default = "default_uniswap_v3_fee")]
         fee: u32,
         /// Minimum swap amount in wei.
         #[serde(default = "default_swap_min_amount")]
-        min_amount: String,
+        min_amount: U256,
         /// Maximum swap amount in wei.
         #[serde(default = "default_swap_max_amount")]
-        max_amount: String,
+        max_amount: U256,
         /// Minimum amount when swapping `token_out` to `token_in`.
         #[serde(default)]
-        reverse_min_amount: Option<String>,
+        reverse_min_amount: Option<U256>,
         /// Maximum amount when swapping `token_out` to `token_in`.
         #[serde(default)]
-        reverse_max_amount: Option<String>,
+        reverse_max_amount: Option<U256>,
     },
     /// B-20 precompile token transfer. Each sender creates and transfers its own token, created
     /// per run during setup.
@@ -310,26 +329,26 @@ pub enum TxTypeConfig {
     /// Aerodrome Slipstream (concentrated liquidity) swap.
     AerodromeCl {
         /// CL Router contract address.
-        router: String,
+        router: Address,
         /// Input token address.
-        token_in: String,
+        token_in: Address,
         /// Output token address.
-        token_out: String,
+        token_out: Address,
         /// Tick spacing for the pool.
         #[serde(default = "default_aerodrome_tick_spacing")]
         tick_spacing: i32,
         /// Minimum swap amount in wei.
         #[serde(default = "default_swap_min_amount")]
-        min_amount: String,
+        min_amount: U256,
         /// Maximum swap amount in wei.
         #[serde(default = "default_swap_max_amount")]
-        max_amount: String,
+        max_amount: U256,
         /// Minimum amount when swapping `token_out` to `token_in`.
         #[serde(default)]
-        reverse_min_amount: Option<String>,
+        reverse_min_amount: Option<U256>,
         /// Maximum amount when swapping `token_out` to `token_in`.
         #[serde(default)]
-        reverse_max_amount: Option<String>,
+        reverse_max_amount: Option<U256>,
     },
 }
 
@@ -354,12 +373,12 @@ const fn default_storage_slots_per_tx() -> u32 {
 /// Target RPCs may enforce a lower per-tx ceiling; tune `slots_per_tx` to fit.
 const MAX_STORAGE_SLOTS_PER_TX: u32 = 1_300;
 
-fn default_swap_min_amount() -> String {
-    "1000000000000000".to_string()
+fn default_swap_min_amount() -> U256 {
+    U256::from(1_000_000_000_000_000u64)
 }
 
-fn default_swap_max_amount() -> String {
-    "10000000000000000".to_string()
+fn default_swap_max_amount() -> U256 {
+    U256::from(10_000_000_000_000_000u64)
 }
 
 const fn default_uniswap_v3_fee() -> u32 {
@@ -415,6 +434,14 @@ impl TestConfig {
         if self.batch_size == 0 {
             return Err(BaselineError::Config("batch_size must be > 0".into()));
         }
+        if self.parse_duration()? == Some(Duration::ZERO) {
+            return Err(BaselineError::Config(
+                "duration must be > 0 (or omit for continuous)".into(),
+            ));
+        }
+        if self.measurement_blocks == Some(0) {
+            return Err(BaselineError::Config("measurement_blocks must be > 0 when set".into()));
+        }
 
         if self.transaction_submission_rpcs.is_empty() {
             return Err(BaselineError::Config(
@@ -444,6 +471,8 @@ impl TestConfig {
         if self.parse_block_time()?.is_zero() {
             return Err(BaselineError::Config("block_time must be > 0".into()));
         }
+
+        self.validity.validate()?;
 
         Ok(())
     }
@@ -573,6 +602,7 @@ impl TestConfig {
             max_concurrent_submit_requests: self.max_concurrent_submit_requests,
             batch_size: self.batch_size,
             duration: self.duration.clone(),
+            measurement_blocks: self.measurement_blocks,
             target_gps: self.target_gps,
             block_time: self.block_time.clone(),
             seed: self.seed,
@@ -586,7 +616,12 @@ impl TestConfig {
                 })
                 .unwrap_or_default(),
             fresh_recipient_ratio: self.fresh_recipient_ratio,
-            looper_contract: self.looper_contract.clone(),
+            validity_ratio: self.validity.ratio,
+            validity_predicate_count: self.validity.predicates.len(),
+            validity_priority_lead_ratio: self.validity.priority_lead_ratio,
+            validity_priority_lead_multiplier: self.validity.priority_lead_multiplier,
+            validity_priority_fee_divisor: self.validity.priority_fee_divisor,
+            looper_contract: self.looper_contract.map(|addr| addr.to_string()),
             swap_token_amount: self.swap_token_amount.clone(),
             b20_mint_amount: self.b20_mint_amount.clone(),
             real_token_setup: self
@@ -643,6 +678,7 @@ impl TestConfig {
             block_time,
             separate_setup: None,
             duration,
+            measurement_blocks: self.measurement_blocks,
             max_in_flight_per_sender: self.in_flight_per_sender as usize,
             max_total_in_flight: self.max_total_in_flight.map(|max| max as usize),
             max_concurrent_submit_requests: self
@@ -652,6 +688,11 @@ impl TestConfig {
             max_gas_price: crate::runner::DEFAULT_MAX_GAS_PRICE,
             flashblocks_ws: self.flashblocks_ws.clone(),
             fresh_recipient_ratio: self.fresh_recipient_ratio,
+            validity_ratio: self.validity.ratio,
+            validity_predicates: self.validity.to_templates()?,
+            validity_priority_lead_ratio: self.validity.priority_lead_ratio,
+            validity_priority_lead_multiplier: self.validity.priority_lead_multiplier,
+            validity_priority_fee_divisor: self.validity.priority_fee_divisor,
         })
     }
 
@@ -661,36 +702,25 @@ impl TestConfig {
             TxTypeConfig::Calldata { max_size, repeat_count } => {
                 TxType::Calldata { max_size: *max_size, repeat_count: *repeat_count }
             }
-            TxTypeConfig::Erc20 { contract } => {
-                let address = contract.parse::<Address>().map_err(|e| {
-                    BaselineError::Config(format!(
-                        "invalid erc20 contract address '{contract}': {e}"
-                    ))
-                })?;
-                TxType::Erc20 { contract: address }
-            }
+            TxTypeConfig::Erc20 { contract } => TxType::Erc20 { contract: *contract },
             TxTypeConfig::Storage { contract, slots_per_tx } => {
-                let address = parse_address(contract, "storage contract")?;
                 if !(1..=MAX_STORAGE_SLOTS_PER_TX).contains(slots_per_tx) {
                     return Err(BaselineError::Config(format!(
                         "storage slots_per_tx must be 1..={MAX_STORAGE_SLOTS_PER_TX}"
                     )));
                 }
-                TxType::Storage { contract: address, slots_per_tx: *slots_per_tx }
+                TxType::Storage { contract: *contract, slots_per_tx: *slots_per_tx }
+            }
+            TxTypeConfig::DoubleCounter { contract } => {
+                TxType::DoubleCounter { contract: *contract }
             }
             TxTypeConfig::Precompile { target, iterations } => {
                 let looper_contract = if *iterations > 1 {
-                    let addr_str = self.looper_contract.as_ref().ok_or_else(|| {
+                    Some(self.looper_contract.ok_or_else(|| {
                         BaselineError::Config(
                             "looper_contract required when precompile iterations > 1".into(),
                         )
-                    })?;
-                    let addr = addr_str.parse::<Address>().map_err(|e| {
-                        BaselineError::Config(format!(
-                            "invalid looper_contract address '{addr_str}': {e}"
-                        ))
-                    })?;
-                    Some(addr)
+                    })?)
                 } else {
                     None
                 };
@@ -713,38 +743,27 @@ impl TestConfig {
                 reverse_min_amount,
                 reverse_max_amount,
             } => {
-                let router = parse_address(router, "uniswap_v3 router")?;
-                let token_in = parse_address(token_in, "uniswap_v3 token_in")?;
-                let token_out = parse_address(token_out, "uniswap_v3 token_out")?;
                 let max_u24: u32 = (1 << 24) - 1;
                 if *fee > max_u24 {
                     return Err(BaselineError::Config(format!(
                         "uniswap_v3 fee {fee} exceeds u24 max ({max_u24})"
                     )));
                 }
-                let min_amount = parse_amount(min_amount, "uniswap_v3 min_amount")?;
-                let max_amount = parse_amount(max_amount, "uniswap_v3 max_amount")?;
-                validate_swap_amounts(min_amount, max_amount, "uniswap_v3")?;
-                let reverse_min_amount = match reverse_min_amount {
-                    Some(amount) => parse_amount(amount, "uniswap_v3 reverse_min_amount")?,
-                    None => min_amount,
-                };
-                let reverse_max_amount = match reverse_max_amount {
-                    Some(amount) => parse_amount(amount, "uniswap_v3 reverse_max_amount")?,
-                    None => max_amount,
-                };
+                validate_swap_amounts(*min_amount, *max_amount, "uniswap_v3")?;
+                let reverse_min_amount = reverse_min_amount.unwrap_or(*min_amount);
+                let reverse_max_amount = reverse_max_amount.unwrap_or(*max_amount);
                 validate_swap_amounts(
                     reverse_min_amount,
                     reverse_max_amount,
                     "uniswap_v3 reverse",
                 )?;
                 TxType::UniswapV3 {
-                    router,
-                    token_in,
-                    token_out,
+                    router: *router,
+                    token_in: *token_in,
+                    token_out: *token_out,
                     fee: *fee,
-                    min_amount,
-                    max_amount,
+                    min_amount: *min_amount,
+                    max_amount: *max_amount,
                     reverse_min_amount,
                     reverse_max_amount,
                 }
@@ -759,20 +778,9 @@ impl TestConfig {
                 reverse_min_amount,
                 reverse_max_amount,
             } => {
-                let router = parse_address(router, "aerodrome_cl router")?;
-                let token_in = parse_address(token_in, "aerodrome_cl token_in")?;
-                let token_out = parse_address(token_out, "aerodrome_cl token_out")?;
-                let min_amount = parse_amount(min_amount, "aerodrome_cl min_amount")?;
-                let max_amount = parse_amount(max_amount, "aerodrome_cl max_amount")?;
-                validate_swap_amounts(min_amount, max_amount, "aerodrome_cl")?;
-                let reverse_min_amount = match reverse_min_amount {
-                    Some(amount) => parse_amount(amount, "aerodrome_cl reverse_min_amount")?,
-                    None => min_amount,
-                };
-                let reverse_max_amount = match reverse_max_amount {
-                    Some(amount) => parse_amount(amount, "aerodrome_cl reverse_max_amount")?,
-                    None => max_amount,
-                };
+                validate_swap_amounts(*min_amount, *max_amount, "aerodrome_cl")?;
+                let reverse_min_amount = reverse_min_amount.unwrap_or(*min_amount);
+                let reverse_max_amount = reverse_max_amount.unwrap_or(*max_amount);
                 validate_swap_amounts(
                     reverse_min_amount,
                     reverse_max_amount,
@@ -784,12 +792,12 @@ impl TestConfig {
                     )));
                 }
                 TxType::AerodromeCl {
-                    router,
-                    token_in,
-                    token_out,
+                    router: *router,
+                    token_in: *token_in,
+                    token_out: *token_out,
                     tick_spacing: *tick_spacing,
-                    min_amount,
-                    max_amount,
+                    min_amount: *min_amount,
+                    max_amount: *max_amount,
                     reverse_min_amount,
                     reverse_max_amount,
                 }
@@ -834,6 +842,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn denim_profile_preserves_gas_per_second() {
+        let baseline = TestConfig::from_yaml(include_str!("../../examples/devnet.yaml")).unwrap();
+        let config =
+            TestConfig::from_yaml(include_str!("../../examples/denim-devnet.yaml")).unwrap();
+        let load = config.to_load_config(Some(1337)).unwrap();
+
+        assert_eq!(load.block_time, Duration::from_millis(200));
+        assert_eq!(load.target_gps, baseline.target_gps);
+        assert_eq!(
+            serde_json::to_value(&config.transactions).unwrap(),
+            serde_json::to_value(&baseline.transactions).unwrap()
+        );
+        assert_eq!(load.target_gps.unwrap() as f64 * load.block_time.as_secs_f64(), 4_000_000.0);
+        assert!(load.flashblocks_ws.is_none());
+        assert!(load.txpool_nodes.is_empty());
+    }
 
     #[test]
     fn parse_minimal_config() {
@@ -945,6 +971,28 @@ duration: "1h 30m"
     }
 
     #[test]
+    fn parse_measurement_blocks_round_trips() {
+        let yaml = r#"
+transaction_submission_rpcs: http://localhost:8545
+measurement_blocks: 500
+"#;
+        let config = TestConfig::from_yaml(yaml).unwrap();
+        assert_eq!(config.measurement_blocks, Some(500));
+        assert_eq!(config.to_load_config(Some(1337)).unwrap().measurement_blocks, Some(500));
+        assert_eq!(config.to_summary().measurement_blocks, Some(500));
+    }
+
+    #[test]
+    fn rejects_zero_measurement_blocks() {
+        let yaml = r#"
+transaction_submission_rpcs: http://localhost:8545
+measurement_blocks: 0
+"#;
+        let error = TestConfig::from_yaml(yaml).unwrap_err();
+        assert!(error.to_string().contains("measurement_blocks must be > 0 when set"));
+    }
+
+    #[test]
     fn parse_precompile_targets() {
         let yaml = r#"
 transaction_submission_rpcs: http://localhost:8545
@@ -1043,7 +1091,10 @@ transactions:
         assert_eq!(config.transactions.len(), 1);
         match &config.transactions[0].tx_type {
             TxTypeConfig::Storage { contract, slots_per_tx } => {
-                assert_eq!(contract, "0x1234567890123456789012345678901234567890");
+                assert_eq!(
+                    *contract,
+                    "0x1234567890123456789012345678901234567890".parse::<Address>().unwrap()
+                );
                 assert_eq!(*slots_per_tx, 25);
             }
             _ => panic!("expected Storage"),
@@ -1141,11 +1192,11 @@ transactions:
     contract: "not_an_address"
     slots_per_tx: 5
 "#;
-        let config = TestConfig::from_yaml(yaml).unwrap();
-        let err = config.to_load_config(Some(1337)).unwrap_err();
+        // An invalid address is now rejected eagerly by serde at deserialize time.
+        let err = TestConfig::from_yaml(yaml).unwrap_err();
         assert!(
-            err.to_string().contains("storage contract"),
-            "expected storage contract address error, got: {err}"
+            err.to_string().contains("failed to parse YAML"),
+            "expected eager deserialize error for invalid address, got: {err}"
         );
     }
 
@@ -1303,6 +1354,154 @@ transactions:
             }
             _ => panic!("expected UniswapV3"),
         }
+    }
+
+    #[test]
+    fn validity_defaults_to_disabled() {
+        let yaml = r#"
+transaction_submission_rpcs: http://localhost:8545
+flashblocks_ws: ws://localhost:7111
+"#;
+        let config = TestConfig::from_yaml(yaml).unwrap();
+        assert_eq!(config.validity.ratio, 0.0);
+        let load_config = config.to_load_config(Some(1337)).unwrap();
+        assert_eq!(load_config.validity_ratio, 0.0);
+        assert!(load_config.validity_predicates.is_empty());
+        assert_eq!(config.to_summary().validity_ratio, 0.0);
+    }
+
+    #[test]
+    fn validity_config_round_trips_predicates() {
+        let yaml = r#"
+transaction_submission_rpcs: http://localhost:8545
+flashblocks_ws: ws://localhost:7111
+validity:
+  ratio: 0.25
+  predicates:
+    - type: balance
+      address: sender
+      op: ">="
+      value: "0"
+    - type: storage
+      address: "0x1234567890123456789012345678901234567890"
+      slot:
+        kind: mapping
+        mapping_slot: "0x0"
+        key: sender
+      op: ">="
+      value: "0x0"
+"#;
+        let config = TestConfig::from_yaml(yaml).unwrap();
+        assert_eq!(config.validity.ratio, 0.25);
+        assert_eq!(config.validity.predicates.len(), 2);
+
+        let load_config = config.to_load_config(Some(1337)).unwrap();
+        assert_eq!(load_config.validity_ratio, 0.25);
+        assert_eq!(load_config.validity_predicates.len(), 2);
+
+        let summary = config.to_summary();
+        assert_eq!(summary.validity_ratio, 0.25);
+        assert_eq!(summary.validity_predicate_count, 2);
+    }
+
+    #[test]
+    fn validity_devnet_example_parses_and_validates() {
+        // Guards the committed example against schema drift: it must parse,
+        // validate, and lower to a runnable LoadConfig with the validity cohort.
+        let yaml = include_str!("../../examples/validity-devnet.yaml");
+        let config = TestConfig::from_yaml(yaml).expect("validity-devnet.yaml must parse");
+        assert_eq!(config.validity.ratio, 0.5);
+        assert_eq!(config.validity.predicates.len(), 1);
+
+        let load_config = config.to_load_config(Some(1337)).expect("must lower to LoadConfig");
+        assert_eq!(load_config.validity_ratio, 0.5);
+        assert_eq!(load_config.validity_predicates.len(), 1);
+    }
+
+    #[test]
+    fn validity_rejects_ratio_above_one() {
+        let yaml = r#"
+transaction_submission_rpcs: http://localhost:8545
+flashblocks_ws: ws://localhost:7111
+validity:
+  ratio: 1.5
+  predicates:
+    - type: balance
+      op: ">="
+      value: "0"
+"#;
+        let err = TestConfig::from_yaml(yaml).unwrap_err();
+        assert!(err.to_string().contains("validity.ratio"));
+    }
+
+    #[test]
+    fn validity_rejects_enabled_without_predicates() {
+        let yaml = r#"
+transaction_submission_rpcs: http://localhost:8545
+flashblocks_ws: ws://localhost:7111
+validity:
+  ratio: 0.5
+"#;
+        let err = TestConfig::from_yaml(yaml).unwrap_err();
+        assert!(err.to_string().contains("validity.predicates must be non-empty"));
+    }
+
+    #[test]
+    fn double_counter_and_validity_priority_round_trip_to_runtime_and_summary() {
+        let yaml = r#"
+transaction_submission_rpcs: http://localhost:8545
+transactions:
+  - weight: 100
+    type: double_counter
+    contract: "0x1111111111111111111111111111111111111111"
+validity:
+  priority_lead_ratio: 0.2
+  priority_lead_multiplier: 4
+  priority_fee_divisor: 3
+"#;
+        let config = TestConfig::from_yaml(yaml).unwrap();
+        assert_eq!(config.validity.priority_lead_ratio, 0.2);
+        assert_eq!(config.validity.priority_lead_multiplier, 4);
+        assert_eq!(config.validity.priority_fee_divisor, 3);
+        assert!(matches!(config.transactions[0].tx_type, TxTypeConfig::DoubleCounter { .. }));
+
+        let load = config.to_load_config(Some(1337)).unwrap();
+        assert_eq!(load.validity_priority_lead_ratio, 0.2);
+        assert_eq!(load.validity_priority_lead_multiplier, 4);
+        assert_eq!(load.validity_priority_fee_divisor, 3);
+        assert!(matches!(load.transactions[0].tx_type, TxType::DoubleCounter { .. }));
+        assert_eq!(config.to_summary().validity_priority_fee_divisor, 3);
+        assert_eq!(config.to_summary().validity_priority_lead_ratio, 0.2);
+        assert_eq!(config.to_summary().validity_priority_lead_multiplier, 4);
+    }
+
+    #[test]
+    fn validity_priority_divisor_defaults_to_one_and_rejects_zero() {
+        let config =
+            TestConfig::from_yaml("transaction_submission_rpcs: http://localhost:8545").unwrap();
+        assert_eq!(config.validity.priority_fee_divisor, 1);
+        assert_eq!(config.to_load_config(Some(1337)).unwrap().validity_priority_fee_divisor, 1);
+
+        let error = TestConfig::from_yaml(
+            "transaction_submission_rpcs: http://localhost:8545\nvalidity:\n  priority_fee_divisor: 0",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("priority_fee_divisor must be >= 1"));
+    }
+
+    #[test]
+    fn validity_priority_lead_settings_reject_out_of_range_values() {
+        let error = TestConfig::from_yaml(
+            "transaction_submission_rpcs: http://localhost:8545\nvalidity:\n  priority_lead_ratio: 1.1",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("priority_lead_ratio must be between 0.0 and 1.0"));
+
+        let error = TestConfig::from_yaml(
+            "transaction_submission_rpcs: http://localhost:8545\nvalidity:\n  priority_lead_multiplier: 0",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("priority_lead_multiplier must be >= 1"));
     }
 
     #[test]

@@ -138,7 +138,7 @@ impl StablecoinV1 {
     /// Ensures `policy_scope` names a built-in B-20 policy slot available on the frozen V1 (Beryl)
     /// common surface.
     ///
-    /// The seize scopes (`SEIZE_HOLDER_POLICY` / `SEIZE_RECEIVER_POLICY`) were introduced at Cobalt
+    /// The seize scopes (`SEIZE_EXEMPT_POLICY` / `SEIZE_RECEIVER_POLICY`) were introduced at Cobalt
     /// (V2), so they are rejected here — matching the base-std `v1.0.0` reference. This is what keeps
     /// the common `updatePolicy` / `policyId` selectors (dialable on V1) from reaching a V2-only
     /// scope.
@@ -156,7 +156,7 @@ impl StablecoinV1 {
                 | B20PolicyType::MintReceiver,
             ) => Ok(()),
             // Cobalt (V2)-only scopes, and any unrecognized id, are not part of the frozen V1 surface.
-            Some(B20PolicyType::SeizeHolder | B20PolicyType::SeizeReceiver) | None => {
+            Some(B20PolicyType::SeizeExempt | B20PolicyType::SeizeReceiver) | None => {
                 Err(BasePrecompileError::revert(IB20::UnsupportedPolicyType {
                     policyScope: policy_scope,
                 }))
@@ -565,12 +565,12 @@ impl<S: StablecoinAccounting, A: PolicyAccounting> Stablecoin<S, A> for Stableco
             B20Guards::ensure_token_role(token, caller, B20TokenRole::DefaultAdmin)?;
         }
         Self::ensure_supported_policy_type(policy_scope)?;
+        let old_policy_id = token.accounting().policy_id(policy_scope)?;
         if !token.policy().policy_exists(token.policy_storage(), new_policy_id)? {
             return Err(BasePrecompileError::revert(IB20::PolicyNotFound {
                 policyId: new_policy_id,
             }));
         }
-        let old_policy_id = token.accounting().policy_id(policy_scope)?;
         token.accounting_mut().set_policy_id(policy_scope, new_policy_id)?;
         token.accounting_mut().emit_event(
             IB20::PolicyUpdated {
@@ -854,6 +854,12 @@ mod tests {
         }
         fn emit_event(&mut self, log: LogData) -> Result<()> {
             self.events.push(log);
+            Ok(())
+        }
+        fn metered_keccak256(&self, data: &[u8]) -> Result<B256> {
+            Ok(keccak256(data))
+        }
+        fn deduct_gas(&self, _gas: u64) -> Result<()> {
             Ok(())
         }
     }

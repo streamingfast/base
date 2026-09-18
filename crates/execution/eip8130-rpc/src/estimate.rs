@@ -8,8 +8,7 @@ use alloy_evm::{
 use alloy_primitives::U256;
 use alloy_rpc_types::state::EvmOverrides;
 use base_common_evm::BaseTransaction as BaseRevm;
-use base_common_network::Base;
-use base_common_rpc_types::BaseTransactionRequest;
+use base_common_rpc_types::{BaseRpcTypes, BaseTransactionRequest};
 use jsonrpsee_types::{ErrorObjectOwned, error::INVALID_PARAMS_CODE};
 use reth_evm::{EvmFactoryFor, HaltReasonFor, TxEnvFor};
 use reth_rpc_eth_api::{
@@ -34,8 +33,8 @@ use revm::context::{Block, BlockEnv, TxEnv, result::ExecutionResult};
 /// the whole gas limit from scratch). The simulation is built from an unsigned
 /// request with a stub authentication blob and never commits state.
 ///
-/// **Fork-agnostic on purpose.** This does not check Cobalt activation; callers
-/// must gate via [`crate::Eip8130CobaltGate`] before invoking it.
+/// **Fork-agnostic on purpose.** This does not check Zenith activation; callers
+/// must gate via [`crate::Eip8130ZenithGate`] before invoking it.
 ///
 /// **Revert semantics match standard `eth_estimateGas`.** If a phased call
 /// reverts (or the simulation halts), this returns an execution error carrying
@@ -71,7 +70,12 @@ impl Eip8130GasEstimator {
         overrides: EvmOverrides,
     ) -> Result<U256, ErrorObjectOwned>
     where
-        Eth: FullEthApi<NetworkTypes = Base> + LoadPendingBlock + Clone + Send + Sync + 'static,
+        Eth: FullEthApi<NetworkTypes = BaseRpcTypes>
+            + LoadPendingBlock
+            + Clone
+            + Send
+            + Sync
+            + 'static,
         Eth::Error: FromEthApiError,
         TxEnvFor<Eth::Evm>: From<BaseRevm<TxEnv>>,
         // Pin the block env to revm's concrete type so block overrides can be

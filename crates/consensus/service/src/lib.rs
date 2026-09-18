@@ -19,6 +19,12 @@ pub use service::{
 mod follow;
 pub use follow::{FollowError, RemoteClient, RemoteL2Client, RemoteL2ClientError};
 
+mod standalone;
+pub use standalone::{
+    StandaloneAttributesBuilder, StandaloneDerivationClient, StandaloneOriginSelector,
+    StandalonePrefund, StandaloneSequencerNode, StandaloneUnsafePayloadGossipClient,
+};
+
 mod actors;
 pub use actors::{
     AlloyL1BlockFetcher, BlockStream, BuildOutcome, BuildPipelineState, BuildRequest,
@@ -46,7 +52,7 @@ pub use actors::{
     RpcActor, RpcActorError, RpcContext, ScheduledTicker, SealState, SealStepError,
     SealStepOutcome, SequencerActor, SequencerActorError, SequencerAdminQuery, SequencerConfig,
     SequencerEngineClient, SequencerEngineRequestCoordinator, SequencerEngineState, ShadowCycle,
-    ShadowReconciliationGate, ShadowReconciliationTask, ShadowSequencingState,
+    ShadowFunding, ShadowReconciliationGate, ShadowReconciliationTask, ShadowSequencingState,
     UnsafePayloadGossipClient, UnsafePayloadGossipClientError, UnsealedPayloadHandle,
     UpgradeSignalMetricsActor, UpgradeSignalNodeConfig, ValidatorEngineRequestHandler,
 };

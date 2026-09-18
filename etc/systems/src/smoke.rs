@@ -6,7 +6,11 @@ use std::{
     sync::{Mutex, OnceLock},
     time::Duration,
 };
-use std::{num::NonZeroU64, path::PathBuf};
+use std::{
+    fs::{self, OpenOptions},
+    num::NonZeroU64,
+    path::PathBuf,
+};
 
 use alloy_network::Ethereum;
 use alloy_primitives::B256;
@@ -28,21 +32,55 @@ use url::Url;
 #[cfg(feature = "upgrade-signal")]
 use crate::upgrade_signal::{MockProtocolVersionsClient, UpgradeSignalStackOptions};
 use crate::{
-    BATCHER, BUILDER, SEQUENCER,
+    BATCHER, BUILDER, DEPLOYER, DeployerContainer, RoleAddresses, SEQUENCER, SharedL1Runtime,
     l1::{L1ContainerConfig, L1Execution, L1RpcProxy, L1Stack, L1StackConfig},
     l2::{
         L2ClientConsensusMode, L2ContainerConfig, L2Stack, L2StackConfig, ShadowSequencersConfig,
+        SnapshotL2Stack, SnapshotL2StackConfig,
     },
     setup::{L1GenesisOutput, L2DeploymentOutput, SetupContainer},
-    system_config::StableSystemTestConfig,
+    system_config::{DevnetConfig, DevnetL1Mode, DevnetL2State},
 };
 
-const DEFAULT_L1_CHAIN_ID: u64 = 1337;
-const DEFAULT_L2_CHAIN_ID: u64 = 84538453;
-/// L1 beacon slot duration. Live `op-deployer` confirms one transaction per L1
-/// slot, so this dominates stack startup time.
-const DEFAULT_SLOT_DURATION: u64 = 1;
 const DEFAULT_SHADOW_BLOCKS_PER_CYCLE: NonZeroU64 = NonZeroU64::new(3).unwrap();
+
+fn deploy_against_shared_l1(
+    runtime: &SharedL1Runtime,
+    output_dir: &std::path::Path,
+    l2_chain_id: u64,
+) -> Result<(L1GenesisOutput, L2DeploymentOutput)> {
+    // All consumers share the fixture's funded deployer account. Serialize live deployments
+    // across nextest processes so independently constructed op-deployer instances do not race
+    // the account nonce.
+    let deployment_lock_path = std::env::temp_dir()
+        .join(format!("base-system-tests-{}.deployment.lock", runtime.network_name));
+    let deployment_lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&deployment_lock_path)
+        .wrap_err("failed to open shared L1 deployment lock")?;
+    deployment_lock.lock().wrap_err("failed to acquire shared L1 deployment lock")?;
+
+    fs::create_dir_all(output_dir.join("el"))?;
+    fs::write(output_dir.join("el/genesis.json"), &runtime.genesis_json)?;
+    DeployerContainer::new(
+        runtime.internal_rpc_url.parse().wrap_err("invalid shared L1 internal RPC URL")?,
+        runtime.chain_id,
+        l2_chain_id,
+        DEPLOYER.private_key,
+        RoleAddresses::default(),
+    )
+    .with_network(&runtime.network_name)
+    .with_output_dir(output_dir.join("l2"))
+    .deploy()
+    .wrap_err("failed to deploy isolated L2 contracts against shared L1")?;
+    Ok((
+        L1GenesisOutput::from_output_dir(output_dir),
+        L2DeploymentOutput::from_output_dir(output_dir),
+    ))
+}
 
 /// Longest wait for a live L1 schedule change to be re-applied by a runtime-admin node (the
 /// upgrade signal poll interval is 12s).
@@ -107,7 +145,7 @@ pub struct SystemTestStack {
     l2_chain_id: u64,
     l1_genesis: L1GenesisOutput,
     l2_deployment: L2DeploymentOutput,
-    l1_stack: L1Stack,
+    l1_stack: L1StackHandle,
     l2_stack: L2Stack,
     l1_rpc_proxy: Option<L1RpcProxy>,
     #[cfg(feature = "upgrade-signal")]
@@ -116,6 +154,36 @@ pub struct SystemTestStack {
     /// (and their upgrade-signal writer tasks) must shut down first.
     #[cfg(feature = "upgrade-signal")]
     _runtime_upgrade_signal_guard: Option<RuntimeUpgradeSignalGuard>,
+}
+
+/// Either a dedicated L1 owned by this stack or a CI-scoped shared fixture.
+#[derive(Debug)]
+enum L1StackHandle {
+    Dedicated(Box<L1Stack>),
+    Shared(SharedL1Runtime),
+}
+
+impl L1StackHandle {
+    fn stack(&self) -> &L1Stack {
+        match self {
+            Self::Dedicated(stack) => stack,
+            Self::Shared(_) => panic!("shared L1 does not expose exclusive stack control"),
+        }
+    }
+
+    async fn rpc_url(&self) -> Result<Url> {
+        match self {
+            Self::Dedicated(stack) => stack.rpc_url().await,
+            Self::Shared(runtime) => runtime.rpc_url.parse().wrap_err("invalid shared L1 RPC URL"),
+        }
+    }
+
+    async fn beacon_url(&self) -> Result<String> {
+        match self {
+            Self::Dedicated(stack) => stack.beacon_url().await,
+            Self::Shared(runtime) => Ok(runtime.beacon_url.clone()),
+        }
+    }
 }
 
 impl std::fmt::Debug for SystemTestStack {
@@ -129,8 +197,8 @@ impl std::fmt::Debug for SystemTestStack {
 
 impl SystemTestStack {
     /// Returns a reference to the L1 stack.
-    pub const fn l1_stack(&self) -> &L1Stack {
-        &self.l1_stack
+    pub fn l1_stack(&self) -> &L1Stack {
+        self.l1_stack.stack()
     }
 
     /// Returns a reference to the L2 stack.
@@ -165,12 +233,18 @@ impl SystemTestStack {
 
     /// Returns the internal RPC URL of the L1 Reth node.
     pub fn l1_internal_rpc_url(&self) -> String {
-        self.l1_stack.reth().internal_rpc_url()
+        match &self.l1_stack {
+            L1StackHandle::Dedicated(stack) => stack.reth().internal_rpc_url(),
+            L1StackHandle::Shared(runtime) => runtime.internal_rpc_url.clone(),
+        }
     }
 
     /// Returns the internal beacon URL of the L1 Lighthouse beacon node.
     pub fn l1_internal_beacon_url(&self) -> String {
-        self.l1_stack.beacon().internal_beacon_url()
+        match &self.l1_stack {
+            L1StackHandle::Dedicated(stack) => stack.beacon().internal_beacon_url(),
+            L1StackHandle::Shared(runtime) => runtime.internal_beacon_url.clone(),
+        }
     }
 
     /// Returns the L2 client's RPC URL.
@@ -272,14 +346,44 @@ impl SystemTestStack {
             l2_client_consensus_rpc: self.l2_stack().client_consensus_rpc_url().to_string(),
         })
     }
+
+    /// Stops in-process services before container-backed L1 resources are dropped.
+    pub async fn shutdown(self) -> Result<()> {
+        let Self {
+            _temp_dir,
+            #[cfg(feature = "upgrade-signal")]
+                l2_chain_id: _,
+            l1_genesis,
+            l2_deployment,
+            l1_stack,
+            l2_stack,
+            l1_rpc_proxy,
+            #[cfg(feature = "upgrade-signal")]
+            upgrade_signal,
+            #[cfg(feature = "upgrade-signal")]
+            _runtime_upgrade_signal_guard,
+        } = self;
+
+        let result = l2_stack.shutdown().await.wrap_err("Failed to shut down L2 stack");
+
+        #[cfg(feature = "upgrade-signal")]
+        drop(upgrade_signal);
+        drop(l1_rpc_proxy);
+        drop(l1_stack);
+        drop(l2_deployment);
+        drop(l1_genesis);
+        drop(_temp_dir);
+        #[cfg(feature = "upgrade-signal")]
+        drop(_runtime_upgrade_signal_guard);
+
+        result
+    }
 }
 
 /// Builder for creating a new `SystemTestStack`.
 #[derive(Debug, Default)]
 pub struct SystemTestStackBuilder {
-    l1_chain_id: Option<u64>,
-    l2_chain_id: Option<u64>,
-    slot_duration: Option<u64>,
+    devnet_config: DevnetConfig,
     isthmus_activation_block: Option<u64>,
     base_azul_activation_block: Option<u64>,
     base_beryl_activation_block: Option<u64>,
@@ -287,16 +391,18 @@ pub struct SystemTestStackBuilder {
     base_denim_activation_block: Option<u64>,
     base_zenith_activation_block: Option<u64>,
     output_dir: Option<PathBuf>,
-    stable_config: Option<StableSystemTestConfig>,
     tx_forwarding_config: Option<TxForwardingConfig>,
     enable_experimental_validity_transactions: bool,
+    payload_builder_cutover: bool,
     verifier_l1_confs: u64,
+    force_batch_submission: bool,
     client_consensus_mode: L2ClientConsensusMode,
     shadow_sequencer_count: usize,
     shadow_blocks_per_cycle: Option<NonZeroU64>,
     shadow_start_block: Option<u64>,
     tmpfs_datadirs: bool,
     l1_fault_injection: bool,
+    shared_l1: Option<SharedL1Runtime>,
     extra_builder_extensions: Vec<Box<dyn BaseNodeExtension>>,
     extra_client_extensions: Vec<Box<dyn BaseNodeExtension>>,
     #[cfg(feature = "upgrade-signal")]
@@ -304,26 +410,41 @@ pub struct SystemTestStackBuilder {
 }
 
 impl SystemTestStackBuilder {
+    const fn has_custom_fork_activation(&self) -> bool {
+        self.isthmus_activation_block.is_some()
+            || self.base_azul_activation_block.is_some()
+            || self.base_beryl_activation_block.is_some()
+            || self.base_cobalt_activation_block.is_some()
+            || self.base_denim_activation_block.is_some()
+            || self.base_zenith_activation_block.is_some()
+    }
+
     /// Creates a new `SystemTestStackBuilder` with default configuration.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Sets the canonical devnet configuration.
+    pub fn with_devnet_config(mut self, config: DevnetConfig) -> Self {
+        self.devnet_config = config;
+        self
+    }
+
     /// Sets the L1 chain ID.
     pub const fn with_l1_chain_id(mut self, chain_id: u64) -> Self {
-        self.l1_chain_id = Some(chain_id);
+        self.devnet_config.l1_chain_id = chain_id;
         self
     }
 
     /// Sets the L2 chain ID.
     pub const fn with_l2_chain_id(mut self, chain_id: u64) -> Self {
-        self.l2_chain_id = Some(chain_id);
+        self.devnet_config.l2_chain_id = chain_id;
         self
     }
 
     /// Sets the L1 beacon slot duration in seconds.
     pub const fn with_slot_duration(mut self, slot_duration: u64) -> Self {
-        self.slot_duration = Some(slot_duration);
+        self.devnet_config.l1_slot_duration = slot_duration;
         self
     }
 
@@ -370,8 +491,8 @@ impl SystemTestStackBuilder {
     }
 
     /// Enables stable container names and ports matching docker-compose.yml.
-    pub fn with_stable_config(mut self) -> Self {
-        self.stable_config = Some(StableSystemTestConfig::standard());
+    pub const fn with_stable_config(mut self) -> Self {
+        self.devnet_config.use_stable_ports = true;
         self
     }
 
@@ -386,6 +507,12 @@ impl SystemTestStackBuilder {
     /// Enables experimental validity transaction ingress and builder acceptance.
     pub const fn with_experimental_validity_transactions(mut self) -> Self {
         self.enable_experimental_validity_transactions = true;
+        self
+    }
+
+    /// Runs both payload builders and cuts selection from flashblocks to basic at Denim.
+    pub const fn with_payload_builder_cutover(mut self) -> Self {
+        self.payload_builder_cutover = true;
         self
     }
 
@@ -407,10 +534,25 @@ impl SystemTestStackBuilder {
         self
     }
 
+    /// Uses a CI-scoped L1 fixture instead of starting a dedicated L1 stack.
+    ///
+    /// The shared fixture is intentionally incompatible with L1 fault injection: reorg tests
+    /// must own and mutate their L1 exclusively.
+    pub fn with_shared_l1(mut self, runtime: SharedL1Runtime) -> Self {
+        self.shared_l1 = Some(runtime);
+        self
+    }
+
     /// Sets the number of L1 blocks to keep distance from the L1 head for the
     /// client (validator) node's derivation pipeline.
     pub const fn with_verifier_l1_confs(mut self, confs: u64) -> Self {
         self.verifier_l1_confs = confs;
+        self
+    }
+
+    /// Posts L2 batches as short-lived calldata so the derived safe head can catch up.
+    pub const fn with_force_batch_submission(mut self) -> Self {
+        self.force_batch_submission = true;
         self
     }
 
@@ -472,11 +614,86 @@ impl SystemTestStackBuilder {
         self
     }
 
+    /// Builds the L1-free snapshot stack represented by this devnet configuration.
+    pub async fn build_snapshot(self) -> Result<SnapshotL2Stack> {
+        let mut stack = self.build_snapshot_sequencer().await?;
+        stack.start_validator().await?;
+        stack.wait_for_validator().await?;
+        Ok(stack)
+    }
+
+    /// Builds the snapshot stack with only the sequencer phase active.
+    pub async fn build_snapshot_sequencer(self) -> Result<SnapshotL2Stack> {
+        self.devnet_config.validate().wrap_err("Invalid devnet configuration")?;
+        eyre::ensure!(
+            self.devnet_config.l1_mode == DevnetL1Mode::None,
+            "snapshot launcher requires L1-free mode"
+        );
+        let DevnetL2State::Snapshot(snapshot) = self.devnet_config.l2_state else {
+            eyre::bail!("snapshot launcher requires snapshot-backed L2 state")
+        };
+        let container_config = self.devnet_config.use_stable_ports.then(|| {
+            let ports = &self.devnet_config.stable.ports;
+            L2ContainerConfig {
+                use_stable_names: true,
+                network_name: Some(self.devnet_config.stable.network_name),
+                builder_http_port: Some(ports.l2_builder_http),
+                builder_ws_port: Some(ports.l2_builder_ws),
+                builder_auth_port: Some(ports.l2_builder_auth),
+                builder_p2p_port: Some(ports.l2_builder_p2p),
+                builder_flashblocks_port: Some(ports.l2_builder_flashblocks),
+                client_http_port: Some(ports.l2_client_http),
+                client_ws_port: Some(ports.l2_client_ws),
+                client_auth_port: Some(ports.l2_client_auth),
+                client_p2p_port: Some(ports.l2_client_p2p),
+                builder_consensus_rpc_port: None,
+                builder_consensus_p2p_tcp_port: None,
+                builder_consensus_p2p_udp_port: None,
+                client_consensus_rpc_port: Some(ports.l2_client_cl_rpc),
+                client_consensus_p2p_tcp_port: None,
+                client_consensus_p2p_udp_port: None,
+            }
+        });
+
+        SnapshotL2Stack::start_sequencer(SnapshotL2StackConfig {
+            snapshot: *snapshot,
+            container_config,
+        })
+        .await
+    }
+
     /// Builds and starts the system test stack.
-    pub async fn build(self) -> Result<SystemTestStack> {
-        let l1_chain_id = self.l1_chain_id.unwrap_or(DEFAULT_L1_CHAIN_ID);
-        let l2_chain_id = self.l2_chain_id.unwrap_or(DEFAULT_L2_CHAIN_ID);
-        let slot_duration = self.slot_duration.unwrap_or(DEFAULT_SLOT_DURATION);
+    pub async fn build(mut self) -> Result<SystemTestStack> {
+        if self.shared_l1.is_none()
+            && !self.l1_fault_injection
+            && !self.has_custom_fork_activation()
+        {
+            self.shared_l1 = SharedL1Runtime::from_env()?;
+        }
+        self.devnet_config.validate().wrap_err("Invalid devnet configuration")?;
+        eyre::ensure!(
+            self.devnet_config.l1_mode == DevnetL1Mode::Real
+                && self.devnet_config.l2_state == DevnetL2State::Fresh,
+            "system test launcher currently supports only real L1 with fresh L2 state"
+        );
+        if let Some(shared_l1) = &self.shared_l1 {
+            eyre::ensure!(
+                !self.l1_fault_injection,
+                "L1 fault-injection tests must use an exclusive L1 stack"
+            );
+            eyre::ensure!(
+                self.devnet_config.l1_chain_id == shared_l1.chain_id,
+                "shared L1 chain ID does not match this system-test configuration"
+            );
+            eyre::ensure!(
+                !self.has_custom_fork_activation(),
+                "custom fork-activation tests must use a dedicated L1 stack"
+            );
+        }
+
+        let l1_chain_id = self.devnet_config.l1_chain_id;
+        let l2_chain_id = self.devnet_config.l2_chain_id;
+        let slot_duration = self.devnet_config.l1_slot_duration;
 
         // Acquire runtime-registry ownership before any node starts, so live overrides are
         // cleared even when a later startup step fails, and so a chain-ID conflict with a
@@ -524,54 +741,57 @@ impl SystemTestStackBuilder {
             setup = setup.with_base_zenith_activation_block(block);
         }
 
-        if let Some(ref config) = self.stable_config {
-            setup = setup.with_network_name(&config.network_name);
-        }
+        let shared_l1 = self.shared_l1.clone();
+        let (l1_genesis, l2_deployment) = if let Some(shared_l1) = &shared_l1 {
+            let output_dir = output_dir.clone();
+            let shared_l1 = shared_l1.clone();
+            tokio::task::spawn_blocking(move || {
+                deploy_against_shared_l1(&shared_l1, &output_dir, l2_chain_id)
+            })
+            .await
+            .wrap_err("shared L1 deployment task panicked")??
+        } else {
+            tokio::task::spawn_blocking(move || setup.generate_genesis())
+                .await
+                .wrap_err("Genesis setup task panicked")?
+                .wrap_err("Failed to generate L1/L2 genesis")?
+        };
 
-        let l1_genesis = tokio::task::spawn_blocking({
-            let setup = setup.clone();
-            move || setup.generate_l1_genesis()
-        })
-        .await
-        .wrap_err("L1 genesis task panicked")?
-        .wrap_err("Failed to generate L1 genesis")?;
-
-        let el_genesis_json = l1_genesis.read_el_genesis()?;
-        let jwt_secret_hex = l1_genesis.read_jwt_secret()?;
-
-        let (l1_container_config, l2_container_config) =
-            self.stable_config.as_ref().map_or((None, None), |config| {
-                let l1_config = L1ContainerConfig {
-                    use_stable_names: true,
-                    network_name: Some(config.network_name.clone()),
-                    http_port: Some(config.ports.l1_http),
-                    engine_port: Some(config.ports.l1_auth),
-                    beacon_http_port: Some(config.ports.l1_cl_http),
-                    beacon_p2p_port: Some(config.ports.l1_cl_p2p),
-                    tmpfs_datadir: self.tmpfs_datadirs,
-                    enable_reorg_control: self.l1_fault_injection,
-                };
-                let l2_config = L2ContainerConfig {
-                    use_stable_names: true,
-                    network_name: Some(config.network_name.clone()),
-                    builder_http_port: Some(config.ports.l2_builder_http),
-                    builder_ws_port: Some(config.ports.l2_builder_ws),
-                    builder_auth_port: Some(config.ports.l2_builder_auth),
-                    builder_p2p_port: Some(config.ports.l2_builder_p2p),
-                    builder_flashblocks_port: Some(config.ports.l2_builder_flashblocks),
-                    client_http_port: Some(config.ports.l2_client_http),
-                    client_ws_port: Some(config.ports.l2_client_ws),
-                    client_auth_port: Some(config.ports.l2_client_auth),
-                    client_p2p_port: Some(config.ports.l2_client_p2p),
-                    builder_consensus_rpc_port: Some(config.ports.l2_builder_cl_rpc),
-                    builder_consensus_p2p_tcp_port: Some(config.ports.l2_builder_cl_p2p),
-                    builder_consensus_p2p_udp_port: None,
-                    client_consensus_rpc_port: Some(config.ports.l2_client_cl_rpc),
-                    client_consensus_p2p_tcp_port: Some(config.ports.l2_client_cl_p2p),
-                    client_consensus_p2p_udp_port: None,
-                };
-                (Some(l1_config), Some(l2_config))
-            });
+        let (l1_container_config, l2_container_config) = if self.devnet_config.use_stable_ports {
+            let config = &self.devnet_config.stable;
+            let l1_config = L1ContainerConfig {
+                use_stable_names: true,
+                network_name: Some(config.network_name.clone()),
+                http_port: Some(config.ports.l1_http),
+                engine_port: Some(config.ports.l1_auth),
+                beacon_http_port: Some(config.ports.l1_cl_http),
+                beacon_p2p_port: Some(config.ports.l1_cl_p2p),
+                tmpfs_datadir: self.tmpfs_datadirs,
+                enable_reorg_control: self.l1_fault_injection,
+            };
+            let l2_config = L2ContainerConfig {
+                use_stable_names: true,
+                network_name: Some(config.network_name.clone()),
+                builder_http_port: Some(config.ports.l2_builder_http),
+                builder_ws_port: Some(config.ports.l2_builder_ws),
+                builder_auth_port: Some(config.ports.l2_builder_auth),
+                builder_p2p_port: Some(config.ports.l2_builder_p2p),
+                builder_flashblocks_port: Some(config.ports.l2_builder_flashblocks),
+                client_http_port: Some(config.ports.l2_client_http),
+                client_ws_port: Some(config.ports.l2_client_ws),
+                client_auth_port: Some(config.ports.l2_client_auth),
+                client_p2p_port: Some(config.ports.l2_client_p2p),
+                builder_consensus_rpc_port: Some(config.ports.l2_builder_cl_rpc),
+                builder_consensus_p2p_tcp_port: Some(config.ports.l2_builder_cl_p2p),
+                builder_consensus_p2p_udp_port: None,
+                client_consensus_rpc_port: Some(config.ports.l2_client_cl_rpc),
+                client_consensus_p2p_tcp_port: Some(config.ports.l2_client_cl_p2p),
+                client_consensus_p2p_udp_port: None,
+            };
+            (Some(l1_config), Some(l2_config))
+        } else {
+            (None, None)
+        };
 
         // Ensure the tmpfs-datadir request reaches the L1 containers even without a stable config.
         let l1_container_config = l1_container_config.or_else(|| {
@@ -582,27 +802,22 @@ impl SystemTestStackBuilder {
             })
         });
 
-        let l1_config = L1StackConfig {
-            el_genesis_json,
-            jwt_secret_hex,
-            testnet_dir: l1_genesis.testnet_dir(),
-            container_config: l1_container_config,
+        let l1_stack = if let Some(shared_l1) = shared_l1 {
+            L1StackHandle::Shared(shared_l1)
+        } else {
+            let l1_config = L1StackConfig {
+                el_genesis_json: l1_genesis.read_el_genesis()?,
+                jwt_secret_hex: l1_genesis.read_jwt_secret()?,
+                testnet_dir: l1_genesis.testnet_dir(),
+                container_config: l1_container_config,
+            };
+            let execution = L1Execution::start(l1_config)
+                .await
+                .wrap_err("Failed to start L1 execution layer")?;
+            L1StackHandle::Dedicated(Box::new(
+                execution.start_consensus().await.wrap_err("Failed to start L1 consensus")?,
+            ))
         };
-
-        // Start Reth first, then overlap live L2 deployment with Lighthouse
-        // startup. `op-deployer apply` only needs the EL RPC; its transactions
-        // sit in the mempool until the validator begins producing blocks.
-        let l1_execution =
-            L1Execution::start(l1_config).await.wrap_err("Failed to start L1 execution layer")?;
-        let l1_internal_rpc_url = l1_execution.reth().internal_rpc_url();
-        let deploy_handle =
-            tokio::task::spawn_blocking(move || setup.deploy_l2_contracts(&l1_internal_rpc_url));
-        let l1_stack =
-            l1_execution.start_consensus().await.wrap_err("Failed to start L1 consensus")?;
-        let l2_deployment = deploy_handle
-            .await
-            .wrap_err("L2 deployment task panicked")?
-            .wrap_err("Failed to deploy L2 contracts")?;
 
         let jwt_secret = JwtSecret::random();
 
@@ -661,7 +876,7 @@ impl SystemTestStackBuilder {
         #[cfg(not(feature = "upgrade-signal"))]
         let (l2_upgrade_signal, l2_execution_upgrade_signal) = (None, None);
 
-        let direct_l1_rpc_url = l1_stack.reth().rpc_url().await?;
+        let direct_l1_rpc_url = l1_stack.rpc_url().await?;
         let l1_rpc_proxy = if self.l1_fault_injection {
             Some(L1RpcProxy::start(direct_l1_rpc_url.clone()).await?)
         } else {
@@ -673,6 +888,8 @@ impl SystemTestStackBuilder {
 
         let l2_config = L2StackConfig {
             l2_genesis: l2_genesis_bytes,
+            builder_datadir: None,
+            client_datadir: None,
             rollup_config: rollup_config_bytes,
             l1_genesis: l1_genesis_bytes,
             jwt_secret,
@@ -680,13 +897,15 @@ impl SystemTestStackBuilder {
             sequencer_key: SEQUENCER.private_key,
             batcher_key: BATCHER.private_key,
             l1_rpc_url: l2_l1_rpc_url,
-            l1_beacon_url: l1_stack.beacon().beacon_url().await?,
+            l1_beacon_url: l1_stack.beacon_url().await?,
             l1_slot_duration: slot_duration,
             container_config: l2_container_config,
             tx_forwarding_config: self.tx_forwarding_config,
             enable_experimental_validity_transactions: self
                 .enable_experimental_validity_transactions,
+            payload_builder_cutover: self.payload_builder_cutover,
             verifier_l1_confs: self.verifier_l1_confs,
+            force_batch_submission: self.force_batch_submission,
             client_consensus_mode: self.client_consensus_mode,
             upgrade_signal: l2_upgrade_signal,
             execution_upgrade_signal: l2_execution_upgrade_signal,

@@ -1,6 +1,6 @@
 //! Version 1 of the B-20 token factory precompile logic, activated at Beryl.
 
-use alloc::{string::ToString, vec::Vec};
+use alloc::string::ToString;
 
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_sol_types::{SolCall, SolEvent, SolValue};
@@ -9,10 +9,10 @@ use base_precompile_storage::{BasePrecompileError, ContractStorage, Result};
 use revm::state::Bytecode;
 
 use crate::{
-    ActivationRegistryStorage, AssetVersion, B20AssetInit, B20AssetStorage, B20AssetToken,
+    ActivationRegistryStorage, AssetVersions, B20AssetInit, B20AssetStorage, B20AssetToken,
     B20FactoryStorage, B20StablecoinInit, B20StablecoinStorage, B20StablecoinToken, B20TokenRole,
-    B20Variant, Factory, IB20Factory, NoopPrecompileCallObserver, PolicyRegistryStorage,
-    PolicyVersions, StablecoinVersion, Token,
+    B20Variant, Factory, IB20Factory, InitCalls, NoopPrecompileCallObserver, PolicyRegistryStorage,
+    PolicyVersions, StablecoinVersions, Token,
 };
 
 /// Version byte for `B20StablecoinEventParams` inside `B20Created.variantParams`.
@@ -43,7 +43,7 @@ impl FactoryV1 {
         token_address: Address,
         common: CommonParams,
         init: B20StablecoinInit,
-        init_calls: Vec<Bytes>,
+        init_calls: &InitCalls<'_>,
         upgrade: BaseUpgrade,
     ) -> Result<()> {
         let policy_version = PolicyVersions::from_base_upgrade(upgrade)
@@ -81,14 +81,15 @@ impl FactoryV1 {
             )?;
         }
 
-        // Pinned to V1: factory-init setup calls run before any later fork can be relevant.
+        let stablecoin_version = StablecoinVersions::from_base_upgrade(upgrade)
+            .ok_or_else(|| BasePrecompileError::Revert(Bytes::new()))?;
         storage.storage().with_caller(B20FactoryStorage::ADDRESS, || {
-            for (index, calldata) in init_calls.into_iter().enumerate() {
+            for (index, &calldata) in init_calls.iter().enumerate() {
                 token
                     .route(
                         storage.storage(),
-                        &calldata,
-                        StablecoinVersion::V1,
+                        calldata,
+                        stablecoin_version,
                         true,
                         NoopPrecompileCallObserver,
                     )
@@ -105,7 +106,7 @@ impl FactoryV1 {
         token_address: Address,
         common: CommonParams,
         init: B20AssetInit,
-        init_calls: Vec<Bytes>,
+        init_calls: &InitCalls<'_>,
         upgrade: BaseUpgrade,
     ) -> Result<()> {
         let policy_version = PolicyVersions::from_base_upgrade(upgrade)
@@ -140,14 +141,15 @@ impl FactoryV1 {
             )?;
         }
 
-        // Pinned to V1: factory-init setup calls run before any later fork can be relevant.
+        let asset_version = AssetVersions::from_base_upgrade(upgrade)
+            .ok_or_else(|| BasePrecompileError::Revert(Bytes::new()))?;
         storage.storage().with_caller(B20FactoryStorage::ADDRESS, || {
-            for (index, calldata) in init_calls.into_iter().enumerate() {
+            for (index, &calldata) in init_calls.iter().enumerate() {
                 token
                     .route(
                         storage.storage(),
-                        &calldata,
-                        AssetVersion::V1,
+                        calldata,
+                        asset_version,
                         true,
                         NoopPrecompileCallObserver,
                     )
@@ -182,18 +184,20 @@ impl FactoryV1 {
 }
 
 impl Factory for FactoryV1 {
-    fn create_b20(
+    fn create_b20_decoded(
         &self,
         storage: &mut B20FactoryStorage<'_>,
-        call: IB20Factory::createB20Call,
+        variant: IB20Factory::B20Variant,
+        params: &[u8],
+        init_calls: &InitCalls<'_>,
         address_hash: B256,
         upgrade: BaseUpgrade,
     ) -> Result<Address> {
-        let variant = B20Variant::from_abi(call.variant)
+        let variant = B20Variant::from_abi(variant)
             .ok_or_else(|| BasePrecompileError::revert(IB20Factory::InvalidVariant {}))?;
         ActivationRegistryStorage::new(storage.storage())
             .ensure_activated(variant.activation_feature().id())?;
-        let params = TokenCreateParams::decode(variant, &call.params)?;
+        let params = TokenCreateParams::decode(variant, params)?;
         Self::check_version(params.version(), variant)?;
         params.validate()?;
         let (token_address, _) = variant.compute_address_from_hash(address_hash);
@@ -211,7 +215,6 @@ impl Factory for FactoryV1 {
         let stub = Bytecode::new_legacy(Bytes::from_static(&[0xef]));
         storage.storage().set_code(token_address, stub)?;
 
-        let init_calls = call.initCalls;
         match params {
             TokenCreateParams::Stablecoin { common, init } => {
                 self.init_stablecoin(storage, token_address, common, init, init_calls, upgrade)?;
@@ -259,7 +262,7 @@ pub enum TokenCreateParams {
 
 impl TokenCreateParams {
     /// Decodes ABI-encoded creation parameters for `variant`.
-    pub fn decode(variant: B20Variant, params: &Bytes) -> Result<Self> {
+    pub fn decode(variant: B20Variant, params: &[u8]) -> Result<Self> {
         match variant {
             B20Variant::Stablecoin => {
                 let p = IB20Factory::B20StablecoinCreateParams::abi_decode_validate(params)

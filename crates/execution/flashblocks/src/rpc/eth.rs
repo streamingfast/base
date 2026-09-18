@@ -59,11 +59,11 @@ use alloy_rpc_types::{
     simulate::{SimBlock, SimulatePayload, SimulatedBlock},
     state::{EvmOverrides, StateOverride, StateOverridesBuilder},
 };
-use alloy_rpc_types_eth::{Filter, Log};
+use alloy_rpc_types_eth::Filter;
 use base_common_evm::BaseTransaction as BaseRevm;
 use base_common_network::Base;
-use base_common_rpc_types::BaseTransactionRequest;
-use base_execution_eip8130_rpc::{ChannelNonceReader, Eip8130CobaltGate, Eip8130GasEstimator};
+use base_common_rpc_types::{BaseLogResponse, BaseRpcTypes, BaseTransactionRequest};
+use base_execution_eip8130_rpc::{ChannelNonceReader, Eip8130GasEstimator, Eip8130ZenithGate};
 use jsonrpsee::{
     core::{RpcResult, async_trait},
     proc_macros::rpc,
@@ -160,7 +160,7 @@ pub trait EthApiOverride {
 
     /// Returns logs matching the filter, including pending flashblock logs.
     #[method(name = "getLogs")]
-    async fn get_logs(&self, filter: Filter) -> RpcResult<Vec<Log>>;
+    async fn get_logs(&self, filter: Filter) -> RpcResult<Vec<BaseLogResponse>>;
 
     /// Returns the number of transactions in a block by block number.
     #[method(name = "getBlockTransactionCountByNumber")]
@@ -188,7 +188,12 @@ impl<Eth: EthApiTypes, FB> EthApiExt<Eth, FB> {
 #[async_trait]
 impl<Eth, FB> EthApiOverrideServer for EthApiExt<Eth, FB>
 where
-    Eth: FullEthApi<NetworkTypes = Base> + LoadPendingBlock + Clone + Send + Sync + 'static,
+    Eth: FullEthApi<NetworkTypes = BaseRpcTypes>
+        + LoadPendingBlock
+        + Clone
+        + Send
+        + Sync
+        + 'static,
     Eth::Error: FromEthApiError,
     <Eth as reth_rpc_eth_api::RpcNodeCore>::Provider:
         reth_chainspec::ChainSpecProvider + reth_provider::BlockReaderIdExt,
@@ -291,7 +296,7 @@ where
         if let Some(key) = nonce_key
             && key != U256::ZERO
         {
-            Eip8130CobaltGate::check(&self.eth_api, block_id)?;
+            Eip8130ZenithGate::check(&self.eth_api, block_id)?;
             Metrics::rpc_get_transaction_count().increment(1);
             let (resolved_block, overrides) = if block_id.is_pending() {
                 let pending_blocks = self.flashblocks_state.get_pending_blocks();
@@ -489,11 +494,11 @@ where
         let final_overrides = state_overrides_builder.build();
 
         // EIP-8130 request: estimate via a single read-only simulation against
-        // the (pending-merged) block state, gated on the Cobalt fork. The
+        // the (pending-merged) block state, gated on the Zenith fork. The
         // deterministic, signature-independent EIP-8130 gas charge means no
         // gas-limit binary search is needed.
         if transaction.as_eip8130().is_some() {
-            Eip8130CobaltGate::check(&self.eth_api, block_id)?;
+            Eip8130ZenithGate::check(&self.eth_api, block_id)?;
             return Eip8130GasEstimator::estimate(
                 &self.eth_api,
                 transaction,
@@ -552,7 +557,7 @@ where
         EthCall::simulate_v1(&self.eth_api, payload, Some(block_id)).await.map_err(Into::into)
     }
 
-    async fn get_logs(&self, filter: Filter) -> RpcResult<Vec<Log>> {
+    async fn get_logs(&self, filter: Filter) -> RpcResult<Vec<BaseLogResponse>> {
         debug!(
             message = "rpc::get_logs",
             address = ?filter.address
@@ -590,7 +595,8 @@ where
                 to_block: Some(BlockNumberOrTag::Latest),
             };
 
-            let historical_logs: Vec<Log> = self.eth_filter.logs(historical_filter).await?;
+            let historical_logs: Vec<BaseLogResponse> =
+                self.eth_filter.logs(historical_filter).await?;
             for log in &historical_logs {
                 fetched_logs.insert((log.block_number, log.log_index));
             }
@@ -601,10 +607,11 @@ where
         let pending_logs = pending_blocks.get_pending_logs(&filter);
 
         // Dedup any logs from the pending state that may already have been covered in the historical logs
-        let deduped_pending_logs: Vec<Log> = pending_logs
+        let deduped_pending_logs: Vec<BaseLogResponse> = pending_logs
             .iter()
             .filter(|log| !fetched_logs.contains(&(log.block_number, log.log_index)))
             .cloned()
+            .map(BaseLogResponse::from)
             .collect();
         all_logs.extend(deduped_pending_logs);
 
@@ -646,7 +653,7 @@ where
 
 impl<Eth, FB> EthApiExt<Eth, FB>
 where
-    Eth: FullEthApi<NetworkTypes = Base> + Send + Sync + 'static,
+    Eth: FullEthApi<NetworkTypes = BaseRpcTypes> + Send + Sync + 'static,
     FB: FlashblocksAPI + Send + Sync + 'static,
 {
     async fn wait_for_flashblocks_receipt(&self, tx_hash: TxHash) -> Option<RpcReceipt<Base>> {

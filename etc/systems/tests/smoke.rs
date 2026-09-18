@@ -1,6 +1,6 @@
 //! Smoke tests for the full `SystemTestStack` stack.
 
-use std::time::Duration;
+use std::{process::Command, time::Duration};
 
 use alloy_consensus::SignableTransaction;
 use alloy_eips::{BlockNumberOrTag, eip2718::Encodable2718};
@@ -9,9 +9,10 @@ use alloy_primitives::{Address, U256};
 use alloy_provider::{Provider, RootProvider};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
+use base_common_genesis::RollupConfig;
 use base_common_network::Base;
 use base_common_rpc_types::BaseTransactionRequest;
-use base_system_tests::{ANVIL_ACCOUNT_1, SystemTestStackBuilder};
+use base_system_tests::{ANVIL_ACCOUNT_1, SetupImage, SystemTestStackBuilder};
 use eyre::{Result, WrapErr};
 use tokio::time::{sleep, timeout};
 
@@ -25,26 +26,32 @@ static SMOKE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 
 #[tokio::test]
 async fn denim_and_zenith_activation_matches_el_and_cl_configs() -> Result<()> {
-    const DENIM_ACTIVATION_BLOCK: u64 = 23;
-    const ZENITH_ACTIVATION_BLOCK: u64 = 25;
+    const AZUL_ACTIVATION_BLOCK: u64 = 20;
+    const DENIM_ACTIVATION_BLOCK: u64 = 25;
+    const ZENITH_ACTIVATION_BLOCK: u64 = 100;
 
     let _guard = SMOKE_TEST_LOCK.lock().await;
     let system = SystemTestStackBuilder::new()
         .with_l1_chain_id(L1_CHAIN_ID)
         .with_l2_chain_id(L2_CHAIN_ID)
+        .with_base_azul_activation_block(AZUL_ACTIVATION_BLOCK)
         .with_base_denim_activation_block(DENIM_ACTIVATION_BLOCK)
         .with_base_zenith_activation_block(ZENITH_ACTIVATION_BLOCK)
         .build()
         .await?;
 
     let genesis: serde_json::Value = serde_json::from_str(&system.l2_deployment().read_genesis()?)?;
-    let rollup: serde_json::Value =
-        serde_json::from_str(&system.l2_deployment().read_rollup_config()?)?;
-    let l2_time = rollup["genesis"]["l2_time"].as_u64().unwrap();
-    let block_time = rollup["block_time"].as_u64().unwrap();
-    let expected_denim = l2_time + block_time * DENIM_ACTIVATION_BLOCK;
-    let expected_zenith = l2_time + block_time * ZENITH_ACTIVATION_BLOCK;
+    let rollup_json = system.l2_deployment().read_rollup_config()?;
+    let rollup: serde_json::Value = serde_json::from_str(&rollup_json)?;
+    let rollup_config: RollupConfig = serde_json::from_str(&rollup_json)?;
+    let expected_azul =
+        rollup_config.genesis.l2_time + rollup_config.block_time * AZUL_ACTIVATION_BLOCK;
+    let expected_denim = rollup_config.l2_block_timestamp(DENIM_ACTIVATION_BLOCK);
+    let expected_zenith = rollup_config.l2_block_timestamp(ZENITH_ACTIVATION_BLOCK);
+    assert_eq!(rollup_config.l2_block_timestamp_parts(ZENITH_ACTIVATION_BLOCK).1, 0);
 
+    assert_eq!(rollup["base"]["azul"].as_u64(), Some(expected_azul));
+    assert_eq!(genesis["config"]["base"]["azul"].as_u64(), Some(expected_azul));
     assert_eq!(rollup["base"]["denim"].as_u64(), Some(expected_denim));
     assert_eq!(genesis["config"]["base"]["denim"].as_u64(), Some(expected_denim));
 
@@ -54,6 +61,35 @@ async fn denim_and_zenith_activation_matches_el_and_cl_configs() -> Result<()> {
     assert_eq!(genesis["config"]["base"]["zenith"].as_u64(), Some(expected_zenith));
 
     Ok(())
+}
+
+#[test]
+fn rejects_post_denim_block_without_whole_second_timestamp() {
+    SetupImage::ensure_built().unwrap();
+    let output = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--entrypoint",
+            "op-deployer",
+            "-e",
+            "SEQUENCER_ADDR=0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc",
+            "devnet-setup:local-v2",
+            "--denim-block",
+            "25",
+            "--zenith-block",
+            "26",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("zenith must align to a whole second after Denim")
+    );
 }
 
 #[tokio::test]

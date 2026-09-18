@@ -38,10 +38,11 @@ const DEFAULT_ROCKSDB_WRITE_BUFFER_SIZE_MIB: u64 = 64;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub enum TxpoolOrdering {
-    /// Order by coinbase tip (fee-based, higher tip = higher priority).
+    /// Order by unified tip-per-gas (higher bid = higher priority).
     ///
-    /// This is the default ordering strategy that prioritizes transactions
-    /// based on the priority fee (tip) they offer to the block producer.
+    /// Standard transactions use `priorityFeePerGas`. EIP-8130 transactions
+    /// with a static coinbase tip use `tip / gasLimit`. Equal bids prefer
+    /// fewer validity predicates.
     #[default]
     CoinbaseTip,
     /// Order by receive timestamp (FIFO, earlier = higher priority).
@@ -345,10 +346,6 @@ pub struct RollupArgs {
     #[arg(long = "rollup.sequencer", visible_aliases = ["rollup.sequencer-http", "rollup.sequencer-ws"])]
     pub sequencer: Option<String>,
 
-    /// Disable transaction pool gossip
-    #[arg(long = "rollup.disable-tx-pool-gossip")]
-    pub disable_txpool_gossip: bool,
-
     /// enables discovery v4 if provided
     #[arg(long = "rollup.discovery.v4", default_value = "false")]
     pub discovery_v4: bool,
@@ -364,7 +361,7 @@ pub struct RollupArgs {
     /// Transaction ordering strategy for the mempool.
     ///
     /// Determines how transactions are prioritized when building blocks.
-    /// - `coinbase-tip`: Order by priority fee (higher tip = higher priority). Default.
+    /// - `coinbase-tip`: Order by tip-per-gas (priority fee, or EIP-8130 coinbase tip / gas limit). Default.
     /// - `timestamp`: Order by receive time (FIFO, earlier = higher priority).
     #[arg(long = "rollup.txpool-ordering", default_value = "coinbase-tip")]
     pub txpool_ordering: TxpoolOrdering,
@@ -505,7 +502,6 @@ impl Default for RollupArgs {
     fn default() -> Self {
         Self {
             sequencer: None,
-            disable_txpool_gossip: false,
             discovery_v4: false,
             sequencer_headers: Vec::new(),
             min_suggested_priority_fee: 1_000_000,
@@ -576,24 +572,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rollup_disable_txpool_args() {
-        let expected_args = RollupArgs { disable_txpool_gossip: true, ..Default::default() };
-        let args =
-            CommandParser::<RollupArgs>::parse_from(["reth", "--rollup.disable-tx-pool-gossip"])
-                .args;
-        assert_eq!(args, expected_args);
-    }
-
-    #[test]
     fn test_parse_rollup_many_args() {
-        let expected_args = RollupArgs {
-            disable_txpool_gossip: true,
-            sequencer: Some("http://host:port".into()),
-            ..Default::default()
-        };
+        let expected_args =
+            RollupArgs { sequencer: Some("http://host:port".into()), ..Default::default() };
         let args = CommandParser::<RollupArgs>::parse_from([
             "reth",
-            "--rollup.disable-tx-pool-gossip",
             "--rollup.sequencer-http",
             "http://host:port",
         ])

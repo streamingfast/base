@@ -9,13 +9,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use alloy_consensus::transaction::SignableTransaction;
-use alloy_eips::Encodable2718;
-use alloy_network::{Ethereum, TransactionBuilder};
-use alloy_primitives::{Address, Bytes, TxHash, U256};
+use alloy_network::Ethereum;
+use alloy_primitives::{Address, TxHash, U256};
 use alloy_provider::{Provider, RootProvider};
-use alloy_rpc_types::{BlockNumberOrTag, TransactionRequest};
-use alloy_signer::SignerSync;
+use alloy_rpc_types::BlockNumberOrTag;
 use alloy_signer_local::PrivateKeySigner;
 use base_common_network::Base;
 use base_tx_manager::NonceManager;
@@ -28,15 +25,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::{
-    BlockWatcher, DisplaySnapshot, FlashblockWatcher, InclusionPulse, InclusionSource, LoadRunner,
-    LoadTestDisplay, LoadTestStage, MIN_PRIORITY_FEE, PipelineStartConfig, PreparedTransaction,
+    BlockWatcher, DisplaySnapshot, FlashblockWatcher, GasPricer, InclusionPulse, InclusionSource,
+    LoadRunner, LoadTestDisplay, LoadTestStage, PipelineStartConfig, PreparedTransaction,
     PresignBuffer, QueuedSubmitFailures, ResultsTracker, SignedBatch, SignedTransaction,
-    SubmissionPipeline, SubmitEvent, TxType,
+    SubmissionPipeline, SubmitEvent, TxType, ValidityRouter,
 };
 use crate::{
     BaselineError, Result,
     metrics::{MetricsCollector, MetricsSummary, PacingCycleObservation, PacingCycleSource},
-    rpc::BaseFeeExt,
+    rpc::{BaseFeeExt, QueryProvider},
     workload::{KeyStream, SeededRng, WorkloadGenerator},
 };
 
@@ -68,6 +65,7 @@ const PROGRESS_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 struct SenderJob {
     sender_index: usize,
+    generation: u64,
     from: Address,
     start_nonce: u64,
     prepared_txs: Vec<PreparedTransaction>,
@@ -76,6 +74,7 @@ struct SenderJob {
 #[derive(Debug)]
 struct SignedSender {
     sender_index: usize,
+    generation: u64,
     signed_txs: Vec<SignedTransaction>,
 }
 
@@ -89,13 +88,39 @@ struct PresignProducerState {
 struct PresignConfig {
     sender_addresses: Vec<Address>,
     sender_next_nonces: Vec<u64>,
+    /// Generation paired with `sender_next_nonces`; bumped when submission reports a terminal
+    /// rejection so stale signed chunks cannot be enqueued after a nonce resync.
+    sender_generations: Vec<u64>,
     signers: Arc<HashMap<Address, PrivateKeySigner>>,
+    nonce_managers: Arc<HashMap<Address, NonceManager<RootProvider<Ethereum>>>>,
     chain_id: u64,
     base_fee_rx: watch::Receiver<u128>,
     max_gas_price: u128,
+    validity_priority_lead_multiplier: u128,
+    validity_priority_fee_divisor: u128,
     estimated_gas: u64,
     fresh_recipient_ratio: f64,
-    signed_chunk_tx: mpsc::Sender<Vec<Vec<SignedTransaction>>>,
+    signed_chunk_tx: mpsc::Sender<Vec<PresignedSenderBatch>>,
+    nonce_reset_rx: mpsc::Receiver<SenderNonceReset>,
+    validity_router: ValidityRouter,
+    /// Query provider used to read the current block height per prepare round
+    /// when resolving offset-based `block_number` validity predicates.
+    query_client: QueryProvider,
+}
+
+#[derive(Debug)]
+struct PresignedSenderBatch {
+    sender_index: usize,
+    generation: u64,
+    txs: Vec<SignedTransaction>,
+}
+
+#[derive(Debug)]
+struct SenderNonceReset {
+    sender_index: usize,
+    address: Address,
+    /// New generation that the producer must adopt after refetching the sender's pending nonce.
+    generation: u64,
 }
 
 struct EnqueueProgress {
@@ -195,7 +220,9 @@ struct EnqueueDrainState<'a> {
 struct PresignEnqueueState<'a> {
     submission_pipeline: &'a SubmissionPipeline,
     next_submit_batch_id: &'a AtomicU64,
-    signed_chunk_rx: &'a mut mpsc::Receiver<Vec<Vec<SignedTransaction>>>,
+    signed_chunk_rx: &'a mut mpsc::Receiver<Vec<PresignedSenderBatch>>,
+    nonce_reset_tx: &'a mpsc::Sender<SenderNonceReset>,
+    sender_indices: &'a HashMap<Address, usize>,
     buffer: &'a mut PresignBuffer,
     progress: &'a mut EnqueueProgress,
     base_fee_tx: &'a watch::Sender<u128>,
@@ -402,6 +429,10 @@ impl LoadRunner {
         self.base_fee = self.client.get_base_fee().await?;
         info!(base_fee = self.base_fee, "fetched current base fee");
 
+        if !self.validity_router.is_disabled() {
+            self.probe_validity_endpoint().await?;
+        }
+
         for account in self.accounts.accounts() {
             if !self.nonce_managers.contains_key(&account.address) {
                 let provider = RootProvider::<Ethereum>::new_http(self.config.query_rpc.clone());
@@ -490,6 +521,8 @@ impl LoadRunner {
             PipelineStartConfig {
                 chain_id: self.config.chain_id,
                 max_gas_price: self.config.max_gas_price,
+                validity_priority_lead_multiplier: self.config.validity_priority_lead_multiplier,
+                validity_priority_fee_divisor: self.config.validity_priority_fee_divisor,
                 max_concurrent_submit_requests: self.config.max_concurrent_submit_requests,
             },
         );
@@ -530,6 +563,12 @@ impl LoadRunner {
         let pre_sign_started = Instant::now();
         let sender_addresses: Vec<Address> =
             self.accounts.accounts().iter().map(|account| account.address).collect();
+        let sender_indices: HashMap<Address, usize> = sender_addresses
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, address)| (address, index))
+            .collect();
         let nonce_initialization_started = Instant::now();
         let sender_start_nonces = self.sender_start_nonces(&sender_addresses).await?;
         let sender_count = sender_addresses.len();
@@ -594,6 +633,7 @@ impl LoadRunner {
         let producer_recipient_rng = std::mem::take(&mut self.recipient_rng);
 
         let (signed_chunk_tx, mut signed_chunk_rx) = mpsc::channel(PRESIGN_CHANNEL_BUFFER);
+        let (nonce_reset_tx, nonce_reset_rx) = mpsc::channel(sender_count.max(1));
         let (base_fee_tx, base_fee_rx) = watch::channel(self.base_fee);
         let pacing_base_fee_tx = base_fee_tx.clone();
         let base_fee_client = self.client.clone();
@@ -619,13 +659,20 @@ impl LoadRunner {
             PresignConfig {
                 sender_addresses,
                 sender_next_nonces: sender_start_nonces,
+                sender_generations: vec![0; sender_count],
                 signers: Arc::clone(&self.signers),
+                nonce_managers: Arc::clone(&self.nonce_managers),
                 chain_id: self.config.chain_id,
                 base_fee_rx,
                 max_gas_price: self.config.max_gas_price,
+                validity_priority_lead_multiplier: self.config.validity_priority_lead_multiplier,
+                validity_priority_fee_divisor: self.config.validity_priority_fee_divisor,
                 estimated_gas: initial_avg_gas,
                 fresh_recipient_ratio: self.config.fresh_recipient_ratio,
                 signed_chunk_tx,
+                nonce_reset_rx,
+                validity_router: self.validity_router.clone(),
+                query_client: self.client.clone(),
             },
         ));
 
@@ -641,6 +688,8 @@ impl LoadRunner {
                 submission_pipeline: &submission_pipeline,
                 next_submit_batch_id: &next_submit_batch_id,
                 signed_chunk_rx: &mut signed_chunk_rx,
+                nonce_reset_tx: &nonce_reset_tx,
+                sender_indices: &sender_indices,
                 buffer: &mut presign_buffer,
                 progress: &mut progress,
                 base_fee_tx: &pacing_base_fee_tx,
@@ -721,7 +770,14 @@ impl LoadRunner {
                 &results_tracker,
             );
             while inclusion_pulse_rx.try_recv().is_ok() {}
-            results_tracker.begin_measurement();
+            let measurement_start_block =
+                receipt_provider.get_block_number().await.map_err(|e| {
+                    BaselineError::Rpc(format!(
+                        "failed to read latest block number for measurement start: {e}"
+                    ))
+                })?;
+            results_tracker
+                .begin_measurement(measurement_start_block, self.config.measurement_blocks);
             self.collector.reset();
             self.collector.set_estimated_gas(initial_avg_gas);
             start = Instant::now();
@@ -752,6 +808,8 @@ impl LoadRunner {
                     submission_pipeline: &submission_pipeline,
                     next_submit_batch_id: &next_submit_batch_id,
                     signed_chunk_rx: &mut signed_chunk_rx,
+                    nonce_reset_tx: &nonce_reset_tx,
+                    sender_indices: &sender_indices,
                     buffer: &mut presign_buffer,
                     progress: &mut progress,
                     base_fee_tx: &pacing_base_fee_tx,
@@ -800,8 +858,9 @@ impl LoadRunner {
         let finished_file = self.config.separate_setup.as_deref().map(|dir| dir.join("finished"));
         Self::publish_handshake(finished_file.as_deref())?;
 
+        // The producer may be blocked sending its next chunk after enqueue stops at the
+        // measurement cutoff. Close its receiver before awaiting it so that send unblocks.
         drop(signed_chunk_rx);
-
         match producer_task.await {
             Ok(Ok(producer_state)) => {
                 self.generator = producer_state.generator;
@@ -845,6 +904,7 @@ impl LoadRunner {
         while self.config.duration.is_none_or(|d| start.elapsed() < d)
             && !self.stop_flag.load(Ordering::SeqCst)
             && open_loop_enqueue_error.is_none()
+            && !results_tracker.measurement_finished()
         {
             // --- Housekeeping (runs once per batch iteration) ---
 
@@ -887,8 +947,10 @@ impl LoadRunner {
 
         submission_pipeline.close_input();
 
+        let stop_at_measurement_cutoff = self.config.measurement_blocks.is_some();
         let drain_started = Instant::now();
         while submission_pipeline.pending_batches() > 0
+            && !stop_at_measurement_cutoff
             && drain_started.elapsed() < SUBMIT_DRAIN_TIMEOUT
         {
             Self::drain_submit_events(
@@ -904,10 +966,14 @@ impl LoadRunner {
 
         let pending_submit_batches = submission_pipeline.pending_batches();
         if pending_submit_batches > 0 {
-            warn!(
-                pending_submit_batches,
-                "timed out waiting for submit queue to drain, closing submit queue"
-            );
+            if stop_at_measurement_cutoff {
+                warn!(pending_submit_batches, "closing submit queue at measured block cutoff");
+            } else {
+                warn!(
+                    pending_submit_batches,
+                    "timed out waiting for submit queue to drain, closing submit queue"
+                );
+            }
             let failures =
                 submission_pipeline.close_and_fail_queued("submit queue abandoned").await;
             Self::apply_queued_submit_failures(
@@ -1098,6 +1164,10 @@ impl LoadRunner {
             self.config_summary.clone(),
             self.fresh_recipient_count(),
         );
+        let measurement_window = results_tracker.measurement_window();
+        summary.measurement_start_block = measurement_window.start_block;
+        summary.measurement_end_block = measurement_window.end_block;
+        summary.measurement_block_count = measurement_window.block_count;
         if let Some(fresh_recipient_count) = summary.fresh_recipient_count {
             info!(fresh_recipient_count, "fresh recipient generation complete");
         }
@@ -1153,18 +1223,38 @@ impl LoadRunner {
         }
     }
 
+    /// Reads the latest canonical block number, used to resolve offset-based
+    /// `block_number` validity predicates at prepare time.
+    async fn current_block_height(client: &QueryProvider) -> Result<u64> {
+        let block = client
+            .get_block_by_number(BlockNumberOrTag::Latest)
+            .hashes()
+            .await
+            .map_err(|e| BaselineError::Rpc(format!("failed to read latest block number: {e}")))?
+            .ok_or_else(|| BaselineError::Rpc("latest block is unavailable".into()))?;
+        Ok(block.header.number)
+    }
+
     fn build_sender_jobs(
         generator: &mut WorkloadGenerator,
         recipient_keys: &mut Option<KeyStream>,
         recipient_rng: &mut SeededRng,
         config: &PresignConfig,
         txs_per_sender: usize,
+        current_block: u64,
     ) -> Result<Vec<SenderJob>> {
         if config.sender_addresses.len() != config.sender_next_nonces.len() {
             return Err(BaselineError::Transaction(format!(
                 "open-loop sender nonce set mismatch: {} addresses vs {} nonces",
                 config.sender_addresses.len(),
                 config.sender_next_nonces.len(),
+            )));
+        }
+        if config.sender_addresses.len() != config.sender_generations.len() {
+            return Err(BaselineError::Transaction(format!(
+                "open-loop sender generation set mismatch: {} addresses vs {} generations",
+                config.sender_addresses.len(),
+                config.sender_generations.len(),
             )));
         }
 
@@ -1174,10 +1264,15 @@ impl LoadRunner {
         }
         let mut sender_jobs = Vec::with_capacity(sender_count);
         for (sender_index, from) in config.sender_addresses.iter().copied().enumerate() {
-            let sender_pool_recipient = config.sender_addresses[(sender_index + 1) % sender_count];
+            let ring_recipient = config.sender_addresses[(sender_index + 1) % sender_count];
+            let pair_index = Self::b20_partner_index(sender_index, sender_count);
+            let pair_recipient = config.sender_addresses[pair_index];
+            let cohort = config.validity_router.cohort_for_sender(from);
             let mut prepared_txs = Vec::with_capacity(txs_per_sender);
             for _ in 0..txs_per_sender {
                 let payload = generator.select_payload()?;
+                let sender_pool_recipient =
+                    if payload.uses_pair_recipient() { pair_recipient } else { ring_recipient };
                 let to = if payload.uses_runner_recipient() {
                     Self::select_recipient(
                         recipient_keys,
@@ -1194,6 +1289,8 @@ impl LoadRunner {
                 let value = tx_request.value.unwrap_or(U256::ZERO);
                 let data = tx_request.input.input().cloned().unwrap_or_default();
                 let gas_limit = tx_request.gas.unwrap_or(21_000);
+                let validity =
+                    config.validity_router.predicates_for(cohort, current_block, from, to_addr);
 
                 prepared_txs.push(PreparedTransaction {
                     from,
@@ -1202,6 +1299,8 @@ impl LoadRunner {
                     data,
                     gas_limit,
                     estimated_gas: config.estimated_gas,
+                    validity,
+                    cohort,
                 });
             }
 
@@ -1209,6 +1308,7 @@ impl LoadRunner {
                 sender_index,
                 from,
                 start_nonce: config.sender_next_nonces[sender_index],
+                generation: config.sender_generations[sender_index],
                 prepared_txs,
             });
         }
@@ -1222,54 +1322,85 @@ impl LoadRunner {
         chain_id: u64,
         base_fee: u128,
         max_gas_price: u128,
-    ) -> Result<Vec<Vec<SignedTransaction>>> {
+        validity_priority_lead_multiplier: u128,
+        validity_priority_fee_divisor: u128,
+    ) -> Result<Vec<PresignedSenderBatch>> {
         let sender_count = sender_jobs.len();
         if sender_count == 0 {
             return Ok(Vec::new());
         }
 
-        let priority_fee =
-            (base_fee / 10).max(MIN_PRIORITY_FEE).min(max_gas_price.saturating_sub(base_fee));
-        let max_fee = SubmissionPipeline::submission_max_fee(base_fee, priority_fee, max_gas_price);
-
-        let mut signing_tasks = Vec::with_capacity(sender_count);
-        for sender_job in sender_jobs {
-            let Some(signer) = signers.get(&sender_job.from).cloned() else {
-                return Err(BaselineError::Transaction(format!(
-                    "missing signer for sender {}",
-                    sender_job.from
-                )));
-            };
+        // Signing is CPU-bound. Chunking work to the available cores avoids growing Tokio's
+        // blocking pool to one thread per sender under high-sender-count stress workloads.
+        let signing_worker_count =
+            std::thread::available_parallelism().map(usize::from).unwrap_or(1).min(sender_count);
+        let jobs_per_task = sender_count.div_ceil(signing_worker_count);
+        let mut sender_jobs = sender_jobs.into_iter();
+        let mut signing_tasks = Vec::with_capacity(signing_worker_count);
+        loop {
+            let jobs = sender_jobs
+                .by_ref()
+                .take(jobs_per_task)
+                .map(|sender_job| {
+                    let signer = signers.get(&sender_job.from).cloned().ok_or_else(|| {
+                        BaselineError::Transaction(format!(
+                            "missing signer for sender {}",
+                            sender_job.from
+                        ))
+                    })?;
+                    Ok((sender_job, signer))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if jobs.is_empty() {
+                break;
+            }
             signing_tasks.push(task::spawn_blocking(move || {
-                Self::sign_sender_job(sender_job, signer, chain_id, priority_fee, max_fee)
+                jobs.into_iter()
+                    .map(|(sender_job, signer)| {
+                        Self::sign_sender_job(
+                            sender_job,
+                            signer,
+                            chain_id,
+                            base_fee,
+                            max_gas_price,
+                            validity_priority_lead_multiplier,
+                            validity_priority_fee_divisor,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()
             }));
         }
 
-        let mut signed_by_sender: Vec<Option<Vec<SignedTransaction>>> =
+        let mut signed_by_sender: Vec<Option<SignedSender>> =
             std::iter::repeat_with(|| None).take(sender_count).collect();
 
         for signing_task in signing_tasks {
-            let signed_sender = signing_task.await.map_err(|e| {
+            let signed_senders = signing_task.await.map_err(|e| {
                 BaselineError::Transaction(format!("open-loop signing task failed: {e}"))
             })??;
-
-            let sender_index = signed_sender.sender_index;
-            if signed_by_sender[sender_index].is_some() {
-                return Err(BaselineError::Transaction(format!(
-                    "duplicate signed sender result for index {sender_index}"
-                )));
+            for signed_sender in signed_senders {
+                let sender_index = signed_sender.sender_index;
+                if signed_by_sender[sender_index].is_some() {
+                    return Err(BaselineError::Transaction(format!(
+                        "duplicate signed sender result for index {sender_index}"
+                    )));
+                }
+                signed_by_sender[sender_index] = Some(signed_sender);
             }
-            signed_by_sender[sender_index] = Some(signed_sender.signed_txs);
         }
 
         let mut ordered_signed_txs = Vec::with_capacity(sender_count);
-        for (sender_index, sender_txs) in signed_by_sender.into_iter().enumerate() {
-            let sender_txs = sender_txs.ok_or_else(|| {
+        for (sender_index, signed_sender) in signed_by_sender.into_iter().enumerate() {
+            let signed_sender = signed_sender.ok_or_else(|| {
                 BaselineError::Transaction(format!(
                     "missing signed transaction set for sender index {sender_index}"
                 ))
             })?;
-            ordered_signed_txs.push(sender_txs);
+            ordered_signed_txs.push(PresignedSenderBatch {
+                sender_index,
+                generation: signed_sender.generation,
+                txs: signed_sender.signed_txs,
+            });
         }
 
         Ok(ordered_signed_txs)
@@ -1290,12 +1421,27 @@ impl LoadRunner {
         // `signed_chunk_rx` (detected below via the `send(...).is_err()` check), which
         // happens once the enqueue loop returns (deadline reached or channel closed).
         loop {
+            // Terminal rejections create a local nonce gap for already-presigned work. Drain reset
+            // requests before building the next chunk so affected senders resume from the node's
+            // pending nonce instead of being removed from the active sender set.
+            Self::drain_nonce_reset_requests(&mut config).await?;
+
+            // Resolve offset-based block_number predicates against the chain
+            // height once per prepare round (not per transaction). Skip the
+            // extra read entirely unless an offset bound is actually configured,
+            // so absolute-only (and non-validity) runs keep their prior behavior.
+            let current_block = if config.validity_router.needs_current_block() {
+                Self::current_block_height(&config.query_client).await?
+            } else {
+                0
+            };
             let sender_jobs = Self::build_sender_jobs(
                 &mut producer_state.generator,
                 &mut producer_state.recipient_keys,
                 &mut producer_state.recipient_rng,
                 &config,
                 chunk_per_sender,
+                current_block,
             )?;
 
             let base_fee = *config.base_fee_rx.borrow_and_update();
@@ -1305,6 +1451,8 @@ impl LoadRunner {
                 config.chain_id,
                 base_fee,
                 config.max_gas_price,
+                config.validity_priority_lead_multiplier,
+                config.validity_priority_fee_divisor,
             )
             .await?;
 
@@ -1329,12 +1477,62 @@ impl LoadRunner {
         Ok(producer_state)
     }
 
+    async fn drain_nonce_reset_requests(config: &mut PresignConfig) -> Result<()> {
+        while let Ok(reset) = config.nonce_reset_rx.try_recv() {
+            let Some(address) = config.sender_addresses.get(reset.sender_index).copied() else {
+                continue;
+            };
+            if address != reset.address {
+                continue;
+            }
+            if config
+                .sender_generations
+                .get(reset.sender_index)
+                .is_some_and(|generation| *generation >= reset.generation)
+            {
+                continue;
+            }
+
+            let nonce_manager = config.nonce_managers.get(&reset.address).ok_or_else(|| {
+                BaselineError::Transaction(format!(
+                    "missing nonce manager for sender {} during nonce reset",
+                    reset.address
+                ))
+            })?;
+            // The nonce manager uses the pending tag for load-test senders, so this restarts after
+            // transactions the node already accepted while avoiding the rejected stale tail.
+            nonce_manager.reset().await;
+            let nonce_guard = nonce_manager.next_nonce().await.map_err(|e| {
+                BaselineError::Transaction(format!(
+                    "failed to reset nonce for sender {}: {e}",
+                    reset.address
+                ))
+            })?;
+            let next_nonce = nonce_guard.nonce();
+            nonce_guard.rollback();
+
+            config.sender_next_nonces[reset.sender_index] = next_nonce;
+            config.sender_generations[reset.sender_index] = reset.generation;
+            info!(
+                sender = %reset.address,
+                sender_index = reset.sender_index,
+                generation = reset.generation,
+                next_nonce,
+                "resynced open-loop sender after terminal rejection"
+            );
+        }
+
+        Ok(())
+    }
+
     fn sign_sender_job(
         sender_job: SenderJob,
         signer: PrivateKeySigner,
         chain_id: u64,
-        priority_fee: u128,
-        max_fee: u128,
+        base_fee: u128,
+        max_gas_price: u128,
+        validity_priority_lead_multiplier: u128,
+        validity_priority_fee_divisor: u128,
     ) -> Result<SignedSender> {
         let mut signed_txs = Vec::with_capacity(sender_job.prepared_txs.len());
 
@@ -1349,49 +1547,22 @@ impl LoadRunner {
                 ))
             })?;
 
-            let mut tx = TransactionRequest::default()
-                .with_from(prepared.from)
-                .with_value(prepared.value)
-                .with_input(prepared.data)
-                .with_nonce(nonce)
-                .with_chain_id(chain_id)
-                .with_max_fee_per_gas(max_fee)
-                .with_max_priority_fee_per_gas(priority_fee)
-                .with_gas_limit(prepared.gas_limit);
-            if let Some(to) = prepared.to {
-                tx = tx.with_to(to);
-            }
-
-            let typed_tx = tx.build_typed_tx().map_err(|e| {
-                BaselineError::Transaction(format!(
-                    "failed to build typed tx for sender {} nonce {}: {e:?}",
-                    prepared.from, nonce
-                ))
-            })?;
-
-            let sig_hash = typed_tx.signature_hash();
-            let signature = signer.sign_hash_sync(&sig_hash).map_err(|e| {
-                BaselineError::Transaction(format!(
-                    "failed to sign tx for sender {} nonce {}: {e}",
-                    prepared.from, nonce
-                ))
-            })?;
-
-            let signed = typed_tx.into_signed(signature);
-            let tx_hash = *signed.hash();
-            let raw = Bytes::from(signed.encoded_2718());
-
-            signed_txs.push(SignedTransaction {
-                raw,
-                tx_hash,
-                from: prepared.from,
-                nonce,
-                gas_limit: prepared.gas_limit,
-                estimated_gas: prepared.estimated_gas,
-            });
+            let fees = GasPricer::new(max_gas_price).fees_for_cohort(
+                base_fee,
+                prepared.cohort,
+                validity_priority_fee_divisor,
+                validity_priority_lead_multiplier,
+            );
+            signed_txs.push(SubmissionPipeline::sign_at_nonce(
+                &signer, &prepared, chain_id, nonce, fees,
+            )?);
         }
 
-        Ok(SignedSender { sender_index: sender_job.sender_index, signed_txs })
+        Ok(SignedSender {
+            sender_index: sender_job.sender_index,
+            generation: sender_job.generation,
+            signed_txs,
+        })
     }
 
     async fn enqueue_signed_while_draining(
@@ -1433,15 +1604,19 @@ impl LoadRunner {
         let mut safety_tick = tokio::time::interval(safety_interval);
         safety_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_block_gas_limit = config.fallback_block_gas_limit;
-        let signal_timeout =
-            config.block_time + (config.block_time / 2).min(Duration::from_millis(250));
+        // Canonical RPC observations are routinely delayed beyond a 200ms block interval. Keep
+        // submitting at the finer safety cadence until one arrives, otherwise a delayed
+        // observation holds the next refill for 300ms and makes transactions miss the payload
+        // build window for the following slot.
+        let fallback_refill_interval = safety_interval;
         let mut last_pulse_at =
-            Instant::now().checked_sub(signal_timeout).unwrap_or_else(Instant::now);
+            Instant::now().checked_sub(fallback_refill_interval).unwrap_or_else(Instant::now);
 
         loop {
             drain_state.drain_run_events();
             if stop_flag.load(Ordering::SeqCst)
                 || config.deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                || drain_state.results_tracker.measurement_finished()
             {
                 return Ok(());
             }
@@ -1457,26 +1632,25 @@ impl LoadRunner {
                         enqueue_state.base_fee_tx.send_replace(canonical.base_fee);
                     }
                     last_pulse_at = pulse.observed_at;
+                    if drain_state.results_tracker.measurement_finished() {
+                        return Ok(());
+                    }
                     Self::run_refill_cycle(
                         enqueue_state,
-                        &config.controller,
                         pulse,
                         last_block_gas_limit,
-                        config.max_in_flight_per_sender,
-                        config.max_total_in_flight,
+                        &config,
                         drain_state,
                     )
                     .await?;
                 }
                 _ = safety_tick.tick() => {
-                    if last_pulse_at.elapsed() >= signal_timeout {
+                    if last_pulse_at.elapsed() >= fallback_refill_interval {
                         Self::run_refill_cycle(
                             enqueue_state,
-                            &config.controller,
                             InclusionPulse::safety(Instant::now()),
                             last_block_gas_limit,
-                            config.max_in_flight_per_sender,
-                            config.max_total_in_flight,
+                            &config,
                             drain_state,
                         )
                         .await?;
@@ -1501,44 +1675,70 @@ impl LoadRunner {
     fn buffer_presigned_chunk(
         buffer: &mut PresignBuffer,
         progress: &mut EnqueueProgress,
-        chunk: Vec<Vec<SignedTransaction>>,
+        chunk: Vec<PresignedSenderBatch>,
     ) {
-        for (sender_index, sender_txs) in chunk.into_iter().enumerate() {
+        for sender_batch in chunk {
             progress.presigned_generated =
-                progress.presigned_generated.saturating_add(sender_txs.len() as u64);
-            buffer.push_sender_batch(sender_index, sender_txs);
+                progress.presigned_generated.saturating_add(sender_batch.txs.len() as u64);
+            buffer.push_sender_batch(
+                sender_batch.sender_index,
+                sender_batch.generation,
+                sender_batch.txs,
+            );
         }
     }
 
     async fn run_refill_cycle(
         enqueue_state: &mut PresignEnqueueState<'_>,
-        controller: &MempoolDepthController,
         pulse: InclusionPulse,
         fallback_block_gas_limit: u64,
-        max_in_flight_per_sender: usize,
-        max_total_in_flight: usize,
+        config: &BlockAlignedEnqueueConfig,
         drain_state: &mut EnqueueDrainState<'_>,
     ) -> Result<()> {
         let cycle_started = pulse.observed_at;
         let canonical = pulse.canonical;
-        while let Ok(chunk) = enqueue_state.signed_chunk_rx.try_recv() {
+        while enqueue_state.buffer.buffered_gas() < config.presign_target_gas {
+            let Ok(chunk) = enqueue_state.signed_chunk_rx.try_recv() else {
+                break;
+            };
             Self::buffer_presigned_chunk(enqueue_state.buffer, enqueue_state.progress, chunk);
         }
         drain_state.drain_run_events();
-        let mut disabled_sender_count = 0usize;
+        let mut reset_sender_count = 0usize;
         for sender in drain_state.rejected_senders.drain() {
-            if enqueue_state.buffer.disable_sender(sender) {
-                disabled_sender_count = disabled_sender_count.saturating_add(1);
+            let Some(&sender_index) = enqueue_state.sender_indices.get(&sender) else {
+                continue;
+            };
+            let Some(generation) = enqueue_state.buffer.reset_sender(sender_index, sender) else {
+                continue;
+            };
+            // Reset is split across the enqueue and producer tasks: the enqueue side owns the
+            // presign buffer and generation filter, while the producer owns future nonce
+            // assignment. The control message stitches those two local state machines together.
+            if enqueue_state
+                .nonce_reset_tx
+                .send(SenderNonceReset { sender_index, address: sender, generation })
+                .await
+                .is_err()
+            {
+                warn!(
+                    sender = %sender,
+                    sender_index,
+                    generation,
+                    "presign producer stopped before sender nonce reset"
+                );
+                continue;
             }
+            reset_sender_count = reset_sender_count.saturating_add(1);
         }
-        if disabled_sender_count > 0 {
-            warn!(disabled_sender_count, "disabled senders after terminal nonce rejection");
+        if reset_sender_count > 0 {
+            warn!(reset_sender_count, "reset senders after terminal nonce rejection");
         }
 
         let plan_started = Instant::now();
         let depth_gas = drain_state.mempool_depth_gas();
         let block_gas_limit = canonical.map_or(fallback_block_gas_limit, |block| block.gas_limit);
-        let plan = controller.plan(
+        let plan = config.controller.plan(
             cycle_started,
             block_gas_limit,
             depth_gas,
@@ -1554,14 +1754,14 @@ impl LoadRunner {
                     queued.saturating_add(drain_state.results_tracker.in_flight_for(from));
                 (
                     *from,
-                    u64::try_from(max_in_flight_per_sender)
+                    u64::try_from(config.max_in_flight_per_sender)
                         .unwrap_or(u64::MAX)
                         .saturating_sub(occupied),
                 )
             })
             .collect();
         let remaining_transaction_slots =
-            drain_state.remaining_transaction_slots(max_total_in_flight);
+            drain_state.remaining_transaction_slots(config.max_total_in_flight);
         let mut selected = enqueue_state.buffer.take_gas_with_limits(
             plan.inject_gas,
             &mut sender_slots,
@@ -1622,7 +1822,8 @@ impl LoadRunner {
         }
         let resulting_depth_gas = drain_state.mempool_depth_gas();
         drain_state.collector.record_pacing_cycle(PacingCycleObservation {
-            elapsed: cycle_started.saturating_duration_since(controller.measurement_started_at),
+            elapsed: cycle_started
+                .saturating_duration_since(config.controller.measurement_started_at),
             source: match pulse.source {
                 InclusionSource::Canonical => PacingCycleSource::Canonical,
                 InclusionSource::Flashblock => PacingCycleSource::Flashblock,
@@ -1906,19 +2107,26 @@ impl LoadRunner {
 mod tests {
     use std::{
         collections::{HashMap, HashSet},
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64},
+        },
         time::{Duration, Instant},
     };
 
     use alloy_primitives::{Address, Bytes, TxHash};
     use tokio::sync::mpsc;
 
-    use super::{EnqueueDrainState, InjectLimit, LoadRunner, MempoolDepthController};
+    use super::{
+        BlockAlignedEnqueueConfig, EnqueueDrainState, EnqueueProgress, InclusionPulse, InjectLimit,
+        LoadRunner, MempoolDepthController, PresignBuffer, PresignEnqueueState,
+    };
     use crate::{
         metrics::MetricsCollector,
         runner::{
-            PipelineStartConfig, ResultsTracker, SUBMIT_BATCH_QUEUE_BUFFER, SignedBatch,
-            SignedTransaction, SubmissionPipeline, SubmitEvent,
+            BlockObservation, BlockPulse, PipelineStartConfig, ResultsTracker,
+            SUBMIT_BATCH_QUEUE_BUFFER, SignedBatch, SignedTransaction, SubmissionPipeline,
+            SubmitCohort, SubmitEvent,
         },
     };
     #[test]
@@ -1940,6 +2148,8 @@ mod tests {
                 nonce: id,
                 gas_limit: 21_000,
                 estimated_gas: 21_000,
+                validity: Vec::new(),
+                cohort: SubmitCohort::Plain,
             }],
         }
     }
@@ -1964,6 +2174,8 @@ mod tests {
             PipelineStartConfig {
                 chain_id: 1,
                 max_gas_price: u128::MAX,
+                validity_priority_lead_multiplier: 1,
+                validity_priority_fee_divisor: 1,
                 max_concurrent_submit_requests: None,
             },
         );
@@ -2116,5 +2328,225 @@ mod tests {
         assert_eq!(plan.floor_gas, 30_000_000);
         assert_eq!(plan.desired_gas, 60_000_000);
         assert_eq!(plan.inject_gas, 60_000_000);
+    }
+
+    #[tokio::test]
+    async fn enqueue_block_aligned_stops_when_measurement_end_is_observed() {
+        let sender = Address::repeat_byte(0x21);
+        let results_tracker = ResultsTracker::new(&[sender]);
+        results_tracker.begin_measurement(10, Some(2));
+        let mut collector = MetricsCollector::new();
+        let mut queued_per_sender = HashMap::from([(sender, 0_u64)]);
+        let mut rejected_senders = HashSet::new();
+        let mut queued_gas = 0u128;
+        let (_submit_event_tx, mut submit_event_rx) = mpsc::channel(8);
+        let (_signed_chunk_tx, mut signed_chunk_rx) = mpsc::channel(1);
+        let (base_fee_tx, _base_fee_rx) = tokio::sync::watch::channel(1_u128);
+        let mut progress = EnqueueProgress { presigned_generated: 0, offered_gas: 0 };
+        let mut presign_buffer = PresignBuffer::new(1);
+        let pipeline = SubmissionPipeline::start(
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            Arc::new(Vec::new()),
+            results_tracker.clone(),
+            mpsc::channel(1).0,
+            PipelineStartConfig {
+                chain_id: 1,
+                max_gas_price: u128::MAX,
+                validity_priority_lead_multiplier: 1,
+                validity_priority_fee_divisor: 1,
+                max_concurrent_submit_requests: None,
+            },
+        );
+        let next_submit_batch_id = AtomicU64::new(0);
+        let stop_flag = AtomicBool::new(false);
+        let (pulse_tx, mut pulse_rx) = mpsc::channel(8);
+        let (nonce_reset_tx, _nonce_reset_rx) = mpsc::channel(1);
+        let sender_indices = HashMap::from([(sender, 0usize)]);
+
+        let mut enqueue_state = PresignEnqueueState {
+            submission_pipeline: &pipeline,
+            next_submit_batch_id: &next_submit_batch_id,
+            signed_chunk_rx: &mut signed_chunk_rx,
+            nonce_reset_tx: &nonce_reset_tx,
+            sender_indices: &sender_indices,
+            buffer: &mut presign_buffer,
+            progress: &mut progress,
+            base_fee_tx: &base_fee_tx,
+        };
+        let mut drain_state = EnqueueDrainState {
+            submit_event_rx: &mut submit_event_rx,
+            queued_per_sender: &mut queued_per_sender,
+            rejected_senders: &mut rejected_senders,
+            queued_gas: &mut queued_gas,
+            collector: &mut collector,
+            results_tracker: &results_tracker,
+            progress_display: None,
+        };
+
+        let (run_result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                LoadRunner::enqueue_block_aligned_transactions(
+                    &mut enqueue_state,
+                    BlockAlignedEnqueueConfig {
+                        controller: MempoolDepthController::new(
+                            None,
+                            Duration::from_secs(2),
+                            1_000_000,
+                            Instant::now(),
+                        ),
+                        fallback_block_gas_limit: 30_000_000,
+                        block_time: Duration::from_secs(2),
+                        presign_target_gas: 0,
+                        max_in_flight_per_sender: 1,
+                        max_total_in_flight: 1,
+                        deadline: None,
+                    },
+                    &mut pulse_rx,
+                    &stop_flag,
+                    &mut drain_state,
+                ),
+                async {
+                    let first_observed_at = Instant::now();
+                    results_tracker.on_new_block_hashes(
+                        BlockObservation { number: 11, observed_at: first_observed_at },
+                        Vec::new(),
+                    );
+                    pulse_tx
+                        .send(InclusionPulse::canonical(
+                            BlockPulse {
+                                number: 11,
+                                gas_used: 1,
+                                gas_limit: 30_000_000,
+                                base_fee: 1,
+                                our_included_gas: 0,
+                                expected_boundary: first_observed_at,
+                                observed_at: first_observed_at,
+                            },
+                            0,
+                        ))
+                        .await
+                        .expect("first pulse should send");
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+
+                    let second_observed_at = Instant::now();
+                    results_tracker.on_new_block_hashes(
+                        BlockObservation { number: 12, observed_at: second_observed_at },
+                        Vec::new(),
+                    );
+                    pulse_tx
+                        .send(InclusionPulse::canonical(
+                            BlockPulse {
+                                number: 12,
+                                gas_used: 1,
+                                gas_limit: 30_000_000,
+                                base_fee: 1,
+                                our_included_gas: 0,
+                                expected_boundary: second_observed_at,
+                                observed_at: second_observed_at,
+                            },
+                            0,
+                        ))
+                        .await
+                        .expect("second pulse should send");
+                }
+            )
+        })
+        .await
+        .expect("enqueue loop should stop at measurement end");
+        run_result.expect("enqueue loop should exit cleanly");
+
+        let summary = collector.summarize(Duration::from_secs(1), None);
+        assert_eq!(summary.pacing.canonical_cycles, 1);
+        assert!(results_tracker.measurement_finished());
+    }
+
+    #[tokio::test]
+    async fn enqueue_block_aligned_refills_at_safety_cadence_when_canonical_pulses_are_late() {
+        let sender = Address::repeat_byte(0x22);
+        let results_tracker = ResultsTracker::new(&[sender]);
+        results_tracker.begin_measurement(10, Some(100));
+        let mut collector = MetricsCollector::new();
+        let mut queued_per_sender = HashMap::from([(sender, 0_u64)]);
+        let mut rejected_senders = HashSet::new();
+        let mut queued_gas = 0u128;
+        let (_submit_event_tx, mut submit_event_rx) = mpsc::channel(8);
+        let (_signed_chunk_tx, mut signed_chunk_rx) = mpsc::channel(1);
+        let (base_fee_tx, _base_fee_rx) = tokio::sync::watch::channel(1_u128);
+        let mut progress = EnqueueProgress { presigned_generated: 0, offered_gas: 0 };
+        let mut presign_buffer = PresignBuffer::new(1);
+        let pipeline = SubmissionPipeline::start(
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            Arc::new(Vec::new()),
+            results_tracker.clone(),
+            mpsc::channel(1).0,
+            PipelineStartConfig {
+                chain_id: 1,
+                max_gas_price: u128::MAX,
+                validity_priority_lead_multiplier: 1,
+                validity_priority_fee_divisor: 1,
+                max_concurrent_submit_requests: None,
+            },
+        );
+        let next_submit_batch_id = AtomicU64::new(0);
+        let stop_flag = AtomicBool::new(false);
+        let (_pulse_tx, mut pulse_rx) = mpsc::channel(1);
+        let (nonce_reset_tx, _nonce_reset_rx) = mpsc::channel(1);
+        let sender_indices = HashMap::from([(sender, 0usize)]);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            LoadRunner::enqueue_block_aligned_transactions(
+                &mut PresignEnqueueState {
+                    submission_pipeline: &pipeline,
+                    next_submit_batch_id: &next_submit_batch_id,
+                    signed_chunk_rx: &mut signed_chunk_rx,
+                    nonce_reset_tx: &nonce_reset_tx,
+                    sender_indices: &sender_indices,
+                    buffer: &mut presign_buffer,
+                    progress: &mut progress,
+                    base_fee_tx: &base_fee_tx,
+                },
+                BlockAlignedEnqueueConfig {
+                    controller: MempoolDepthController::new(
+                        None,
+                        Duration::from_secs(2),
+                        1_000_000,
+                        Instant::now(),
+                    ),
+                    fallback_block_gas_limit: 30_000_000,
+                    block_time: Duration::from_secs(2),
+                    presign_target_gas: 0,
+                    max_in_flight_per_sender: 1,
+                    max_total_in_flight: 1,
+                    // The 200ms block interval gets a 50ms safety cadence. With no canonical
+                    // pulses, this should perform the immediate safety refill plus a periodic
+                    // refill before the deadline. The old 300ms fallback only
+                    // performed the initial refill here, which allowed 200ms slots to go empty.
+                    deadline: Some(Instant::now() + Duration::from_millis(210)),
+                },
+                &mut pulse_rx,
+                &stop_flag,
+                &mut EnqueueDrainState {
+                    submit_event_rx: &mut submit_event_rx,
+                    queued_per_sender: &mut queued_per_sender,
+                    rejected_senders: &mut rejected_senders,
+                    queued_gas: &mut queued_gas,
+                    collector: &mut collector,
+                    results_tracker: &results_tracker,
+                    progress_display: None,
+                },
+            ),
+        )
+        .await
+        .expect("enqueue loop should stop when deadline is reached")
+        .expect("enqueue loop should exit cleanly");
+
+        let summary = collector.summarize(Duration::from_secs(1), None);
+        assert_eq!(summary.pacing.canonical_cycles, 0);
+        assert!(summary.pacing.safety_cycles >= 2);
+        assert!(!results_tracker.measurement_finished());
     }
 }

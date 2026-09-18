@@ -6,20 +6,26 @@
 use std::sync::Arc;
 
 use base_builder_cli::Args;
-use base_builder_core::{
-    BuilderApiExtension, BuilderApiExtensionConfig, FlashblocksServiceBuilder,
-};
+use base_builder_core::BuilderApiExtension;
 use base_builder_metering::MeteringStoreExtension;
+use base_builder_multiplex::MultiplexingServiceBuilder;
 use base_execution_cli::{Cli, StandardBaseRethNode};
 use base_node_runner::BaseNodeRunner;
 use base_observability_events::GlobalTransactionEventWriter;
 use base_shadow_indexer::{ShadowIndexerConfig, ShadowIndexerExtension};
-use base_txpool_rpc::{TxPoolRpcConfig, TxPoolRpcExtension};
+use base_txpool_rpc::{
+    SendRawTransactionValidityConfig, SendRawTransactionValidityExtension, TxPoolRpcConfig,
+    TxPoolRpcExtension,
+};
 
 type BuilderCli = Cli<Args>;
 
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
+
+#[cfg(all(feature = "jemalloc-prof", unix))]
+#[unsafe(export_name = "malloc_conf")]
+static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 
 fn main() {
     base_cli_utils::init_common!();
@@ -40,9 +46,10 @@ fn main() {
             transaction_events_enabled.then(|| builder_args.transaction_events.writer_config()),
         )?;
 
-        let accept_validity_transactions = builder_args.enable_experimental_validity_transactions;
+        let builder_api_config = builder_args.builder_api_config()?;
         let shadow_indexer_config = ShadowIndexerConfig::try_from(&builder_args.shadow_indexer)?;
-        let max_validity_predicates = builder_args.experimental_validity_max_predicates;
+        let payload_builder_cutover = builder_args.payload_builder_cutover;
+        let basic_payload_builder = builder_args.basic_payload_builder;
         let builder_config = builder_args
             .into_builder_config(Arc::clone(&metering_provider))
             .expect("Failed to convert rollup args to builder config");
@@ -54,13 +61,22 @@ fn main() {
             .with_da_config(da_config)
             .with_gas_limit_config(gas_limit_config)
             .with_manifest_precheck_enabled(manifest_precheck_enabled)
-            .with_service_builder(FlashblocksServiceBuilder::new(builder_config));
+            .with_service_builder(
+                MultiplexingServiceBuilder::new(builder_config)
+                    .with_cutover_enabled(payload_builder_cutover)
+                    .with_basic_only(basic_payload_builder),
+            );
         runner.install_ext::<MeteringStoreExtension>(metering_provider);
         runner.install_ext::<TxPoolRpcExtension>(TxPoolRpcConfig::default());
-        runner.install_ext::<BuilderApiExtension>(BuilderApiExtensionConfig::new(
-            accept_validity_transactions,
-            max_validity_predicates,
-        ));
+        runner.install_ext::<BuilderApiExtension>(builder_api_config);
+        if builder_api_config.accept_experimental_validity_transactions {
+            runner.install_ext::<SendRawTransactionValidityExtension>(
+                SendRawTransactionValidityConfig {
+                    max_validity_predicates: builder_api_config.max_validity_predicates,
+                    ..Default::default()
+                },
+            );
+        }
         runner.install_ext::<ShadowIndexerExtension>(shadow_indexer_config);
         StandardBaseRethNode::install_upgrade_signal_runtime_extension(&mut runner, &rollup_args)?;
         runner.add_started_callback(|| {

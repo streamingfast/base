@@ -27,7 +27,7 @@ use tracing::debug;
 use crate::{
     Admission, BasePooledTx, BaseTransactionValidator, GuardLimits, GuardMetrics,
     InvalidationCause, InvalidationKey, LimitRejection, MempoolGuard, ParkableBestTransactions,
-    ParkableTransactionPool, ParkedBestTransactions, StateDiffInvalidation,
+    ParkableTransactionPool, ParkedBestTransactions, StateDiffInvalidation, ValidityPoolMetrics,
     best::MergeBestTransactions,
     two_d_nonce_pool::{InsertOutcome, TwoDNoncePool},
 };
@@ -91,6 +91,10 @@ pub struct BaseTransactionPool<
     listeners: Arc<RwLock<SidecarListeners<T>>>,
     /// Shared admission and invalidation ledger for EIP-8130 transactions.
     guard: Arc<RwLock<MempoolGuard>>,
+    /// Block-height expiry index for validity-predicate transactions, evicted as
+    /// the chain advances past a transaction's last valid block. Not gated on
+    /// transaction type, so it also covers the EIP-1559 advanced-submission path.
+    block_expiry: Arc<RwLock<crate::BlockExpiryIndex>>,
     /// Serializes the short protocol-pool insertion/admission section so a
     /// concurrent same-nonce replacement cannot leave a stale guard record.
     /// Validation remains outside this lock.
@@ -127,6 +131,7 @@ where
             nonce_pool: Arc::clone(&self.nonce_pool),
             listeners: Arc::clone(&self.listeners),
             guard: Arc::clone(&self.guard),
+            block_expiry: Arc::clone(&self.block_expiry),
             protocol_admission_lock: Arc::clone(&self.protocol_admission_lock),
         }
     }
@@ -168,6 +173,7 @@ where
             nonce_pool: Arc::new(RwLock::new(TwoDNoncePool::new(price_bump_config))),
             listeners: Arc::new(RwLock::new(SidecarListeners::default())),
             guard: Arc::new(RwLock::new(MempoolGuard::unlimited())),
+            block_expiry: Arc::new(RwLock::new(crate::BlockExpiryIndex::new())),
             protocol_admission_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -335,6 +341,73 @@ where
         }
     }
 
+    /// Returns the block-expiry bound for a validated transaction's validity
+    /// predicates, or `None` when they impose no finite block bound.
+    fn validity_block_expiry_bound(validated: &TransactionValidationOutcome<T>) -> Option<u64> {
+        let transaction = validated.as_valid_transaction()?;
+        crate::ValidityPredicate::block_expiry_bound(
+            transaction.transaction().validity_predicates(),
+        )
+    }
+
+    /// Records a transaction's last valid block in the block-expiry index,
+    /// dropping any replaced transaction's stale entry in the same pass so a
+    /// fee-bump replacement does not orphan the old hash until its expiry block.
+    fn register_block_expiry(
+        &self,
+        hash: TxHash,
+        last_valid_block: Option<u64>,
+        replaced: Option<TxHash>,
+    ) {
+        if last_valid_block.is_none() && replaced.is_none() {
+            return;
+        }
+        let mut block_expiry = self.block_expiry.write();
+        if let Some(replaced) = replaced {
+            block_expiry.remove(&replaced);
+        }
+        if let Some(last_valid_block) = last_valid_block {
+            block_expiry.insert(hash, last_valid_block);
+        }
+    }
+
+    /// Evicts validity-predicate transactions whose last valid block is before
+    /// the newly committed `block_number`.
+    ///
+    /// This is the pool-side, block-granular half of validity expiry (the
+    /// builder enforces the finer flashblock deadline). Driven from
+    /// `on_canonical_state_change`, so eviction rides block cadence. Entries for
+    /// transactions removed by other paths (inclusion, replacement) are cleaned
+    /// up lazily when their own expiry block is reached, bounding index growth to
+    /// the furthest live block bound.
+    fn expire_by_block(&self, block_number: u64) {
+        let _admission_guard = self.protocol_admission_lock.lock();
+        let expired = self.block_expiry.write().drain_expired(block_number);
+        let removed = self.remove_dropped_across_pools(expired);
+        // Release any guard slots directly rather than deferring to the
+        // reconciliation sweep: an EIP-8130 transaction may carry block_number
+        // validity predicates, so an evicted tx can also hold guard capacity.
+        // `release` is a no-op for the common EIP-1559 case that is not tracked.
+        self.release_from_guard(&removed);
+        if !removed.is_empty() {
+            GuardMetrics::record_block_expiry_invalidations(removed.len());
+            debug!(
+                count = removed.len(),
+                block = block_number,
+                "validity transactions invalidated by block expiry"
+            );
+        }
+    }
+
+    /// Returns whether a validated transaction carries validity predicates, for
+    /// lane-churn accounting. Invalid outcomes carry no pooled transaction and
+    /// are never counted.
+    fn has_validity_predicates(validated: &TransactionValidationOutcome<T>) -> bool {
+        validated
+            .as_valid_transaction()
+            .is_some_and(|transaction| !transaction.transaction().validity_predicates().is_empty())
+    }
+
     fn reconcile_guard(&self) {
         let tracked = self.guard.read().tracked_hashes();
         if tracked.is_empty() {
@@ -438,6 +511,10 @@ where
         // tracked replacement bypasses this check and is reaccounted after the
         // protocol pool atomically accepts the fee bump.
         let pre_admitted = self.pre_admit_protocol_transaction(hash, replaced, &validated)?;
+        // Capture the block-expiry bound and validity-lane flag before
+        // `validated` is consumed below.
+        let block_expiry_bound = Self::validity_block_expiry_bound(&validated);
+        let is_validity = Self::has_validity_predicates(&validated);
         let mut outcomes =
             self.protocol_pool.inner().add_transactions(origin, std::iter::once(validated));
         let outcome = match outcomes.pop() {
@@ -459,6 +536,10 @@ where
             }
         };
         self.gate_protocol_admission(hash, replaced, pre_admitted)?;
+        self.register_block_expiry(hash, block_expiry_bound, replaced);
+        if is_validity {
+            ValidityPoolMetrics::record_admission(replaced.is_some());
+        }
         Ok(outcome)
     }
 
@@ -553,6 +634,13 @@ where
         validated: TransactionValidationOutcome<T>,
         origin: TransactionOrigin,
     ) -> PoolResult<AddedTransactionOutcome> {
+        // Capture the block-expiry bound before `validated` is consumed by the
+        // match below, mirroring the protocol admission paths. A sidecar (EIP-8130)
+        // transaction carrying block-number validity predicates must be recorded
+        // in the block-expiry index so it is evicted once its last valid block
+        // passes; a finite 2D-nonce-channel sidecar has no time-based expiry, so
+        // without this it would linger indefinitely.
+        let block_expiry_bound = Self::validity_block_expiry_bound(&validated);
         match validated {
             TransactionValidationOutcome::Valid {
                 transaction,
@@ -576,6 +664,7 @@ where
                     .limit_class()
                     .map(|class| class.classification_generation);
                 let admission = Self::admission_for(&validated.transaction);
+                let is_validity = !validated.transaction.validity_predicates().is_empty();
                 let outcome = nonce_pool.insert_validated(validated, state_nonce)?;
                 // nonce_pool serializes sidecar replacement. Never acquire it while holding guard.
                 let mut guard = self.guard.write();
@@ -622,6 +711,18 @@ where
                 }
                 drop(guard);
                 listeners.on_inserted(&nonce_pool, &outcome);
+                if is_validity {
+                    ValidityPoolMetrics::record_admission(outcome.replaced.is_some());
+                }
+                // Record the block-expiry bound after a successful insertion,
+                // dropping the replaced hash's stale entry in the same pass.
+                // Release the sidecar locks first so the block-expiry index is
+                // not acquired while holding the nonce pool.
+                let inserted_hash = outcome.outcome.hash;
+                let replaced_hash = outcome.replaced.as_ref().map(|replaced| *replaced.hash());
+                drop(listeners);
+                drop(nonce_pool);
+                self.register_block_expiry(inserted_hash, block_expiry_bound, replaced_hash);
                 Ok(outcome.outcome)
             }
             TransactionValidationOutcome::Invalid(transaction, error) => {
@@ -776,6 +877,10 @@ where
             self.ensure_protocol_classification_current(hash, &validated)?;
             let replaced = self.protocol_replacement_hash(sender, nonce);
             let pre_admitted = self.pre_admit_protocol_transaction(hash, replaced, &validated)?;
+            // Capture the block-expiry bound and validity-lane flag before
+            // `validated` is consumed below.
+            let block_expiry_bound = Self::validity_block_expiry_bound(&validated);
+            let is_validity = Self::has_validity_predicates(&validated);
             let events =
                 match self.protocol_pool.inner().add_transaction_and_subscribe(origin, validated) {
                     Ok(events) => events,
@@ -787,6 +892,10 @@ where
                     }
                 };
             self.gate_protocol_admission(hash, replaced, pre_admitted)?;
+            self.register_block_expiry(hash, block_expiry_bound, replaced);
+            if is_validity {
+                ValidityPoolMetrics::record_admission(replaced.is_some());
+            }
             return Ok(events);
         }
 
@@ -1381,6 +1490,7 @@ where
     ) {
         let block_hash = update.hash();
         let now = update.timestamp();
+        let block_number = update.number();
         let mined_transactions = update.mined_transactions.clone();
         // Free mined capacity atomically with admission before the heavier pool
         // maintenance. The transaction is already canonical, so it no longer
@@ -1390,6 +1500,10 @@ where
             let mut guard = self.guard.write();
             for hash in &mined_transactions {
                 guard.release(hash);
+            }
+            let mut block_expiry = self.block_expiry.write();
+            for hash in &mined_transactions {
+                block_expiry.remove(hash);
             }
         }
         self.protocol_pool.on_canonical_state_change(update);
@@ -1416,6 +1530,7 @@ where
             }
         }
         self.expire_due_buckets(now);
+        self.expire_by_block(block_number);
         self.reconcile_guard();
         GuardMetrics::tracked().set(self.guard.read().len() as f64);
     }
@@ -1691,8 +1806,9 @@ mod tests {
         BaseBlock, BasePooledTransaction as ConsensusPooledTransaction, BasePrimitives,
         BaseTxEnvelope, Eip8130Constants, Eip8130Signed, TxEip8130,
     };
-    use base_execution_chainspec::{BaseChainSpec, BaseChainSpecBuilder};
+    use base_execution_chainspec::BaseChainSpec;
     use base_execution_evm::BaseEvmConfig;
+    use base_test_utils::build_test_genesis_zenith;
     use futures::{StreamExt, future::join_all};
     use reth_primitives_traits::SealedBlock;
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
@@ -1704,7 +1820,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::{BaseL1BlockInfo, BaseOrdering, BasePooledTransaction, LimitClass, WatchSet};
+    use crate::{
+        BaseL1BlockInfo, BaseOrdering, BasePooledTransaction, LimitClass, ValidityOperator,
+        ValidityPredicate, WatchSet,
+    };
 
     fn test_chain_id() -> u64 {
         ChainConfig::mainnet().chain_id
@@ -1916,7 +2035,9 @@ mod tests {
 
     fn build_integration_pool()
     -> (IntegrationPool, MockEthProvider<BasePrimitives, Arc<BaseChainSpec>>) {
-        let chain_spec = Arc::new(BaseChainSpecBuilder::base_mainnet().cobalt_activated().build());
+        let mut genesis = build_test_genesis_zenith();
+        genesis.config.chain_id = test_chain_id();
+        let chain_spec = Arc::new(BaseChainSpec::from_genesis(genesis));
         let client = MockEthProvider::<BasePrimitives>::new()
             .with_chain_spec(Arc::clone(&chain_spec))
             .with_genesis_block();
@@ -1983,6 +2104,29 @@ mod tests {
             assert!(result.is_ok(), "standard transaction {nonce} was guard-rejected: {result:?}");
         }
         assert!(pool.guard.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn protocol_validity_transaction_replaces_with_only_a_higher_max_fee() {
+        let (pool, client) = build_integration_pool();
+        let signer = signer();
+        fund(&client, signer.address());
+        let predicate =
+            ValidityPredicate::BlockNumber { op: ValidityOperator::LessThan, value: U256::from(2) };
+        let original = self_paid_eoa_8130(&signer, U256::ZERO, 0, 0, 1_000)
+            .with_validity_predicates(vec![predicate.clone()]);
+        let original_hash = *original.hash();
+        pool.add_transaction(TransactionOrigin::Local, original).await.unwrap();
+
+        let replacement = self_paid_eoa_8130(&signer, U256::ZERO, 0, 0, 1_001)
+            .with_validity_predicates(vec![predicate]);
+        let replacement_hash = *replacement.hash();
+        pool.add_transaction(TransactionOrigin::Local, replacement)
+            .await
+            .expect("validity replacement only requires a higher max fee");
+
+        assert!(pool.get(&original_hash).is_none());
+        assert!(pool.get(&replacement_hash).is_some());
     }
 
     #[tokio::test]
@@ -2321,6 +2465,70 @@ mod tests {
             nonce: 0,
             balance: U256::from(999),
         }]);
+        assert!(pool.get(&hash).is_none());
+        assert!(!pool.guard.read().contains(&hash));
+    }
+
+    #[test]
+    fn register_block_expiry_drops_the_replaced_entry() {
+        let (pool, _) = build_integration_pool();
+        let replaced = TxHash::repeat_byte(0x11);
+        let new_hash = TxHash::repeat_byte(0x22);
+
+        // Seed the index with the soon-to-be-replaced transaction.
+        pool.register_block_expiry(replaced, Some(100), None);
+        assert_eq!(pool.block_expiry.read().len(), 1);
+
+        // A fee-bump replacement must evict the stale entry rather than
+        // accumulate it, so the index does not grow per replacement.
+        pool.register_block_expiry(new_hash, Some(200), Some(replaced));
+        assert_eq!(pool.block_expiry.read().len(), 1);
+
+        // Only the new hash remains, tracked at its own bound.
+        let mut index = pool.block_expiry.write();
+        assert!(index.drain_expired(150).is_empty());
+        assert_eq!(index.drain_expired(201), vec![new_hash]);
+    }
+
+    #[test]
+    fn register_block_expiry_drops_a_replaced_entry_without_a_new_bound() {
+        let (pool, _) = build_integration_pool();
+        let replaced = TxHash::repeat_byte(0x33);
+        let new_hash = TxHash::repeat_byte(0x44);
+
+        pool.register_block_expiry(replaced, Some(100), None);
+        assert_eq!(pool.block_expiry.read().len(), 1);
+
+        // An unbounded replacement still clears the replaced hash's stale entry.
+        pool.register_block_expiry(new_hash, None, Some(replaced));
+        assert!(pool.block_expiry.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sidecar_validity_transaction_registers_block_expiry() {
+        let (pool, client) = build_integration_pool();
+        let signer = signer();
+        fund(&client, signer.address());
+
+        // A finite 2D-nonce-channel EIP-8130 sidecar carrying a block-number
+        // upper-bound predicate. Such a transaction has no time-based expiry, so
+        // block-expiry registration is the only thing that prevents it from
+        // lingering in the pool forever once it can no longer be included.
+        let transaction = self_paid_eoa_8130(&signer, U256::from(1), 0, 0, 1_000)
+            .with_validity_predicates(vec![crate::ValidityPredicate::BlockNumber {
+                op: crate::ValidityOperator::LessThanOrEqual,
+                value: U256::from(100),
+            }]);
+        let hash = *transaction.hash();
+        pool.add_transaction(TransactionOrigin::Local, transaction).await.unwrap();
+
+        // The sidecar admission path must record the tx's last valid block.
+        assert_eq!(pool.block_expiry.read().len(), 1);
+        assert!(pool.get(&hash).is_some());
+
+        // Once the last valid block is behind the tip, block-expiry eviction
+        // removes it and releases any guard capacity it held.
+        pool.expire_by_block(101);
         assert!(pool.get(&hash).is_none());
         assert!(!pool.guard.read().contains(&hash));
     }

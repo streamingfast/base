@@ -165,19 +165,24 @@ pub trait StorageOps {
     }
 }
 
-/// Fork-dependent features for persistent storage writes.
+/// Fork-dependent features for native precompile behavior.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StorageFeatures {
-    /// Preserve storage behavior from before Cobalt activation.
+    /// Preserve precompile behavior from before Cobalt activation.
     #[default]
     Legacy,
-    /// Apply Cobalt storage behavior, including dynamic tail cleanup on shrink.
+    /// Apply Cobalt behavior, including dynamic tail cleanup and compact ABI decode errors.
     Cobalt,
 }
 
 impl StorageFeatures {
     /// Returns whether dynamic storage tail cleanup is enabled.
     pub fn dynamic_storage_tail_cleanup_enabled(self) -> bool {
+        self >= Self::Cobalt
+    }
+
+    /// Returns whether ABI decode failures should omit the decoder message.
+    pub fn selector_only_abi_decode_errors_enabled(self) -> bool {
         self >= Self::Cobalt
     }
 }
@@ -335,7 +340,7 @@ pub trait Storable: StorableType + Sized {
             Some(offset) => {
                 let bytes = Self::BYTES;
                 let current = storage.load(slot)?;
-                let cleared = crate::packing::delete_from_word(current, offset, bytes)?;
+                let cleared = crate::packing::Word::delete_from_word(current, offset, bytes)?;
                 storage.store(slot, cleared)
             }
         }
@@ -370,7 +375,7 @@ impl<T: Packable> Storable for T {
             None => storage.load(slot).and_then(Self::from_word),
             Some(offset) => {
                 let slot_value = storage.load(slot)?;
-                crate::packing::extract_from_word(slot_value, offset, Self::BYTES)
+                crate::packing::Word::extract_from_word(slot_value, offset, Self::BYTES)
             }
         }
     }
@@ -382,7 +387,8 @@ impl<T: Packable> Storable for T {
             None => storage.store(slot, self.to_word()),
             Some(offset) => {
                 let current = storage.load(slot)?;
-                let updated = crate::packing::insert_into_word(current, self, offset, Self::BYTES)?;
+                let updated =
+                    crate::packing::Word::insert_into_word(current, self, offset, Self::BYTES)?;
                 storage.store(slot, updated)
             }
         }

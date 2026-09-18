@@ -3,7 +3,7 @@
 use std::{sync::Arc, time::Duration};
 
 use alloy_eips::Encodable2718;
-use base_execution_txpool::{BundleTransaction, NoExtensions, ValidatedTransactionExtensions};
+use base_execution_txpool::{NoExtensions, ValidatedTransactionExtensions};
 use futures::{StreamExt, future::join_all, stream::FuturesUnordered};
 use jsonrpsee::http_client::HttpClientBuilder;
 use reth_tasks::TaskExecutor;
@@ -36,13 +36,6 @@ pub enum ForwardingSetupError {
     },
 }
 
-/// Maximum time allowed for destination queues and in-flight requests to drain.
-#[cfg(not(test))]
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
-/// Short deadline used by unit tests that verify forced shutdown.
-#[cfg(test)]
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(50);
-
 /// Owns transaction forwarding configuration and starts destination pipelines.
 #[derive(Debug)]
 pub struct TxForwardingService {
@@ -59,7 +52,7 @@ impl TxForwardingService {
     pub fn spawn<P>(self, pool: P, executor: &TaskExecutor) -> TxForwardingHandle
     where
         P: TransactionPool + Clone + Send + 'static,
-        P::Transaction: PoolTransaction + BundleTransaction,
+        P::Transaction: PoolTransaction,
         <P::Transaction as PoolTransaction>::Consensus: Encodable2718,
     {
         self.spawn_with_extensions::<P, NoExtensions>(pool, executor)
@@ -69,7 +62,7 @@ impl TxForwardingService {
     pub fn spawn_with_extensions<P, E>(self, pool: P, executor: &TaskExecutor) -> TxForwardingHandle
     where
         P: TransactionPool + Clone + Send + 'static,
-        P::Transaction: PoolTransaction + BundleTransaction,
+        P::Transaction: PoolTransaction,
         <P::Transaction as PoolTransaction>::Consensus: Encodable2718,
         E: ValidatedTransactionExtensions<P::Transaction>,
     {
@@ -79,6 +72,7 @@ impl TxForwardingService {
                 reader_cancel,
                 reader_tasks: Vec::new(),
                 forwarder_tasks: Vec::new(),
+                shutdown_timeout: TxForwardingHandle::DEFAULT_SHUTDOWN_TIMEOUT,
             };
         }
 
@@ -129,7 +123,12 @@ impl TxForwardingService {
             info!(builder_url = %builder_url, "started transaction forwarding destination");
         }
 
-        TxForwardingHandle { reader_cancel, reader_tasks, forwarder_tasks }
+        TxForwardingHandle {
+            reader_cancel,
+            reader_tasks,
+            forwarder_tasks,
+            shutdown_timeout: TxForwardingHandle::DEFAULT_SHUTDOWN_TIMEOUT,
+        }
     }
 
     /// Starts one forwarder per destination, driven by queues the caller owns.
@@ -178,6 +177,7 @@ impl TxForwardingService {
             reader_cancel: CancellationToken::new(),
             reader_tasks: Vec::new(),
             forwarder_tasks,
+            shutdown_timeout: TxForwardingHandle::DEFAULT_SHUTDOWN_TIMEOUT,
         })
     }
 }
@@ -187,9 +187,20 @@ pub struct TxForwardingHandle {
     reader_cancel: CancellationToken,
     reader_tasks: Vec<JoinHandle<()>>,
     forwarder_tasks: Vec<JoinHandle<()>>,
+    shutdown_timeout: Duration,
 }
 
 impl TxForwardingHandle {
+    /// Default maximum time allowed for destination queues and in-flight requests to drain.
+    pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Overrides how long [`Self::shutdown`] lets forwarders drain before aborting them.
+    #[must_use]
+    pub const fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_timeout = timeout;
+        self
+    }
+
     /// Stops pool readers, drains each destination queue, and reports task outcomes.
     pub async fn shutdown(self) -> ShutdownReport {
         self.reader_cancel.cancel();
@@ -199,7 +210,7 @@ impl TxForwardingHandle {
         let mut task_failures = reader_results.len() - readers_completed;
 
         let mut forwarders: FuturesUnordered<_> = self.forwarder_tasks.into_iter().collect();
-        let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + self.shutdown_timeout;
         let mut forwarders_completed = 0;
         let mut timed_out = false;
 
@@ -281,10 +292,6 @@ mod tests {
             transaction: ValidatedTransaction {
                 sender: Address::repeat_byte(byte),
                 raw: Bytes::from(vec![byte]),
-                min_block_number: None,
-                max_block_number: None,
-                min_timestamp: None,
-                max_timestamp: None,
                 extensions: Default::default(),
             },
             tx_hash: B256::repeat_byte(byte),
@@ -361,6 +368,7 @@ mod tests {
             reader_cancel,
             reader_tasks: vec![reader_task],
             forwarder_tasks: vec![forwarder_task],
+            shutdown_timeout: TxForwardingHandle::DEFAULT_SHUTDOWN_TIMEOUT,
         };
 
         let report = handle.shutdown().await;
@@ -377,6 +385,7 @@ mod tests {
             reader_cancel: CancellationToken::new(),
             reader_tasks: vec![tokio::spawn(async { panic!("reader failed") })],
             forwarder_tasks: vec![tokio::spawn(async { panic!("forwarder failed") })],
+            shutdown_timeout: TxForwardingHandle::DEFAULT_SHUTDOWN_TIMEOUT,
         };
 
         let report = handle.shutdown().await;
@@ -393,6 +402,7 @@ mod tests {
             reader_cancel: CancellationToken::new(),
             reader_tasks: Vec::new(),
             forwarder_tasks: vec![tokio::spawn(std::future::pending())],
+            shutdown_timeout: Duration::from_millis(50),
         };
 
         let report = handle.shutdown().await;

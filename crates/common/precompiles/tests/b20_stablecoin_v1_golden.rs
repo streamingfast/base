@@ -733,7 +733,7 @@ fn golden_burn_blocked_reverts_when_not_blocked() {
     assert_eq!(err, BasePrecompileError::revert(IB20::AccountNotBlocked { account: ALICE }));
 }
 
-/// The seize common selectors (`seizeWithMemo` and the `SEIZE_ROLE` / `SEIZE_HOLDER_POLICY` /
+/// The seize common selectors (`seizeWithMemo` and the `SEIZE_ROLE` / `SEIZE_EXEMPT_POLICY` /
 /// `SEIZE_RECEIVER_POLICY` getters) were introduced at Cobalt (`StablecoinV2`). At V1 (Beryl) they
 /// are absent from the frozen common `IB20` surface, so `route` rejects them as `UnknownFunctionSelector`.
 #[test]
@@ -742,7 +742,7 @@ fn golden_seize_selectors_unknown_at_v1() {
     let calls: Vec<Vec<u8>> = vec![
         IB20::seizeWithMemoCall { from: ALICE, to: BOB, amount: u(1), memo: MEMO }.abi_encode(),
         IB20::SEIZE_ROLECall {}.abi_encode(),
-        IB20::SEIZE_HOLDER_POLICYCall {}.abi_encode(),
+        IB20::SEIZE_EXEMPT_POLICYCall {}.abi_encode(),
         IB20::SEIZE_RECEIVER_POLICYCall {}.abi_encode(),
     ];
     for calldata in calls {
@@ -753,12 +753,12 @@ fn golden_seize_selectors_unknown_at_v1() {
 }
 
 /// The seize policy scopes were introduced at Cobalt (`StablecoinV2`). Although the
-/// `SEIZE_HOLDER_POLICY()` / `SEIZE_RECEIVER_POLICY()` getter selectors are absent from V1, the scope
+/// `SEIZE_EXEMPT_POLICY()` / `SEIZE_RECEIVER_POLICY()` getter selectors are absent from V1, the scope
 /// *values* must also not leak through the common `updatePolicy` selector, which is dialable on V1:
 /// V1 rejects them with `UnsupportedPolicyType`, matching the base-std `v1.0.0` reference.
 #[test]
 fn golden_update_policy_rejects_seize_scopes_at_v1() {
-    for scope in [B20PolicyType::SeizeHolder.id(), B20PolicyType::SeizeReceiver.id()] {
+    for scope in [B20PolicyType::SeizeExempt.id(), B20PolicyType::SeizeReceiver.id()] {
         let mut s = fresh();
         let mut policy = FakePolicyAccounting::new();
         policy.create_existing_policy(7);
@@ -780,7 +780,7 @@ fn golden_update_policy_rejects_seize_scopes_at_v1() {
 /// `policyId` selector is dialable on V1 but must reject the V2-only seize scopes.
 #[test]
 fn golden_policy_id_rejects_seize_scopes_at_v1() {
-    for scope in [B20PolicyType::SeizeHolder.id(), B20PolicyType::SeizeReceiver.id()] {
+    for scope in [B20PolicyType::SeizeExempt.id(), B20PolicyType::SeizeReceiver.id()] {
         let mut s = fresh();
         let err = op(
             &mut s,
@@ -1197,6 +1197,30 @@ fn golden_permit_reverts_when_expired() {
     s.set_timestamp(u(11));
     let err = op(&mut s, owner, FakePolicyAccounting::new(), call.abi_encode()).unwrap_err();
     assert_eq!(err, BasePrecompileError::revert(IB20::ExpiredSignature { deadline: u(10) }));
+}
+
+/// V1 `permit` is deliberately UNMETERED (Beryl's gas schedule is frozen): it hashes with plain
+/// `keccak256` and recovers without a `deduct_gas` charge, so `gas_deducted()` stays `0`. The V2
+/// golden pins this at `3000`; that metered/unmetered contrast is the point of this pair.
+#[test]
+fn golden_permit_charges_no_recovery_gas() {
+    let mut s = fresh();
+    let owner = anvil_owner();
+    let calldata =
+        signed_permit(domain_separator(&mut fresh()), U256::ZERO, owner, BOB, u(500), U256::MAX)
+            .abi_encode();
+    s.set_caller(owner);
+    s.set_timestamp(U256::ZERO);
+    StorageCtx::enter(&mut s, |ctx| {
+        B20StablecoinToken::with_storage_and_policy(
+            B20StablecoinStorage::from_address(TOKEN, ctx),
+            FakePolicyAccounting::new(),
+            PolicyVersion::V1,
+        )
+        .route(ctx, &calldata, StablecoinVersion::V1, true, NoopPrecompileCallObserver)
+    })
+    .expect("permit must succeed");
+    assert_eq!(s.gas_deducted(), 0, "V1 permit must not charge any recovery gas (unmetered)");
 }
 
 // ============================================================================
@@ -1894,6 +1918,30 @@ fn gas(
     (s.counter_sload(), s.counter_sstore(), s.counter_keccak256())
 }
 
+/// Like [`gas`], but for calls expected to revert — still counts the storage footprint
+/// incurred before the revert.
+fn gas_reverting(
+    setup: impl FnOnce(&mut B20StablecoinStorage<'_>),
+    caller: Address,
+    policy: FakePolicyAccounting,
+    calldata: Vec<u8>,
+) -> (u64, u64, u64) {
+    let mut s = fresh();
+    seed(&mut s, setup);
+    s.set_caller(caller);
+    s.reset_counters();
+    StorageCtx::enter(&mut s, |ctx| {
+        B20StablecoinToken::with_storage_and_policy(
+            B20StablecoinStorage::from_address(TOKEN, ctx),
+            policy,
+            PolicyVersion::V1,
+        )
+        .route(ctx, &calldata, StablecoinVersion::V1, true, NoopPrecompileCallObserver)
+    })
+    .expect_err("gas-footprint op must revert");
+    (s.counter_sload(), s.counter_sstore(), s.counter_keccak256())
+}
+
 /// An `FakePolicyAccounting` authorizing `who` under the default (0) scope.
 fn allow0(who: Address) -> FakePolicyAccounting {
     let mut p = FakePolicyAccounting::new();
@@ -2069,6 +2117,36 @@ fn golden_gas_footprints() {
                 .abi_encode(),
             ),
         ),
+        (
+            "update_policy_reverts_missing_policy",
+            gas_reverting(
+                |_t| {},
+                ADMIN,
+                FakePolicyAccounting::new(),
+                IB20::updatePolicyCall {
+                    policyScope: B20PolicyType::TransferSender.id(),
+                    newPolicyId: 99,
+                }
+                .abi_encode(),
+            ),
+        ),
+        (
+            "permit",
+            gas(
+                |_t| {},
+                anvil_owner(),
+                FakePolicyAccounting::new(),
+                signed_permit(
+                    domain_separator(&mut fresh()),
+                    U256::ZERO,
+                    anvil_owner(),
+                    BOB,
+                    u(500),
+                    U256::MAX,
+                )
+                .abi_encode(),
+            ),
+        ),
     ];
 
     let expected: &[(&str, (u64, u64, u64))] = &[
@@ -2088,6 +2166,8 @@ fn golden_gas_footprints() {
         ("revoke_role", (1, 1, 0)),
         ("set_role_admin", (1, 1, 0)),
         ("update_policy", (2, 1, 0)),
+        ("update_policy_reverts_missing_policy", (1, 0, 0)),
+        ("permit", (3, 2, 0)),
     ];
 
     bless_or_assert_gas(&actual, expected);
@@ -2165,7 +2245,7 @@ fn v1_op_coverage_checklist(call: IB20::IB20Calls, ext: IB20Stablecoin::IB20Stab
         ]),
         C::seizeWithMemo(_)
         | C::SEIZE_ROLE(_)
-        | C::SEIZE_HOLDER_POLICY(_)
+        | C::SEIZE_EXEMPT_POLICY(_)
         | C::SEIZE_RECEIVER_POLICY(_) => covered(&[golden_seize_selectors_unknown_at_v1]),
 
         // pause / config / roles / policy / permit

@@ -25,7 +25,10 @@ use base_common_flashblocks::{
 };
 use base_execution_consensus::{calculate_receipt_root_no_memo, isthmus};
 use base_execution_evm::{BaseEvmConfig, BaseNextBlockEnvAttributes};
-use base_execution_payload_builder::{BaseBuiltPayload, BasePayloadBuilderAttributes};
+use base_execution_payload_builder::{
+    BaseBuiltPayload, BasePayloadBuilderAttributes, BuilderMetrics as SharedBuilderMetrics,
+    ValidityMetrics,
+};
 use base_execution_txpool::AccountStateDiff;
 use base_observability_events::{GlobalTransactionEventWriter, TransactionEventType};
 use eyre::WrapErr as _;
@@ -55,10 +58,8 @@ use tracing::{debug, error, info, metadata::Level, span, warn};
 use crate::{
     BuilderConfig, BuilderMetrics, ExecutionInfo, PayloadBuilder, ResourceLimits,
     flashblocks::{
-        FlashblocksExtraCtx,
-        best_txs::{BestFlashblocksTxs, ParkableBestPayloadTransactions},
-        context::BasePayloadBuilderCtx,
-        generator::BuildArguments,
+        BasePayloadBuilderCtx, BestFlashblocksTxs, FlashblocksExtraCtx,
+        ParkableBestPayloadTransactions, generator::BuildArguments,
     },
     traits::{ClientBounds, PoolBounds},
     transaction_events::{
@@ -868,7 +869,9 @@ where
                     rejection_reasons = ?diag.rejection_reasons(),
                     txs_considered = diag.txs_considered,
                     txs_included = diag.txs_included,
+                    txs_deferred = diag.txs_deferred,
                     txs_rejected = diag.txs_rejected_total(),
+                    txs_excluded = diag.txs_excluded_total(),
                     min_priority_fee_wei = diag.min_priority_fee.unwrap_or(0),
                     current_gas = info.cumulative_gas_used,
                     target_gas = limits.block_gas_limit,
@@ -928,6 +931,12 @@ where
 
         // Record cumulative uncompressed block size
         BuilderMetrics::block_uncompressed_size().record(info.cumulative_uncompressed_bytes as f64);
+
+        // Record validity-predicate state loads accumulated across the block's flashblocks.
+        ValidityMetrics::record_predicate_loads(&info.predicate_loads);
+
+        // Record validity inclusion and EIP-1559 fee revenue for the block.
+        SharedBuilderMetrics::record_inclusion(&info.inclusion);
 
         debug!(
             target: "payload_builder",
