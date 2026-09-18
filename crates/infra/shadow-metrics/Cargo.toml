@@ -12,15 +12,17 @@ workspace = true
 
 [dependencies]
 tracing.workspace = true
-base-metrics.workspace = true
 alloy-consensus.workspace = true
+alloy-primitives.workspace = true
 base-shadow-indexer-db.workspace = true
-metrics = { workspace = true, optional = true }
+base-common-consensus = { workspace = true, features = ["reth"] }
+serde = { workspace = true, features = ["derive"] }
+axum = { workspace = true, features = ["json", "query"] }
 anyhow = { workspace = true, features = ["std"] }
-tokio = { workspace = true, features = ["time"] }
 thiserror = { workspace = true, features = ["std"] }
 sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "tls-native-tls"] }
 
-[features]
-default = [ "metrics" ]
-metrics = [ "base-metrics/metrics", "dep:metrics" ]
+[dev-dependencies]
+chrono.workspace = true
+reth-primitives-traits.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

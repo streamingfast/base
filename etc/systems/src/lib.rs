@@ -7,11 +7,25 @@
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+use tracing_subscriber as _;
+
 mod utils;
 pub use utils::unique_name;
 
 mod b20;
 pub use b20::{B20CreateConfig, B20PrecompileClient};
+
+mod benchmark_cli;
+pub use benchmark_cli::{
+    AggregateBenchmarkArgs, BenchmarkCli, BenchmarkCommand, SnapshotBenchmarkArgs,
+};
+
+mod benchmark_report;
+pub use benchmark_report::{
+    SnapshotBenchmarkReportConfig, SnapshotBenchmarkResult, SnapshotBlockMetrics,
+    VisualizerBlockMetrics, VisualizerMetadata, VisualizerRun, VisualizerRunResult,
+    VisualizerSequencerMetrics, VisualizerValidatorMetrics,
+};
 
 mod config;
 pub use config::{
@@ -33,6 +47,9 @@ pub use docker::{
     stop_system_test_containers,
 };
 
+mod devnet_cli;
+pub use devnet_cli::{DevnetCli, DevnetCommand, SharedL1Args, SnapshotArgs, SnapshotRuntime};
+
 mod host;
 pub use host::{host_address, with_host_port_if_needed};
 
@@ -47,15 +64,23 @@ pub use l1::{
 
 mod l2;
 pub use l2::{
-    InProcessBatcher, InProcessBatcherConfig, InProcessBuilder, InProcessBuilderConfig,
-    InProcessClient, InProcessClientConfig, InProcessConsensus, InProcessConsensusConfig,
-    InProcessFollowConsensus, InProcessFollowConsensusConfig, L2ClientConsensus,
+    ChainSpecSource, InProcessBatcher, InProcessBatcherConfig, InProcessBuilder,
+    InProcessBuilderConfig, InProcessClient, InProcessClientConfig, InProcessConsensus,
+    InProcessConsensusConfig, InProcessFollowConsensus, InProcessFollowConsensusConfig,
+    InProcessStandaloneSequencer, InProcessStandaloneSequencerConfig, L2ClientConsensus,
     L2ClientConsensusMode, L2ContainerConfig, L2Stack, L2StackConfig, ShadowSequencer,
-    ShadowSequencerConfig, ShadowSequencersConfig,
+    ShadowSequencerConfig, ShadowSequencersConfig, SnapshotBoundary, SnapshotL2Stack,
+    SnapshotL2StackConfig, TestNodeRuntime,
 };
 
 mod network;
 pub use network::{ensure_network_exists, ensure_network_exists_with_name, network_name};
+
+mod prover_service;
+pub use prover_service::InProcessProverService;
+
+mod prometheus_metrics;
+pub use prometheus_metrics::{PrometheusBlockCollector, PrometheusSnapshot};
 
 mod rpc;
 pub use rpc::{SystemTestProviderExt, SystemTestRpcClient};
@@ -67,13 +92,20 @@ pub use setup::{
     SetupImage,
 };
 
+mod shared_l1;
+pub use shared_l1::{SHARED_L1_RUNTIME_ENV, SharedL1, SharedL1Runtime};
+
 mod smoke;
 #[cfg(feature = "upgrade-signal")]
 pub use smoke::RuntimeUpgradeSignalGuard;
 pub use smoke::{SystemTestStack, SystemTestStackBuilder};
 
 mod system_config;
-pub use system_config::{StableSystemTestConfig, SystemTestPorts};
+pub use system_config::{
+    DevnetBlockInterval, DevnetConfig, DevnetL1Mode, DevnetL2State, DevnetPrefund,
+    DevnetSnapshotConfig, DevnetSnapshotHead, ResolvedSnapshotChain, SnapshotChainConfig,
+    StableSystemTestConfig, SystemTestPorts,
+};
 
 #[cfg(feature = "upgrade-signal")]
 mod upgrade_signal;
@@ -82,3 +114,6 @@ pub use upgrade_signal::{MockProtocolVersionsClient, UpgradeSignalStackOptions};
 
 mod urls;
 pub use urls::SystemTestUrls;
+
+mod zk_host;
+pub use zk_host::InProcessZkHost;

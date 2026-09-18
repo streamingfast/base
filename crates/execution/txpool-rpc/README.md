@@ -10,10 +10,12 @@ transaction pool.
 Exposes JSON-RPC APIs for transaction pool administration and transaction lifecycle tracking.
 `AdminTxPoolApiImpl` provides admin-level pool management, while `TransactionStatusApiImpl`
 allows clients to query the current status of individual transactions by hash. The separate
-`SendRawTransactionValidityExtension` registers local mempool ingress through
-`base_sendRawTransactionValidity`; typed validity predicates are preserved while forwarding to
-builders. This endpoint is experimental: predicates are not currently evaluated during block
-construction, so callers must not rely on them to prevent transaction inclusion.
+`SendRawTransactionValidityExtension` registers local ingress through
+`base_sendRawTransactionValidity` on both mempool/client nodes and builder nodes. Typed
+validity predicates are preserved in the pool (and while forwarding to builders). This endpoint
+is experimental, but predicates are evaluated and enforced by the builder during block
+construction: a transaction is only included at a point where all of its predicates hold, and
+it is evicted once it can no longer be included.
 
 ## Usage
 
@@ -26,12 +28,14 @@ base-txpool-rpc = { workspace = true }
 
 ```rust,ignore
 use base_txpool_rpc::{
-    SendRawTransactionValidityExtension, TxPoolRpcConfig, TxPoolRpcExtension,
+    DEFAULT_MAX_VALIDITY_PREDICATES, SendRawTransactionValidityExtension, TxPoolRpcConfig,
+    TxPoolRpcExtension,
 };
 
 runner.install_ext::<TxPoolRpcExtension>(TxPoolRpcConfig::default());
 // Install only when the node's explicit experimental validity flag is enabled.
-runner.install_ext::<SendRawTransactionValidityExtension>(());
+// The config is the maximum number of validity predicates accepted per transaction.
+runner.install_ext::<SendRawTransactionValidityExtension>(DEFAULT_MAX_VALIDITY_PREDICATES);
 ```
 
 ## License

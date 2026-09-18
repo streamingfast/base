@@ -14,14 +14,14 @@ use alloc::{
     vec::Vec,
 };
 
-use alloy_primitives::{Address, B256, FixedBytes, U256, b256, keccak256};
+use alloy_primitives::{Address, B256, FixedBytes, U256, b256};
 use alloy_sol_types::{SolEvent, SolValue};
 use base_precompile_storage::{BasePrecompileError, Result};
 
 use crate::{
     Asset, AssetAccounting, B20_MAX_SUPPLY_CAP, B20AssetStorage, B20AssetToken, B20Guards,
-    B20PausableFeature, B20PolicyType, B20TokenRole, Eip712Domain, IB20, IB20Asset, PermitArgs,
-    PolicyAccounting, Token, TransferPolicyIds,
+    B20PausableFeature, B20PolicyType, B20TokenRole, Eip712Domain, IB20, IB20Asset, NonZeroAddress,
+    PermitArgs, PolicyAccounting, Token, TransferPolicyIds,
 };
 
 /// `keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")`
@@ -60,22 +60,20 @@ impl AssetV2 {
 
     /// Balance-moving core of `transfer`/`transferFrom`, without the pause check.
     ///
-    /// `policies` carries the sender/receiver ids pre-read from their shared slot by the caller;
-    /// `Some` enforces both (unprivileged path), `None` skips them (factory-privileged path).
+    /// `from` / `to` are [`NonZeroAddress`]: callers validate zero addresses (and choose the
+    /// typed revert) before any policy SLOAD. `policies` carries the sender/receiver ids
+    /// pre-read from their shared slot by the caller; `Some` enforces both (unprivileged
+    /// path), `None` skips them (factory-privileged path).
     fn transfer_inner<S: AssetAccounting, A: PolicyAccounting>(
         &self,
         token: &mut B20AssetToken<S, A>,
-        from: Address,
-        to: Address,
+        from: NonZeroAddress,
+        to: NonZeroAddress,
         amount: U256,
         policies: Option<&TransferPolicyIds>,
     ) -> Result<()> {
-        if to == Address::ZERO {
-            return Err(BasePrecompileError::revert(IB20::InvalidReceiver { receiver: to }));
-        }
-        if from == Address::ZERO {
-            return Err(BasePrecompileError::revert(IB20::InvalidSender { sender: from }));
-        }
+        let from = from.get();
+        let to = to.get();
         if let Some(policies) = policies {
             B20Guards::ensure_authorized_by_id(
                 token,
@@ -189,7 +187,7 @@ impl AssetV2 {
     }
 
     /// Ensures `policy_scope` names a built-in B-20 policy slot available on the V2 (Cobalt) common
-    /// surface, which adds the seize scopes (`SEIZE_HOLDER_POLICY` / `SEIZE_RECEIVER_POLICY`) on top
+    /// surface, which adds the seize scopes (`SEIZE_EXEMPT_POLICY` / `SEIZE_RECEIVER_POLICY`) on top
     /// of V1.
     ///
     /// The match is exhaustive on purpose: a policy scope added to `B20PolicyType` for a future fork
@@ -202,7 +200,7 @@ impl AssetV2 {
                 | B20PolicyType::TransferReceiver
                 | B20PolicyType::TransferExecutor
                 | B20PolicyType::MintReceiver
-                | B20PolicyType::SeizeHolder
+                | B20PolicyType::SeizeExempt
                 | B20PolicyType::SeizeReceiver,
             ) => Ok(()),
             None => Err(BasePrecompileError::revert(IB20::UnsupportedPolicyType {
@@ -246,11 +244,15 @@ impl<S: AssetAccounting, A: PolicyAccounting> Asset<S, A> for AssetV2 {
         privileged: bool,
     ) -> Result<()> {
         B20Guards::ensure_not_paused(token, IB20::PausableFeature::TRANSFER)?;
+        let to = NonZeroAddress::new(to)
+            .map_err(|_| BasePrecompileError::revert(IB20::InvalidReceiver { receiver: to }))?;
+        let from = NonZeroAddress::new(caller)
+            .map_err(|_| BasePrecompileError::revert(IB20::InvalidSender { sender: caller }))?;
         if privileged {
-            return self.transfer_inner(token, caller, to, amount, None);
+            return self.transfer_inner(token, from, to, amount, None);
         }
         let policies = token.accounting().transfer_policy_ids()?;
-        self.transfer_inner(token, caller, to, amount, Some(&policies))
+        self.transfer_inner(token, from, to, amount, Some(&policies))
     }
 
     fn transfer_from(
@@ -263,13 +265,12 @@ impl<S: AssetAccounting, A: PolicyAccounting> Asset<S, A> for AssetV2 {
         privileged: bool,
     ) -> Result<()> {
         B20Guards::ensure_not_paused(token, IB20::PausableFeature::TRANSFER)?;
-        if to == Address::ZERO {
-            return Err(BasePrecompileError::revert(IB20::InvalidReceiver { receiver: to }));
-        }
-        if from == Address::ZERO {
-            return Err(BasePrecompileError::revert(IB20::InvalidSender { sender: from }));
-        }
-        let allowance = token.accounting().allowance(from, caller)?;
+        // Validate before allowance / transfer-policy-id SLOADs.
+        let to = NonZeroAddress::new(to)
+            .map_err(|_| BasePrecompileError::revert(IB20::InvalidReceiver { receiver: to }))?;
+        let from = NonZeroAddress::new(from)
+            .map_err(|_| BasePrecompileError::revert(IB20::InvalidSender { sender: from }))?;
+        let allowance = token.accounting().allowance(from.get(), caller)?;
         let is_infinite = allowance == U256::MAX;
         if !is_infinite && allowance < amount {
             return Err(BasePrecompileError::revert(IB20::InsufficientAllowance {
@@ -284,7 +285,7 @@ impl<S: AssetAccounting, A: PolicyAccounting> Asset<S, A> for AssetV2 {
             // One SLOAD fetches all transfer policy ids, reused for the executor and
             // sender/receiver checks.
             let policies = token.accounting().transfer_policy_ids()?;
-            if caller != from {
+            if caller != from.get() {
                 B20Guards::ensure_authorized_by_id(
                     token,
                     B20PolicyType::TransferExecutor.id(),
@@ -297,7 +298,7 @@ impl<S: AssetAccounting, A: PolicyAccounting> Asset<S, A> for AssetV2 {
         if is_infinite {
             return Ok(());
         }
-        token.accounting_mut().set_allowance(from, caller, allowance - amount)
+        token.accounting_mut().set_allowance(from.get(), caller, allowance - amount)
     }
 
     fn approve(
@@ -708,8 +709,8 @@ impl<S: AssetAccounting, A: PolicyAccounting> Asset<S, A> for AssetV2 {
         }
         let domain_sep = self.domain_separator(token, chain_id)?;
         let nonce = token.accounting().nonce(args.owner)?;
-        let signing_hash = args.signing_hash(domain_sep, nonce);
-        let recovered = args.recover_signer(signing_hash)?;
+        let signing_hash = args.metered_signing_hash(token.accounting(), domain_sep, nonce)?;
+        let recovered = args.metered_recover_signer(token.accounting(), signing_hash)?;
         PermitArgs::validate_recovered_address(recovered, args.owner)?;
         token.accounting_mut().increment_nonce(args.owner)?;
         self.approve(token, args.owner, args.spender, args.value)
@@ -871,12 +872,12 @@ impl<S: AssetAccounting, A: PolicyAccounting> Asset<S, A> for AssetV2 {
 
     fn domain_separator(&self, token: &B20AssetToken<S, A>, chain_id: u64) -> Result<B256> {
         let name = token.accounting().name()?;
-        let name_hash = keccak256(name.as_bytes());
-        let version_hash = keccak256(VERSION);
+        let name_hash = token.accounting().metered_keccak256(name.as_bytes())?;
+        let version_hash = token.accounting().metered_keccak256(VERSION)?;
         let encoded =
             (DOMAIN_TYPEHASH, name_hash, version_hash, U256::from(chain_id), token.token_address())
                 .abi_encode();
-        Ok(keccak256(&encoded))
+        token.accounting().metered_keccak256(&encoded)
     }
 
     fn eip712_domain(&self, token: &B20AssetToken<S, A>, chain_id: u64) -> Result<Eip712Domain> {
@@ -1112,6 +1113,10 @@ mod tests {
         extra_metadata: BTreeMap<String, String>,
         used_announcement_ids: BTreeSet<String>,
         events: Vec<LogData>,
+        /// Number of `metered_keccak256` calls (interior-mutable so `&self` metering can record).
+        keccak_charges: core::cell::Cell<u64>,
+        /// Cumulative gas passed to `deduct_gas`.
+        gas_deducted: core::cell::Cell<u64>,
     }
 
     impl FakeAccounting {
@@ -1139,6 +1144,8 @@ mod tests {
                 extra_metadata: BTreeMap::new(),
                 used_announcement_ids: BTreeSet::new(),
                 events: Vec::new(),
+                keccak_charges: core::cell::Cell::new(0),
+                gas_deducted: core::cell::Cell::new(0),
             }
         }
     }
@@ -1251,6 +1258,14 @@ mod tests {
         }
         fn emit_event(&mut self, log: LogData) -> Result<()> {
             self.events.push(log);
+            Ok(())
+        }
+        fn metered_keccak256(&self, data: &[u8]) -> Result<B256> {
+            self.keccak_charges.set(self.keccak_charges.get() + 1);
+            Ok(keccak256(data))
+        }
+        fn deduct_gas(&self, gas: u64) -> Result<()> {
+            self.gas_deducted.set(self.gas_deducted.get() + gas);
             Ok(())
         }
     }
@@ -1620,10 +1635,10 @@ mod tests {
 
     // --- seize ---
 
-    /// Points `SEIZE_HOLDER_POLICY` at the always-block policy, making every account seizable.
+    /// Points `SEIZE_EXEMPT_POLICY` at the always-block policy, making every account seizable.
     fn make_seizable(tok: &mut Tok) {
         tok.accounting_mut()
-            .set_policy_id(B20PolicyType::SeizeHolder.id(), PolicyRegistryStorage::ALWAYS_BLOCK_ID)
+            .set_policy_id(B20PolicyType::SeizeExempt.id(), PolicyRegistryStorage::ALWAYS_BLOCK_ID)
             .unwrap();
     }
 
@@ -1659,7 +1674,7 @@ mod tests {
         let mut tok = token();
         fund(&mut tok, ALICE, U256::from(100u64));
         grant(&mut tok, B20TokenRole::Seize.id(), ADMIN);
-        // SEIZE_HOLDER_POLICY unset => ALWAYS_ALLOW => ALICE authorized => not seizable.
+        // SEIZE_EXEMPT_POLICY unset => ALWAYS_ALLOW => ALICE authorized (exempt) => not seizable.
         let err =
             LOGIC.seize_with_memo(&mut tok, ADMIN, ALICE, BOB, U256::from(1u64), MEMO).unwrap_err();
         assert_eq!(err, BasePrecompileError::revert(IB20::AccountNotSeizable { account: ALICE }));
@@ -1682,7 +1697,7 @@ mod tests {
     #[test]
     fn seize_reverts_on_zero_from() {
         let mut tok = token();
-        // A non-default `SeizeHolder` (here ALWAYS_BLOCK via `make_seizable`) treats the zero
+        // A non-default `SeizeExempt` (here ALWAYS_BLOCK via `make_seizable`) treats the zero
         // address as seizable, so without the `from != 0` guard a zero-amount seize from the zero
         // address would emit a misleading `Transfer(0x0, to, 0)` that indexers read as a mint.
         make_seizable(&mut tok);
@@ -1790,10 +1805,10 @@ mod tests {
     }
 
     #[test]
-    fn seize_holder_policy_beats_receiver_policy() {
+    fn seize_exempt_policy_beats_receiver_policy() {
         let mut tok = token();
         grant(&mut tok, B20TokenRole::Seize.id(), ADMIN);
-        // SEIZE_HOLDER unset => ALICE not seizable; SEIZE_RECEIVER blocks BOB. Holder check fires first.
+        // SEIZE_EXEMPT unset => ALICE not seizable; SEIZE_RECEIVER blocks BOB. Exempt check fires first.
         tok.accounting_mut()
             .set_policy_id(
                 B20PolicyType::SeizeReceiver.id(),
@@ -1952,6 +1967,50 @@ mod tests {
         assert_eq!(
             err,
             BasePrecompileError::revert(IB20::ExpiredSignature { deadline: U256::from(10u64) })
+        );
+    }
+
+    #[test]
+    fn permit_charges_metered_hashing_and_fixed_recovery() {
+        let mut tok = token();
+        let owner = anvil_owner();
+        let args = signed_permit(&tok, owner, BOB, U256::from(500u64), U256::MAX);
+
+        // `signed_permit` computes the domain separator during setup, so measure deltas.
+        let keccak_before = tok.accounting().keccak_charges.get();
+        let gas_before = tok.accounting().gas_deducted.get();
+
+        LOGIC.permit(&mut tok, CHAIN_ID, U256::ZERO, args).unwrap();
+
+        // domain separator (name, version, encoded) + signing digest (struct hash, digest) = 5.
+        assert_eq!(tok.accounting().keccak_charges.get() - keccak_before, 5);
+        // Fixed ECRECOVER-comparable recovery charge, applied exactly once.
+        assert_eq!(tok.accounting().gas_deducted.get() - gas_before, PermitArgs::RECOVER_GAS);
+    }
+
+    #[test]
+    fn caught_revert_permit_loop_charges_each_iteration() {
+        let mut tok = token();
+        let owner = anvil_owner();
+        // Realistic DoS shape: a valid, recoverable signature but an unrelated `owner`, so every
+        // call performs the full EIP-712 hashing and secp256k1 recovery and then reverts
+        // `InvalidSigner` (before the nonce is bumped, so the same args replays each iteration).
+        let mut args = signed_permit(&tok, owner, BOB, U256::from(1u64), U256::MAX);
+        args.owner = Address::repeat_byte(0xcc);
+
+        const ITERATIONS: u64 = 8;
+        let keccak_before = tok.accounting().keccak_charges.get();
+        let gas_before = tok.accounting().gas_deducted.get();
+        for _ in 0..ITERATIONS {
+            assert!(LOGIC.permit(&mut tok, CHAIN_ID, U256::ZERO, args.clone()).is_err());
+        }
+
+        // A caught-revert loop no longer runs for free: hashing and recovery metering scale
+        // linearly with the number of calls.
+        assert_eq!(tok.accounting().keccak_charges.get() - keccak_before, 5 * ITERATIONS);
+        assert_eq!(
+            tok.accounting().gas_deducted.get() - gas_before,
+            PermitArgs::RECOVER_GAS * ITERATIONS
         );
     }
 

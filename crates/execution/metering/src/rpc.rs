@@ -2,49 +2,42 @@
 
 use std::sync::Arc;
 
-use alloy_consensus::{BlockHeader, Header, Sealed};
+use alloy_consensus::Header;
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{B256, U256};
 use base_bundles::{Bundle, MeterBundleResponse, ParsedBundle};
 use base_common_consensus::BaseBlock;
 use base_common_evm::L1BlockInfo;
-use base_common_flz::flz_compress_len;
 use base_execution_chainspec::BaseChainSpec;
 use base_execution_evm::extract_l1_info_from_tx;
-use base_flashblocks::FlashblocksAPI;
 use jsonrpsee::core::{RpcResult, async_trait};
-use reth_primitives_traits::SealedHeader;
 use reth_provider::{
     BlockReader, BlockReaderIdExt, ChainSpecProvider, HeaderProvider, StateProviderFactory,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::{
-    MeterBlockResponse, MeteredPriorityFeeResponse, PendingState, PriorityFeeEstimator,
-    ResourceDemand, ResourceFeeEstimateResponse,
+    MeterBlockResponse,
     block::meter_block,
     meter::{MeterBundleInput, meter_bundle},
     traits::MeteringApiServer,
 };
 
 /// Implementation of the metering RPC API.
-pub struct MeteringApiImpl<Provider, FB> {
+pub struct MeteringApiImpl<Provider> {
     provider: Provider,
-    flashblocks_api: Arc<FB>,
-    /// Optional priority fee estimator for `meteredPriorityFeePerGas`.
-    priority_fee_estimator: Option<Arc<PriorityFeeEstimator>>,
     /// Opcodes and precompiles to track for gas metering. When non-empty, a
     /// `MeteringInspector` is attached during bundle execution.
     metered_opcodes: Arc<crate::MeteredOpcodes>,
 }
 
-impl<Provider, FB> std::fmt::Debug for MeteringApiImpl<Provider, FB> {
+impl<Provider> std::fmt::Debug for MeteringApiImpl<Provider> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MeteringApiImpl").finish_non_exhaustive()
     }
 }
 
-impl<Provider, FB> MeteringApiImpl<Provider, FB>
+impl<Provider> MeteringApiImpl<Provider>
 where
     Provider: StateProviderFactory
         + ChainSpecProvider<ChainSpec = BaseChainSpec>
@@ -52,30 +45,15 @@ where
         + BlockReader<Block = BaseBlock>
         + HeaderProvider<Header = Header>
         + Clone,
-    FB: FlashblocksAPI,
 {
-    /// Creates a new instance of `MeteringApi` without priority fee estimation.
-    pub const fn new(
-        provider: Provider,
-        flashblocks_api: Arc<FB>,
-        metered_opcodes: Arc<crate::MeteredOpcodes>,
-    ) -> Self {
-        Self { provider, flashblocks_api, priority_fee_estimator: None, metered_opcodes }
-    }
-
-    /// Creates a new instance with priority fee estimation enabled.
-    pub const fn with_estimator(
-        provider: Provider,
-        flashblocks_api: Arc<FB>,
-        estimator: Arc<PriorityFeeEstimator>,
-        metered_opcodes: Arc<crate::MeteredOpcodes>,
-    ) -> Self {
-        Self { provider, flashblocks_api, priority_fee_estimator: Some(estimator), metered_opcodes }
+    /// Creates a new instance of `MeteringApi`.
+    pub const fn new(provider: Provider, metered_opcodes: Arc<crate::MeteredOpcodes>) -> Self {
+        Self { provider, metered_opcodes }
     }
 }
 
 #[async_trait]
-impl<Provider, FB> MeteringApiServer for MeteringApiImpl<Provider, FB>
+impl<Provider> MeteringApiServer for MeteringApiImpl<Provider>
 where
     Provider: StateProviderFactory
         + ChainSpecProvider<ChainSpec = BaseChainSpec>
@@ -86,17 +64,14 @@ where
         + Send
         + Sync
         + 'static,
-    FB: FlashblocksAPI + Send + Sync + 'static,
 {
     async fn meter_bundle(&self, bundle: Bundle) -> RpcResult<MeterBundleResponse> {
-        debug!(
-            num_transactions = &bundle.txs.len(),
-            min_block_number = ?bundle.min_block_number,
-            max_block_number = ?bundle.max_block_number,
-            "Starting bundle metering"
-        );
+        debug!(num_transactions = &bundle.txs.len(), "Starting bundle metering");
 
-        let canonical_tip = self
+        // Simulate against the latest canonical header and state for that
+        // header's hash. Do not pin state to `Number(n)`: reth routes numbered
+        // lookups through historical/DB state instead of the in-memory tip.
+        let header = self
             .provider
             .sealed_header_by_number_or_tag(BlockNumberOrTag::Latest)
             .map_err(|e| {
@@ -114,59 +89,7 @@ where
                 )
             })?;
 
-        let pending_guard = self.flashblocks_api.get_pending_blocks();
-        let pending_blocks = pending_guard
-            .as_ref()
-            .filter(|pending| {
-                let based_on_tip = matches!(
-                    pending.canonical_block_number(),
-                    BlockNumberOrTag::Number(number) if number == canonical_tip.number()
-                ) && pending.parent_hash() == canonical_tip.hash();
-
-                if !based_on_tip {
-                    debug!(
-                        canonical_tip = canonical_tip.number(),
-                        canonical_tip_hash = %canonical_tip.hash(),
-                        pending_canonical = %pending.canonical_block_number(),
-                        pending_parent_hash = %pending.parent_hash(),
-                        "Ignoring stale flashblock state for bundle metering"
-                    );
-                }
-
-                based_on_tip
-            })
-            .cloned();
-
-        // Use pending only when it is based on the current canonical tip.
-        let (header, flashblock_index, canonical_block_number) = pending_blocks.as_ref().map_or_else(
-            || {
-                let canonical_block_number = BlockNumberOrTag::Number(canonical_tip.number());
-
-                debug!(
-                    canonical_block = canonical_tip.number(),
-                    "No tip-aligned flashblocks available, using canonical block state for metering"
-                );
-
-                (canonical_tip, 0, canonical_block_number)
-            },
-            |pb| {
-                let latest_header: Sealed<Header> = pb.latest_header();
-                let flashblock_index = pb.latest_flashblock_index();
-                let canonical_block_number = pb.canonical_block_number();
-
-                debug!(
-                    latest_block = latest_header.number,
-                    canonical_block = %canonical_block_number,
-                    flashblock_index = flashblock_index,
-                    "Using latest flashblock state for metering"
-                );
-
-                // Convert Sealed<Header> to SealedHeader
-                let sealed_header =
-                    SealedHeader::new(latest_header.inner().clone(), latest_header.hash());
-                (sealed_header, flashblock_index, canonical_block_number)
-            },
-        );
+        debug!(canonical_block = header.number, "Using canonical block state for metering");
 
         let parsed_bundle = ParsedBundle::try_from(bundle).map_err(|e| {
             jsonrpsee::types::ErrorObjectOwned::owned(
@@ -176,42 +99,23 @@ where
             )
         })?;
 
-        // Get state provider for the canonical block
-        let state_provider =
-            self.provider.state_by_block_number_or_tag(canonical_block_number).map_err(|e| {
-                error!(error = %e, "Failed to get state provider");
-                jsonrpsee::types::ErrorObjectOwned::owned(
-                    jsonrpsee::types::ErrorCode::InternalError.code(),
-                    format!("Failed to get state provider: {e}"),
-                    None::<()>,
-                )
-            })?;
+        let state_provider = self.provider.state_by_block_hash(header.hash()).map_err(|e| {
+            error!(error = %e, block_hash = %header.hash(), "Failed to get state provider");
+            jsonrpsee::types::ErrorObjectOwned::owned(
+                jsonrpsee::types::ErrorCode::InternalError.code(),
+                format!("Failed to get state provider: {e}"),
+                None::<()>,
+            )
+        })?;
 
-        // If we have pending blocks, extract the pending state for metering
-        let pending_state =
-            pending_blocks.as_ref().map(|pb| PendingState { bundle_state: pb.get_bundle_state() });
+        let l1_block_info = self.get_l1_block_info(header.hash())?;
+        let state_block_number = header.number;
 
-        // Pending flashblock headers can omit parent_beacon_block_root; prefer the CL-provided
-        // value from the flashblock base payload when available, otherwise fall back to the header.
-        let parent_beacon_block_root = header.parent_beacon_block_root().or_else(|| {
-            pending_blocks.as_ref().and_then(|pb| {
-                pb.get_flashblocks()
-                    .first()
-                    .and_then(|fb| fb.base.as_ref().map(|base| base.parent_beacon_block_root))
-            })
-        });
-
-        // Get L1 block info from the canonical block (not flashblock header, which has zero hash)
-        let l1_block_info = self.get_l1_block_info(canonical_block_number)?;
-
-        // Meter bundle using utility function
         let output = meter_bundle(MeterBundleInput {
             state_provider,
             chain_spec: self.provider.chain_spec(),
             bundle: parsed_bundle,
-            header: header.clone(),
-            parent_beacon_block_root,
-            pending_state,
+            header,
             l1_block_info,
             metered_opcodes: Arc::clone(&self.metered_opcodes),
         })
@@ -247,8 +151,7 @@ where
             num_transactions = output.results.len(),
             total_gas_used = output.total_gas_used,
             total_time_us = output.total_time_us,
-            state_block_number = header.number,
-            flashblock_index = flashblock_index,
+            state_block_number,
             "Bundle metering completed successfully"
         );
 
@@ -259,8 +162,7 @@ where
             eth_sent_to_coinbase: U256::from(0),
             gas_fees: output.total_gas_fees,
             results: output.results,
-            state_block_number: header.number,
-            state_flashblock_index: pending_blocks.as_ref().map(|pb| pb.latest_flashblock_index()),
+            state_block_number,
             total_gas_used: output.total_gas_used,
             total_execution_time_us,
         })
@@ -339,94 +241,9 @@ where
 
         Ok(response)
     }
-
-    async fn metered_priority_fee_per_gas(
-        &self,
-        bundle: Bundle,
-    ) -> RpcResult<MeteredPriorityFeeResponse> {
-        let Some(estimator) = &self.priority_fee_estimator else {
-            debug!("Priority fee estimation requested but no estimator configured");
-            return Err(jsonrpsee::types::ErrorObjectOwned::owned(
-                jsonrpsee::types::ErrorCode::InternalError.code(),
-                "Priority fee estimation not configured".to_string(),
-                None::<()>,
-            ));
-        };
-
-        debug!(
-            num_transactions = &bundle.txs.len(),
-            min_block_number = ?bundle.min_block_number,
-            max_block_number = ?bundle.max_block_number,
-            "Starting metered priority fee estimation"
-        );
-
-        // Meter the bundle to get resource consumption
-        let meter_bundle_response = self.meter_bundle(bundle.clone()).await?;
-
-        // Compute resource demand from metering results
-        let demand = compute_resource_demand(&bundle, &meter_bundle_response);
-
-        // Get rolling estimate from the estimator
-        let rolling_estimate = estimator.estimate_rolling(demand).map_err(|e| {
-            debug!(error = %e, "Priority fee estimation failed");
-            jsonrpsee::types::ErrorObjectOwned::owned(
-                jsonrpsee::types::ErrorCode::InternalError.code(),
-                format!("Priority fee estimation failed: {e}"),
-                None::<()>,
-            )
-        })?;
-
-        let Some(rolling_estimate) = rolling_estimate else {
-            warn!("No metering data available for priority fee estimation");
-            return Err(jsonrpsee::types::ErrorObjectOwned::owned(
-                jsonrpsee::types::ErrorCode::InternalError.code(),
-                "No metering data available: cache is empty or not yet populated".to_string(),
-                None::<()>,
-            ));
-        };
-
-        // Build response
-        let resource_estimates: Vec<ResourceFeeEstimateResponse> = rolling_estimate
-            .estimates
-            .iter()
-            .map(|(kind, est)| ResourceFeeEstimateResponse {
-                resource: kind.as_camel_case().to_string(),
-                threshold_priority_fee: est.threshold_priority_fee,
-                recommended_priority_fee: est.recommended_priority_fee,
-                cumulative_usage: U256::from(est.cumulative_usage),
-                threshold_tx_count: est.threshold_tx_count as u64,
-                total_transactions: est.total_transactions as u64,
-            })
-            .collect();
-
-        debug!(
-            priority_fee = %rolling_estimate.priority_fee,
-            blocks_sampled = rolling_estimate.blocks_sampled,
-            "Metered priority fee estimation completed"
-        );
-
-        Ok(MeteredPriorityFeeResponse {
-            meter_bundle: meter_bundle_response,
-            priority_fee: rolling_estimate.priority_fee,
-            blocks_sampled: rolling_estimate.blocks_sampled as u64,
-            resource_estimates,
-        })
-    }
 }
 
-/// Computes resource demand from bundle metering results.
-fn compute_resource_demand(bundle: &Bundle, meter_result: &MeterBundleResponse) -> ResourceDemand {
-    // Calculate DA bytes from bundle transactions
-    let da_bytes: u64 =
-        bundle.txs.iter().fold(0u64, |acc, tx| acc.saturating_add(flz_compress_len(tx) as u64));
-
-    ResourceDemand {
-        gas_used: Some(meter_result.total_gas_used),
-        data_availability_bytes: Some(da_bytes),
-    }
-}
-
-impl<Provider, FB> MeteringApiImpl<Provider, FB>
+impl<Provider> MeteringApiImpl<Provider>
 where
     Provider: StateProviderFactory
         + ChainSpecProvider<ChainSpec = BaseChainSpec>
@@ -437,19 +254,14 @@ where
         + Send
         + Sync
         + 'static,
-    FB: FlashblocksAPI + Send + Sync + 'static,
 {
-    /// Get L1 block info from the first transaction of a block.
-    ///
-    /// Uses the block number/tag to look up the block, which works for both canonical blocks
-    /// and when metering against pending flashblocks (where we use the canonical parent block
-    /// to get L1 info, since flashblock headers have zero hashes and can't be looked up by hash).
-    fn get_l1_block_info(&self, block_id: BlockNumberOrTag) -> RpcResult<L1BlockInfo> {
+    /// Get L1 block info from the first transaction of a canonical block.
+    fn get_l1_block_info(&self, block_hash: B256) -> RpcResult<L1BlockInfo> {
         let first_tx = self
             .provider
-            .block_by_number_or_tag(block_id)
+            .block_by_hash(block_hash)
             .map_err(|e| {
-                error!(error = %e, block = ?block_id, "Failed to get block");
+                error!(error = %e, block_hash = %block_hash, "Failed to get block");
                 jsonrpsee::types::ErrorObjectOwned::owned(
                     jsonrpsee::types::ErrorCode::InternalError.code(),
                     format!("Failed to get block: {e}"),
@@ -459,7 +271,7 @@ where
             .ok_or_else(|| {
                 jsonrpsee::types::ErrorObjectOwned::owned(
                     jsonrpsee::types::ErrorCode::InvalidParams.code(),
-                    format!("Block not found: {block_id:?}"),
+                    format!("Block not found: {block_hash}"),
                     None::<()>,
                 )
             })?
@@ -469,7 +281,7 @@ where
             .ok_or_else(|| {
                 jsonrpsee::types::ErrorObjectOwned::owned(
                     jsonrpsee::types::ErrorCode::InvalidParams.code(),
-                    format!("Block has no transactions: {block_id:?}"),
+                    format!("Block has no transactions: {block_hash}"),
                     None::<()>,
                 )
             })?
@@ -510,29 +322,17 @@ mod tests {
     use base_common_flashblocks::{
         ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, Flashblock, Metadata,
     };
-    use base_flashblocks::{FlashblocksConfig, PendingBlocks, PendingBlocksBuilder};
+    use base_flashblocks::{FlashblocksConfig, PendingBlocksBuilder};
     use base_node_runner::test_utils::{L1_BLOCK_INFO_DEPOSIT_TX, TestHarness};
     use base_test_utils::Account;
     use reth_transaction_pool::test_utils::TransactionBuilder;
     use url::Url;
 
     use super::*;
-    use crate::{MeteringConfig, MeteringExtension, MeteringResourceLimits};
+    use crate::{MeteringConfig, MeteringExtension};
 
-    fn create_bundle(txs: Vec<Bytes>, block_number: u64, min_timestamp: Option<u64>) -> Bundle {
-        Bundle {
-            txs,
-            block_number: Some(block_number),
-            min_block_number: Some(block_number),
-            max_block_number: Some(block_number),
-            flashblock_number_min: None,
-            flashblock_number_max: None,
-            min_timestamp,
-            max_timestamp: None,
-            reverting_tx_hashes: vec![],
-            replacement_uuid: None,
-            dropping_tx_hashes: vec![],
-        }
+    fn create_bundle(txs: Vec<Bytes>) -> Bundle {
+        Bundle { txs }
     }
 
     async fn setup() -> eyre::Result<(TestHarness, RpcClient)> {
@@ -562,51 +362,6 @@ mod tests {
         ]
     }
 
-    fn pending_blocks_on_parent(
-        block_number: u64,
-        parent_hash: B256,
-    ) -> eyre::Result<PendingBlocks> {
-        let header = Header {
-            number: block_number,
-            parent_hash,
-            timestamp: 1_700_000_000 + block_number,
-            gas_limit: 30_000_000,
-            base_fee_per_gas: Some(1_000_000_000),
-            ..Default::default()
-        };
-        let flashblock = Flashblock {
-            payload_id: Default::default(),
-            index: 0,
-            base: Some(ExecutionPayloadBaseV1 {
-                parent_beacon_block_root: B256::ZERO,
-                parent_hash,
-                fee_recipient: Default::default(),
-                prev_randao: B256::ZERO,
-                block_number,
-                gas_limit: 30_000_000,
-                timestamp: 1_700_000_000 + block_number,
-                extra_data: Default::default(),
-                base_fee_per_gas: alloy_primitives::U256::from(1_000_000_000u64),
-            }),
-            diff: ExecutionPayloadFlashblockDeltaV1 {
-                state_root: B256::ZERO,
-                receipts_root: B256::ZERO,
-                logs_bloom: Bloom::default(),
-                gas_used: 0,
-                block_hash: B256::ZERO,
-                transactions: vec![],
-                withdrawals: vec![],
-                withdrawals_root: B256::ZERO,
-                blob_gas_used: Some(0),
-            },
-            metadata: Metadata::new(block_number),
-        };
-        let mut builder = PendingBlocksBuilder::new();
-        builder.with_header(header.seal(B256::ZERO));
-        builder.with_flashblocks([flashblock]);
-        Ok(builder.build()?)
-    }
-
     #[tokio::test]
     async fn test_meter_bundle_empty() -> eyre::Result<()> {
         let (harness, client) = setup().await?;
@@ -616,7 +371,7 @@ mod tests {
             .build_block_from_transactions(generate_txs_for_block(harness.chain_id()).await)
             .await?;
 
-        let bundle = create_bundle(vec![], 0, None);
+        let bundle = create_bundle(vec![]);
 
         let response: MeterBundleResponse = client.request("base_meterBundle", (bundle,)).await?;
 
@@ -656,7 +411,7 @@ mod tests {
 
         let tx_bytes = Bytes::from(envelope.encoded_2718());
 
-        let bundle = create_bundle(vec![tx_bytes], 0, None);
+        let bundle = create_bundle(vec![tx_bytes]);
 
         let response: MeterBundleResponse = client.request("base_meterBundle", (bundle,)).await?;
 
@@ -726,7 +481,7 @@ mod tests {
         let tx2_envelope: BaseTxEnvelope = tx2_signed;
         let tx2_bytes = Bytes::from(tx2_envelope.encoded_2718());
 
-        let bundle = create_bundle(vec![tx1_bytes, tx2_bytes], 0, None);
+        let bundle = create_bundle(vec![tx1_bytes, tx2_bytes]);
 
         let response: MeterBundleResponse = client.request("base_meterBundle", (bundle,)).await?;
 
@@ -755,11 +510,7 @@ mod tests {
     async fn test_meter_bundle_invalid_transaction() -> eyre::Result<()> {
         let (_harness, client) = setup().await?;
 
-        let bundle = create_bundle(
-            vec![Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef])], // Invalid transaction data
-            0,
-            None,
-        );
+        let bundle = create_bundle(vec![Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef])]);
 
         let result: Result<MeterBundleResponse, _> =
             client.request("base_meterBundle", (bundle,)).await;
@@ -776,60 +527,7 @@ mod tests {
             .build_block_from_transactions(generate_txs_for_block(harness.chain_id()).await)
             .await?;
 
-        let bundle = create_bundle(vec![], 1, None);
-
-        let response: MeterBundleResponse = client.request("base_meterBundle", (bundle,)).await?;
-
-        assert_eq!(response.state_block_number, 1);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_meter_bundle_ignores_bundle_block_number() -> eyre::Result<()> {
-        let (harness, client) = setup().await?;
-        harness
-            .build_block_from_transactions(generate_txs_for_block(harness.chain_id()).await)
-            .await?;
-
-        let bundle1 = create_bundle(vec![], 1, None);
-        let response1: MeterBundleResponse = client.request("base_meterBundle", (bundle1,)).await?;
-
-        let bundle2 = create_bundle(vec![], 999, None);
-        let response2: MeterBundleResponse = client.request("base_meterBundle", (bundle2,)).await?;
-
-        assert_eq!(response1.state_block_number, response2.state_block_number);
-        assert_eq!(response1.state_block_number, 1);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_meter_bundle_custom_timestamp() -> eyre::Result<()> {
-        let (harness, client) = setup().await?;
-        harness
-            .build_block_from_transactions(generate_txs_for_block(harness.chain_id()).await)
-            .await?;
-
-        let custom_timestamp = 1234567890;
-        let bundle = create_bundle(vec![], 0, Some(custom_timestamp));
-
-        let response: MeterBundleResponse = client.request("base_meterBundle", (bundle,)).await?;
-
-        assert_eq!(response.results.len(), 0);
-        assert_eq!(response.total_gas_used, 0);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_meter_bundle_arbitrary_block_number() -> eyre::Result<()> {
-        let (harness, client) = setup().await?;
-        harness
-            .build_block_from_transactions(generate_txs_for_block(harness.chain_id()).await)
-            .await?;
-
-        let bundle = create_bundle(vec![], 999999, None);
+        let bundle = create_bundle(vec![]);
 
         let response: MeterBundleResponse = client.request("base_meterBundle", (bundle,)).await?;
 
@@ -882,7 +580,7 @@ mod tests {
         let envelope2: BaseTxEnvelope = signed_tx2;
         let tx2_bytes = Bytes::from(envelope2.encoded_2718());
 
-        let bundle = create_bundle(vec![tx1_bytes, tx2_bytes], 0, None);
+        let bundle = create_bundle(vec![tx1_bytes, tx2_bytes]);
 
         let response: MeterBundleResponse = client.request("base_meterBundle", (bundle,)).await?;
 
@@ -915,7 +613,7 @@ mod tests {
     async fn test_meter_bundle_no_l1_block_info() -> eyre::Result<()> {
         let (_harness, client) = setup().await?;
 
-        let bundle = create_bundle(vec![], 1, None);
+        let bundle = create_bundle(vec![]);
         let response: Result<MeterBundleResponse, _> =
             client.request("base_meterBundle", (bundle,)).await;
 
@@ -924,160 +622,72 @@ mod tests {
         Ok(())
     }
 
+    /// Flashblock pending state must not be used for `meter_bundle`.
+    ///
+    /// Overlaying lagged pending state caused expensive database reads that
+    /// stalled RPC nodes. Canonical state is the source of truth.
     #[tokio::test]
-    async fn test_meter_bundle_selects_pending_only_when_based_on_canonical_tip() -> eyre::Result<()>
-    {
-        // Create a shared flashblocks state that we can inject pending blocks into
+    async fn test_meter_bundle_ignores_flashblock_pending_state() -> eyre::Result<()> {
         let flashblocks_config =
             FlashblocksConfig::new(Url::parse("ws://localhost:12345").unwrap(), 10);
         let flashblocks_state = Arc::clone(&flashblocks_config.state);
 
-        // Setup harness with flashblocks-enabled metering
         let harness = TestHarness::builder()
             .with_ext::<MeteringExtension>(MeteringConfig::with_flashblocks(flashblocks_config))
             .build()
             .await?;
         let client = harness.rpc_client()?;
 
-        // Build a canonical block with L1 block info deposit
         harness
             .build_block_from_transactions(generate_txs_for_block(harness.chain_id()).await)
             .await?;
-        let tip = harness.latest_block();
 
-        flashblocks_state.set_pending_blocks_for_testing(Some(pending_blocks_on_parent(
-            tip.number + 1,
-            tip.hash(),
-        )?));
+        let flashblock_header = Header {
+            number: 2,
+            timestamp: 1_700_000_001,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(1_000_000_000),
+            ..Default::default()
+        };
+        let sealed_header = flashblock_header.seal(B256::ZERO);
 
-        let bundle = create_bundle(vec![], 0, None);
+        let flashblock = Flashblock {
+            payload_id: Default::default(),
+            index: 0,
+            base: Some(ExecutionPayloadBaseV1 {
+                parent_beacon_block_root: B256::ZERO,
+                parent_hash: B256::ZERO,
+                fee_recipient: Default::default(),
+                prev_randao: B256::ZERO,
+                block_number: 2,
+                gas_limit: 30_000_000,
+                timestamp: 1_700_000_001,
+                extra_data: Default::default(),
+                base_fee_per_gas: alloy_primitives::U256::from(1_000_000_000u64),
+            }),
+            diff: ExecutionPayloadFlashblockDeltaV1 {
+                state_root: B256::ZERO,
+                receipts_root: B256::ZERO,
+                logs_bloom: Bloom::default(),
+                gas_used: 0,
+                block_hash: B256::ZERO,
+                transactions: vec![],
+                withdrawals: vec![],
+                withdrawals_root: B256::ZERO,
+                blob_gas_used: Some(0),
+            },
+            metadata: Metadata::new(2),
+        };
+
+        let mut builder = PendingBlocksBuilder::new();
+        builder.with_header(sealed_header);
+        builder.with_flashblocks([flashblock]);
+        flashblocks_state.set_pending_blocks_for_testing(Some(builder.build()?));
+
+        let bundle = create_bundle(vec![]);
         let response: MeterBundleResponse = client.request("base_meterBundle", (bundle,)).await?;
 
-        assert_eq!(response.state_block_number, tip.number + 1);
-        assert_eq!(response.state_flashblock_index, Some(0));
-
-        flashblocks_state.set_pending_blocks_for_testing(Some(pending_blocks_on_parent(
-            tip.number,
-            tip.hash(),
-        )?));
-
-        let response: MeterBundleResponse =
-            client.request("base_meterBundle", (create_bundle(vec![], 0, None),)).await?;
-        assert_eq!(response.state_block_number, tip.number);
-        assert_eq!(response.state_flashblock_index, None);
-
-        flashblocks_state.set_pending_blocks_for_testing(Some(pending_blocks_on_parent(
-            tip.number + 1,
-            B256::repeat_byte(0x42),
-        )?));
-
-        let response: MeterBundleResponse =
-            client.request("base_meterBundle", (create_bundle(vec![], 0, None),)).await?;
-        assert_eq!(response.state_block_number, tip.number);
-        assert_eq!(response.state_flashblock_index, None);
-
-        Ok(())
-    }
-
-    // === Priority Fee Estimation RPC Tests (PR 1a) ===
-
-    async fn setup_with_estimator() -> eyre::Result<(TestHarness, RpcClient)> {
-        let config = MeteringConfig::enabled()
-            .with_resource_limits(MeteringResourceLimits {
-                gas_limit: Some(30_000_000),
-                da_bytes: Some(1_000_000),
-            })
-            .with_target_flashblocks_per_block(4);
-        let harness = TestHarness::builder().with_ext::<MeteringExtension>(config).build().await?;
-        let client = harness.rpc_client()?;
-        Ok((harness, client))
-    }
-
-    #[test]
-    fn compute_resource_demand_preserves_gas_and_da_dimensions() {
-        let tx = Bytes::from_static(&[0x02, 0x01, 0x02, 0x03]);
-        let bundle = create_bundle(vec![tx.clone()], 0, None);
-        let meter_result = MeterBundleResponse { total_gas_used: 21_000, ..Default::default() };
-
-        let demand = compute_resource_demand(&bundle, &meter_result);
-
-        assert_eq!(demand.gas_used, Some(21_000));
-        assert_eq!(demand.data_availability_bytes, Some(flz_compress_len(&tx) as u64));
-    }
-
-    #[tokio::test]
-    async fn test_metered_priority_fee_per_gas_empty_cache_returns_error() -> eyre::Result<()> {
-        let (harness, client) = setup_with_estimator().await?;
-
-        harness
-            .build_block_from_transactions(generate_txs_for_block(harness.chain_id()).await)
-            .await?;
-
-        let bundle = create_bundle(vec![], 0, None);
-
-        let result: Result<serde_json::Value, _> =
-            client.request("base_meteredPriorityFeePerGas", (bundle,)).await;
-
-        // Should error because the metering cache is empty
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("No metering data available"));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_metered_priority_fee_per_gas_empty_cache_with_tx_returns_error()
-    -> eyre::Result<()> {
-        let (harness, client) = setup_with_estimator().await?;
-
-        harness
-            .build_block_from_transactions(generate_txs_for_block(harness.chain_id()).await)
-            .await?;
-
-        let sender_secret = Account::Alice.signer_b256();
-
-        let tx = TransactionBuilder::default()
-            .signer(sender_secret)
-            .chain_id(harness.chain_id())
-            .nonce(0)
-            .to(address!("0x1111111111111111111111111111111111111111"))
-            .value(1000)
-            .gas_limit(21_000)
-            .max_fee_per_gas(1_000_000_000)
-            .max_priority_fee_per_gas(1_000_000_000)
-            .into_eip1559();
-
-        let signed_tx =
-            BaseTransactionSigned::Eip1559(tx.as_eip1559().expect("eip1559 transaction").clone());
-        let envelope: BaseTxEnvelope = signed_tx;
-        let tx_bytes = Bytes::from(envelope.encoded_2718());
-
-        let bundle = create_bundle(vec![tx_bytes], 0, None);
-
-        let result: Result<serde_json::Value, _> =
-            client.request("base_meteredPriorityFeePerGas", (bundle,)).await;
-
-        // Should error because the metering cache is empty
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("No metering data available"));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_metered_priority_fee_per_gas_no_estimator_returns_error() -> eyre::Result<()> {
-        // Use setup() which doesn't configure resource limits (no estimator)
-        let (_harness, client) = setup().await?;
-
-        let bundle = create_bundle(vec![], 0, None);
-
-        let result: Result<serde_json::Value, _> =
-            client.request("base_meteredPriorityFeePerGas", (bundle,)).await;
-
-        // Should error because no estimator is configured
-        assert!(result.is_err());
+        assert_eq!(response.state_block_number, 1);
 
         Ok(())
     }

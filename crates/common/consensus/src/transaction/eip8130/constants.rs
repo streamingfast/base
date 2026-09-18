@@ -43,32 +43,50 @@ impl Eip8130Constants {
     /// and replay protection relies on `valid_before` (which must be non-zero).
     pub const NONCE_KEY_MAX: U256 = U256::MAX;
 
-    /// Actor scope bit: ungated `sender_auth` validation context; may originate
-    /// transactions to any `call.to`.
-    pub const SCOPE_SENDER: u16 = 0x0001;
-
-    /// Actor scope bit: policy-gated sender context; may originate transactions
-    /// only to the actor's `policy_manager`.
-    pub const SCOPE_POLICY: u16 = 0x0002;
-
-    /// Actor scope bit: nonce authorization context; permits a restricted actor
-    /// to use sequenced `nonce_key`s (otherwise nonceless-only).
-    pub const SCOPE_NONCE: u16 = 0x0004;
+    /// Actor scope bit: ungated `sender_auth` validation context (the "operator"
+    /// grant); may originate transactions to any `call.to`. Renamed from `SENDER`
+    /// to reflect that it is the more permissive grant: length decides what gets
+    /// stored; POLICY decides whether the sender is gated; OPERATOR overrides
+    /// POLICY.
+    pub const SCOPE_OPERATOR: u16 = 0x0001;
 
     /// Actor scope bit: self-pay gas; authorizes paying the account's own gas
     /// when `payer == sender`.
-    pub const SCOPE_SELF_PAYER: u16 = 0x0008;
+    pub const SCOPE_SELF_PAYER: u16 = 0x0002;
 
     /// Actor scope bit: sponsor gas; authorizes acting as `payer_auth` for a
     /// different sender (`payer != sender`).
-    pub const SCOPE_SPONSOR_PAYER: u16 = 0x0010;
+    pub const SCOPE_SPONSOR_PAYER: u16 = 0x0004;
 
+    /// Actor scope bit: policy-gated sender context; may originate transactions
+    /// only to the actor's `policy_manager`. Optional grant — a chain with no
+    /// policy system leaves this bit unused.
+    pub const SCOPE_POLICY: u16 = 0x0008;
+
+    /// Actor scope bit: nonce authorization context; permits a restricted actor
+    /// to use sequenced `nonce_key`s (otherwise nonceless-only). Optional grant.
+    pub const SCOPE_NONCE: u16 = 0x0010;
+
+    /// Whether `scope` gates the sender to its policy manager.
+    ///
+    /// Length decides what gets stored; POLICY decides whether the sender is
+    /// gated; OPERATOR overrides POLICY. The protocol gates on `SCOPE_POLICY`
+    /// (not on whether policy bytes were attached); `SCOPE_OPERATOR` is not
+    /// suppressed by `SCOPE_POLICY`.
+    #[must_use]
+    pub const fn sender_is_policy_gated(scope: u16) -> bool {
+        scope & Self::SCOPE_POLICY != 0 && scope & Self::SCOPE_OPERATOR == 0
+    }
+
+    // Core grants occupy bits 0-2 so a chain may omit POLICY/NONCE without
+    // renumbering anything else; the optional POLICY and NONCE grants trail them.
     // ERC-1271 signing rides on operational authority (admin `scope == 0x00`, or
-    // a SENDER actor without POLICY); it is not its own scope bit, so there is no
+    // an OPERATOR actor); it is not its own scope bit, so there is no
     // `SCOPE_SIGNATURE`. The remaining bits of the `uint16` scope are spare,
-    // reserved for future pure grants. The Keystore itself is scope-agnostic
-    // except for `scope == 0` (admin) and the single interpreted `SCOPE_POLICY`
-    // bit; every other bit is stored verbatim and interpreted protocol-side.
+    // reserved for future pure grants. Length decides what gets stored; POLICY
+    // decides whether the sender is gated; OPERATOR overrides POLICY. The
+    // Keystore attaches policy by payload length (empty vs 52 bytes) and stores
+    // `scope` verbatim. The protocol node gates `sender_auth` on `SCOPE_POLICY`.
 
     /// Domain-separation prefix for the `replay_id` preimage
     /// (`keccak256(REPLAY_ID_TYPE || rlp([...])`).
@@ -152,19 +170,6 @@ impl Eip8130Constants {
     /// is never a valid authenticator selector; addresses below this are reserved.
     pub const K1_AUTHENTICATOR: Address = address!("0x0000000000000000000000000000000000000001");
 
-    /// `AccountState.flags` bit (spec `CONTRACT_ESTABLISHED`): set on every
-    /// account the keystore establishes — `createAccount` (mirrored by the
-    /// node's create path) and `importAccount` — marking it
-    /// "keystore-established, not a proven address key."
-    ///
-    /// Permanent once set and never consulted during authentication. The protocol
-    /// reads it for code-delegation gating: an account may have **empty code yet
-    /// retain EIP-8130 state** (e.g. an EIP-6780 same-transaction `SELFDESTRUCT`),
-    /// so empty code alone must never be read as proof of a known EOA key. The
-    /// node therefore rejects a delegation onto an empty-code account that carries
-    /// this flag (it is not a proven-key EOA and must not be re-delegated as one).
-    pub const FLAG_CONTRACT_ESTABLISHED: u8 = 0x01;
-
     /// `AccountState.flags` bit that disables the implicit default-EOA path.
     ///
     /// The implicit default EOA is a [`Self::K1_AUTHENTICATOR`] signature whose
@@ -173,21 +178,21 @@ impl Eip8130Constants {
     /// `createAccount`/`importAccount` (disabled by default), and by authorizing
     /// or revoking the self-actor; once set it is never cleared (monotonic), so
     /// an explicit self-actor entry always implies the flag is set.
-    pub const DEFAULT_EOA_REVOKED: u8 = 0x02;
+    pub const DEFAULT_EOA_REVOKED: u8 = 0x01;
 
     /// `AccountState.flags` bit (spec `LOCKED`): when set, actor configuration is
     /// frozen — every config change and delegation is rejected on both the native
     /// and EVM paths. The only permitted operation is `applySignedLockChanges`'s
     /// unlock op. Set/cleared exclusively through the EVM `applySignedLockChanges`
     /// entry point.
-    pub const FLAG_LOCKED: u8 = 0x04;
+    pub const FLAG_LOCKED: u8 = 0x02;
 
     /// `AccountState.flags` bit (spec `UNLOCK_INITIATED`): selects how the packed
     /// `lock_union` field is interpreted. While clear, `lock_union` holds the
     /// configured `unlock_delay` (seconds, `uint16` range); while set, it holds
     /// `unlocks_at` (the timestamp at which the pending unlock takes effect). Only
     /// meaningful when [`Self::FLAG_LOCKED`] is set.
-    pub const FLAG_UNLOCK_INITIATED: u8 = 0x08;
+    pub const FLAG_UNLOCK_INITIATED: u8 = 0x04;
 
     /// Exact byte length of a policy-bearing actor's `policyData`:
     /// `manager (20) || commitment (32)`. Required when `scope & SCOPE_POLICY`
@@ -269,6 +274,14 @@ impl Eip8130Constants {
     /// the interleaved admission flow is proven out.
     pub const MAX_ACTOR_CHANGES_PER_CONFIG: usize = 5;
 
+    /// Maximum number of call phases accepted in one transaction.
+    ///
+    /// Each phase occupies an in-memory [`alloc::vec::Vec`] even when its RLP
+    /// payload is empty. Bounding the count while decoding prevents a sequence
+    /// of single-byte empty RLP lists from amplifying into unbounded allocations
+    /// before transaction-pool admission limits run.
+    pub const MAX_CALL_PHASES_PER_TX: usize = 1_024;
+
     /// Maximum runtime bytecode size for a create entry, matching EIP-170's
     /// `MAX_CODE_SIZE` limit. EIP-8130 places runtime code directly, so the
     /// mempool rejects oversized code before execution.
@@ -298,7 +311,7 @@ mod tests {
     #[test]
     fn scope_bits_are_orthogonal() {
         let bits = [
-            Eip8130Constants::SCOPE_SENDER,
+            Eip8130Constants::SCOPE_OPERATOR,
             Eip8130Constants::SCOPE_POLICY,
             Eip8130Constants::SCOPE_NONCE,
             Eip8130Constants::SCOPE_SELF_PAYER,
@@ -311,6 +324,23 @@ mod tests {
             acc |= b;
         }
         assert_eq!(Eip8130Constants::SCOPE_UNRESTRICTED, 0);
+    }
+
+    #[test]
+    fn scope_bit_values_match_the_keystore_ordering() {
+        // Core grants lead (bits 0-2); optional POLICY/NONCE trail (bits 3-4).
+        // Pinned to the EIP-8130 `Scopes` library ordering (base/eip-8130 #95).
+        assert_eq!(Eip8130Constants::SCOPE_OPERATOR, 0x0001);
+        assert_eq!(Eip8130Constants::SCOPE_SELF_PAYER, 0x0002);
+        assert_eq!(Eip8130Constants::SCOPE_SPONSOR_PAYER, 0x0004);
+        assert_eq!(Eip8130Constants::SCOPE_POLICY, 0x0008);
+        assert_eq!(Eip8130Constants::SCOPE_NONCE, 0x0010);
+        assert!(Eip8130Constants::sender_is_policy_gated(Eip8130Constants::SCOPE_POLICY));
+        assert!(!Eip8130Constants::sender_is_policy_gated(Eip8130Constants::SCOPE_OPERATOR));
+        assert!(!Eip8130Constants::sender_is_policy_gated(
+            Eip8130Constants::SCOPE_OPERATOR | Eip8130Constants::SCOPE_POLICY
+        ));
+        assert!(!Eip8130Constants::sender_is_policy_gated(0));
     }
 
     #[test]

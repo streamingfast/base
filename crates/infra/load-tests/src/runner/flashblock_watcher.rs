@@ -202,19 +202,20 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::runner::{InclusionSource, SentTransaction};
+    use crate::runner::{InclusionSource, SentTransaction, SubmitCohort};
 
     #[tokio::test]
     async fn matching_flashblock_publishes_early_refill_pulse() {
         let sender = Address::with_last_byte(1);
         let tx_hash = TxHash::repeat_byte(2);
         let tracker = ResultsTracker::new(&[sender]);
-        tracker.begin_measurement();
+        tracker.begin_measurement(0, None);
         tracker.sent_transactions(vec![SentTransaction {
             tx_hash,
             from: sender,
             estimated_gas: 21_000,
             measured: true,
+            cohort: SubmitCohort::Plain,
         }]);
         let (pulse_tx, mut pulse_rx) = mpsc::channel(1);
         let watcher = FlashblockWatcher::new(

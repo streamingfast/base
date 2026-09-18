@@ -12,25 +12,26 @@ use std::{
 };
 
 use alloy_network::{Ethereum, EthereumWallet, TransactionBuilder};
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, TxHash, U256};
 use alloy_provider::{Provider, RootProvider};
 use alloy_signer_local::PrivateKeySigner;
 use base_tx_manager::NonceManager;
 use rand::Rng;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, instrument};
+use tracing::{debug, info, instrument};
 
 use super::{
     DisplaySnapshot, LoadConfig, LoadTestDisplay, LoadTestStage, SubmissionPipeline, TxType,
+    ValidityRouter,
 };
 use crate::{
     BaselineError, Result,
     config::WorkloadConfig,
     metrics::{ConfigSummary, MetricsCollector, MetricsSummary},
     rpc::{
-        BaseFeeExt, BatchRpcClient, QueryProvider, RpcProviders, RpcResultExt,
-        create_wallet_provider,
+        BaseFeeExt, BatchRpcClient, JSON_RPC_METHOD_NOT_FOUND, QueryProvider, RpcProviders,
+        RpcResultExt, create_wallet_provider,
     },
     workload::{
         AccountPool, ChainPrepContext, KeyStream, PREP_CONCURRENCY, RealTokenRecoverySummary,
@@ -55,6 +56,7 @@ pub struct LoadRunner {
     pub(super) nonce_managers: Arc<HashMap<Address, NonceManager<RootProvider<Ethereum>>>>,
     pub(super) signers: Arc<HashMap<Address, PrivateKeySigner>>,
     pub(super) submission_batch_rpcs: Arc<Vec<BatchRpcClient>>,
+    pub(super) validity_router: ValidityRouter,
     pub(super) base_fee: u128,
     pub(super) display: Option<LoadTestDisplay>,
     pub(super) snapshot_tx: Option<watch::Sender<DisplaySnapshot>>,
@@ -76,6 +78,15 @@ impl LoadRunner {
         )
     )]
     pub fn new(config: LoadConfig) -> Result<Self> {
+        let requested_account_count = config.account_count;
+        let config = Self::with_b20_pair_accounts(config);
+        if config.account_count != requested_account_count {
+            info!(
+                requested = requested_account_count,
+                account_count = config.account_count,
+                "B-20 pairs senders; added one funded partner account"
+            );
+        }
         config.validate()?;
 
         let client = RpcProviders::query(config.query_rpc.clone())?;
@@ -156,6 +167,7 @@ impl LoadRunner {
             None
         };
         let recipient_rng = SeededRng::new(config.seed.wrapping_add(FRESH_RECIPIENT_RNG_SALT));
+        let validity_router = ValidityRouter::new(&config);
 
         Ok(Self {
             config,
@@ -169,6 +181,7 @@ impl LoadRunner {
             nonce_managers: Arc::new(HashMap::new()),
             signers,
             submission_batch_rpcs,
+            validity_router,
             base_fee: 0,
             display: None,
             snapshot_tx: None,
@@ -208,6 +221,37 @@ impl LoadRunner {
         accounts.accounts().iter().map(|a| (a.address, a.signer.clone())).collect()
     }
 
+    /// Probes each submission endpoint for validity-transaction support.
+    ///
+    /// Sends a throwaway `base_sendRawTransactionValidity` request; a
+    /// method-not-found response means the node was not started with validity
+    /// transactions enabled, so the run aborts loudly rather than silently
+    /// degrading to plain submission. Any other response (including a rejection
+    /// of the throwaway payload) confirms the method is served.
+    pub(super) async fn probe_validity_endpoint(&self) -> Result<()> {
+        for url in &self.config.transaction_submission_rpcs {
+            let provider = RpcProviders::query(url.clone())?;
+            let result: std::result::Result<TxHash, _> = provider
+                .client()
+                .request(
+                    "base_sendRawTransactionValidity",
+                    (serde_json::json!("0x"), serde_json::json!({ "validity": [] })),
+                )
+                .await;
+            if let Err(err) = &result
+                && let Some(payload) = err.as_error_resp()
+                && payload.code == JSON_RPC_METHOD_NOT_FOUND
+            {
+                return Err(BaselineError::Config(format!(
+                    "submission endpoint {url} does not serve base_sendRawTransactionValidity; \
+                     start the node with --enable-experimental-validity-transactions"
+                )));
+            }
+            debug!(url = %url, "validity endpoint capability probe passed");
+        }
+        Ok(())
+    }
+
     pub(super) async fn calibrate_avg_gas(&self) -> Result<u64> {
         let total_weight: u64 =
             self.config.transactions.iter().map(|tx| u64::from(tx.weight)).sum();
@@ -230,7 +274,11 @@ impl LoadRunner {
                 self.b20_run_salt,
             )?;
             let sender_index = type_index % accounts.len();
-            let recipient_index = (sender_index + 1) % accounts.len();
+            let recipient_index = if matches!(tx_config.tx_type, TxType::B20) {
+                Self::b20_partner_index(sender_index, accounts.len())
+            } else {
+                (sender_index + 1) % accounts.len()
+            };
             let account = &accounts[sender_index];
             let from = account.address;
             let to = accounts[recipient_index].address;
@@ -378,6 +426,29 @@ impl LoadRunner {
         self.config.transactions.iter().any(|t| matches!(t.tx_type, TxType::B20))
     }
 
+    /// Ensures B-20 workloads have even sender count so every alice has a funded bob.
+    fn with_b20_pair_accounts(mut config: LoadConfig) -> LoadConfig {
+        if config.transactions.iter().any(|t| matches!(t.tx_type, TxType::B20))
+            && config.account_count % 2 == 1
+        {
+            config.account_count = config.account_count.saturating_add(1);
+        }
+        config
+    }
+
+    /// Index of the paired B-20 counterparty (`0<->1`, `2<->3`, ...).
+    ///
+    /// Odd leftover senders pair with the previous account so the index stays in range.
+    pub(super) const fn b20_partner_index(sender_index: usize, sender_count: usize) -> usize {
+        if sender_count < 2 {
+            sender_index
+        } else if (sender_index ^ 1) < sender_count {
+            sender_index ^ 1
+        } else {
+            sender_index - 1
+        }
+    }
+
     /// Recovers real-token balances before native ETH drain.
     pub async fn recover_real_tokens(
         &self,
@@ -481,6 +552,47 @@ impl std::fmt::Debug for LoadRunner {
 #[cfg(test)]
 mod tests {
     use super::{LoadConfig, LoadRunner};
+    use crate::runner::{TxConfig, TxType};
+
+    #[test]
+    fn b20_odd_sender_count_adds_funded_partner() {
+        let config = LoadConfig {
+            account_count: 1,
+            transactions: vec![TxConfig { weight: 100, tx_type: TxType::B20 }],
+            ..LoadConfig::devnet()
+        };
+        let runner = LoadRunner::new(config).expect("valid config");
+        assert_eq!(runner.accounts.len(), 2, "single B-20 sender must get a funded bob");
+        assert_eq!(runner.config.account_count, 2);
+    }
+
+    #[test]
+    fn b20_even_sender_count_unchanged() {
+        let config = LoadConfig {
+            account_count: 10,
+            transactions: vec![TxConfig { weight: 100, tx_type: TxType::B20 }],
+            ..LoadConfig::devnet()
+        };
+        let runner = LoadRunner::new(config).expect("valid config");
+        assert_eq!(runner.accounts.len(), 10, "even B-20 sender count must stay unchanged");
+    }
+
+    #[test]
+    fn non_b20_odd_sender_count_unchanged() {
+        let config = LoadConfig { account_count: 1, ..LoadConfig::devnet() };
+        let runner = LoadRunner::new(config).expect("valid config");
+        assert_eq!(runner.accounts.len(), 1, "ETH transfer workloads must not add a partner");
+    }
+
+    #[test]
+    fn b20_partner_index_pairs_neighbors() {
+        assert_eq!(LoadRunner::b20_partner_index(0, 1), 0, "lone sender has no partner");
+        assert_eq!(LoadRunner::b20_partner_index(0, 2), 1, "alice -> bob");
+        assert_eq!(LoadRunner::b20_partner_index(1, 2), 0, "bob -> alice");
+        assert_eq!(LoadRunner::b20_partner_index(2, 4), 3);
+        assert_eq!(LoadRunner::b20_partner_index(3, 4), 2);
+        assert_eq!(LoadRunner::b20_partner_index(2, 3), 1, "odd leftover pairs with previous");
+    }
 
     #[test]
     fn fresh_recipient_seed_mode_randomizes_across_runs_even_below_ratio_one() {

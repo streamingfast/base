@@ -25,6 +25,10 @@
 //! 2. A narrow [`BlockProjection`] golden over the B-20 transfer transaction alone, with volatile
 //!    fields excluded by construction. Regenerate with `GOLDEN_UPDATE=1`.
 
+#[path = "common/balance.rs"]
+mod balance;
+#[path = "common/beryl.rs"]
+mod beryl;
 mod common;
 
 use std::{path::PathBuf, time::Duration};
@@ -53,14 +57,14 @@ async fn b20_transfer_is_traced() -> Result<()> {
     // `reth_firehose::is_tracer_initialized()` at payload-validation time.
     let capture = BaseFirehoseCapture::install(common::L2_CHAIN_ID, Some(0), Some(0), None);
 
-    let (_system, provider) = common::start_beryl_system().await?;
+    let (_system, provider) = beryl::start_beryl_system().await?;
     let admin = PrivateKeySigner::from_bytes(&ANVIL_ACCOUNT_5.private_key)
         .wrap_err("Failed to parse admin private key")?;
     let recipient = ANVIL_ACCOUNT_6.address;
-    common::wait_for_balance(&provider, admin.address()).await?;
+    beryl::wait_for_balance(&provider, admin.address()).await?;
 
     let b20 = B20PrecompileClient::new(&provider, &admin, common::L2_CHAIN_ID)
-        .with_receipt_timeout(common::TX_RECEIPT_TIMEOUT);
+        .with_receipt_timeout(beryl::TX_RECEIPT_TIMEOUT);
     b20.activate_feature(ActivationFeature::B20Asset.id()).await?;
 
     let salt = B256::repeat_byte(TOKEN_SALT);
@@ -72,7 +76,7 @@ async fn b20_transfer_is_traced() -> Result<()> {
         admin.address(),
     );
     let token = b20.create_token(B20Variant::Asset, params, salt).await?;
-    b20.wait_for_token_code(token, common::TX_RECEIPT_TIMEOUT, common::BLOCK_POLL_INTERVAL).await?;
+    b20.wait_for_token_code(token, beryl::TX_RECEIPT_TIMEOUT, common::BLOCK_POLL_INTERVAL).await?;
 
     let receipt = b20
         .send_call_receipt(

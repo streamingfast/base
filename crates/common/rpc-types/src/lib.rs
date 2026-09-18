@@ -16,6 +16,9 @@ pub use block::{BaseBlockResponse, BaseHeaderResponse};
 mod genesis;
 pub use genesis::{ChainInfo, FeeInfo, GenesisInfo, UpgradeInfo};
 
+mod log;
+pub use log::BaseLogResponse;
+
 mod receipt;
 pub use receipt::{
     BaseTransactionReceipt, Eip8130ReceiptFields, L1BlockInfo, TransactionReceiptFields,
@@ -24,7 +27,7 @@ pub use receipt::{
 #[cfg(feature = "eip8130")]
 mod eip8130;
 #[cfg(feature = "eip8130")]
-pub use eip8130::{EIP8130_PRE_COBALT_RPC_ERROR, Eip8130Nonce};
+pub use eip8130::{EIP8130_PRE_ZENITH_RPC_ERROR, Eip8130Nonce};
 
 mod transaction;
 pub use transaction::{
@@ -34,3 +37,5 @@ pub use transaction::{
 
 #[cfg(feature = "reth")]
 mod reth;
+#[cfg(feature = "reth")]
+pub use reth::BaseRpcTypes;

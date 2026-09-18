@@ -884,7 +884,7 @@ where
     /// This behaves the same as [`EthTransactionValidator::validate_one_with_state`], but in
     /// addition applies Base-specific validity checks:
     /// - ensures tx is not eip4844
-    /// - for eip8130 (account abstraction): rejects submissions before the Cobalt upgrade is
+    /// - for eip8130 (account abstraction): rejects submissions before the Zenith upgrade is
     ///   active, runs structural checks, then runs EIP-8130-specific stateful validation for
     ///   actor authorization, nonce/replay state, intrinsic gas, create/delegation safety, and
     ///   payer funding instead of using the inner Eth validator
@@ -1519,20 +1519,24 @@ where
             TxAuthError::Authorize(AuthorizeError::Storage(_)) => {
                 "account configuration read failed"
             }
-            TxAuthError::Authorize(AuthorizeError::ZeroActor) => "actor id is zero",
-            TxAuthError::Authorize(AuthorizeError::NotBound { .. }) => "actor is not bound",
+            TxAuthError::Authorize(AuthorizeError::AuthenticationFailed) => "actor id is zero",
+            TxAuthError::Authorize(AuthorizeError::AuthenticatorMismatch { .. }) => {
+                "actor is not bound"
+            }
             TxAuthError::Authorize(AuthorizeError::DefaultEoaRevoked { .. }) => {
                 "default EOA actor is revoked"
             }
-            TxAuthError::Authorize(AuthorizeError::Expired { .. }) => "actor credential expired",
+            TxAuthError::Authorize(AuthorizeError::ActorExpired { .. }) => {
+                "actor credential expired"
+            }
             TxAuthError::Authorize(AuthorizeError::NestedSignatureScope { .. }) => {
                 "delegate nested actor lacks SIGNATURE scope"
             }
             TxAuthError::SenderRecovery => "EOA sender recovery failed",
             TxAuthError::Scope { .. } => "actor scope insufficient",
-            TxAuthError::AccountLocked => "account is locked",
+            TxAuthError::AccountIsLocked => "account is locked",
             TxAuthError::DelegationUnauthorized => "delegation requires admin actor",
-            TxAuthError::ConfigSequence { .. } => "config change sequence mismatch",
+            TxAuthError::BadSequence { .. } => "config change sequence mismatch",
             TxAuthError::StaleEpoch { .. } => "config change local epoch is stale",
             TxAuthError::SequenceSaturated => "config change channel sequence is saturated",
             TxAuthError::Apply(apply) => Self::map_apply_error(apply),
@@ -1553,30 +1557,29 @@ where
             ApplyError::MalformedRevokeData => "actor change revoke data is malformed",
             ApplyError::InvalidChangePayload => "account-change op payload must be empty",
             ApplyError::EpochSaturated => "local epoch is saturated",
-            ApplyError::UnsupportedChangeType => "unsupported account-change op",
+            ApplyError::UnknownChangeType => "unknown account-change op",
+            ApplyError::AccountIsLocked => "account is locked",
+            ApplyError::ExpiryDoesNotOutliveUnlock => {
+                "authorize expiry does not outlive the unlock floor"
+            }
             ApplyError::InvalidActorId => "actor id bytes32(0) is reserved",
             ApplyError::InvalidAuthenticator => "actor authenticator is not canonical",
-            ApplyError::MalformedPolicyData => "actor policy data is malformed",
-            ApplyError::NotAnActor { .. } => "revoked actor is not authorized",
+            ApplyError::InvalidPolicyData => "actor policy data is malformed",
             ApplyError::NoInitialActors => "create entry has no initial actors",
             ApplyError::ActorsNotSortedOrDuplicate => {
                 "create initial actors are not strictly ascending"
             }
             ApplyError::EmptyBytecode => "create bytecode is empty",
             ApplyError::BytecodeTooLarge => "create bytecode exceeds the size limit",
-            ApplyError::AccountDeploymentFailed { .. } => {
-                "create bytecode is not deployable (size or reserved 0xEF prefix)"
-            }
-            ApplyError::AlreadyCreated { .. } => "create account already exists",
+            ApplyError::CreateCodeExceedsMaxSize => "create bytecode exceeds MAX_CODE_SIZE",
+            ApplyError::CreateCodeStartsWithEf => "create bytecode begins with 0xEF",
+            ApplyError::AlreadyInitialized { .. } => "create account already exists",
             ApplyError::CreateAddressMismatch { .. } => "create address does not match the sender",
             ApplyError::InvalidCreatePosition => "create entry must be the only one, at index 0",
             ApplyError::MultipleDelegations => "at most one delegation is allowed",
             ApplyError::CreateAndDelegation => "create and delegation may not coexist",
             ApplyError::NonDelegatableCode { .. } => "delegation sender has non-delegation code",
-            ApplyError::ContractEstablishedCodeless { .. } => {
-                "delegation target is an empty-code keystore-established account"
-            }
-            ApplyError::SequenceOverflow => "config change sequence overflow",
+            ApplyError::SequenceSaturated => "config change sequence is saturated",
             ApplyError::EmptyChangeSet => "signed account-change batch is empty",
         }
     }
@@ -1671,19 +1674,28 @@ where
 
     /// Runs the mempool admission checks that apply to EIP-8130 (account
     /// abstraction) transactions without requiring authenticator dispatch or account
-    /// state lookups. Enforces the Cobalt fork gate and the structural
+    /// state lookups. Enforces the Zenith fork gate and the structural
     /// invariants listed in EIP-8130 § Validation and § Nonce-Free Mode.
     fn validate_eip8130_structural(
         &self,
         signed: &Eip8130Signed,
     ) -> Result<(), InvalidPoolTransactionError> {
+        let size = signed.encode_2718_len();
+        let limit = self.inner.max_tx_input_bytes();
+        if size > limit {
+            return Err(InvalidPoolTransactionError::OversizedData { size, limit });
+        }
+        if signed.tx().calls.len() > Eip8130Constants::MAX_CALL_PHASES_PER_TX {
+            return Err(Self::eip8130_error("call phase count exceeds maximum"));
+        }
+
         // Single read of the head-block timestamp so the fork gate and the
         // expiry check see the same value even when `on_new_head_block` updates
         // the atomic concurrently.
         let now = self.block_timestamp();
         // Fork gate: EIP-8130 (account abstraction) transactions are only
-        // admissible to the pool once the Cobalt upgrade is active.
-        if !self.chain_spec().is_cobalt_active_at_timestamp(now) {
+        // admissible to the pool once the Zenith upgrade is active.
+        if !self.chain_spec().is_zenith_active_at_timestamp(now) {
             return Err(InvalidTransactionError::TxTypeNotSupported.into());
         }
         let local_chain_id = self.inner.chain_spec().chain().id();
@@ -1920,9 +1932,10 @@ where
     /// spent on duplicate detection), every `authenticator` is at or above the
     /// `K1_AUTHENTICATOR` floor (i.e. not the `address(0)` empty sentinel), no
     /// two entries share the same `actor_id`, and each entry's `policy_data` is
-    /// structurally consistent with its `scope`: empty unless `SCOPE_POLICY` is
-    /// set, otherwise exactly `manager (20) || commitment (32)` (52 bytes). The
-    /// same consistency is enforced downstream in `authorize_actor`/`slice_policy`;
+    /// a valid attachment length: empty, or exactly `manager (20) ||
+    /// commitment (32)` (52 bytes). Length decides what gets stored; POLICY
+    /// decides whether the sender is gated; OPERATOR overrides POLICY. The same
+    /// length check is enforced downstream in `authorize_actor`/`slice_policy`;
     /// checking it here rejects malformed creates before the expensive overlay
     /// path runs.
     fn validate_initial_actors(actors: &[InitialActor]) -> Result<(), InvalidPoolTransactionError> {
@@ -1937,9 +1950,8 @@ where
             if previous.is_some_and(|previous| actor.actor_id <= previous) {
                 return Err(InvalidTransactionError::TxTypeNotSupported.into());
             }
-            let policy = actor.scope & Eip8130Constants::SCOPE_POLICY != 0;
-            let expected_policy_len = if policy { Eip8130Constants::POLICY_DATA_LEN } else { 0 };
-            if actor.policy_data.len() != expected_policy_len {
+            let len = actor.policy_data.len();
+            if len != 0 && len != Eip8130Constants::POLICY_DATA_LEN {
                 return Err(InvalidTransactionError::TxTypeNotSupported.into());
             }
             previous = Some(actor.actor_id);
@@ -2158,7 +2170,7 @@ mod tests {
     use base_execution_chainspec::{BaseChainSpec, BaseChainSpecBuilder};
     use base_execution_eip8130::{AccountChangeApplier, ConfigChangeAuthorizer};
     use base_execution_evm::BaseEvmConfig;
-    use base_test_utils::Account;
+    use base_test_utils::{Account, build_test_genesis_zenith};
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
     use reth_transaction_pool::{
         TransactionOrigin, TransactionValidationOutcome, blobstore::InMemoryBlobStore,
@@ -2174,6 +2186,12 @@ mod tests {
         BaseEvmConfig,
     >;
 
+    fn zenith_chain_spec() -> Arc<BaseChainSpec> {
+        let mut genesis = build_test_genesis_zenith();
+        genesis.config.chain_id = test_chain_id();
+        Arc::new(BaseChainSpec::from_genesis(genesis))
+    }
+
     /// Builds a [`BaseTransactionValidator`] configured against the given chain spec with
     /// no accounts seeded.
     fn build_test_validator_with_spec(chain_spec: Arc<BaseChainSpec>) -> TestValidator {
@@ -2188,20 +2206,34 @@ mod tests {
         BaseTransactionValidator::with_block_info(inner, BaseL1BlockInfo::default())
     }
 
-    /// Builds a [`BaseTransactionValidator`] against a Cobalt-activated mainnet chain spec with
-    /// no accounts seeded. EIP-8130 admission is fork-gated on Cobalt, so the structural-gate
-    /// tests run with Cobalt active (at genesis) to exercise the checks past the fork gate.
+    /// Builds a [`BaseTransactionValidator`] against a Zenith-activated test chain spec with
+    /// no accounts seeded. EIP-8130 admission is fork-gated on Zenith, so the structural-gate
+    /// tests run with Zenith active (at genesis) to exercise the checks past the fork gate.
     fn build_test_validator() -> TestValidator {
-        let chain_spec = Arc::new(BaseChainSpecBuilder::base_mainnet().cobalt_activated().build());
-        build_test_validator_with_spec(chain_spec)
+        build_test_validator_with_spec(zenith_chain_spec())
     }
 
-    /// Builds a Cobalt-activated validator with one canonical account seeded.
+    /// Builds a Zenith-activated validator with a custom encoded transaction-size limit.
+    fn build_test_validator_with_max_tx_input_bytes(max_tx_input_bytes: usize) -> TestValidator {
+        let chain_spec = zenith_chain_spec();
+        let client = MockEthProvider::<BasePrimitives>::new()
+            .with_chain_spec(Arc::clone(&chain_spec))
+            .with_genesis_block();
+        let evm_config = BaseEvmConfig::base(Arc::clone(&chain_spec));
+        let inner = EthTransactionValidatorBuilder::new(client, evm_config)
+            .no_shanghai()
+            .no_cancun()
+            .with_max_tx_input_bytes(max_tx_input_bytes)
+            .build(InMemoryBlobStore::default());
+        BaseTransactionValidator::with_block_info(inner, BaseL1BlockInfo::default())
+    }
+
+    /// Builds a Zenith-activated validator with one canonical account seeded.
     fn build_test_validator_with_account(
         address: Address,
         account: ExtendedAccount,
     ) -> TestValidator {
-        let chain_spec = Arc::new(BaseChainSpecBuilder::base_mainnet().cobalt_activated().build());
+        let chain_spec = zenith_chain_spec();
         let client = MockEthProvider::<BasePrimitives>::new()
             .with_chain_spec(Arc::clone(&chain_spec))
             .with_genesis_block();
@@ -2517,10 +2549,49 @@ mod tests {
     }
 
     #[test]
-    fn rejects_eip8130_before_cobalt_activation() {
-        // Mainnet leaves Cobalt unscheduled, so the fork gate rejects an otherwise
-        // structurally valid EIP-8130 transaction regardless of its contents.
-        let validator = build_test_validator_with_spec(Arc::new(BaseChainSpec::mainnet()));
+    fn accepts_eip8130_at_encoded_size_limit() {
+        let signed = sign_eoa_eip8130(minimal_valid_eoa_tx());
+        let validator = build_test_validator_with_max_tx_input_bytes(signed.encode_2718_len());
+
+        assert!(validator.validate_eip8130_structural(&signed).is_ok());
+    }
+
+    #[test]
+    fn rejects_eip8130_over_encoded_size_limit() {
+        let signed = sign_eoa_eip8130(minimal_valid_eoa_tx());
+        let size = signed.encode_2718_len();
+        let limit = size - 1;
+        let validator = build_test_validator_with_max_tx_input_bytes(limit);
+
+        assert!(matches!(
+            validator.validate_eip8130_structural(&signed),
+            Err(InvalidPoolTransactionError::OversizedData {
+                size: rejected_size,
+                limit: rejected_limit,
+            }) if rejected_size == size && rejected_limit == limit
+        ));
+    }
+
+    #[test]
+    fn rejects_constructed_eip8130_over_call_phase_limit() {
+        let validator = build_test_validator();
+        let tx = TxEip8130 {
+            calls: vec![Vec::new(); Eip8130Constants::MAX_CALL_PHASES_PER_TX + 1],
+            ..minimal_valid_eoa_tx()
+        };
+        let signed = sign_eoa_eip8130(tx);
+
+        assert_structural_reason(
+            validator.validate_eip8130_structural(&signed),
+            "call phase count exceeds maximum",
+        );
+    }
+
+    #[test]
+    fn rejects_eip8130_before_zenith_activation() {
+        // Cobalt alone does not open the EIP-8130 gate.
+        let chain_spec = BaseChainSpecBuilder::base_mainnet().cobalt_activated().build();
+        let validator = build_test_validator_with_spec(Arc::new(chain_spec));
         let signed = sign_eoa_eip8130(minimal_valid_eoa_tx());
         assert_unsupported(validator.validate_eip8130_structural(&signed));
     }
@@ -2893,7 +2964,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_eip8130_create_with_policy_data_on_ungated_actor() {
+    fn accepts_eip8130_create_with_policy_data_on_ungated_actor() {
+        // Length decides what gets stored; POLICY is not required to attach.
         let mut entry = make_valid_create_entry();
         entry.initial_actors[0].scope = 0;
         entry.initial_actors[0].policy_data = vec![0u8; Eip8130Constants::POLICY_DATA_LEN].into();
@@ -2901,10 +2973,10 @@ mod tests {
             account_changes: vec![AccountChange::Create(entry)],
             ..minimal_valid_eoa_tx()
         };
-        assert_unsupported(TestValidator::validate_account_changes(
-            &sign_eoa_eip8130(tx),
-            test_chain_id(),
-        ));
+        assert!(
+            TestValidator::validate_account_changes(&sign_eoa_eip8130(tx), test_chain_id(),)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -3450,7 +3522,7 @@ mod tests {
     #[test]
     fn eip8130_payer_max_cost_includes_l1_and_operator_fees() {
         let chain_config = ChainConfig::mainnet();
-        let chain_spec = Arc::new(BaseChainSpecBuilder::base_mainnet().cobalt_activated().build());
+        let chain_spec = zenith_chain_spec();
         let signer = PrivateKeySigner::random();
         let sender = signer.address();
         // Headroom above the worst-case intrinsic: admission pins the sender policy
@@ -3510,7 +3582,7 @@ mod tests {
 
     #[test]
     fn nonce_free_manifest_uses_transaction_validity_window() {
-        let chain_spec = Arc::new(BaseChainSpecBuilder::base_mainnet().cobalt_activated().build());
+        let chain_spec = zenith_chain_spec();
         let signer = PrivateKeySigner::random();
         let now = 100;
         // `valid_before` is in milliseconds; at the admission-window edge it is
@@ -3608,7 +3680,7 @@ mod tests {
     /// freshly-created account's evolving state (the create installs an
     /// unrestricted owner; the config change then advances the multichain
     /// channel from sequence 0). If the overlay did not persist the create's
-    /// storage transitions, the config change would fail with `NotBound`.
+    /// storage transitions, the config change would fail with `AuthenticatorMismatch`.
     #[test]
     fn admits_eip8130_create_then_config_change_via_overlay() {
         let signer = PrivateKeySigner::random();

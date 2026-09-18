@@ -29,19 +29,24 @@ mod best;
 
 mod validity;
 pub use validity::{
-    DEFAULT_MAX_VALIDITY_PREDICATES, PredicateContext, TransactionValidity, ValidityOperator,
-    ValidityPredicate, ValidityPredicateError,
+    DEFAULT_MAX_VALIDITY_EXPIRY_SECS, DEFAULT_MAX_VALIDITY_PREDICATES, FIRST_POOL_FLASHBLOCK_INDEX,
+    PredicateContext, TransactionValidity, ValidityOperator, ValidityPredicate,
+    ValidityPredicateError, deserialize_bounded_predicates,
 };
+
+mod block_expiry;
+pub use block_expiry::BlockExpiryIndex;
 
 mod transaction;
 pub use transaction::{
-    BLOCK_TIME_SECS, BasePooledTransaction, BasePooledTx, BundleTransaction,
-    MAX_BUNDLE_ADVANCE_BLOCKS, MAX_BUNDLE_ADVANCE_MILLIS, MAX_BUNDLE_ADVANCE_SECS,
-    TimestampedTransaction, unix_time_millis,
+    BasePooledTransaction, BasePooledTx, TimestampedTransaction, unix_time_millis,
 };
 
 mod ordering;
-pub use ordering::{BaseOrdering, BestTransactionPriority, TimestampOrdering};
+pub use ordering::{
+    BaseOrdering, BasePriority, BestTransactionPriority, TimestampOrdering, UnifiedTipOrdering,
+    UnifiedTipPriority,
+};
 
 mod parking;
 pub use parking::{
@@ -63,12 +68,6 @@ pub use pool_error_label::PoolRejectionLabel;
 mod builder;
 pub use builder::{BuilderApiImpl, BuilderApiMetrics, BuilderApiServer};
 
-mod bundle;
-pub use bundle::{
-    BundleApiMetrics, SendBundleApiImpl, SendBundleApiServer, SendBundleRequest,
-    maintain_bundle_transactions,
-};
-
 mod wire;
 pub use wire::{
     ExtensionError, NoExtensions, ValidatedTransaction, ValidatedTransactionExtensions,
@@ -77,6 +76,6 @@ pub use wire::{
 mod two_d_nonce_pool;
 
 mod metrics;
-pub use metrics::{GuardMetrics, ValidatorMetrics};
+pub use metrics::{GuardMetrics, ValidatorMetrics, ValidityPoolMetrics};
 
 pub mod estimated_da_size;

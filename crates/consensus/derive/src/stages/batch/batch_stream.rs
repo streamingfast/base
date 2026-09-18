@@ -71,7 +71,7 @@ where
         Ok(self.config.is_holocene_active(origin.timestamp))
     }
 
-    /// Gets a [`SingleBatch`] from the in-memory buffer.
+    /// Gets a span-derived [`SingleBatch`] from the in-memory buffer and assigns its parent hash.
     pub fn get_single_batch(
         &mut self,
         parent: L2BlockInfo,
@@ -79,8 +79,12 @@ where
     ) -> Result<Option<SingleBatch>, SpanBatchError> {
         trace!(target: "batch_span", buffer_len = self.buffer.len(), "Attempting to get a SingleBatch from buffer");
 
+        let parent_hash = parent.block_info.hash;
         self.try_hydrate_buffer(parent, l1_origins)?;
-        Ok(self.buffer.pop_front())
+        Ok(self.buffer.pop_front().map(|mut batch| {
+            batch.parent_hash = parent_hash;
+            batch
+        }))
     }
 
     /// Hydrates the buffer with single batches derived from the span batch, if there is one
@@ -129,6 +133,15 @@ where
         if !self.is_active()? {
             trace!(target: "batch_span", "BatchStream stage is inactive, pass-through.");
             return self.prev.next_batch().await;
+        }
+
+        let next = parent.block_info.number + 1;
+        if self.config.is_denim_active(self.config.l2_block_timestamp(next))
+            && (self.span.is_some() || !self.buffer.is_empty())
+        {
+            warn!(target: "batch_span", next_block_number = next, "Dropping cached span state after Denim activation");
+            self.flush();
+            return Err(PipelineError::NotEnoughData.temp());
         }
 
         // If the buffer is empty, attempt to pull a batch from the previous stage.
@@ -258,7 +271,7 @@ mod tests {
     use alloy_eips::{BlockNumHash, NumHash};
     use alloy_primitives::{FixedBytes, b256};
     use base_common_consensus::BaseBlock;
-    use base_common_genesis::{ChainGenesis, SystemConfig, UpgradeConfig};
+    use base_common_genesis::{BaseUpgradeConfig, ChainGenesis, SystemConfig, UpgradeConfig};
     use base_protocol::{SingleBatch, SpanBatchElement};
 
     use super::*;
@@ -382,10 +395,15 @@ mod tests {
             panic!("Wrong batch type");
         }
 
-        let batch = stream.next_batch(Default::default(), &mock_origins).await.unwrap();
+        let parent = L2BlockInfo {
+            block_info: BlockInfo { hash: FixedBytes::repeat_byte(0x11), ..Default::default() },
+            ..Default::default()
+        };
+        let batch = stream.next_batch(parent, &mock_origins).await.unwrap();
         if let Batch::Single(single) = batch {
             assert_eq!(single.epoch_num, 1);
             assert_eq!(single.timestamp, 4);
+            assert_eq!(single.parent_hash, parent.block_info.hash);
         } else {
             panic!("Wrong batch type");
         }
@@ -418,6 +436,53 @@ mod tests {
         let err = stream.next_batch(Default::default(), &mock_origins).await.unwrap_err();
         assert_eq!(err, PipelineError::Eof.temp());
         assert_eq!(stream.span_buffer_size(), 0);
+        assert!(stream.span.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_crossing_span_stops_before_first_denim_block() {
+        let span = SpanBatch {
+            batches: vec![
+                SpanBatchElement { epoch_num: 1, timestamp: 2, ..Default::default() },
+                SpanBatchElement { epoch_num: 1, timestamp: 4, ..Default::default() },
+                SpanBatchElement { epoch_num: 1, timestamp: 6, ..Default::default() },
+                SpanBatchElement { epoch_num: 1, timestamp: 8, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let origins = [BlockInfo { number: 1, ..Default::default() }];
+        let config = Arc::new(RollupConfig {
+            block_time: 2,
+            upgrades: UpgradeConfig {
+                delta_time: Some(0),
+                holocene_time: Some(0),
+                base: BaseUpgradeConfig { denim: Some(6), ..Default::default() },
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let prev = TestBatchStreamProvider::new(vec![Ok(Batch::Span(span))]);
+        let mut stream = BatchStream::new(prev, config, TestL2ChainProvider::default());
+
+        let first = stream.next_batch(L2BlockInfo::default(), &origins).await.unwrap();
+        assert_eq!(first.timestamp(), 2);
+
+        let second_parent = L2BlockInfo {
+            block_info: BlockInfo { number: 1, timestamp: 2, ..Default::default() },
+            ..Default::default()
+        };
+        let second = stream.next_batch(second_parent, &origins).await.unwrap();
+        assert_eq!(second.timestamp(), 4);
+
+        let denim_parent = L2BlockInfo {
+            block_info: BlockInfo { number: 2, timestamp: 4, ..Default::default() },
+            ..Default::default()
+        };
+        assert_eq!(
+            stream.next_batch(denim_parent, &origins).await,
+            Err(PipelineError::NotEnoughData.temp())
+        );
+        assert!(stream.buffer.is_empty());
         assert!(stream.span.is_none());
     }
 
@@ -502,7 +567,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_batch_pass_through() {
-        let data = vec![Ok(Batch::Single(SingleBatch::default()))];
+        let single =
+            SingleBatch { parent_hash: FixedBytes::repeat_byte(0x11), ..Default::default() };
+        let data = vec![Ok(Batch::Single(single.clone()))];
         let config = Arc::new(RollupConfig {
             upgrades: UpgradeConfig { holocene_time: Some(0), ..Default::default() },
             ..Default::default()
@@ -516,7 +583,7 @@ mod tests {
 
         // The next batch should be passed through to the [BatchQueue] stage.
         let batch = stream.next_batch(Default::default(), &[]).await.unwrap();
-        assert!(matches!(batch, Batch::Single(_)));
+        assert_eq!(batch, Batch::Single(single));
         assert_eq!(stream.span_buffer_size(), 0);
         assert!(stream.span.is_none());
     }

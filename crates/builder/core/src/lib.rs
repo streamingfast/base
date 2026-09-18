@@ -23,10 +23,11 @@ mod execution_metering_mode;
 pub use execution_metering_mode::ExecutionMeteringMode;
 
 mod traits;
+pub use base_execution_payload_builder::{
+    MeteringProvider, NoopMeteringProvider, RejectionCache, ResourceMeteringConfig,
+    SharedMeteringProvider,
+};
 pub use traits::{ClientBounds, NodeBounds, PayloadTxsBounds, PoolBounds};
-
-mod metering;
-pub use metering::{MeteringProvider, NoopMeteringProvider, SharedMeteringProvider};
 
 mod rejected_tx_forwarder;
 pub use rejected_tx_forwarder::RejectedTxForwarder;
@@ -36,21 +37,26 @@ pub use rejected_tx_forwarder::RejectedTxForwarder;
 // builder-specific payload construction private to the builder crate.
 mod transaction_events;
 
-mod rejection_cache;
-pub use rejection_cache::RejectionCache;
-
 mod flashblocks;
 pub use flashblocks::{
     BasePayloadBuilderCtx, BestFlashblocksTxs, BlockPayloadJob, BlockPayloadJobGenerator,
-    BuildArguments, FlashblockDiagnostics, FlashblockSelectionOutcome, FlashblocksExtraCtx,
-    FlashblocksServiceBuilder, ParkableBestPayloadTransactions, ParkablePayloadTransactions,
+    BuildArguments, FLOW_STANDARD, FLOW_VALIDITY, FlashblockDiagnostics,
+    FlashblockSelectionOutcome, FlashblocksExtraCtx, FlashblocksServiceBuilder, InclusionFlow,
+    InclusionTracker, ParkableBestPayloadTransactions, ParkablePayloadTransactions,
     ParkedPredicateIndex, PayloadBuilder, PayloadHandler, PayloadJobDeadline,
-    PayloadTransactionInvalidated, ResolvePayload, ValidityPredicateKey,
+    PayloadTransactionInvalidated, PredicateLoadTracker, PredicateReadRecorder, ResolvePayload,
+    StateChangeEffects, ValidityPredicateEvaluation, ValidityPredicateKey,
 };
 
 mod extension;
 pub use extension::{
     BuilderApiExtension, BuilderApiExtensionConfig, DEFAULT_MAX_VALIDITY_PREDICATES,
+};
+
+mod shadow_validity;
+pub use shadow_validity::{
+    MAX_SHADOW_VALIDITY_SAMPLE_RATE_BPS, ShadowValidityBuilderApi, ShadowValidityConfig,
+    ShadowValidityConfigError,
 };
 
 /// Shared test infrastructure: local node instances, chain drivers, transaction builders, and pool observers.

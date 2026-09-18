@@ -134,10 +134,6 @@ pub(crate) struct BuilderConsideredEventData {
     #[serde(flatten)]
     budget: BuilderBudgetFields,
     #[serde(skip_serializing_if = "Option::is_none")]
-    bundle_min_block: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bundle_max_block: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     tx_age_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metering_wait_duration_ms: Option<u128>,
@@ -152,22 +148,9 @@ impl BuilderConsideredEventData {
     ) -> Self {
         Self {
             budget: BuilderBudgetFields::new(info, limits, resources),
-            bundle_min_block: None,
-            bundle_max_block: None,
             tx_age_ms: None,
             metering_wait_duration_ms: None,
         }
-    }
-
-    /// Adds the block window associated with a bundle transaction.
-    pub(crate) const fn with_bundle_block_window(
-        mut self,
-        min_block_number: Option<u64>,
-        max_block_number: Option<u64>,
-    ) -> Self {
-        self.bundle_min_block = min_block_number;
-        self.bundle_max_block = max_block_number;
-        self
     }
 
     /// Adds metering wait details to the considered-event payload.
@@ -191,14 +174,6 @@ pub(crate) struct BuilderRejectedEventData {
     rejection_detail: String,
     permanent: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    bundle_min_block: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bundle_max_block: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    current_block: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    block_timestamp: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     tx_age_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metering_wait_duration_ms: Option<u128>,
@@ -221,10 +196,6 @@ impl BuilderRejectedEventData {
             rejection_reason,
             rejection_detail: rejection_detail.into(),
             permanent,
-            bundle_min_block: None,
-            bundle_max_block: None,
-            current_block: None,
-            block_timestamp: None,
             tx_age_ms: None,
             metering_wait_duration_ms: None,
             dry_run: None,
@@ -248,29 +219,6 @@ impl BuilderRejectedEventData {
         )
     }
 
-    /// Adds the block window associated with a bundle transaction.
-    pub(crate) const fn with_bundle_block_window(
-        mut self,
-        min_block_number: Option<u64>,
-        max_block_number: Option<u64>,
-    ) -> Self {
-        self.bundle_min_block = min_block_number;
-        self.bundle_max_block = max_block_number;
-        self
-    }
-
-    /// Adds the current block associated with a bundle rejection.
-    pub(crate) const fn with_current_block(mut self, block_number: u64) -> Self {
-        self.current_block = Some(block_number);
-        self
-    }
-
-    /// Adds the block timestamp associated with a bundle rejection.
-    pub(crate) const fn with_block_timestamp(mut self, timestamp: u64) -> Self {
-        self.block_timestamp = Some(timestamp);
-        self
-    }
-
     /// Adds metering wait details to the rejected-event payload.
     pub(crate) const fn with_metering_wait(
         mut self,
@@ -286,6 +234,58 @@ impl BuilderRejectedEventData {
     pub(crate) const fn with_dry_run(mut self, dry_run: bool) -> Self {
         self.dry_run = Some(dry_run);
         self
+    }
+}
+
+/// Fields emitted when the builder defers a transaction for later re-evaluation.
+#[derive(Debug, Serialize)]
+pub(crate) struct BuilderDeferredEventData {
+    #[serde(flatten)]
+    budget: BuilderBudgetFields,
+    defer_reason: &'static str,
+    defer_detail: String,
+}
+
+impl BuilderDeferredEventData {
+    /// Creates a deferred-event payload with an explicit reason and detail.
+    pub(crate) fn new(
+        defer_reason: &'static str,
+        defer_detail: impl Into<String>,
+        info: &ExecutionInfo,
+        limits: &ResourceLimits,
+        resources: Option<&TxResources>,
+    ) -> Self {
+        Self {
+            budget: BuilderBudgetFields::new(info, limits, resources),
+            defer_reason,
+            defer_detail: defer_detail.into(),
+        }
+    }
+}
+
+/// Fields emitted when the builder discards a transaction that can no longer become valid.
+#[derive(Debug, Serialize)]
+pub(crate) struct BuilderExpiredEventData {
+    #[serde(flatten)]
+    budget: BuilderBudgetFields,
+    expire_reason: &'static str,
+    expire_detail: String,
+}
+
+impl BuilderExpiredEventData {
+    /// Creates an expired-event payload with an explicit reason and detail.
+    pub(crate) fn new(
+        expire_reason: &'static str,
+        expire_detail: impl Into<String>,
+        info: &ExecutionInfo,
+        limits: &ResourceLimits,
+        resources: Option<&TxResources>,
+    ) -> Self {
+        Self {
+            budget: BuilderBudgetFields::new(info, limits, resources),
+            expire_reason,
+            expire_detail: expire_detail.into(),
+        }
     }
 }
 
@@ -554,6 +554,8 @@ fn serialize_builder_event_data<T: Serialize>(data: BuilderEventData<T>) -> Map<
 
 #[cfg(test)]
 mod tests {
+    use alloy_primitives::B256;
+
     use super::*;
 
     fn context() -> BuilderTransactionEventContext {
@@ -647,5 +649,51 @@ mod tests {
             )),
             "tx_execution_time_exceeded"
         );
+    }
+
+    #[test]
+    fn deferred_rejected_and_expired_event_payloads_are_distinguishable() {
+        let info = ExecutionInfo::default();
+        let limits = ResourceLimits::default();
+        let deferred = serde_json::to_value(BuilderDeferredEventData::new(
+            "validity_predicate_not_satisfied",
+            "a validity predicate is not satisfied by the current build state",
+            &info,
+            &limits,
+            None,
+        ))
+        .unwrap();
+        let rejected = serde_json::to_value(BuilderRejectedEventData::new(
+            "validity_predicate_not_satisfied",
+            "a validity predicate is not satisfied by the current build state",
+            false,
+            &info,
+            &limits,
+            None,
+        ))
+        .unwrap();
+        let expired = serde_json::to_value(BuilderExpiredEventData::new(
+            "validity_predicate_expired",
+            "a validity predicate can no longer be satisfied at or after the current build position",
+            &info,
+            &limits,
+            None,
+        ))
+        .unwrap();
+
+        assert_eq!(deferred["defer_reason"], "validity_predicate_not_satisfied");
+        assert!(deferred.get("rejection_reason").is_none());
+        assert!(deferred.get("expire_reason").is_none());
+        assert!(!deferred.as_object().unwrap().contains_key("validity_predicates"));
+
+        assert_eq!(rejected["rejection_reason"], "validity_predicate_not_satisfied");
+        assert!(rejected.get("defer_reason").is_none());
+        assert!(rejected.get("expire_reason").is_none());
+        assert!(!rejected.as_object().unwrap().contains_key("validity_predicates"));
+
+        assert_eq!(expired["expire_reason"], "validity_predicate_expired");
+        assert!(expired.get("defer_reason").is_none());
+        assert!(expired.get("rejection_reason").is_none());
+        assert!(!expired.as_object().unwrap().contains_key("validity_predicates"));
     }
 }

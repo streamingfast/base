@@ -21,6 +21,7 @@ alloy-primitives.workspace = true
 # base
 base-common-chains.workspace = true
 base-common-genesis.workspace = true
+base-common-eip8130.workspace = true
 base-precompile-macros.workspace = true
 base-precompile-storage.workspace = true
 
@@ -40,6 +41,10 @@ required-features = ["test-utils"]
 
 [[test]]
 name = "b20_stablecoin_v1_golden"
+required-features = ["test-utils"]
+
+[[test]]
+name = "b20_stablecoin_v2_golden"
 required-features = ["test-utils"]
 
 [[test]]
@@ -65,6 +70,7 @@ std = [
 	"alloy-primitives/std",
 	"alloy-sol-types/std",
 	"base-common-chains/std",
+	"base-common-eip8130/std",
 	"base-common-genesis/std",
 	"base-precompile-storage/std",
 	"revm/std",
@@ -86,3 +92,5 @@ test-utils = [
 	"base-common-genesis/test-utils",
 	"base-precompile-storage/test-utils",
 ]
+# Node-only wall-clock call timing. Leave off in zkVM guests.
+metrics = [ "std" ]

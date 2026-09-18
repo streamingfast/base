@@ -7,17 +7,14 @@
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
-mod metrics;
-pub use metrics::ShadowMetrics;
-
-mod reader;
-pub use reader::{
-    DEFAULT_MAX_ROWS_PER_POLL, DEFAULT_POLL_INTERVAL_SECS, ShadowMetricsReader,
-    ShadowMetricsReaderConfig,
-};
+mod api;
+pub use api::api_router;
 
 mod stats;
 pub use stats::ShadowBlockStats;
 
 mod store;
+pub use base_shadow_indexer_db::{
+    DEFAULT_DATABASE, DEFAULT_PORT, DEFAULT_USERNAME, PgConnectionParams,
+};
 pub use store::{ShadowMetricsSchemaReadinessError, ShadowMetricsStore};

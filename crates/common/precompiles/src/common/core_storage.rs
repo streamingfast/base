@@ -4,7 +4,7 @@ use alloc::string::String;
 
 use alloy_primitives::{Address, B256, FixedBytes, U256};
 use base_precompile_macros::Storable;
-use base_precompile_storage::{Mapping, Result, StorageOps, extract_from_word};
+use base_precompile_storage::{Mapping, Result, StorageOps, Word};
 
 use crate::TransferPolicyIds;
 
@@ -82,10 +82,13 @@ pub struct B20CoreStorage {
     pub nonces: Mapping<Address, U256>, // offset 13
     // The base-std mock keeps an `initialized` bootstrap flag as its last field; this impl checks
     // factory-init via deployed marker bytecode instead, so it stores no such field.
-    /// Seizable-account policy ID, consulted against `from` by the seize operations.
+    /// Seize-exempt policy ID, consulted against `from` by the seize operations. Accounts
+    /// authorized by this policy are exempt from seizure; `from` is seizable only when it is NOT
+    /// in the scope. The unset always-allow default keeps seizure closed until an issuer
+    /// configures it.
     #[accessor]
     #[mutator]
-    pub seize_holder_policy_id: u64, // slot 14, offset 0
+    pub seize_exempt_policy_id: u64, // slot 14, offset 0
     /// Seize-receiver policy ID, consulted against `to` by the seize operations.
     #[accessor]
     #[mutator]
@@ -105,17 +108,17 @@ impl B20CoreStorageHandler<'_> {
         let slot = self.transfer_sender_policy_id.slot();
         let word = StorageOps::load(&self.transfer_sender_policy_id, slot)?;
         Ok(TransferPolicyIds {
-            sender: extract_from_word::<u64>(
+            sender: Word::extract_from_word::<u64>(
                 word,
                 __packing_b20_core_storage::TRANSFER_SENDER_POLICY_ID_LOC.offset_bytes,
                 size_of::<u64>(),
             )?,
-            receiver: extract_from_word::<u64>(
+            receiver: Word::extract_from_word::<u64>(
                 word,
                 __packing_b20_core_storage::TRANSFER_RECEIVER_POLICY_ID_LOC.offset_bytes,
                 size_of::<u64>(),
             )?,
-            executor: extract_from_word::<u64>(
+            executor: Word::extract_from_word::<u64>(
                 word,
                 __packing_b20_core_storage::TRANSFER_EXECUTOR_POLICY_ID_LOC.offset_bytes,
                 size_of::<u64>(),
@@ -165,8 +168,8 @@ mod tests {
         assert_eq!(__packing_b20_core_storage::PAUSED_LOC.offset_slots, 11);
         assert_eq!(__packing_b20_core_storage::SUPPLY_CAP_LOC.offset_slots, 12);
         assert_eq!(__packing_b20_core_storage::NONCES_LOC.offset_slots, 13);
-        assert_eq!(__packing_b20_core_storage::SEIZE_HOLDER_POLICY_ID_LOC.offset_slots, 14);
-        assert_eq!(__packing_b20_core_storage::SEIZE_HOLDER_POLICY_ID_LOC.offset_bytes, 0);
+        assert_eq!(__packing_b20_core_storage::SEIZE_EXEMPT_POLICY_ID_LOC.offset_slots, 14);
+        assert_eq!(__packing_b20_core_storage::SEIZE_EXEMPT_POLICY_ID_LOC.offset_bytes, 0);
         assert_eq!(__packing_b20_core_storage::SEIZE_RECEIVER_POLICY_ID_LOC.offset_slots, 14);
         assert_eq!(__packing_b20_core_storage::SEIZE_RECEIVER_POLICY_ID_LOC.offset_bytes, 8);
         assert_eq!(__packing_b20_core_storage::SEIZE_RESERVED_LOC.offset_slots, 14);

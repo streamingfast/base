@@ -11,16 +11,15 @@ use alloc::string::ToString;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_sol_types::{SolCall, SolInterface, SolValue};
 use base_common_genesis::BaseUpgrade;
-use base_precompile_storage::{BasePrecompileError, StorageCtx};
-use revm::precompile::PrecompileResult;
+use base_precompile_storage::{BasePrecompileError, PrecompileResult, StorageCtx};
 
 use crate::{
-    B20PolicyType, B20StablecoinToken, B20TokenRole, B20Variant, BerylCallRecorder,
-    BerylMetricLabels, BerylSelector,
+    B20PolicyType, B20StablecoinToken, B20TokenRole, B20Variant,
     IB20::{self, IB20Calls as C},
     IB20Stablecoin::{self, IB20StablecoinCalls as SC},
     NoopPrecompileCallObserver, PermitArgs, PolicyAccounting, PrecompileCallObserver,
-    StablecoinAccounting, StablecoinVersion, StablecoinVersions,
+    PrecompileCallRecorder, PrecompileMetricLabels, PrecompileSelector, StablecoinAccounting,
+    StablecoinVersion, StablecoinVersions,
 };
 
 impl<S: StablecoinAccounting, A: PolicyAccounting> B20StablecoinToken<S, A> {
@@ -45,9 +44,9 @@ impl<S: StablecoinAccounting, A: PolicyAccounting> B20StablecoinToken<S, A> {
     where
         O: PrecompileCallObserver,
     {
-        let mut recorder = BerylCallRecorder::start(
+        let mut recorder = PrecompileCallRecorder::start(
             observer.clone(),
-            BerylMetricLabels::b20_stablecoin_call(calldata),
+            PrecompileMetricLabels::b20_stablecoin_call(calldata),
         );
         if !ctx.call_value().is_zero() {
             return recorder
@@ -109,7 +108,7 @@ impl<S: StablecoinAccounting, A: PolicyAccounting> B20StablecoinToken<S, A> {
     {
         let logic = version.implementation();
 
-        if let Some(selector) = BerylSelector::selector(calldata)
+        if let Some(selector) = PrecompileSelector::selector(calldata)
             && IB20Stablecoin::IB20StablecoinCalls::valid_selector(selector)
         {
             let call = IB20Stablecoin::IB20StablecoinCalls::abi_decode_validate(calldata).map_err(
@@ -166,7 +165,7 @@ impl<S: StablecoinAccounting, A: PolicyAccounting> B20StablecoinToken<S, A> {
                     B20PolicyType::TransferExecutor.id().abi_encode().into()
                 }
                 C::MINT_RECEIVER_POLICY(_) => B20PolicyType::MintReceiver.id().abi_encode().into(),
-                C::SEIZE_HOLDER_POLICY(_) => B20PolicyType::SeizeHolder.id().abi_encode().into(),
+                C::SEIZE_EXEMPT_POLICY(_) => B20PolicyType::SeizeExempt.id().abi_encode().into(),
                 C::SEIZE_RECEIVER_POLICY(_) => {
                     B20PolicyType::SeizeReceiver.id().abi_encode().into()
                 }

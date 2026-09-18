@@ -2,8 +2,7 @@
 
 use alloy_primitives::Bytes;
 use alloy_sol_types::SolCall;
-use base_precompile_storage::{BasePrecompileError, IntoPrecompileResult, StorageCtx};
-use revm::precompile::PrecompileResult;
+use base_precompile_storage::{BasePrecompileError, PrecompileResult, StorageCtx};
 
 use crate::{
     INonceManager::{self, INonceManagerCalls as C},
@@ -27,20 +26,14 @@ impl NonceManagerStorage<'_> {
     pub fn dispatch(&self, ctx: StorageCtx<'_>, calldata: &[u8]) -> PrecompileResult {
         // `getNonce` is nonpayable; reject attached ETH before charging calldata gas.
         if !ctx.call_value().is_zero() {
-            return BasePrecompileError::revert(INonceManager::NonPayable {})
-                .into_precompile_result(ctx.gas_used(), ctx.state_gas_used());
+            return ctx.error_result(BasePrecompileError::revert(INonceManager::NonPayable {}));
         }
         let calldata_cost = (calldata.len() as u64).div_ceil(32).saturating_mul(CALLDATA_WORD_GAS);
         if let Err(error) = ctx.deduct_gas(calldata_cost) {
-            return error.into_precompile_result(ctx.gas_used(), ctx.state_gas_used());
+            return ctx.error_result(error);
         }
         // `getNonce` is a read-only getter and never produces a gas refund.
-        self.inner(calldata).into_precompile_result(
-            ctx.gas_used(),
-            ctx.state_gas_used(),
-            0,
-            |output| output,
-        )
+        ctx.result_output(self.inner(calldata), |output| output)
     }
 
     fn inner(&self, calldata: &[u8]) -> base_precompile_storage::Result<Bytes> {
@@ -66,7 +59,7 @@ mod tests {
     fn dispatch(
         storage: &mut HashMapStorageProvider,
         calldata: &[u8],
-    ) -> revm::precompile::PrecompileOutput {
+    ) -> base_precompile_storage::PrecompileOutput {
         StorageCtx::enter(storage, |ctx| NonceManagerStorage::new(ctx).dispatch(ctx, calldata))
             .expect("dispatch should not fail fatally")
     }
@@ -126,5 +119,19 @@ mod tests {
         let output = dispatch(&mut storage, &[0xde, 0xad, 0xbe, 0xef]);
 
         assert!(output.is_revert());
+    }
+
+    #[test]
+    fn dispatch_returns_selector_only_for_decode_failure_at_cobalt() {
+        let mut storage = HashMapStorageProvider::new_with_storage_features(
+            1,
+            base_precompile_storage::StorageFeatures::Cobalt,
+        );
+        let selector = INonceManager::getNonceCall::SELECTOR;
+
+        let output = dispatch(&mut storage, &selector);
+
+        assert!(output.is_revert());
+        assert_eq!(output.bytes, Bytes::from(selector));
     }
 }

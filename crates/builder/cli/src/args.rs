@@ -4,8 +4,8 @@ use core::{net::SocketAddr, time::Duration};
 use std::path::PathBuf;
 
 use base_builder_core::{
-    BuilderConfig, DEFAULT_MAX_VALIDITY_PREDICATES, ExecutionMeteringMode, RejectionCache,
-    SharedMeteringProvider,
+    BuilderApiExtensionConfig, BuilderConfig, DEFAULT_MAX_VALIDITY_PREDICATES,
+    ExecutionMeteringMode, RejectionCache, ShadowValidityConfig, SharedMeteringProvider,
 };
 use base_builder_metering::MeteringStore;
 use base_execution_cli::ShadowIndexerArgs;
@@ -185,19 +185,41 @@ pub struct Args {
     #[arg(long = "builder.enable-resource-metering", default_value = "false")]
     pub enable_resource_metering: bool,
 
-    /// Accept experimental validity-bearing transactions from forwarding nodes.
+    /// Enable experimental validity-bearing transactions on this builder.
     ///
-    /// Predicates are preserved but are not yet enforced during block construction.
+    /// Registers `base_sendRawTransactionValidity` for direct ingress and accepts
+    /// validity metadata on `base_insertValidatedTransaction` from forwarding nodes.
+    /// Predicates are preserved and enforced during block construction.
     #[arg(long = "builder.enable-experimental-validity-transactions", default_value = "false")]
     pub enable_experimental_validity_transactions: bool,
 
     /// Maximum validity predicates accepted per experimental transaction.
+    ///
+    /// Capped at [`DEFAULT_MAX_VALIDITY_PREDICATES`], the fixed wire ceiling the
+    /// request deserializer enforces. Values above it can never be honored and
+    /// are rejected at startup rather than silently truncated.
     #[arg(
         long = "builder.experimental-validity-max-predicates",
         default_value_t = DEFAULT_MAX_VALIDITY_PREDICATES,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new()
+            .range(1..=DEFAULT_MAX_VALIDITY_PREDICATES as u64),
         requires = "enable_experimental_validity_transactions"
     )]
     pub experimental_validity_max_predicates: usize,
+
+    /// Decorate sampled ordinary transactions with a behavior-preserving validity predicate.
+    ///
+    /// This must only be enabled on a shadow builder.
+    #[arg(long = "builder.shadow-validity-injection.enabled", default_value = "false")]
+    pub shadow_validity_injection_enabled: bool,
+
+    /// Sampling rate for shadow validity injection, in basis points.
+    #[arg(
+        long = "builder.shadow-validity-injection.sample-rate-bps",
+        default_value = "100",
+        value_parser = clap::builder::RangedU64ValueParser::<u16>::new().range(1..=10_000)
+    )]
+    pub shadow_validity_injection_sample_rate_bps: u16,
 
     /// Maximum cumulative uncompressed (EIP-2718 encoded) block size in bytes
     #[arg(long = "builder.max-uncompressed-block-size")]
@@ -207,6 +229,12 @@ pub struct Args {
     /// Transactions younger than this without metering data will be skipped.
     #[arg(long = "builder.metering-wait-duration-ms")]
     pub metering_wait_duration_ms: Option<u64>,
+
+    /// Hard cutoff, in milliseconds, on cumulative validity-predicate evaluation time per
+    /// builder iteration. Once exceeded, further validity-gated transactions are deferred to a
+    /// later iteration rather than evaluated.
+    #[arg(long = "builder.predicate-eval-hard-cutoff-ms", default_value = "10")]
+    pub predicate_eval_hard_cutoff_ms: u64,
 
     /// URL of the audit-archiver RPC endpoint for forwarding rejected transactions
     #[arg(long = "builder.audit-archiver-url", env = "BUILDER_AUDIT_ARCHIVER_URL")]
@@ -255,6 +283,22 @@ pub struct Args {
     #[command(flatten)]
     pub flashblocks: FlashblocksArgs,
 
+    /// Runs both payload builders and selects the basic builder when Denim activates.
+    #[arg(
+        long = "builder.payload-builder-cutover",
+        default_value = "false",
+        conflicts_with = "basic_payload_builder"
+    )]
+    pub payload_builder_cutover: bool,
+
+    /// Runs only the basic payload builder after the cutover is complete.
+    #[arg(
+        long = "builder.basic-payload-builder",
+        default_value = "false",
+        conflicts_with = "payload_builder_cutover"
+    )]
+    pub basic_payload_builder: bool,
+
     /// Transaction event journal configuration
     #[command(flatten)]
     pub transaction_events: TransactionEventsArgs,
@@ -297,8 +341,11 @@ impl Default for Args {
             enable_resource_metering: false,
             enable_experimental_validity_transactions: false,
             experimental_validity_max_predicates: DEFAULT_MAX_VALIDITY_PREDICATES,
+            shadow_validity_injection_enabled: false,
+            shadow_validity_injection_sample_rate_bps: 100,
             max_uncompressed_block_size: None,
             metering_wait_duration_ms: None,
+            predicate_eval_hard_cutoff_ms: 10,
             audit_archiver_url: None,
             rejected_tx_channel_size: 500,
             max_rejected_txs_per_block: 500,
@@ -309,6 +356,8 @@ impl Default for Args {
             sampling_ratio: 100,
             manifest_precheck_enabled: true,
             flashblocks: FlashblocksArgs::default(),
+            payload_builder_cutover: false,
+            basic_payload_builder: false,
             transaction_events: TransactionEventsArgs::default(),
             shadow_indexer: ShadowIndexerArgs::default(),
         }
@@ -316,6 +365,24 @@ impl Default for Args {
 }
 
 impl Args {
+    /// Builds validated configuration for the builder transaction insertion RPC.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when shadow injection is enabled without validity transaction support.
+    pub fn builder_api_config(&self) -> eyre::Result<BuilderApiExtensionConfig> {
+        let shadow_validity = if self.shadow_validity_injection_enabled {
+            ShadowValidityConfig::enabled(self.shadow_validity_injection_sample_rate_bps)?
+        } else {
+            ShadowValidityConfig::disabled()
+        };
+        Ok(BuilderApiExtensionConfig::new(
+            self.enable_experimental_validity_transactions,
+            self.experimental_validity_max_predicates,
+        )
+        .with_shadow_validity(shadow_validity)?)
+    }
+
     /// Converts these CLI arguments into a [`BuilderConfig`] using the given shared metering
     /// provider. The same provider must also be passed to the RPC extension so that the
     /// building loop and the `base_setMeteringInformation` handler share a single store.
@@ -352,6 +419,7 @@ impl Args {
             execution_metering_mode: self.execution_metering_mode,
             max_uncompressed_block_size: self.max_uncompressed_block_size,
             metering_wait_duration: self.metering_wait_duration_ms.map(Duration::from_millis),
+            predicate_eval_hard_cutoff: Duration::from_millis(self.predicate_eval_hard_cutoff_ms),
             metering_provider,
             rejection_cache: RejectionCache::new(
                 self.rejection_cache_max_capacity,
@@ -399,6 +467,9 @@ mod tests {
         let args = Args::default();
         assert!(!args.enable_experimental_validity_transactions);
         assert_eq!(args.experimental_validity_max_predicates, DEFAULT_MAX_VALIDITY_PREDICATES);
+        assert!(!args.shadow_validity_injection_enabled);
+        assert_eq!(args.shadow_validity_injection_sample_rate_bps, 100);
+        assert!(!args.builder_api_config().unwrap().shadow_validity.is_enabled());
         let config = convert(args);
         assert_eq!(config.block_time, Duration::from_millis(1000));
         assert!(config.max_gas_per_txn.is_none());
@@ -418,6 +489,76 @@ mod tests {
         assert_eq!(parsed.args.experimental_validity_max_predicates, 8);
     }
 
+    #[test]
+    fn experimental_validity_max_predicates_rejects_values_above_the_wire_ceiling() {
+        // The request deserializer bounds batches at DEFAULT_MAX_VALIDITY_PREDICATES,
+        // so a larger configured maximum could never be honored. Reject it at
+        // startup instead of silently accepting an unenforceable limit.
+        let error = CommandParser::try_parse_from([
+            "builder",
+            "--builder.enable-experimental-validity-transactions",
+            "--builder.experimental-validity-max-predicates",
+            &(DEFAULT_MAX_VALIDITY_PREDICATES + 1).to_string(),
+        ])
+        .expect_err("a maximum above the wire ceiling should be rejected");
+
+        assert!(error.to_string().contains("--builder.experimental-validity-max-predicates"));
+    }
+
+    #[test]
+    fn experimental_validity_max_predicates_rejects_zero() {
+        let error = CommandParser::try_parse_from([
+            "builder",
+            "--builder.enable-experimental-validity-transactions",
+            "--builder.experimental-validity-max-predicates",
+            "0",
+        ])
+        .expect_err("a maximum of zero should be rejected");
+
+        assert!(error.to_string().contains("--builder.experimental-validity-max-predicates"));
+    }
+
+    #[test]
+    fn experimental_validity_max_predicates_accepts_the_wire_ceiling() {
+        let parsed = CommandParser::parse_from([
+            "builder",
+            "--builder.enable-experimental-validity-transactions",
+            "--builder.experimental-validity-max-predicates",
+            &DEFAULT_MAX_VALIDITY_PREDICATES.to_string(),
+        ]);
+
+        assert_eq!(
+            parsed.args.experimental_validity_max_predicates,
+            DEFAULT_MAX_VALIDITY_PREDICATES
+        );
+    }
+
+    #[test]
+    fn shadow_validity_injection_requires_validity_support() {
+        let args = Args { shadow_validity_injection_enabled: true, ..Default::default() };
+        assert!(args.builder_api_config().is_err());
+
+        let args = Args {
+            enable_experimental_validity_transactions: true,
+            shadow_validity_injection_enabled: true,
+            shadow_validity_injection_sample_rate_bps: 250,
+            ..Default::default()
+        };
+        let config = args.builder_api_config().unwrap();
+        assert!(config.shadow_validity.is_enabled());
+        assert_eq!(config.shadow_validity.sample_rate_basis_points(), 250);
+    }
+
+    #[test]
+    fn shadow_validity_sampling_rate_is_cli_bounded() {
+        let result = CommandParser::try_parse_from([
+            "builder",
+            "--builder.shadow-validity-injection.sample-rate-bps",
+            "10001",
+        ]);
+        assert!(result.is_err());
+    }
+
     #[rstest]
     #[case::enabled(true)]
     #[case::disabled(false)]
@@ -431,6 +572,35 @@ mod tests {
         let parsed =
             CommandParser::parse_from(["test", "--builder.eip8130-manifest-precheck=false"]);
         assert!(!parsed.args.manifest_precheck_enabled);
+    }
+
+    #[test]
+    fn payload_builder_cutover_defaults_to_disabled() {
+        let parsed = CommandParser::parse_from(["test"]);
+        assert!(!parsed.args.payload_builder_cutover);
+        assert!(!parsed.args.basic_payload_builder);
+    }
+
+    #[test]
+    fn payload_builder_cutover_requires_explicit_opt_in() {
+        let parsed = CommandParser::parse_from(["test", "--builder.payload-builder-cutover"]);
+        assert!(parsed.args.payload_builder_cutover);
+    }
+
+    #[test]
+    fn basic_payload_builder_requires_explicit_opt_in() {
+        let parsed = CommandParser::parse_from(["test", "--builder.basic-payload-builder"]);
+        assert!(parsed.args.basic_payload_builder);
+    }
+
+    #[test]
+    fn payload_builder_modes_are_mutually_exclusive() {
+        let parsed = CommandParser::try_parse_from([
+            "test",
+            "--builder.payload-builder-cutover",
+            "--builder.basic-payload-builder",
+        ]);
+        assert!(parsed.is_err());
     }
 
     #[rstest]
@@ -496,7 +666,6 @@ mod tests {
                 gas_fees: U256::ZERO,
                 results: vec![],
                 state_block_number: 0,
-                state_flashblock_index: None,
                 total_gas_used: 21000,
                 total_execution_time_us: 500,
             },
@@ -519,6 +688,16 @@ mod tests {
         assert_eq!(config.metering_wait_duration, expected);
     }
 
+    #[rstest]
+    #[case::default(10, Duration::from_millis(10))]
+    #[case::zero(0, Duration::from_millis(0))]
+    #[case::custom(25, Duration::from_millis(25))]
+    fn predicate_eval_hard_cutoff_maps_correctly(#[case] input: u64, #[case] expected: Duration) {
+        let args = Args { predicate_eval_hard_cutoff_ms: input, ..Default::default() };
+        let config = convert(args);
+        assert_eq!(config.predicate_eval_hard_cutoff, expected);
+    }
+
     #[test]
     fn metering_store_ttl_propagates_to_store() {
         let args = Args {
@@ -538,7 +717,6 @@ mod tests {
                 gas_fees: U256::ZERO,
                 results: vec![],
                 state_block_number: 0,
-                state_flashblock_index: None,
                 total_gas_used: 21000,
                 total_execution_time_us: 0,
             },

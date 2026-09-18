@@ -12,8 +12,8 @@ use base_consensus_node::{
     UpgradeSignalBuilderConfig,
 };
 use base_upgrade_signal::{
-    UpgradeSignalArgs, UpgradeSignalConfig, UpgradeSignalMetricLayer, UpgradeSignalRuntimeApplier,
-    UpgradeSignalSchedule, UpgradeSignalStartupMode,
+    UpgradeSignalArgs, UpgradeSignalConfig, UpgradeSignalDefaults, UpgradeSignalMetricLayer,
+    UpgradeSignalRuntimeApplier, UpgradeSignalSchedule, UpgradeSignalStartupMode,
 };
 use clap::Args;
 use eyre::Context;
@@ -378,6 +378,27 @@ impl ConsensusNodeArgs {
         Ok(())
     }
 
+    /// Validates that synthetic account funding is confined to shadow sequencers.
+    pub fn validate_shadow_funding(&self) -> eyre::Result<()> {
+        let sequencer = &self.config.sequencer_flags;
+        if sequencer.shadow_funding_amount.is_some() && sequencer.shadow_funding_address.is_none() {
+            eyre::bail!("shadow funding amount requires a shadow funding address");
+        }
+        if sequencer
+            .shadow_funding_amount
+            .is_some_and(|amount| amount > alloy_primitives::U256::from(u128::MAX))
+        {
+            eyre::bail!("shadow funding amount exceeds u128::MAX (TxDeposit::mint limit)");
+        }
+        if sequencer.shadow_funding_address.is_some()
+            && (!self.config.node_mode.is_sequencer()
+                || sequencer.shadow_blocks_per_cycle.is_none())
+        {
+            eyre::bail!("shadow funding is only supported in shadow sequencer mode");
+        }
+        Ok(())
+    }
+
     /// Validates that the dangerous DA batcher sender override is only used by validators.
     pub fn validate_da_batcher_sender_override(&self) -> eyre::Result<()> {
         if self.config.l1_rpc_args.l1_da_batcher_sender_override.is_some()
@@ -433,6 +454,7 @@ impl ConsensusNodeArgs {
         startup_mode: UpgradeSignalStartupMode,
     ) -> eyre::Result<RollupNode> {
         self.validate_sequencer_key()?;
+        self.validate_shadow_funding()?;
         self.validate_da_batcher_sender_override()?;
         self.validate_da_batch_inbox_override()?;
         self.config.l1_rpc_args.apply_da_batch_inbox_override(&mut cfg);
@@ -551,13 +573,22 @@ impl ConsensusNodeArgs {
         signal_config.request_timeout = self.config.l1_rpc_args.l1_rpc_timeout;
         let reader =
             signal_config.reader(self.resolved_upgrade_signal_l1_rpc(upgrade_signal_l1_rpc))?;
-        let schedule = signal_config
-            .read_validated_schedule(
+        // Apply the fail-closed startup policy (see `read_startup_schedule`): retry until the L1
+        // contract returns an authoritative schedule, abort startup only for an unsupportable
+        // upgrade nearing activation, but start with a loud alarm (`None`) for one that is still far
+        // off — so a restart is not blocked by a distant upgrade. The live poller fails the node
+        // closed once it nears activation.
+        let Some(schedule) = signal_config
+            .read_startup_schedule(
                 &reader,
                 "consensus startup",
                 &[UpgradeSignalMetricLayer::Consensus],
+                UpgradeSignalDefaults::STARTUP_SCHEDULE_RETRY_INTERVAL,
             )
-            .await?;
+            .await?
+        else {
+            return Ok(());
+        };
 
         Self::apply_schedule_to_rollup_config(cfg, &schedule);
 
@@ -961,6 +992,66 @@ mod tests {
         );
 
         assert!(args.validate_sequencer_key().is_ok());
+    }
+
+    #[test]
+    fn shadow_funding_is_rejected_outside_shadow_sequencer_mode() {
+        let args = ConsensusNodeArgs::new(
+            ConsensusChainArgs { l2_chain_id: Chain::from(8453_u64) },
+            ConsensusNodeConfigArgs {
+                node_mode: NodeMode::Sequencer,
+                sequencer_flags: SequencerArgs {
+                    shadow_funding_address: Some(address!(
+                        "2222222222222222222222222222222222222222"
+                    )),
+                    ..SequencerArgs::default()
+                },
+                ..default_node_config_args()
+            },
+        );
+
+        assert!(args.validate_shadow_funding().is_err());
+    }
+
+    #[test]
+    fn shadow_funding_is_accepted_in_shadow_sequencer_mode() {
+        let args = ConsensusNodeArgs::new(
+            ConsensusChainArgs { l2_chain_id: Chain::from(8453_u64) },
+            ConsensusNodeConfigArgs {
+                node_mode: NodeMode::Sequencer,
+                sequencer_flags: SequencerArgs {
+                    shadow_blocks_per_cycle: std::num::NonZeroU64::new(10),
+                    shadow_funding_address: Some(address!(
+                        "2222222222222222222222222222222222222222"
+                    )),
+                    ..SequencerArgs::default()
+                },
+                ..default_node_config_args()
+            },
+        );
+
+        assert!(args.validate_shadow_funding().is_ok());
+    }
+
+    #[test]
+    fn shadow_funding_above_deposit_mint_limit_is_rejected() {
+        let args = ConsensusNodeArgs::new(
+            ConsensusChainArgs { l2_chain_id: Chain::from(8453_u64) },
+            ConsensusNodeConfigArgs {
+                node_mode: NodeMode::Sequencer,
+                sequencer_flags: SequencerArgs {
+                    shadow_blocks_per_cycle: std::num::NonZeroU64::new(10),
+                    shadow_funding_address: Some(address!(
+                        "2222222222222222222222222222222222222222"
+                    )),
+                    shadow_funding_amount: Some(U256::from(u128::MAX) + U256::from(1)),
+                    ..SequencerArgs::default()
+                },
+                ..default_node_config_args()
+            },
+        );
+
+        assert!(args.validate_shadow_funding().is_err());
     }
 
     #[test]

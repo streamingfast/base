@@ -251,7 +251,7 @@ fn expand_token(input: DeriveInput) -> syn::Result<TokenStream> {
                         self.b20.transfer_executor_policy_id()
                     }
                     crate::B20PolicyType::MintReceiver => self.b20.mint_receiver_policy_id(),
-                    crate::B20PolicyType::SeizeHolder => self.b20.seize_holder_policy_id(),
+                    crate::B20PolicyType::SeizeExempt => self.b20.seize_exempt_policy_id(),
                     crate::B20PolicyType::SeizeReceiver => self.b20.seize_receiver_policy_id(),
                 }
             }
@@ -281,8 +281,8 @@ fn expand_token(input: DeriveInput) -> syn::Result<TokenStream> {
                     crate::B20PolicyType::MintReceiver => {
                         self.b20.set_mint_receiver_policy_id(policy_id)
                     }
-                    crate::B20PolicyType::SeizeHolder => {
-                        self.b20.set_seize_holder_policy_id(policy_id)
+                    crate::B20PolicyType::SeizeExempt => {
+                        self.b20.set_seize_exempt_policy_id(policy_id)
                     }
                     crate::B20PolicyType::SeizeReceiver => {
                         self.b20.set_seize_receiver_policy_id(policy_id)
@@ -295,6 +295,17 @@ fn expand_token(input: DeriveInput) -> syn::Result<TokenStream> {
                 log: ::alloy_primitives::LogData,
             ) -> ::base_precompile_storage::Result<()> {
                 self.emit_event(log)
+            }
+
+            fn metered_keccak256(
+                &self,
+                data: &[u8],
+            ) -> ::base_precompile_storage::Result<::alloy_primitives::B256> {
+                ::base_precompile_storage::ContractStorage::storage(self).metered_keccak256(data)
+            }
+
+            fn deduct_gas(&self, gas: u64) -> ::base_precompile_storage::Result<()> {
+                ::base_precompile_storage::ContractStorage::storage(self).deduct_gas(gas)
             }
         }
     })

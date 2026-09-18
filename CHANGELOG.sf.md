@@ -1,3 +1,30 @@
+## v1.4.0-fh3.1
+
+### Changed
+
+* Rebased on upstream Base `v1.4.0` and `streamingfast/reth` `base-v2.5.2.6-fh3.1` (Base's reth
+  fork `base-v2.5.2.6` plus Firehose). Base Sepolia operators must run this release before the
+  Cobalt hardfork on 2026-09-23 18:00:00 UTC.
+
+* The new `base-builder-multiplex` payload service accepts the Firehose-wrapped EVM configuration
+  and hands the unwrapped `BaseEvmConfig` to its basic payload builder, so payload building is the
+  same as upstream.
+
+### Added
+
+* `base-system-tests --test firehose_cobalt_b20` runs the Cobalt precompile surfaces through the
+  Firehose tracer on the Docker-backed stack: a B-20 seize, a scheduled and cancelled UI
+  multiplier update, a composite policy and a call into the `NonceManager` precompile. It checks
+  block invariants, that every traced receipt log equals the RPC receipt log, and a golden of the
+  seize transaction.
+
+### Notes
+
+* Cobalt does not enable EIP-8130 transactions (type `0x79`). Upstream moved them behind the Zenith
+  upgrade, which is `None` on every canonical chain, so tracing is unaffected on Base Sepolia and
+  mainnet. The tracer would stop on a `0x79` transaction (the tx type has no Firehose mapping), so
+  EIP-8130 tracing must be added before any network schedules Zenith.
+
 ## v1.3.2-fh3.1-1
 
 ### Changed

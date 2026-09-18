@@ -5,11 +5,10 @@ Metering RPC for Base node. Provides RPC methods for measuring transaction and b
 ## Overview
 
 Exposes JSON-RPC endpoints for profiling transaction and block execution on the Base node.
-`base_meterBundle` simulates a bundle and returns per-transaction gas and timing metrics.
+`base_meterBundle` simulates a bundle against latest canonical state and returns
+per-transaction gas, opcode, and timing metrics.
 `base_meterBlockByHash` and `base_meterBlockByNumber` re-execute a historical block and return
 a breakdown of signer recovery and EVM execution times.
-`base_meteredPriorityFeePerGas` combines bundle metering with a priority fee recommendation
-based on recent block resource usage.
 
 ## Usage
 
@@ -24,7 +23,7 @@ base-metering = { workspace = true }
 
 ### `base_meterBundle`
 
-Simulates and meters a bundle of transactions.
+Simulates and meters a bundle of transactions against latest canonical state.
 
 **Parameters:**
 - `bundle`: Bundle object containing transactions to simulate
@@ -60,6 +59,12 @@ responses; the rename is breaking and there are no legacy aliases.
   `TX_EFFECT_ETH_TRANSFER_TO_EXISTING_ACCOUNT`, and
   `TX_EFFECT_ETH_SELF_TRANSFER`. These are zero-gas classifiers, not intrinsic
   buckets.
+- Net post-state effects from post-tx `EvmState`, counted from `original → present`
+  rather than journal size: `STATE_NEW_STORAGE_SLOT`,
+  `STATE_CHANGED_STORAGE_SLOT`, `STATE_CLEARED_STORAGE_SLOT`,
+  `STATE_TOUCHED_ACCOUNT`, and `STATE_CHANGED_ACCOUNT`. These are zero-gas
+  counts, not `SSTORE`. `STATE_CHANGED_STORAGE_SLOT` is a superset of new slots
+  and clears. Loaded but unwritten accounts and slots are omitted.
 
 Standard-transaction values are calculated from the active revm gas schedule,
 including calldata, creation, initcode, access-list, authorization, and floor
@@ -86,81 +91,6 @@ Re-executes a block by number and returns timing metrics.
 
 **Returns:**
 - `MeterBlockResponse`: Contains timing breakdown for signer recovery and EVM execution
-
-### `base_meteredPriorityFeePerGas`
-
-Meters a bundle and returns a recommended priority fee based on recent block congestion.
-
-**Parameters:**
-- `bundle`: Bundle object containing transactions to simulate
-
-**Returns:**
-- `MeteredPriorityFeeResponse`: Contains metering results plus priority fee recommendation
-
-**Response:**
-```json
-{
-  "bundleGasPrice": "0x...",
-  "bundleHash": "0x...",
-  "results": [...],
-  "totalGasUsed": 21000,
-  "totalExecutionTimeUs": 1234,
-  "priorityFee": "0x5f5e100",
-  "blocksSampled": 12,
-  "resourceEstimates": [
-    {
-      "resource": "gasUsed",
-      "thresholdPriorityFee": "0x3b9aca00",
-      "recommendedPriorityFee": "0x5f5e100",
-      "cumulativeUsage": "0x1e8480",
-      "thresholdTxCount": 5,
-      "totalTransactions": 10
-    },
-    {
-      "resource": "dataAvailability",
-      ...
-    }
-  ]
-}
-```
-
-**Algorithm:**
-1. Meter the bundle to get resource consumption (gas and DA bytes)
-2. Use cached metering data from recent blocks (populated by ingestion pipeline)
-3. For each block in the cache:
-   - Estimate gas and DA bytes against cumulative
-     transaction prefixes for scheduled tx-pool flashblocks `1..=target_flashblocks_per_block`,
-     using the same growing cumulative targets the builder derives from whole-block budgets.
-   - These estimates use the configured target number of tx-pool flashblocks per block, not the
-     number of flashblocks observed in the cache. The base flashblock at index `0` is not part of
-     this schedule.
-   - Use the block-end estimate for the accumulating resources as that block's rolling summary.
-4. Take the median fee across all blocks for each resource (upper median for even counts)
-5. Return the maximum fee across all resources as `priorityFee`
-
-Note: The cache must be populated by the ingestion pipeline for estimates to be available.
-The `blocksSampled` field indicates how many blocks were used in the rolling estimate.
-For gas or DA estimation, `target_flashblocks_per_block` must be configured so the estimator can
-mirror the builder's flashblock budgeting.
-
-## Ingestion
-
-The metering collector consumes `PendingBlocks` flashblock snapshots and stores transaction
-resource usage in the metering cache. It retains execution timing for per-transaction execution
-limits, but priority-fee estimation only uses gas and DA resources.
-
-## Architecture
-
-The ingestion pipeline works as follows:
-
-1. The flashblocks websocket feed updates `PendingBlocks` snapshots for the current pending range
-2. `MeteringCollector` walks newly observed flashblocks from those snapshots
-3. DA bytes are computed from the raw transaction bytes in each flashblock diff
-4. Transactions are inserted into `MeteringCache` at the correct block/flashblock location
-5. `base_meteredPriorityFeePerGas` uses the cache to estimate gas and DA priority fees
-
-Note: flashblock diffs must include raw transaction bytes for accurate DA-based priority fee
-estimation. These bytes are used to compute compressed transaction size via `flz_compress_len`.
 
 ## License
 

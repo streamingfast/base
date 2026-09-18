@@ -36,7 +36,7 @@ use base_consensus_node::{
 use base_execution_chainspec::BaseChainSpec;
 use base_execution_evm::BaseEvmConfig;
 use base_execution_payload_builder::{
-    BaseBuiltPayload, BasePayloadBuilder, BasePayloadBuilderAttributes,
+    BaseBuiltPayload, BasePayloadBuilder, BasePayloadBuilderAttributes, NoopPayloadTransactions,
 };
 use base_execution_txpool::BasePooledTransaction;
 use base_node_core::BaseNode;
@@ -208,6 +208,13 @@ impl ActionEngineClient {
                 "beryl activation timestamp ({beryl}) must be <= cobalt activation timestamp ({cobalt})",
             );
         }
+        if let Some(denim) = hf.base.denim {
+            let cobalt = hf.base.cobalt.expect("denim requires cobalt to be configured");
+            assert!(
+                cobalt <= denim,
+                "cobalt activation timestamp ({cobalt}) must be <= denim activation timestamp ({denim})",
+            );
+        }
 
         // Base Azul requires Osaka (the EL counterpart).
         genesis.config.osaka_time = hf.base.azul;
@@ -220,6 +227,12 @@ impl ActionEngineClient {
         }
         if let Some(ts) = hf.base.cobalt {
             base.insert("cobalt".to_string(), serde_json::json!(ts));
+        }
+        if let Some(ts) = hf.base.denim {
+            base.insert("denim".to_string(), serde_json::json!(ts));
+        }
+        if let Some(ts) = hf.base.zenith {
+            base.insert("zenith".to_string(), serde_json::json!(ts));
         }
         if base.is_empty() {
             genesis.config.extra_fields.remove("base");
@@ -405,7 +418,10 @@ impl ActionEngineClient {
             pool,
             inner.blockchain_provider.clone(),
             inner.evm_config.clone(),
-        );
+        )
+        .with_transactions(|_pool: TestPool, _attrs| {
+            NoopPayloadTransactions::<BasePooledTransaction>::default()
+        });
         let outcome = RethPayloadBuilder::try_build(&payload_builder, args).map_err(|e| {
             TransportError::from(TransportErrorKind::custom_str(&format!(
                 "payload builder failed: {e}"
@@ -1047,5 +1063,48 @@ impl SequencerEngineClient for ActionEngineClient {
 impl crate::SequencerEngineBackend for ActionEngineClient {
     fn block_hash_registry(&self) -> SharedBlockHashRegistry {
         self.block_registry.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use base_common_genesis::{BaseUpgradeConfig, UpgradeConfig};
+
+    use super::*;
+
+    #[test]
+    fn build_genesis_propagates_base_activations() {
+        let config = RollupConfig {
+            upgrades: UpgradeConfig {
+                base: BaseUpgradeConfig {
+                    azul: Some(42),
+                    beryl: Some(42),
+                    cobalt: Some(42),
+                    denim: Some(42),
+                    zenith: Some(42),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let genesis = ActionEngineClient::build_genesis_for_rollup(&config);
+
+        assert_eq!(genesis.config.extra_fields["base"]["denim"], serde_json::json!(42));
+        assert_eq!(genesis.config.extra_fields["base"]["zenith"], serde_json::json!(42));
+    }
+
+    #[test]
+    #[should_panic(expected = "denim requires cobalt to be configured")]
+    fn build_genesis_requires_cobalt_before_denim() {
+        let config = RollupConfig {
+            upgrades: UpgradeConfig {
+                base: BaseUpgradeConfig { denim: Some(42), ..Default::default() },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        ActionEngineClient::build_genesis_for_rollup(&config);
     }
 }
