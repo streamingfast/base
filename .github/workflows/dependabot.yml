@@ -15,3 +15,5 @@ jobs:
         uses: actions/dependency-review-action@v4
         with:
           fail-on-severity: high # Fail on high, critical
+          # p3-challenger 0.4.3-succinct, pinned by every SP1 release; remove once SP1 ships a fixed build.
+          allow-ghsas: GHSA-vj64-rjf3-w3v7
