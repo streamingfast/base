@@ -10,6 +10,14 @@
   and hands the unwrapped `BaseEvmConfig` to its basic payload builder, so payload building is the
   same as upstream.
 
+### Added
+
+* `base-system-tests --test firehose_cobalt_b20` runs the Cobalt precompile surfaces through the
+  Firehose tracer on the Docker-backed stack: a B-20 seize, a scheduled and cancelled UI
+  multiplier update, a composite policy and a call into the `NonceManager` precompile. It checks
+  block invariants, that every traced receipt log equals the RPC receipt log, and a golden of the
+  seize transaction.
+
 ### Notes
 
 * Cobalt does not enable EIP-8130 transactions (type `0x79`). Upstream moved them behind the Zenith
