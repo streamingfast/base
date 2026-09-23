@@ -1,3 +1,10 @@
+## v1.4.0-fh3.1-1
+
+### Changed
+
+* The Docker image is built on `firehose-ethereum` `v2.23.0`. The code is the same as
+  `v1.4.0-fh3.1`.
+
 ## v1.4.0-fh3.1
 
 ### Changed
