@@ -1,5 +1,5 @@
 [workspace.package]
-version = "1.4.0"
+version = "1.4.2"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
@@ -385,6 +385,7 @@ reth-storage-api = { git = "https://github.com/base/reth", tag = "base-v2.5.2.6"
 reth-rpc-eth-api = { git = "https://github.com/base/reth", tag = "base-v2.5.2.6" }
 reth-chain-state = { git = "https://github.com/base/reth", tag = "base-v2.5.2.6" }
 reth-trie-common = { git = "https://github.com/base/reth", tag = "base-v2.5.2.6" }
+reth-engine-tree = { git = "https://github.com/base/reth", tag = "base-v2.5.2.6" }
 reth-payload-util = { git = "https://github.com/base/reth", tag = "base-v2.5.2.6" }
 reth-node-builder = { git = "https://github.com/base/reth", tag = "base-v2.5.2.6" }
 reth-node-metrics = { git = "https://github.com/base/reth", tag = "base-v2.5.2.6" }
@@ -679,6 +680,7 @@ reth-discv5 = { git = "https://github.com/streamingfast/reth.git", tag = "base-v
 reth-e2e-test-utils = { git = "https://github.com/streamingfast/reth.git", tag = "base-v2.5.2.6-fh3.1" }
 reth-ecies = { git = "https://github.com/streamingfast/reth.git", tag = "base-v2.5.2.6-fh3.1" }
 reth-engine-primitives = { git = "https://github.com/streamingfast/reth.git", tag = "base-v2.5.2.6-fh3.1" }
+reth-engine-tree = { git = "https://github.com/streamingfast/reth.git", tag = "base-v2.5.2.6-fh3.1" }
 reth-eth-wire = { git = "https://github.com/streamingfast/reth.git", tag = "base-v2.5.2.6-fh3.1" }
 reth-eth-wire-types = { git = "https://github.com/streamingfast/reth.git", tag = "base-v2.5.2.6-fh3.1" }
 reth-ethereum-forks = { git = "https://github.com/streamingfast/reth.git", tag = "base-v2.5.2.6-fh3.1" }
