@@ -1,3 +1,11 @@
+## v1.4.2-fh3.1
+
+### Changed
+
+* Rebased on upstream Base `v1.4.2`. It schedules the Cobalt hardfork on Base mainnet at
+  2026-09-30 18:00:00 UTC, so mainnet operators must run this release before then.
+  `streamingfast/reth` stays on `base-v2.5.2.6-fh3.1`.
+
 ## v1.4.0-fh3.1-1
 
 ### Changed
