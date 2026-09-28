@@ -1,3 +1,9 @@
+## Unreleased
+
+### Changed
+
+* Firehose `Call.keccak_preimages` now keeps only the preimages that explain a storage change key of the transaction or system call; set `FIREHOSE_ETHEREUM_TRACER_DISABLE_KECCAK_FILTER=true` to keep them all (streamingfast/evm-firehose-tracer-rs#36).
+
 ## v1.4.2-fh3.1
 
 ### Changed
