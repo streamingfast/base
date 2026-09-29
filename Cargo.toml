@@ -648,22 +648,15 @@ governor = "0.7"
 # Firehose tracer (defined by the streamingfast reth fork, release/base-2.x branch).
 reth-firehose = { git = "https://github.com/streamingfast/reth.git", branch = "firehose-keccak-filter/base-2.x" }
 reth-firehose-tests = { git = "https://github.com/streamingfast/reth.git", branch = "firehose-keccak-filter/base-2.x" }
-firehose-tracer = "5.4.2"
+firehose-tracer = "5.5.0"
 
 # Shared tracing-regression framework (capture / invariants / projection / golden).
-firehose-tracer-test = "5.4.2"
+firehose-tracer-test = "5.5.0"
 
 # Chain-agnostic generator for replayable Firehose prestate fixtures.
-firehose-tracer-prestate = "5.4.2"
+firehose-tracer-prestate = "5.5.0"
 
 [patch.crates-io]
-## Firehose additions
-# Temporary: the keccak preimage filter is not on crates.io yet. Remove once firehose-tracer
-# 5.5.0 is published and the lock points to it.
-firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", rev = "3321aec1ebb9e215de2bd9cc58e7f1726496e47f" }
-firehose-tracer-test = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", rev = "3321aec1ebb9e215de2bd9cc58e7f1726496e47f" }
-firehose-tracer-prestate = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", rev = "3321aec1ebb9e215de2bd9cc58e7f1726496e47f" }
-
 # SF fork of alloy-evm that routes system calls (EIP-4788, EIP-2935, etc.) through the
 # Inspector, so Firehose tracing observes them. Must match the patch in streamingfast/reth.
 alloy-evm = { git = "https://github.com/streamingfast/evm.git", tag = "v0.38.0-sf" }
