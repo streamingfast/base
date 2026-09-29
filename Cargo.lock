@@ -9863,9 +9863,9 @@ checksum = "9844ddc3a6e533d62bba727eb6c28b5d360921d5175e9ff0f1e621a5c590a4d5"
 
 [[package]]
 name = "firehose-tracer"
-version = "5.4.2"
+version = "5.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9adcf31369936f33026953c2601276b356fef9a4428b7dd03e9ab010cd8b4e8"
+checksum = "a53eb86c6d17bd4e5517e46f56498d33d128d0641d78d15b86cf2c0605c814ee"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -9886,9 +9886,9 @@ dependencies = [
 
 [[package]]
 name = "firehose-tracer-prestate"
-version = "5.4.2"
+version = "5.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8536a2c1a21e4168e197a7bb831b0f879718b5d51f78575ed501e2936f33cc19"
+checksum = "67ef9f9516014ba4f4f75025ef6325d4e15c2a66f99395fac74cd940348feac4"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -9911,9 +9911,9 @@ dependencies = [
 
 [[package]]
 name = "firehose-tracer-test"
-version = "5.4.2"
+version = "5.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e5028ed593f33bdee615ed7ee170370ff2b8cb4f2419472b0a6762918b70221"
+checksum = "90e9cd98b48db9ec72bc4c6ef8bb0ab0e7455105347fa0e27da4add6b0f6d46a"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -11221,7 +11221,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b1e4910d3a9137442723dfb772c32dc10674c4181ca078d2fd227cd5dce9db0"
 dependencies = [
  "bincode 1.3.3",
- "derive_more 2.1.1",
+ "derive_more 1.0.0",
  "iai-callgrind-macros",
  "iai-callgrind-runner",
 ]
@@ -11232,7 +11232,7 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d03775318d3f9f01b39ac6612b01464006dc397a654a89dd57df2fd34fb68c3"
 dependencies = [
- "derive_more 2.1.1",
+ "derive_more 1.0.0",
  "proc-macro-error2",
  "proc-macro2",
  "quote",
@@ -16322,7 +16322,7 @@ checksum = "1e061d1b48cb8d38042de4ae0a7a6401009d6143dc80d2e2d6f31f0bdd6470c7"
 [[package]]
 name = "reth-basic-payload-builder"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -16349,7 +16349,7 @@ dependencies = [
 [[package]]
 name = "reth-chain-state"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -16380,7 +16380,7 @@ dependencies = [
 [[package]]
 name = "reth-chainspec"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-chains",
  "alloy-consensus 2.4.1",
@@ -16400,7 +16400,7 @@ dependencies = [
 [[package]]
 name = "reth-cli"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-genesis",
  "clap",
@@ -16413,7 +16413,7 @@ dependencies = [
 [[package]]
 name = "reth-cli-commands"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-chains",
  "alloy-consensus 2.4.1",
@@ -16502,7 +16502,7 @@ dependencies = [
 [[package]]
 name = "reth-cli-runner"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "reth-tasks",
  "tokio",
@@ -16512,7 +16512,7 @@ dependencies = [
 [[package]]
 name = "reth-cli-util"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives",
@@ -16563,7 +16563,7 @@ dependencies = [
 [[package]]
 name = "reth-config"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "eyre",
  "humantime-serde",
@@ -16580,7 +16580,7 @@ dependencies = [
 [[package]]
 name = "reth-consensus"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eip7928 0.4.5",
@@ -16594,7 +16594,7 @@ dependencies = [
 [[package]]
 name = "reth-consensus-common"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -16607,7 +16607,7 @@ dependencies = [
 [[package]]
 name = "reth-consensus-debug-client"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -16632,7 +16632,7 @@ dependencies = [
 [[package]]
 name = "reth-db"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-primitives",
  "derive_more 2.1.1",
@@ -16661,7 +16661,7 @@ dependencies = [
 [[package]]
 name = "reth-db-api"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -16687,7 +16687,7 @@ dependencies = [
 [[package]]
 name = "reth-db-common"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-genesis",
@@ -16717,7 +16717,7 @@ dependencies = [
 [[package]]
 name = "reth-db-models"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives",
@@ -16732,7 +16732,7 @@ dependencies = [
 [[package]]
 name = "reth-discv4"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -16757,7 +16757,7 @@ dependencies = [
 [[package]]
 name = "reth-discv5"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -16781,7 +16781,7 @@ dependencies = [
 [[package]]
 name = "reth-dns-discovery"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-primitives",
  "dashmap",
@@ -16805,7 +16805,7 @@ dependencies = [
 [[package]]
 name = "reth-downloaders"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -16840,7 +16840,7 @@ dependencies = [
 [[package]]
 name = "reth-e2e-test-utils"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -16897,7 +16897,7 @@ dependencies = [
 [[package]]
 name = "reth-ecies"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "aes",
  "alloy-primitives",
@@ -16924,7 +16924,7 @@ dependencies = [
 [[package]]
 name = "reth-engine-local"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -16947,7 +16947,7 @@ dependencies = [
 [[package]]
 name = "reth-engine-primitives"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -16974,7 +16974,7 @@ dependencies = [
 [[package]]
 name = "reth-engine-tree"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eip7928 0.4.5",
@@ -17031,7 +17031,7 @@ dependencies = [
 [[package]]
 name = "reth-engine-util"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -17061,7 +17061,7 @@ dependencies = [
 [[package]]
 name = "reth-era"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17079,7 +17079,7 @@ dependencies = [
 [[package]]
 name = "reth-era-downloader"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-primitives",
  "bytes",
@@ -17095,7 +17095,7 @@ dependencies = [
 [[package]]
 name = "reth-era-utils"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -17119,7 +17119,7 @@ dependencies = [
 [[package]]
 name = "reth-errors"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "reth-consensus",
  "reth-execution-errors",
@@ -17130,7 +17130,7 @@ dependencies = [
 [[package]]
 name = "reth-eth-wire"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-chains",
  "alloy-primitives",
@@ -17159,7 +17159,7 @@ dependencies = [
 [[package]]
 name = "reth-eth-wire-types"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-chains",
  "alloy-consensus 2.4.1",
@@ -17185,7 +17185,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-consensus"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17201,7 +17201,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-engine-primitives"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives",
@@ -17217,7 +17217,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-forks"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-eip2124",
  "alloy-hardforks 0.4.7",
@@ -17231,7 +17231,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-payload-builder"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17261,7 +17261,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-primitives"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17275,7 +17275,7 @@ dependencies = [
 [[package]]
 name = "reth-etl"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "rayon",
  "reth-db-api",
@@ -17285,7 +17285,7 @@ dependencies = [
 [[package]]
 name = "reth-evm"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eip7928 0.4.5",
@@ -17311,7 +17311,7 @@ dependencies = [
 [[package]]
 name = "reth-evm-ethereum"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17331,7 +17331,7 @@ dependencies = [
 [[package]]
 name = "reth-execution-cache"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-primitives",
  "fixed-cache",
@@ -17349,7 +17349,7 @@ dependencies = [
 [[package]]
 name = "reth-execution-errors"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-evm",
  "alloy-primitives",
@@ -17362,7 +17362,7 @@ dependencies = [
 [[package]]
 name = "reth-execution-types"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17381,7 +17381,7 @@ dependencies = [
 [[package]]
 name = "reth-exex"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17419,7 +17419,7 @@ dependencies = [
 [[package]]
 name = "reth-exex-test-utils"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-eips 2.4.1",
  "eyre",
@@ -17451,7 +17451,7 @@ dependencies = [
 [[package]]
 name = "reth-exex-types"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives",
@@ -17465,7 +17465,7 @@ dependencies = [
 [[package]]
 name = "reth-firehose"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eip7928 0.4.5",
@@ -17494,7 +17494,7 @@ dependencies = [
 [[package]]
 name = "reth-firehose-tests"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17521,7 +17521,7 @@ dependencies = [
 [[package]]
 name = "reth-fs-util"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "serde",
  "serde_json",
@@ -17531,7 +17531,7 @@ dependencies = [
 [[package]]
 name = "reth-invalid-block-hooks"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -17557,7 +17557,7 @@ dependencies = [
 [[package]]
 name = "reth-ipc"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "bytes",
  "futures",
@@ -17577,7 +17577,7 @@ dependencies = [
 [[package]]
 name = "reth-libmdbx"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "bitflags 2.13.1",
  "byteorder",
@@ -17594,7 +17594,7 @@ dependencies = [
 [[package]]
 name = "reth-mdbx-sys"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "bindgen 0.72.1",
  "cc",
@@ -17603,7 +17603,7 @@ dependencies = [
 [[package]]
 name = "reth-metrics"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "futures",
  "libc",
@@ -17617,7 +17617,7 @@ dependencies = [
 [[package]]
 name = "reth-net-banlist"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-primitives",
  "ipnet",
@@ -17626,7 +17626,7 @@ dependencies = [
 [[package]]
 name = "reth-net-nat"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "futures-util",
  "if-addrs 0.14.0",
@@ -17640,7 +17640,7 @@ dependencies = [
 [[package]]
 name = "reth-network"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17699,7 +17699,7 @@ dependencies = [
 [[package]]
 name = "reth-network-api"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -17724,7 +17724,7 @@ dependencies = [
 [[package]]
 name = "reth-network-p2p"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eip7928 0.4.5",
@@ -17748,7 +17748,7 @@ dependencies = [
 [[package]]
 name = "reth-network-peers"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -17763,7 +17763,7 @@ dependencies = [
 [[package]]
 name = "reth-network-types"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-eip2124",
  "humantime-serde",
@@ -17777,7 +17777,7 @@ dependencies = [
 [[package]]
 name = "reth-nippy-jar"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "anyhow",
  "bincode 1.3.3",
@@ -17794,7 +17794,7 @@ dependencies = [
 [[package]]
 name = "reth-node-api"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-rpc-types-engine",
  "eyre",
@@ -17818,7 +17818,7 @@ dependencies = [
 [[package]]
 name = "reth-node-builder"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17887,7 +17887,7 @@ dependencies = [
 [[package]]
 name = "reth-node-core"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17942,7 +17942,7 @@ dependencies = [
 [[package]]
 name = "reth-node-ethereum"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17991,7 +17991,7 @@ dependencies = [
 [[package]]
 name = "reth-node-ethstats"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -18015,7 +18015,7 @@ dependencies = [
 [[package]]
 name = "reth-node-events"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -18039,7 +18039,7 @@ dependencies = [
 [[package]]
 name = "reth-node-metrics"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "bytes",
  "eyre",
@@ -18068,7 +18068,7 @@ dependencies = [
 [[package]]
 name = "reth-node-types"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "reth-chainspec",
  "reth-db-api",
@@ -18080,7 +18080,7 @@ dependencies = [
 [[package]]
 name = "reth-payload-builder"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -18104,7 +18104,7 @@ dependencies = [
 [[package]]
 name = "reth-payload-builder-primitives"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "pin-project",
  "reth-payload-primitives",
@@ -18116,7 +18116,7 @@ dependencies = [
 [[package]]
 name = "reth-payload-primitives"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -18139,7 +18139,7 @@ dependencies = [
 [[package]]
 name = "reth-payload-util"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -18149,7 +18149,7 @@ dependencies = [
 [[package]]
 name = "reth-payload-validator"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-rpc-types-engine",
@@ -18192,7 +18192,7 @@ dependencies = [
 [[package]]
 name = "reth-provider"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eip7928 0.4.5",
@@ -18242,7 +18242,7 @@ dependencies = [
 [[package]]
 name = "reth-prune"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -18269,7 +18269,7 @@ dependencies = [
 [[package]]
 name = "reth-prune-types"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-primitives",
  "arbitrary",
@@ -18285,7 +18285,7 @@ dependencies = [
 [[package]]
 name = "reth-revm"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -18300,7 +18300,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-dyn-abi",
@@ -18376,7 +18376,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-api"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-genesis",
@@ -18406,7 +18406,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-builder"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-network 2.4.1",
  "alloy-provider",
@@ -18449,7 +18449,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-convert"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-evm",
@@ -18469,7 +18469,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-engine-api"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives",
@@ -18500,7 +18500,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-eth-api"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-dyn-abi",
@@ -18547,7 +18547,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-eth-types"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-chains",
  "alloy-consensus 2.4.1",
@@ -18598,7 +18598,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-layer"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-rpc-types-engine",
  "http 1.4.2",
@@ -18612,7 +18612,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-server-types"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives",
@@ -18643,7 +18643,7 @@ dependencies = [
 [[package]]
 name = "reth-stages"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -18694,7 +18694,7 @@ dependencies = [
 [[package]]
 name = "reth-stages-api"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives",
@@ -18722,7 +18722,7 @@ dependencies = [
 [[package]]
 name = "reth-stages-types"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-primitives",
  "arbitrary",
@@ -18736,7 +18736,7 @@ dependencies = [
 [[package]]
 name = "reth-static-file"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-primitives",
  "parking_lot",
@@ -18756,7 +18756,7 @@ dependencies = [
 [[package]]
 name = "reth-static-file-types"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-primitives",
  "clap",
@@ -18771,7 +18771,7 @@ dependencies = [
 [[package]]
 name = "reth-storage-api"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eip7928 0.4.5",
@@ -18797,7 +18797,7 @@ dependencies = [
 [[package]]
 name = "reth-storage-errors"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives",
@@ -18814,7 +18814,7 @@ dependencies = [
 [[package]]
 name = "reth-storage-overlay"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives",
@@ -18841,7 +18841,7 @@ dependencies = [
 [[package]]
 name = "reth-tasks"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "crossbeam-utils",
  "dashmap",
@@ -18862,7 +18862,7 @@ dependencies = [
 [[package]]
 name = "reth-testing-utils"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -18878,7 +18878,7 @@ dependencies = [
 [[package]]
 name = "reth-tokio-util"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "tokio",
  "tokio-stream",
@@ -18888,7 +18888,7 @@ dependencies = [
 [[package]]
 name = "reth-tracing"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "clap",
  "eyre",
@@ -18908,7 +18908,7 @@ dependencies = [
 [[package]]
 name = "reth-tracing-otlp"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -18927,7 +18927,7 @@ dependencies = [
 [[package]]
 name = "reth-transaction-pool"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -18970,7 +18970,7 @@ dependencies = [
 [[package]]
 name = "reth-trie"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -18996,7 +18996,7 @@ dependencies = [
 [[package]]
 name = "reth-trie-common"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -19023,7 +19023,7 @@ dependencies = [
 [[package]]
 name = "reth-trie-db"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-primitives",
  "reth-db-api",
@@ -19039,7 +19039,7 @@ dependencies = [
 [[package]]
 name = "reth-trie-parallel"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-evm",
  "alloy-primitives",
@@ -19063,7 +19063,7 @@ dependencies = [
 [[package]]
 name = "reth-trie-sparse"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1#5f32583f6662b2a6eb8b4d33081265ab31bf54fc"
+source = "git+https://github.com/streamingfast/reth.git?tag=base-v2.5.2.6-fh3.1-1#6f14cf591ab0da7f4e0aaf67d870707077c6e71c"
 dependencies = [
  "alloy-primitives",
  "alloy-trie",
