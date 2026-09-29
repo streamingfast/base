@@ -660,9 +660,9 @@ firehose-tracer-prestate = "5.4.2"
 ## Firehose additions
 # Temporary: the keccak preimage filter is not on crates.io yet. Remove once firehose-tracer
 # 5.5.0 is published and the lock points to it.
-firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", branch = "feature/keccak-preimage-filter" }
-firehose-tracer-test = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", branch = "feature/keccak-preimage-filter" }
-firehose-tracer-prestate = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", branch = "feature/keccak-preimage-filter" }
+firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", rev = "3321aec1ebb9e215de2bd9cc58e7f1726496e47f" }
+firehose-tracer-test = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", rev = "3321aec1ebb9e215de2bd9cc58e7f1726496e47f" }
+firehose-tracer-prestate = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", rev = "3321aec1ebb9e215de2bd9cc58e7f1726496e47f" }
 
 # SF fork of alloy-evm that routes system calls (EIP-4788, EIP-2935, etc.) through the
 # Inspector, so Firehose tracing observes them. Must match the patch in streamingfast/reth.
