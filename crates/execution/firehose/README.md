@@ -25,6 +25,10 @@ This crate is that wrapper for Base / OP Stack.
 - [`OpFirehoseEvmConfig`] — `ConfigureEvm` wrapper whose `batch_executor` constructs
   `FirehoseBlockExecutor::new_with_hooks(..., OpPreTxAdjust, OpPostTxExtras)` so the
   pipeline fires the same OP hooks the live engine-API path already uses.
+- [`BuiltBlock`] and [`BuiltBlockTracer`] — tracing of a block the payload builder assembles
+  from payload attributes alone, which is how the consensus node derives blocks from L1. Such a
+  block enters the chain already executed and skips the engine validation, so the payload
+  builder calls `BuiltBlock::trace` on it.
 
 ## Paths into the hooks
 
@@ -32,3 +36,4 @@ This crate is that wrapper for Base / OP Stack.
 | ----------------------------- | --------------------------------------------------------- |
 | Staged sync (pipeline)        | `OpFirehoseEvmConfig::batch_executor` in this crate       |
 | Engine API (live)             | reth's engine validator (`execute_and_trace_block`), using the hooks `OpFirehoseEvmConfig` selects through `reth_firehose::FirehoseLiveHooks` |
+| Block built from attributes   | `BuiltBlock::trace`, called by the payload builder for `no_tx_pool` builds |

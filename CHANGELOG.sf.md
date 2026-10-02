@@ -1,3 +1,9 @@
+## Unreleased
+
+### Fixed
+
+* Firehose now emits the blocks a node builds from payload attributes alone (`no_tx_pool`). This is how the consensus node derives blocks from L1, for example when the node starts behind the chain and catches up from L1 data. These blocks were inserted already executed and skipped the engine validation that traces live blocks, so they were missing from the Firehose stream, which could not continue past the gap. Blocks received through `engine_newPayload` and blocks replayed by staged sync were not affected.
+
 ## v1.4.2-fh3.1-1
 
 ### Changed

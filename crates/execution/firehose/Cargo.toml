@@ -15,10 +15,12 @@ workspace = true
 reth-evm.workspace = true
 reth-revm.workspace = true
 reth-firehose.workspace = true
+reth-storage-api.workspace = true
 firehose-tracer.workspace = true
 reth-primitives-traits.workspace = true
 
 # base
+base-execution-evm.workspace = true
 base-common-evm = { workspace = true, features = ["reth"] }
 base-common-consensus = { workspace = true, features = ["reth"] }
 
