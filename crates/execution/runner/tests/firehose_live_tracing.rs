@@ -1,4 +1,4 @@
-//! Regression test for Firehose tracing on the engine-tree live-block path.
+//! Regression test for Firehose tracing of live blocks, on both paths a block can take into a node.
 //!
 //! Blocks that a node has to *execute itself* when they arrive via `engine_newPayload` are routed
 //! into the Firehose tracer by reth's engine validator (`validate_block_with_state` →
@@ -9,14 +9,17 @@
 //!
 //! ## Why two nodes
 //!
-//! A node that *builds* a block (the sequencer flow) inserts it into its tree as already-executed
+//! A node that *builds* a block inserts it into its tree as already-executed
 //! (`InsertExecutedBlock`), so a subsequent `engine_newPayload` for that same block short-circuits
-//! and never re-runs `validate_block_with_state` — the traced path is skipped. The live path is
-//! only exercised by a node that did **not** build the block: a follower receiving payloads from a
-//! sequencer. So this test runs two nodes — a `sequencer` that builds payloads and a `follower`
-//! that executes them via `engine_newPayload` — and asserts the follower emits `FIRE BLOCK` lines.
-//! If the dispatch into `execute_and_trace_block` is missing, no `FIRE BLOCK` lines are produced and
-//! the test fails.
+//! and never re-runs `validate_block_with_state`. That is how a consensus node derives blocks from
+//! L1: it asks the node to build each one from payload attributes alone (`no_tx_pool`). The payload
+//! builder traces such a block itself, through `base_execution_firehose::BuiltBlock::trace`.
+//!
+//! The engine path is only exercised by a node that did **not** build the block. So this test runs
+//! two nodes — a `sequencer` that builds payloads from attributes alone and a `follower` that
+//! executes them via `engine_newPayload` — and asserts each block is emitted once by each node, and
+//! that the two emissions are identical. If either path stops tracing, a block is emitted once
+//! instead of twice and the test fails.
 //!
 //! ## OP Stack hooks
 //!
@@ -27,8 +30,7 @@
 //!
 //! It lives in its own integration-test binary because it installs a process-wide tracer;
 //! cargo/nextest run each integration binary in its own process, keeping the global tracer isolated
-//! from the rest of the suite. The tracer is global, but only the follower's
-//! `validate_block_with_state` execution feeds it — building on the sequencer does not trace.
+//! from the rest of the suite. Both nodes feed that one tracer.
 
 use std::{sync::Arc, time::Duration};
 
@@ -57,8 +59,8 @@ use reth_provider::ChainSpecProvider;
 use tokio::time::sleep;
 
 /// Number of blocks to advance. All of them (block 1 included — the genesis block itself is
-/// emitted separately at node startup, not through this path) exercise the
-/// live `execute_and_trace_block` path on the follower.
+/// emitted separately at node startup, not through this path) are built on the sequencer and
+/// exercise the live `execute_and_trace_block` path on the follower.
 const PRODUCED_BLOCKS: u64 = 3;
 
 /// Base EIP-1559 base-fee params (`eip1559Denominator` / `eip1559Elasticity`) matching the
@@ -69,7 +71,7 @@ const EIP1559_ELASTICITY: u32 = 6;
 const MIN_BASE_FEE: u64 = 1_000_000_000;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn live_payload_validation_emits_firehose_blocks() -> Result<()> {
+async fn built_and_validated_blocks_emit_firehose_blocks() -> Result<()> {
     // Install a buffer-backed global Firehose tracer BEFORE any block is validated, so the live
     // path's `is_tracer_initialized()` gate activates and routes execution through
     // `execute_and_trace_block`. The chain id matches the test genesis; the fork timestamps only
@@ -96,9 +98,9 @@ async fn live_payload_validation_emits_firehose_blocks() -> Result<()> {
     genesis.extra_data = Bytes::from(extra_data);
     let chain_spec = Arc::new(BaseChainSpec::from_genesis(genesis));
 
-    // Two nodes on the same genesis: the sequencer builds payloads; the follower executes them via
-    // `engine_newPayload` (the path under test). Building does not trace; only the follower's
-    // `validate_block_with_state` execution feeds the global tracer.
+    // Two nodes on the same genesis: the sequencer builds payloads from attributes alone, which
+    // the payload builder traces; the follower executes them via `engine_newPayload`, which the
+    // engine traces.
     let sequencer = LocalNode::new(vec![], chain_spec.clone()).await?;
     let follower = LocalNode::new(vec![], chain_spec.clone()).await?;
     sleep(Duration::from_millis(NODE_STARTUP_DELAY_MS)).await;
@@ -160,7 +162,7 @@ async fn live_payload_validation_emits_firehose_blocks() -> Result<()> {
             3,
         )?;
 
-        // Sequencer builds the payload (this does NOT trace — it builds, it does not validate).
+        // Sequencer builds the payload from the attributes alone; the payload builder traces it.
         let payload_id = seq_engine
             .update_forkchoice(parent_hash, parent_hash, Some(attributes))
             .await?
@@ -180,7 +182,7 @@ async fn live_payload_validation_emits_firehose_blocks() -> Result<()> {
 
         // Follower validates the externally-produced payload via `engine_newPayload`. Since the
         // follower did not build it, this drives `validate_block_with_state` →
-        // `execute_and_trace_block` — the traced path under test.
+        // `execute_and_trace_block`.
         let status = fol_engine
             .new_payload(execution_payload, vec![], parent_beacon_block_root, execution_requests)
             .await?;
@@ -198,19 +200,23 @@ async fn live_payload_validation_emits_firehose_blocks() -> Result<()> {
     let traced = capture.traced_block_numbers();
     assert!(
         !traced.is_empty(),
-        "no FIRE BLOCK lines were emitted — the follower's live payload-validation path is not \
-         traced.\nCaptured tracer output:\n{}",
+        "no FIRE BLOCK lines were emitted — neither the built-block path nor the follower's live \
+         payload-validation path is traced.\nCaptured tracer output:\n{}",
         capture.raw_text()
     );
 
-    // Every produced block goes through the live `execute_and_trace_block` path. Require each to
-    // have been traced exactly once.
+    // Every produced block is traced once when the sequencer builds it and once when the follower
+    // validates it, and both paths must produce the same block.
+    let blocks = capture.blocks()?;
     for number in 1..=PRODUCED_BLOCKS {
-        let count = traced.iter().filter(|traced| **traced == number).count();
-        assert_eq!(count, 1, "expected one FIRE BLOCK line for live block #{number}, got {traced:?}");
+        let emitted: Vec<_> = blocks.iter().filter(|block| block.number == number).collect();
+        let [built, validated] = emitted.as_slice() else {
+            panic!("expected two FIRE BLOCK lines for block #{number}, got {traced:?}");
+        };
+        assert_eq!(built, validated, "built and validated traces of block #{number} differ");
     }
 
-    for block in capture.blocks()? {
+    for block in blocks {
         let [deposit, transfer] = block.transaction_traces.as_slice() else {
             panic!(
                 "block #{} should hold the L1-info deposit and one transfer, got {} traces",

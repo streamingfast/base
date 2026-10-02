@@ -17,6 +17,7 @@ use base_common_chains::Upgrades;
 use base_common_consensus::{BaseTransaction, CoinbaseTip, Predeploys};
 use base_common_evm::L1BlockInfo;
 use base_execution_eip8130::IntrinsicGas;
+use base_execution_firehose::{BuiltBlock, BuiltBlockTracer};
 use base_execution_txpool::{
     BasePooledTx, GuardMetrics, ParkableTransactionPool, PredicateContext, ValidityPredicate,
     estimated_da_size::DataAvailabilitySized,
@@ -294,7 +295,7 @@ where
     Evm: ConfigureEvm<
             Primitives = N,
             NextBlockEnvCtx: BuildNextEnv<Attrs, N::BlockHeader, Client::ChainSpec>,
-        >,
+        > + BuiltBlockTracer<N>,
     Txs: BasePayloadTransactions<Pool>,
     Attrs: Attributes<Transaction = N::SignedTx>,
 {
@@ -306,7 +307,21 @@ where
         args: BuildArguments<Self::Attributes, Self::BuiltPayload>,
     ) -> Result<BuildOutcome<Self::BuiltPayload>, PayloadBuilderError> {
         let pool = self.pool.clone();
-        self.build_payload(args, |attrs| self.best_transactions.best_transactions(pool, attrs))
+        let no_tx_pool = args.config.attributes.no_tx_pool();
+        let outcome = self
+            .build_payload(args, |attrs| self.best_transactions.best_transactions(pool, attrs))?;
+
+        // A block built from the payload attributes alone enters the chain without the engine
+        // validation that Firehose traces, so it is traced here.
+        if no_tx_pool
+            && let BuildOutcome::Freeze(payload) = &outcome
+            && let Some(executed) = &payload.executed_block
+        {
+            BuiltBlock::trace(&self.evm_config, &self.client, &executed.recovered_block)
+                .map_err(PayloadBuilderError::other)?;
+        }
+
+        Ok(outcome)
     }
 
     fn on_missing_payload(
