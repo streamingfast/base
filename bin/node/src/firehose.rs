@@ -1,8 +1,8 @@
 //! Firehose tracer wiring for `base-reth-node`.
 //!
 //! Initializes the process-wide Firehose tracer and installs:
-//! * the canonical-block `ExEx` that re-executes committed chains through the
-//!   global Firehose inspector;
+//! * the startup hook that emits `FIRE INIT` and, on an empty chain, the genesis block. Canonical
+//!   blocks are then traced by the engine as it executes them;
 //! * (optionally) the [`FirehoseFlashblocksExtension`] that subscribes to a
 //!   flashblock WebSocket feed and emits per-flashblock partial-block FIRE
 //!   events via a separate, dedicated tracer.
@@ -20,14 +20,23 @@ use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{debug, info, warn};
 use url::Url;
 
-/// Runner-level extension that installs the Firehose `ExEx`.
+/// Runner-level extension that emits `FIRE INIT` and, on an empty chain, the genesis block.
+///
+/// Must run in the component-initialized hook: the tracer panics on a block that starts before
+/// `on_blockchain_init`, and the consensus engine can execute blocks before node-started hooks run.
 #[derive(Debug)]
 pub struct FirehoseExtension;
 
 impl BaseNodeExtension for FirehoseExtension {
     fn apply(self: Box<Self>, hooks: NodeHooks) -> NodeHooks {
-        hooks.install_exex("firehose", |ctx| async move {
-            Ok(async move { reth_firehose::run_exex(ctx).await })
+        hooks.add_component_initialized_hook(|node| {
+            let chain_spec = node.provider.chain_spec();
+            reth_firehose::tracer().on_blockchain_init(
+                "reth",
+                concat!("base-", env!("CARGO_PKG_VERSION")),
+                firehose_tracer::config::ChainConfig::new(chain_spec.chain().id()),
+            );
+            reth_firehose::emit_genesis_block_on_empty_chain(&node.provider, chain_spec.genesis())
         })
     }
 }
