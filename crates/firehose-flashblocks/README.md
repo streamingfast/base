@@ -11,4 +11,4 @@ ahead of the canonical engine-API confirmation.
 
 The entire subsystem is a no-op unless `--firehose-flashblocks-url` is set on
 the node binary; in that case the streamer runs alongside (but independently
-of) the canonical live-block tracer driven by `reth_firehose::run_exex`.
+of) the canonical live-block tracer driven by the engine.

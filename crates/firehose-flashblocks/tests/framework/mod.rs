@@ -1449,7 +1449,7 @@ pub(crate) fn test_genesis() -> Genesis {
 ///   FIRE BLOCK lines are emitted by the **flashblock tracer**.
 /// - [`TestEvent::CanonicalBlock`] — marks the block available in [`GenesisClient`] *and*
 ///   emits a canonical (non-flash) FIRE BLOCK line through a dedicated **canonical tracer**.
-///   This simulates the live-node behaviour where the global `FirehoseExtension` `ExEx` emits
+///   This simulates the live-node behaviour where the global canonical tracer emits
 ///   a canonical FIRE BLOCK whenever a block is finalised by the engine, independent of the
 ///   flashblock tracer.
 ///
@@ -1691,7 +1691,7 @@ fn run_flashblock_sequence_internal(
                 // that need to bootstrap from block N can find it.
                 client.mark_canonical_block_available(block_number);
 
-                // Emit a canonical FIRE BLOCK to simulate the global ExEx tracer emitting the
+                // Emit a canonical FIRE BLOCK to simulate the global canonical tracer emitting the
                 // finalised block. A minimal block with the correct number is sufficient; the
                 // test assertions use metadata-only comparisons.
                 let header = client.header_for_block(block_number);
