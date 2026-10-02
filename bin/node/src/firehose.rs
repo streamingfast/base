@@ -33,7 +33,7 @@ impl BaseNodeExtension for FirehoseExtension {
             let chain_spec = node.provider.chain_spec();
             reth_firehose::tracer().on_blockchain_init(
                 "reth",
-                env!("CARGO_PKG_VERSION"),
+                concat!("base-", env!("CARGO_PKG_VERSION")),
                 firehose_tracer::config::ChainConfig::new(chain_spec.chain().id()),
             );
             reth_firehose::emit_genesis_block_on_empty_chain(&node.provider, chain_spec.genesis())

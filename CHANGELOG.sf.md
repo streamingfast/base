@@ -2,7 +2,7 @@
 
 ### Changed
 
-* The node no longer installs a Firehose execution extension (ExEx). It only emitted `FIRE INIT` and the genesis block; blocks are traced by the engine. Both are now emitted at startup before the consensus engine exists, so no block can be traced ahead of `FIRE INIT`. Unless another ExEx is enabled, the node stops writing the ExEx write-ahead log. `FIRE INIT` now reports the Base node version instead of the `reth-firehose` crate version.
+* The node no longer installs a Firehose execution extension (ExEx). It only emitted `FIRE INIT` and the genesis block; blocks are traced by the engine. Both are now emitted at startup before the consensus engine exists, so no block can be traced ahead of `FIRE INIT`. Unless another ExEx is enabled, the node stops writing the ExEx write-ahead log. `FIRE INIT` now reports the Base node version, as `reth base-1.4.2`, instead of the `reth-firehose` crate version.
 
 ## v1.4.2-fh3.1-1
 
