@@ -4506,11 +4506,13 @@ dependencies = [
  "alloy-primitives",
  "base-common-consensus",
  "base-common-evm",
+ "base-execution-evm",
  "firehose-tracer",
  "reth-evm",
  "reth-firehose",
  "reth-primitives-traits",
  "reth-revm",
+ "reth-storage-api",
 ]
 
 [[package]]
@@ -4532,6 +4534,7 @@ dependencies = [
  "base-execution-chainspec",
  "base-execution-eip8130",
  "base-execution-evm",
+ "base-execution-firehose",
  "base-execution-txpool",
  "base-metrics",
  "base-observability-events",

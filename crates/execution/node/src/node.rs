@@ -1173,7 +1173,8 @@ where
                 HeaderTy<Node::Types>,
                 <Node::Types as NodeTypes>::ChainSpec,
             >,
-        > + 'static,
+        > + base_execution_firehose::BuiltBlockTracer<PrimitivesTy<Node::Types>>
+        + 'static,
     Pool:
         TransactionPool<Transaction: BasePooledTx<Consensus = TxTy<Node::Types>>> + Unpin + 'static,
     Txs: BasePayloadTransactions<Pool>,

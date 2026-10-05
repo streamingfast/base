@@ -1,8 +1,12 @@
-## Unreleased
+## v1.4.2-fh3.1-2
 
 ### Changed
 
 * The node no longer installs a Firehose execution extension (ExEx). It only emitted `FIRE INIT` and the genesis block; blocks are traced by the engine. Both are now emitted at startup before the consensus engine exists, so no block can be traced ahead of `FIRE INIT`. Unless another ExEx is enabled, the node stops writing the ExEx write-ahead log. `FIRE INIT` now reports the Base node version, as `reth base-1.4.2`, instead of the `reth-firehose` crate version.
+
+### Fixed
+
+* Firehose now emits the blocks a node builds from payload attributes alone (`no_tx_pool`). This is how the consensus node derives blocks from L1, for example when the node starts behind the chain and catches up from L1 data. These blocks were inserted already executed and skipped the engine validation that traces live blocks, so they were missing from the Firehose stream, which could not continue past the gap. Blocks received through `engine_newPayload` and blocks replayed by staged sync were not affected.
 
 ## v1.4.2-fh3.1-1
 

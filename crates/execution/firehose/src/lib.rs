@@ -7,3 +7,6 @@ pub use extras::{OpPostTxExtras, OpPreTxAdjust};
 
 mod evm_config;
 pub use evm_config::{OpChainHooks, OpFirehoseEvmConfig};
+
+mod built_block;
+pub use built_block::{BuiltBlock, BuiltBlockTracer};
