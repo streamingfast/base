@@ -1,7 +1,8 @@
 //! Hook accumulator for the node builder.
 //!
-//! [`NodeHooks`] collects RPC, node-started, and `ExEx` hooks that extensions install. These hooks
-//! are applied to a configured reth builder via [`NodeHooks::apply_to`] just before launch.
+//! [`NodeHooks`] collects RPC, component-initialized, node-started, and `ExEx` hooks that
+//! extensions install. These hooks are applied to a configured reth builder via
+//! [`NodeHooks::apply_to`] just before launch.
 
 use std::fmt;
 
@@ -43,6 +44,9 @@ type RpcModuleHook = Box<dyn FnOnce(&mut BaseRpcContext<'_>) -> Result<()> + Sen
 /// Hook type for extending add-ons.
 type AddOnsHook = Box<dyn FnOnce(ConcreteBaseAddOns) -> ConcreteBaseAddOns>;
 
+/// Hook type for component-initialized callbacks.
+type ComponentInitializedHook = Box<dyn FnOnce(BaseNodeAdapter) -> Result<()> + Send + 'static>;
+
 /// Hook type for node-started callbacks.
 type NodeStartedHook = Box<dyn FnOnce(BaseFullNode) -> Result<()> + Send + 'static>;
 
@@ -65,6 +69,7 @@ pub type RethNodeBuilder<CB> =
 /// Pure hook accumulator for the Base node builder.
 ///
 /// Extensions call [`add_rpc_module`](Self::add_rpc_module),
+/// [`add_component_initialized_hook`](Self::add_component_initialized_hook),
 /// [`add_node_started_hook`](Self::add_node_started_hook), and
 /// [`install_exex`](Self::install_exex) to register hooks. The runner then calls
 /// [`apply_to`](Self::apply_to) to drain all hooks onto the concrete configured builder.
@@ -72,6 +77,7 @@ pub type RethNodeBuilder<CB> =
 /// After applying hooks, call [`.launch()`](RethNodeBuilder::launch) on the configured builder.
 pub struct NodeHooks {
     rpc_hooks: Vec<RpcModuleHook>,
+    component_initialized_hooks: Vec<ComponentInitializedHook>,
     node_started_hooks: Vec<NodeStartedHook>,
     add_ons_hooks: Vec<AddOnsHook>,
     exex_hooks: Vec<(String, BoxExExFactory)>,
@@ -82,6 +88,7 @@ impl NodeHooks {
     pub fn new() -> Self {
         Self {
             rpc_hooks: Vec::new(),
+            component_initialized_hooks: Vec::new(),
             node_started_hooks: Vec::new(),
             exex_hooks: Vec::new(),
             add_ons_hooks: Vec::new(),
@@ -96,7 +103,13 @@ impl NodeHooks {
     where
         CB: NodeComponentsBuilder<BaseNodeTypes, Components = BaseComponents>,
     {
-        let Self { rpc_hooks, node_started_hooks, exex_hooks, add_ons_hooks } = self;
+        let Self {
+            rpc_hooks,
+            component_initialized_hooks,
+            node_started_hooks,
+            exex_hooks,
+            add_ons_hooks,
+        } = self;
 
         // Install ExEx hooks
         for (id, factory) in exex_hooks {
@@ -113,6 +126,16 @@ impl NodeHooks {
             builder = builder.extend_rpc_modules(move |mut ctx: BaseRpcContext<'_>| {
                 for hook in rpc_hooks {
                     hook(&mut ctx)?;
+                }
+                Ok(())
+            });
+        }
+
+        // Install component-initialized hooks
+        if !component_initialized_hooks.is_empty() {
+            builder = builder.on_component_initialized(move |node: BaseNodeAdapter| {
+                for hook in component_initialized_hooks {
+                    hook(node.clone())?;
                 }
                 Ok(())
             });
@@ -160,6 +183,16 @@ impl NodeHooks {
         F: FnOnce(EventStream<ConsensusEngineEvent<BasePrimitives>>) + Send + 'static,
     {
         self.add_add_ons_hook(move |add_ons| add_ons.on_engine_events(hook))
+    }
+
+    /// Adds a hook that runs once the node components are built, before the consensus engine
+    /// and the RPC servers exist. No block is executed before these hooks return.
+    pub fn add_component_initialized_hook<F>(mut self, hook: F) -> Self
+    where
+        F: FnOnce(BaseNodeAdapter) -> Result<()> + Send + 'static,
+    {
+        self.component_initialized_hooks.push(Box::new(hook));
+        self
     }
 
     /// Adds a node-started hook that will run after the node has started.

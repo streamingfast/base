@@ -496,7 +496,7 @@ fn block_payload_has_correct_block_number() {
 ///
 /// This verifies the [`TestEvent::CanonicalBlock`] path: it both marks block 1 available in
 /// [`GenesisClient`] so that the bootstrap provider call succeeds, and emits a canonical FIRE
-/// BLOCK (simulating the global `ExEx` tracer), for a total of three emitted events.
+/// BLOCK (simulating the global canonical tracer), for a total of three emitted events.
 ///
 /// - `base1` → Flash1 (flashblock tracer, block 1).
 /// - `canonical_block(1, hash("1a"))` → Canonical1 (canonical tracer, block 1) + makes block 1 available.
@@ -557,7 +557,7 @@ fn canonical_block_unblocks_next_base() {
 /// `accumulated_db` is always `None` and the provider call for the parent block is mandatory.
 ///
 /// The `canonical_block(1, hash("1a"))` event also emits a canonical FIRE BLOCK (simulating the global
-/// `ExEx` tracer), so two events appear in total: Canonical1 then Flash2.
+/// canonical tracer), so two events appear in total: Canonical1 then Flash2.
 #[test]
 fn canonical_block_unblocks_non_sequential_gap() {
     let genesis = test_genesis();
@@ -598,9 +598,9 @@ fn canonical_block_unblocks_non_sequential_gap() {
 /// Sequence breakdown:
 /// - `base1` → flashblock for block 1 (`flash_idx` 0) → Flash1 emitted by flashblock tracer.
 /// - `canonical_block(1, hash("1a"))` → makes block 1 available **and** emits Canonical1 via the canonical
-///   tracer, simulating the global `ExEx` tracer finalising block 1.
+///   tracer, simulating the global canonical tracer finalising block 1.
 /// - `canonical_block(2, hash("2a"))` → makes block 2 available **and** emits Canonical2 via the canonical
-///   tracer, simulating the global `ExEx` tracer finalising block 2 (even though no flashblock was
+///   tracer, simulating the global canonical tracer finalising block 2 (even though no flashblock was
 ///   sent for block 2).
 /// - `base3` → flashblock for block 3 (`flash_idx` 0). The processor detects a block gap
 ///   (current = 1, incoming = 3) which triggers the bootstrap path. Because block 2 was already

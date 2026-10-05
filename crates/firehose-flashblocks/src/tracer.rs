@@ -39,7 +39,7 @@ impl FlashblocksTracerHandle {
     /// Constructs the dedicated tracer with the given config and chain-config, sharing the
     /// process-wide stdout lock with the global tracer.
     ///
-    /// `chain_config` matches what the live tracer received in [`reth_firehose::run_exex`]
+    /// `chain_config` matches what the live tracer received at node startup
     /// (chain id of the running node); a fresh `on_blockchain_init` is emitted on this
     /// instance — required because `Tracer` guards `on_block_start` behind its own per-instance
     /// `init_sent` flag.

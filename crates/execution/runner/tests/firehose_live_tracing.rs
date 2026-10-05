@@ -57,7 +57,7 @@ use reth_provider::ChainSpecProvider;
 use tokio::time::sleep;
 
 /// Number of blocks to advance. All of them (block 1 included — the genesis block itself is
-/// emitted separately at node startup by the Firehose ExEx, not through this path) exercise the
+/// emitted separately at node startup, not through this path) exercise the
 /// live `execute_and_trace_block` path on the follower.
 const PRODUCED_BLOCKS: u64 = 3;
 
