@@ -1,3 +1,29 @@
+## v1.5.0-fh3.1
+
+### Changed
+
+* Rebased on upstream Base `v1.5.0` and `streamingfast/reth` `base-v2.5.2.8-fh3.1` (Base's reth
+  fork `base-v2.5.2.8` plus Firehose). Base Sepolia operators must run this release before the
+  Denim hardfork on 2026-10-21 18:00:00 UTC. Denim produces blocks every 200 ms, so up to 5
+  consecutive Firehose blocks share the same header `timestamp`; every block gets a BaseTime
+  deposit at transaction index 1.
+
+### Fixed
+
+* Firehose now emits the state Base writes before a block's transactions without going through the
+  EVM, which the tracer could not see. The Denim activation block now carries the BaseTime
+  predeploy install: a block-level code change for `0xc0D3C0d3C0d3C0D3c0d3C0d3c0D3C0d3c0d30030`,
+  and a system call from `0xfffffffffffffffffffffffffffffffffffffffe` to
+  `0x4200000000000000000000000000000000000030` holding its implementation slot write. The Canyon
+  `create2deployer` install and the Everest nonce manager code are emitted the same way.
+
+### Known issues
+
+* EIP-8130 transactions (type `0x79`) are enabled by the Everest upgrade, which an L1 signal can
+  schedule without a new release. Firehose does not support them yet: the node stops on the first
+  one with an error naming the transaction and its type. No network has scheduled Everest. See
+  `ACTIVATIONS.md`.
+
 ## v1.4.2-fh3.1-2
 
 ### Changed
