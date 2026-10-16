@@ -20,8 +20,8 @@ variable "DEVNET_TARGETS" {
   default = ["base", "op-batcher"]
 }
 
-variable "INGRESS_TARGETS" {
-  default = ["base", "ingress-rpc", "audit-archiver", "op-batcher"]
+variable "TX_OBSERVABILITY_TARGETS" {
+  default = ["base", "audit-archiver", "op-batcher"]
 }
 
 group "default" {
@@ -31,6 +31,7 @@ group "default" {
 group "rust-services" {
   targets = [
     "base",
+    "unified",
     "execution",
     "consensus",
     "builder",
@@ -38,7 +39,6 @@ group "rust-services" {
     "snapshotter",
     "proposer",
     "websocket-proxy",
-    "ingress-rpc",
     "audit-archiver",
     "sidecrush",
     "prover-service",
@@ -50,8 +50,8 @@ group "devnet" {
   targets = DEVNET_TARGETS
 }
 
-group "ingress" {
-  targets = INGRESS_TARGETS
+group "tx-observability" {
+  targets = TX_OBSERVABILITY_TARGETS
 }
 
 target "profiling-tools" {
@@ -83,6 +83,17 @@ target "base" {
     SCCACHE_CACHE_ID = "rust-services-base-sccache"
   }
   tags = ["base:local"]
+}
+
+target "unified" {
+  inherits = ["_rust-service-common"]
+  target = "unified"
+  args = {
+    CARGO_CHEF_ARGS = "--package base"
+    CARGO_FEATURES = PROFILE == "profiling" ? "--features=jemalloc-prof" : ""
+    SCCACHE_CACHE_ID = "rust-services-unified-sccache"
+  }
+  tags = ["base-unified:local"]
 }
 
 target "execution" {
@@ -155,16 +166,6 @@ target "websocket-proxy" {
     SCCACHE_CACHE_ID = "rust-services-websocket-proxy-sccache"
   }
   tags = ["websocket-proxy:local"]
-}
-
-target "ingress-rpc" {
-  inherits = ["_rust-service-common"]
-  target = "ingress-rpc"
-  args = {
-    CARGO_CHEF_ARGS = "--package ingress-rpc"
-    SCCACHE_CACHE_ID = "rust-services-ingress-rpc-sccache"
-  }
-  tags = ["ingress-rpc:local"]
 }
 
 target "audit-archiver" {

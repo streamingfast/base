@@ -46,13 +46,25 @@ RUN set -eux; \
     unzip /tmp/protoc.zip -d /usr/local; \
     rm /tmp/protoc.zip
 
-FROM rust-builder-base AS planner
-COPY . .
+FROM rust-builder-base AS workspace-source
+# Keep these inputs aligned with workspace members; runtime scripts are copied later.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY .cargo ./.cargo
+COPY actions ./actions
+COPY acceptance ./acceptance
+COPY bin ./bin
+COPY crates ./crates
+COPY etc/tools ./etc/tools
+COPY etc/systems ./etc/systems
+
+FROM workspace-source AS planner
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM rust-builder-base AS rust-deps
 ARG PROFILE=release
-ARG CARGO_CHEF_ARGS=""
+# Default to the `base` target's packages so plain `docker compose build` does not
+# cook the whole workspace, whose SP1 crates need Go. Bake overrides this per target.
+ARG CARGO_CHEF_ARGS="--package base --package base-reth-node --package base-consensus --package base-snapshotter-bin"
 ARG CARGO_FEATURES=""
 ARG SCCACHE_CACHE_ID=rust-services-sccache
 COPY --from=planner /app/recipe.json recipe.json
@@ -62,7 +74,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo chef cook --profile "$PROFILE" --recipe-path recipe.json ${CARGO_CHEF_ARGS} ${CARGO_FEATURES}
 
 FROM rust-deps AS source
-COPY . .
+COPY --from=workspace-source /app/ /app/
 
 FROM source AS base-image-builder
 ARG PROFILE=release
@@ -72,6 +84,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=${SCCACHE_CACHE_ID},target=/sccache,sharing=locked \
     set -eux; \
+    if [ "$PROFILE" = "dev" ]; then export CARGO_PROFILE_DEV_DEBUG=0; fi; \
     cargo build --profile "$PROFILE" ${CARGO_FEATURES} \
       --package base --bin base \
       --package base-reth-node --bin base-reth-node \
@@ -158,15 +171,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo build --profile $PROFILE --package websocket-proxy-bin --bin websocket-proxy && \
     cp /app/target/$([ "$PROFILE" = "dev" ] && echo debug || echo "$PROFILE")/websocket-proxy /app/websocket-proxy
 
-FROM source AS ingress-rpc-builder
-ARG PROFILE=release
-ARG SCCACHE_CACHE_ID=rust-services-sccache
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=${SCCACHE_CACHE_ID},target=/sccache,sharing=locked \
-    cargo build --profile $PROFILE --package ingress-rpc --bin ingress-rpc && \
-    cp /app/target/$([ "$PROFILE" = "dev" ] && echo debug || echo "$PROFILE")/ingress-rpc /app/ingress-rpc
-
 FROM source AS audit-archiver-builder
 ARG PROFILE=release
 ARG SCCACHE_CACHE_ID=rust-services-sccache
@@ -219,21 +223,23 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /var/log/supervisor
 COPY --from=base-image-builder /app/base ./base
-# Compose uses this wrapper to source generated devnet upgrade-signal env before /app/base.
-COPY etc/scripts/devnet/base-entrypoint.sh ./base-entrypoint.sh
-# Keep split binaries here for now, needed for bare metal work
-# Remove only when there is an alternative available
-# e.g. when we publish independent separate Docker images for each
-# via the CI
+# Keep the split binaries in the public node image for compatibility. Release
+# builds also publish each binary in its own image.
 COPY --from=base-image-builder /app/base-reth-node ./base-reth-node
 COPY --from=base-image-builder /app/base-consensus ./base-consensus
 COPY --from=base-image-builder /app/snapshotter ./snapshotter
+# Compose uses this wrapper to source generated devnet upgrade-signal env before /app/base.
+COPY etc/scripts/devnet/base-entrypoint.sh ./base-entrypoint.sh
 COPY etc/scripts/node/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY etc/scripts/node/execution-entrypoint .
 COPY etc/scripts/node/consensus-entrypoint .
 RUN chmod +x ./base-entrypoint.sh execution-entrypoint consensus-entrypoint
 # Operator default. Devnet compose overrides entrypoint to /app/base or base-entrypoint.sh.
 CMD ["/usr/bin/supervisord"]
+
+FROM runtime-base AS unified
+COPY --from=base-builder /app/base ./base
+ENTRYPOINT ["./base"]
 
 FROM runtime-base AS execution
 COPY --from=execution-builder /app/base-reth-node ./base-reth-node
@@ -263,10 +269,6 @@ ENTRYPOINT ["./base-proposer"]
 FROM runtime-base AS websocket-proxy
 COPY --from=websocket-proxy-builder /app/websocket-proxy ./websocket-proxy
 ENTRYPOINT ["./websocket-proxy"]
-
-FROM runtime-base AS ingress-rpc
-COPY --from=ingress-rpc-builder /app/ingress-rpc ./ingress-rpc
-ENTRYPOINT ["./ingress-rpc"]
 
 FROM runtime-base AS audit-archiver
 COPY --from=audit-archiver-builder /app/audit-archiver ./audit-archiver

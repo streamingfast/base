@@ -1,24 +1,17 @@
 //! Shadow-builder validity predicate injection for forwarded transactions.
 
-use alloy_consensus::BlockHeader;
-use alloy_primitives::U256;
-use base_common_chains::Upgrades;
+use std::sync::Arc;
+
+use alloy_primitives::{TxHash, U256};
+use base_bundles::MeterBundleResponse;
 use base_execution_txpool::{
-    BasePooledTransaction, BuilderApiImpl, BuilderApiServer, TransactionValidity,
-    ValidatedTransaction, ValidityOperator, ValidityPredicate,
+    BasePooledTransaction, BuilderApiImpl, BuilderApiServer, InsertMetering, TransactionValidity,
+    ValidatedTransaction, ValidityOperator, ValidityPredicate, ValiditySignatureMode,
 };
-use jsonrpsee::{
-    core::RpcResult,
-    types::{ErrorCode, ErrorObjectOwned},
-};
-use reth_chainspec::ChainSpecProvider;
-use reth_storage_api::BlockReaderIdExt;
+use jsonrpsee::core::RpcResult;
 use reth_transaction_pool::TransactionPool;
 
-use crate::{BuilderApiExtensionConfig, BuilderMetrics};
-
-/// Cobalt activates before Denim, while full blocks are two seconds apart.
-const PRE_DENIM_BLOCK_INTERVAL_SECS: u64 = 2;
+use crate::{BuilderApiExtensionConfig, BuilderMetrics, SharedMeteringProvider};
 
 /// Number of basis points representing a 100% sampling rate.
 pub const MAX_SHADOW_VALIDITY_SAMPLE_RATE_BPS: u16 = 10_000;
@@ -29,9 +22,6 @@ pub enum ShadowValidityConfigError {
     /// The configured sampling rate is zero or exceeds 100%.
     #[error("shadow validity sample rate must be between 1 and 10000 basis points")]
     InvalidSampleRate,
-    /// Injection was enabled without enabling validity extensions.
-    #[error("shadow validity injection requires experimental validity transactions to be enabled")]
-    ValidityTransactionsDisabled,
 }
 
 /// Configuration for decorating forwarded transactions with shadow-only validity predicates.
@@ -75,7 +65,7 @@ impl ShadowValidityConfig {
         if !self.enabled {
             return InjectionOutcome::Disabled;
         }
-        if !tx.extensions.validity.is_empty() {
+        if !tx.extensions.validity.is_empty() || tx.extensions.validity_signature.is_some() {
             return InjectionOutcome::ExistingValidity;
         }
         // EIP-1559 transactions use the 0x02 EIP-2718 type byte. The inner RPC handler performs
@@ -117,61 +107,54 @@ impl Default for ShadowValidityConfig {
     }
 }
 
-/// Builder API that decorates sampled transactions before normal validated insertion.
-#[derive(Debug)]
-pub struct ShadowValidityBuilderApi<P, Provider> {
-    inner: BuilderApiImpl<P, TransactionValidity>,
-    config: ShadowValidityConfig,
-    provider: Provider,
-    experimental_override: bool,
+/// Adapts [`SharedMeteringProvider`] to the insert-path metering sink.
+#[derive(Debug, Clone)]
+struct InsertMeteringAdapter(SharedMeteringProvider);
+
+impl InsertMetering for InsertMeteringAdapter {
+    fn insert_metering(&self, tx_hash: TxHash, metering: MeterBundleResponse) {
+        self.0.insert(tx_hash, metering);
+    }
 }
 
-impl<P, Provider> ShadowValidityBuilderApi<P, Provider> {
+/// Builder API that decorates sampled transactions before normal validated insertion.
+#[derive(Debug)]
+pub struct ShadowValidityBuilderApi<P> {
+    inner: BuilderApiImpl<P, TransactionValidity>,
+    config: ShadowValidityConfig,
+}
+
+impl<P> ShadowValidityBuilderApi<P> {
     /// Creates a builder API using validated configuration.
-    pub const fn new(pool: P, provider: Provider, config: BuilderApiExtensionConfig) -> Self {
+    pub fn new(
+        pool: P,
+        config: BuilderApiExtensionConfig,
+        metering_provider: SharedMeteringProvider,
+    ) -> Self {
         Self {
-            inner: BuilderApiImpl::with_extensions(pool, true, config.max_validity_predicates),
-            config: config.shadow_validity,
-            provider,
-            experimental_override: config.accept_experimental_validity_transactions,
+            inner: BuilderApiImpl::with_extensions(pool, true, config.max_validity_predicates)
+                .with_validity_signature_mode(config.validity_signature_mode)
+                .with_metering_cache(Arc::new(InsertMeteringAdapter(metering_provider))),
+            // Shadow injection cannot create a user's signature. Never inject while
+            // enforcing authorization, even for callers constructing config directly.
+            config: if config.validity_signature_mode == ValiditySignatureMode::Required {
+                ShadowValidityConfig::disabled()
+            } else {
+                config.shadow_validity
+            },
         }
     }
 }
 
 #[async_trait::async_trait]
-impl<P, Provider> BuilderApiServer<TransactionValidity> for ShadowValidityBuilderApi<P, Provider>
+impl<P> BuilderApiServer<TransactionValidity> for ShadowValidityBuilderApi<P>
 where
     P: TransactionPool<Transaction = BasePooledTransaction> + Send + Sync + 'static,
-    Provider: BlockReaderIdExt + ChainSpecProvider<ChainSpec: Upgrades> + Send + Sync + 'static,
 {
     async fn insert_validated_transaction(
         &self,
         mut tx: ValidatedTransaction<TransactionValidity>,
     ) -> RpcResult<()> {
-        if !tx.extensions.validity.is_empty() && !self.experimental_override {
-            let active = self
-                .provider
-                .latest_header()
-                .map_err(|error| {
-                    ErrorObjectOwned::owned(
-                        ErrorCode::InternalError.code(),
-                        error.to_string(),
-                        None::<()>,
-                    )
-                })?
-                .is_some_and(|header| {
-                    self.provider.chain_spec().is_cobalt_active_at_timestamp(
-                        header.timestamp().saturating_add(PRE_DENIM_BLOCK_INTERVAL_SECS),
-                    )
-                });
-            if !active {
-                return Err(ErrorObjectOwned::owned(
-                    ErrorCode::InvalidParams.code(),
-                    "transaction extensions are disabled before Cobalt",
-                    None::<()>,
-                ));
-            }
-        }
         let outcome = self.config.inject(&mut tx);
         if self.config.is_enabled() {
             BuilderMetrics::shadow_validity_injection_total(outcome.label()).increment(1);
@@ -203,7 +186,11 @@ impl InjectionOutcome {
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::{Address, Bytes};
+    use alloy_consensus::TxEip1559;
+    use alloy_eips::eip2718::Encodable2718;
+    use alloy_primitives::{Address, Bytes, Signature};
+    use base_common_consensus::{BaseTransactionSigned, BaseTypedTransaction};
+    use reth_transaction_pool::noop::NoopTransactionPool;
 
     use super::*;
 
@@ -211,6 +198,7 @@ mod tests {
         ValidatedTransaction {
             sender: Address::repeat_byte(0x11),
             raw,
+            metering: None,
             extensions: TransactionValidity::default(),
         }
     }
@@ -258,11 +246,40 @@ mod tests {
     }
 
     #[test]
-    fn configuration_rejects_unsafe_combinations() {
+    fn signature_only_sidecars_are_not_modified_by_shadow_injection() {
+        let config = ShadowValidityConfig::enabled(MAX_SHADOW_VALIDITY_SAMPLE_RATE_BPS).unwrap();
+        let mut tx = transaction(Bytes::from_static(&[0x02, 0x01]));
+        tx.extensions.validity_signature =
+            Some(Signature::new(U256::from(1), U256::from(1), false));
+        let original = tx.clone();
+        assert_eq!(config.inject(&mut tx), InjectionOutcome::ExistingValidity);
+        assert_eq!(tx.extensions, original.extensions);
+    }
+
+    #[tokio::test]
+    async fn enforced_signatures_disable_shadow_injection_for_direct_config_callers() {
+        let api = ShadowValidityBuilderApi::new(
+            NoopTransactionPool::<BasePooledTransaction>::new(),
+            BuilderApiExtensionConfig::default()
+                .with_shadow_validity(
+                    ShadowValidityConfig::enabled(MAX_SHADOW_VALIDITY_SAMPLE_RATE_BPS).unwrap(),
+                )
+                .with_validity_signature_mode(ValiditySignatureMode::Required),
+            Arc::new(crate::NoopMeteringProvider),
+        );
+        let signed = BaseTransactionSigned::new_unhashed(
+            BaseTypedTransaction::Eip1559(TxEip1559 { chain_id: 8453, ..Default::default() }),
+            Signature::new(U256::from(1), U256::from(2), false),
+        );
+        let tx = transaction(signed.encoded_2718().into());
+        let error = api.insert_validated_transaction(tx).await.unwrap_err();
+        assert!(error.message().starts_with("pool rejected transaction:"));
+    }
+
+    #[test]
+    fn configuration_rejects_out_of_range_sample_rates() {
         assert!(ShadowValidityConfig::enabled(0).is_err());
         assert!(ShadowValidityConfig::enabled(MAX_SHADOW_VALIDITY_SAMPLE_RATE_BPS + 1).is_err());
-        let shadow = ShadowValidityConfig::enabled(1).unwrap();
-        assert!(BuilderApiExtensionConfig::new(false, 1).with_shadow_validity(shadow).is_err());
-        assert!(BuilderApiExtensionConfig::new(true, 1).with_shadow_validity(shadow).is_ok());
+        assert!(ShadowValidityConfig::enabled(MAX_SHADOW_VALIDITY_SAMPLE_RATE_BPS).is_ok());
     }
 }

@@ -301,11 +301,20 @@ pub enum TxTypeConfig {
     /// Uniswap V3 style swap.
     UniswapV3 {
         /// Router contract address.
-        router: Address,
+        ///
+        /// Required unless a harness flow auto-wires swap addresses.
+        #[serde(default)]
+        router: Option<Address>,
         /// Input token address.
-        token_in: Address,
+        ///
+        /// Required unless a harness flow auto-wires swap addresses.
+        #[serde(default)]
+        token_in: Option<Address>,
         /// Output token address.
-        token_out: Address,
+        ///
+        /// Required unless a harness flow auto-wires swap addresses.
+        #[serde(default)]
+        token_out: Option<Address>,
         /// Fee tier (default 3000 = 0.3%).
         #[serde(default = "default_uniswap_v3_fee")]
         fee: u32,
@@ -329,11 +338,20 @@ pub enum TxTypeConfig {
     /// Aerodrome Slipstream (concentrated liquidity) swap.
     AerodromeCl {
         /// CL Router contract address.
-        router: Address,
+        ///
+        /// Required unless a harness flow auto-wires swap addresses.
+        #[serde(default)]
+        router: Option<Address>,
         /// Input token address.
-        token_in: Address,
+        ///
+        /// Required unless a harness flow auto-wires swap addresses.
+        #[serde(default)]
+        token_in: Option<Address>,
         /// Output token address.
-        token_out: Address,
+        ///
+        /// Required unless a harness flow auto-wires swap addresses.
+        #[serde(default)]
+        token_out: Option<Address>,
         /// Tick spacing for the pool.
         #[serde(default = "default_aerodrome_tick_spacing")]
         tick_spacing: i32,
@@ -617,6 +635,7 @@ impl TestConfig {
                 .unwrap_or_default(),
             fresh_recipient_ratio: self.fresh_recipient_ratio,
             validity_ratio: self.validity.ratio,
+            validity_signing: self.validity.signing,
             validity_predicate_count: self.validity.predicates.len(),
             validity_priority_lead_ratio: self.validity.priority_lead_ratio,
             validity_priority_lead_multiplier: self.validity.priority_lead_multiplier,
@@ -687,8 +706,10 @@ impl TestConfig {
             batch_size: self.batch_size as usize,
             max_gas_price: crate::runner::DEFAULT_MAX_GAS_PRICE,
             flashblocks_ws: self.flashblocks_ws.clone(),
+            canonical_heads_ws: None,
             fresh_recipient_ratio: self.fresh_recipient_ratio,
             validity_ratio: self.validity.ratio,
+            validity_signing: self.validity.signing,
             validity_predicates: self.validity.to_templates()?,
             validity_priority_lead_ratio: self.validity.priority_lead_ratio,
             validity_priority_lead_multiplier: self.validity.priority_lead_multiplier,
@@ -757,10 +778,28 @@ impl TestConfig {
                     reverse_max_amount,
                     "uniswap_v3 reverse",
                 )?;
+                let router = router.ok_or_else(|| {
+                    BaselineError::Config(
+                        "uniswap_v3 router is required (set deploy_devnet_swap_harness for fresh-devnet auto-deploy)"
+                            .into(),
+                    )
+                })?;
+                let token_in = token_in.ok_or_else(|| {
+                    BaselineError::Config(
+                        "uniswap_v3 token_in is required (set deploy_devnet_swap_harness for fresh-devnet auto-deploy)"
+                            .into(),
+                    )
+                })?;
+                let token_out = token_out.ok_or_else(|| {
+                    BaselineError::Config(
+                        "uniswap_v3 token_out is required (set deploy_devnet_swap_harness for fresh-devnet auto-deploy)"
+                            .into(),
+                    )
+                })?;
                 TxType::UniswapV3 {
-                    router: *router,
-                    token_in: *token_in,
-                    token_out: *token_out,
+                    router,
+                    token_in,
+                    token_out,
                     fee: *fee,
                     min_amount: *min_amount,
                     max_amount: *max_amount,
@@ -791,10 +830,28 @@ impl TestConfig {
                         "aerodrome_cl tick_spacing {tick_spacing} exceeds i24 range"
                     )));
                 }
+                let router = router.ok_or_else(|| {
+                    BaselineError::Config(
+                        "aerodrome_cl router is required (set deploy_devnet_swap_harness for fresh-devnet auto-deploy)"
+                            .into(),
+                    )
+                })?;
+                let token_in = token_in.ok_or_else(|| {
+                    BaselineError::Config(
+                        "aerodrome_cl token_in is required (set deploy_devnet_swap_harness for fresh-devnet auto-deploy)"
+                            .into(),
+                    )
+                })?;
+                let token_out = token_out.ok_or_else(|| {
+                    BaselineError::Config(
+                        "aerodrome_cl token_out is required (set deploy_devnet_swap_harness for fresh-devnet auto-deploy)"
+                            .into(),
+                    )
+                })?;
                 TxType::AerodromeCl {
-                    router: *router,
-                    token_in: *token_in,
-                    token_out: *token_out,
+                    router,
+                    token_in,
+                    token_out,
                     tick_spacing: *tick_spacing,
                     min_amount: *min_amount,
                     max_amount: *max_amount,
@@ -1411,11 +1468,11 @@ validity:
         let yaml = include_str!("../../examples/validity-devnet.yaml");
         let config = TestConfig::from_yaml(yaml).expect("validity-devnet.yaml must parse");
         assert_eq!(config.validity.ratio, 0.5);
-        assert_eq!(config.validity.predicates.len(), 1);
+        assert_eq!(config.validity.predicates.len(), 2);
 
         let load_config = config.to_load_config(Some(1337)).expect("must lower to LoadConfig");
         assert_eq!(load_config.validity_ratio, 0.5);
-        assert_eq!(load_config.validity_predicates.len(), 1);
+        assert_eq!(load_config.validity_predicates.len(), 2);
     }
 
     #[test]
@@ -1525,6 +1582,25 @@ transactions:
             }
             _ => panic!("expected AerodromeCl"),
         }
+    }
+
+    #[test]
+    fn swap_configs_allow_missing_addresses_until_runtime_resolution() {
+        let yaml = r#"
+transaction_submission_rpcs: http://localhost:8545
+flashblocks_ws: ws://localhost:7111
+transactions:
+  - weight: 50
+    type: uniswap_v3
+    fee: 500
+  - weight: 50
+    type: aerodrome_cl
+    tick_spacing: 100
+"#;
+
+        let config = TestConfig::from_yaml(yaml).unwrap();
+        let error = config.to_load_config(Some(84538453)).unwrap_err();
+        assert!(error.to_string().contains("uniswap_v3 router is required"));
     }
 
     #[test]

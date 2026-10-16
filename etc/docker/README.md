@@ -2,17 +2,28 @@
 
 This directory contains the Dockerfiles and Compose configuration for the **local devnet** and internal Rust services.
 
-The public operator image (`ghcr.io/base/node`) is the `base` target in `Dockerfile.rust-services`. Published images and operator `--build` use `PROFILE=release` (same as `base/node`), while `just devnet` builds `dev`. `PROFILE` is set on the shared `_rust-service-common` target, so passing it as an environment variable applies it to every target in the invocation; to give one target a different profile, override just that target's build arg — `docker buildx bake -f etc/docker/docker-bake.hcl builder consensus --set builder.args.PROFILE=release-symbols --load` builds `builder` with profiling symbols while `consensus` stays on the default `release`. Operator entrypoints live in `etc/scripts/node/`; operators edit `.env.mainnet` / `.env.sepolia` at the repo root. Root `docker-compose.yml` pulls the published image, or compiles this tree with `--build`. `just devnet up` overrides the entrypoint to `./base`.
+The public operator image (`ghcr.io/base/node`) is the `base` target in `Dockerfile.rust-services`. It retains the unified binary, execution node, consensus node, and snapshotter for compatibility. Releases also publish single-binary images:
+
+| Image | Bake target | Entrypoint |
+| --- | --- | --- |
+| `ghcr.io/base/base` | `unified` | `base` |
+| `ghcr.io/base/base-reth-node` | `execution` | `base-reth-node` |
+| `ghcr.io/base/base-consensus` | `consensus` | `base-consensus` |
+| `ghcr.io/base/base-builder` | `builder` | `base-builder` |
+| `ghcr.io/base/basectl` | `basectl` | `basectl` |
+| `ghcr.io/base/base-snapshotter` | `snapshotter` | `snapshotter` |
+
+RC and final releases apply the same version tag to every image. Published images and operator `--build` use `PROFILE=release` (same as `base/node`), while `just devnet` builds `dev`. `PROFILE` is set on the shared `_rust-service-common` target, so passing it as an environment variable applies it to every target in the invocation; to give one target a different profile, override just that target's build arg — `docker buildx bake -f etc/docker/docker-bake.hcl builder consensus --set builder.args.PROFILE=release-symbols --load` builds `builder` with profiling symbols while `consensus` stays on the default `release`. Operator entrypoints live in `etc/scripts/node/`; operators edit `.env.mainnet` / `.env.sepolia` at the repo root. Root `docker-compose.yml` pulls the published image, or compiles this tree with `--build`. `just devnet up` overrides the entrypoint to `./base`.
 
 ## Dockerfiles
 
-`Dockerfile.rust-services` is the shared multi-target Dockerfile for the Debian-based Rust services. The `base` target is published as `ghcr.io/base/node` and is also the local devnet image. Devnet compose overrides the default supervisord CMD.
+`Dockerfile.rust-services` is the shared multi-target Dockerfile for the Debian-based Rust services. The `base` target is published as `ghcr.io/base/node` and is also the local devnet image. The `unified` target contains only the `base` binary. Devnet compose overrides the compatibility image's default supervisord CMD.
 
 `Dockerfile.devnet` builds a utility image containing genesis generation tools (`eth-genesis-state-generator`, `eth2-val-tools`, `op-deployer`) and setup scripts. This image bootstraps L1 and L2 chain configurations for local development.
 
 `Dockerfile.op-batcher` builds Go `op-batcher/v1.16.5` at commit
 [`abe047af`](https://github.com/ethereum-optimism/optimism/commit/abe047afc995e0e22abf5ea9b157e267e907d494),
-matching the Base mainnet infrastructure source pin. The `devnet` and `ingress`
+matching the Base mainnet infrastructure source pin. The `devnet` and `tx-observability`
 Bake groups build it as `op-batcher:local`; it runs as the canonical batcher.
 The Rust `base batcher` (the `base batcher` subcommand of `base:local`) runs
 alongside it in shadow mode; no separate Rust batcher image is needed.
@@ -23,7 +34,7 @@ image cannot bypass the integrated offline generator. Bump the tag in the setup
 container, smoke test, Justfile, and Compose files when changing this interface.
 
 Compose devnets and the system-test stack use `op-deployer`, built from
-[`base/optimism` at `0066b17c`](https://github.com/base/optimism/tree/0066b17c3fe0cbb5ea935de6d5b18d4fc86dc439).
+[`base/optimism` at `896142b3`](https://github.com/base/optimism/tree/896142b334ea20220aa552e9478e5ec406716911).
 The binary generates both chains offline in one process, applies Base activation
 settings, merges L1 contract allocations with the prefunded genesis template, and
 writes the final execution and rollup configs. Contract artifacts are unpacked
@@ -60,7 +71,7 @@ The `docker-compose.yml` orchestrates a complete local devnet environment with b
 - Unified Base sequencer and validator/RPC nodes on L2
 - The canonical Go `op-batcher` (`op-batcher` service) submitting L2 data to L1
 - The Rust `base batcher` (`base-batcher` service) running in **shadow mode**
-- A shadow validator (`base-shadow-validator` service) deriving the shadow DA
+- A shadow validator (`base-shadow-validator` service) deriving its chain from the shadow DA
 
 All services read configuration from `devnet-env` in this directory. The devnet stores chain data in `.devnet/` which is created on first run.
 
@@ -77,10 +88,18 @@ infrastructure:
   mainnet's runtime config. `--txmgr.cell-proof-time=0` enables Fusaka cell
   proofs from genesis for the local L1 (chain ID 1337), which this version does
   not auto-detect.
-- **Shadow DA — `base-batcher`.** The Rust `base batcher` runs in `--shadow-mode`,
-  posting to `SHADOW_BATCH_INBOX_ADDRESS` from `SHADOW_BATCHER_ADDR` — a distinct,
-  funded dev account, so its L1 nonces never collide with the op-batcher's. It
-  anchors recovery on the shadow validator via `--parity-validator-l2-rpc-url`.
+- **Shadow DA — `base-batcher`.** The Rust `base batcher` runs in shadow mode
+  (`--shadow.enabled`), posting to `SHADOW_BATCH_INBOX_ADDRESS` from
+  `SHADOW_BATCHER_ADDR` — a distinct, funded dev account, so its L1 nonces never
+  collide with the op-batcher's. It reads the blocks to submit through
+  `--sequencer-urls`: the consensus RPC of `base-builder`, which forwards the
+  block reads to its execution client, or the three conductors in the HA
+  devnet, among which it finds the leader. It follows the shadow validator's
+  derivation through `--shadow.validator-rollup-rpc`, checks through
+  `--shadow.inbox` that the batch inbox of the validator's rollup config is
+  `SHADOW_BATCH_INBOX_ADDRESS`, and compares the validator's blocks with the
+  leader sequencer's through `--shadow.validator-l2-rpc`. It runs with
+  `--no-throttle`, which shadow mode requires.
 - **Shadow validator — `base-shadow-validator`.** A validator-mode `rpc` node
   that overrides the batch inbox and batcher sender
   (`--l1.dangerously-override-da-batch-inbox`,
@@ -164,14 +183,13 @@ just anvil-nitro-local up
 Set `L2_BASE_DENIM_BLOCK` to another block to move activation, or set it to an
 empty value to leave Denim unscheduled.
 
-To exercise validity transactions on the native payload builder, the deployment
-must schedule Denim and configure both sides of the forwarding path:
+To exercise validity transactions on the native payload builder, the deployment must schedule Denim and configure both sides
+of the forwarding path:
 
-- builder: `--builder.enable-experimental-validity-transactions` and
-  `--builder.payload-builder-cutover`. The builder flag also registers
-  `base_sendRawTransactionValidity` for direct ingress.
-- ingress/client: `--enable-experimental-validity-transactions` and a
-  `--builder-rpc-urls` endpoint targeting the builder
+- builder: `--builder.payload-builder-cutover`. The builder always registers
+  `base_sendRawTransactionValidity` for direct submission.
+- mempool/client: `--enable-tx-forwarding` and a `--builder-rpc-urls` endpoint
+  targeting the builder
 
 The default devnet compose files include these flags and schedule Cobalt at
 block 22 and Denim at block 25. Builder selection and block cadence change at
@@ -179,8 +197,15 @@ Denim. Native payload building supports balance,
 storage, and block-number predicates; `flashblock_index` predicates remain specific
 to the Flashblocks builder and are rejected after the Denim cutover.
 
+Everest enables EIP-8130 account-abstraction transactions. Everest mode additionally
+activates Everest at block 100:
+
+```bash
+just devnet up everest
+```
+
 Zenith is the permanently unscheduled, genesis-only gate for future hardfork feature testing.
-Zenith mode additionally activates Zenith at block 100:
+Zenith mode additionally activates Everest and Zenith at block 100:
 
 ```bash
 just devnet up zenith
@@ -206,6 +231,40 @@ To observe the L1 schedule without dynamically applying it, start devnet in metr
 ```bash
 UPGRADE_SIGNAL_MODE=metrics-only just devnet up
 ```
+
+### Dynamic upgrades dashboard
+
+Open the [Base Devnet Control Room](http://localhost:3000/d/devnet-overview) and
+select **Dynamic Upgrades**, or open the
+[dashboard directly](http://localhost:3000/d/dynamic-upgrades). Grafana provisions
+it automatically from `etc/scripts/devnet/grafana/dashboards/dynamic-upgrades.json`;
+no manual import or additional service is required. The control-room link retains
+the time range and node filters. Leave both layers selected to compare execution
+(`el`) and consensus (`cl`), then filter by upgrade or instance to investigate.
+
+Use the schedule and propagation panels while running the upgrade-signal commands
+above. Activation timestamps and minimum protocol versions describe the schedule
+**observed from L1**, not proof of successful application or node readiness.
+Timestamp zero means unscheduled; protocol versions are encoded as
+`major * 1_000_000 + minor * 1_000 + patch`. Divergence compares only the selected,
+reporting nodes and layers, so check scrape availability and reporter coverage too.
+
+**No data is not a healthy zero.** Upgrade counters are created lazily, and an
+apply-status gauge may not exist until a live apply is attempted. Counter increases
+can miss the first event; fail-closed counters are best-effort because the process
+may exit before Prometheus scrapes them. Check node logs and scrape availability
+when investigating a halt. Empty-schedule reads are per layer and deliberately
+ignore the upgrade filter. In `metrics-only` mode, observing a schedule does not
+apply it.
+
+Validate the dashboard queries and edge cases without starting a devnet (requires
+Python 3 and Docker):
+
+```bash
+python3 etc/scripts/devnet/grafana/test-dynamic-upgrades.py
+```
+
+### Building individual images
 
 To build a specific Rust service image directly:
 

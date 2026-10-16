@@ -26,12 +26,12 @@ base_metrics::define_metrics! {
             "safe_head_reorg",
             "safe_head_mismatch",
             "stalled_channel",
-            "admin_pause",
+            "admin_stop",
         ]
     )]
     pipeline_reset_total: counter,
     #[describe("Total number of L1 batch submissions")]
-    #[label(name = "outcome", default = ["submitted", "confirmed", "failed", "requeued"])]
+    #[label(name = "outcome", default = ["submitted", "confirmed", "failed"])]
     submission_total: counter,
     #[describe("Total bytes of frame payload submitted to the DA layer")]
     #[label(name = "da_type", default = ["blob", "calldata"])]
@@ -51,6 +51,8 @@ base_metrics::define_metrics! {
     pending_blocks: gauge,
     #[describe("Number of L1 transactions currently in-flight")]
     in_flight_submissions: gauge,
+    #[describe("Whether the L1 head WebSocket subscription is live (0: polling only)")]
+    l1_head_subscription_active: gauge,
     #[describe("Compression ratio for each closed channel")]
     channel_compression_ratio: histogram,
     #[describe("Channel lifetime in L1 blocks")]
@@ -96,8 +98,8 @@ impl BatcherMetrics {
     /// The rollup node passed a fully confirmed channel without deriving it.
     pub const RESET_STALLED_CHANNEL: &'static str = "stalled_channel";
 
-    /// The batcher was paused through the admin API.
-    pub const RESET_ADMIN_PAUSE: &'static str = "admin_pause";
+    /// The batcher was stopped through the admin API.
+    pub const RESET_ADMIN_STOP: &'static str = "admin_stop";
 
     /// Submission accepted and handed to the tx manager.
     pub const OUTCOME_SUBMITTED: &'static str = "submitted";
@@ -105,11 +107,8 @@ impl BatcherMetrics {
     /// Submission confirmed on L1.
     pub const OUTCOME_CONFIRMED: &'static str = "confirmed";
 
-    /// Submission failed (tx reverted or timed out) and was requeued.
+    /// Submission failed for any reason and was requeued.
     pub const OUTCOME_FAILED: &'static str = "failed";
-
-    /// Submission requeued due to txpool blockage.
-    pub const OUTCOME_REQUEUED: &'static str = "requeued";
 
     /// Blob DA: frames encoded into EIP-4844 blobs.
     pub const DA_TYPE_BLOB: &'static str = "blob";

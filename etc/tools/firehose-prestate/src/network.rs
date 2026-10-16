@@ -75,6 +75,7 @@ impl PrestateNetwork {
                 beryl: chain.beryl_timestamp,
                 cobalt: chain.cobalt_timestamp,
                 denim: chain.denim_timestamp,
+                everest: chain.everest_timestamp,
                 zenith: None,
             },
             activation_admin_address: ChainConfig::beryl_activation_admin_address_by_chain_id(
