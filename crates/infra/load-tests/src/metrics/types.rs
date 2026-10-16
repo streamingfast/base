@@ -185,9 +185,9 @@ pub struct GasMetrics {
 pub struct ThroughputSample {
     /// Elapsed time since the test started, in seconds.
     pub elapsed_secs: f64,
-    /// Rolling 30s transactions-per-second at this point.
+    /// Rolling 10-second transactions-per-second at this point.
     pub tps: f64,
-    /// Rolling 30s gas-per-second at this point.
+    /// Rolling 10-second gas-per-second at this point.
     pub gps: f64,
 }
 
@@ -391,6 +391,9 @@ pub struct ConfigSummary {
     /// Fraction of senders routed through the validity submission endpoint.
     #[serde(default)]
     pub validity_ratio: f64,
+    /// Sidecar signing strategy used during staged validity-signature rollout.
+    #[serde(default)]
+    pub validity_signing: crate::config::ValiditySigningMode,
     /// Number of predicate templates attached to validity transactions.
     #[serde(default)]
     pub validity_predicate_count: usize,

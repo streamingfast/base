@@ -7,7 +7,6 @@
 //!   flashblock WebSocket feed and emits per-flashblock partial-block FIRE
 //!   events via a separate, dedicated tracer.
 
-use alloy_primitives::B256;
 use base_firehose_flashblocks::{
     FirehoseFlashblocksProcessor, FirehoseFlashblocksStreamer, FlashblocksTracerHandle,
 };
@@ -15,7 +14,6 @@ use base_node_runner::{BaseNodeExtension, FromExtensionConfig, NodeHooks};
 use reth_chain_state::CanonStateSubscriptions;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_engine_primitives::ConsensusEngineEvent;
-use tokio::sync::mpsc;
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{debug, info, warn};
 use url::Url;
@@ -80,17 +78,37 @@ impl BaseNodeExtension for FirehoseFlashblocksExtension {
     fn apply(self: Box<Self>, hooks: NodeHooks) -> NodeHooks {
         let ws_url = self.ws_url;
 
-        // Both hooks need to push canonical blocks into the processor, but the processor is only
-        // available in the node-started hook. Use an unbounded mpsc so the engine-event hook can
-        // forward early signals (`BlockReceived` at newPayload arrival, `CanonicalBlockAdded`
-        // after validation+insertion) without knowing the processor's concrete type. The
-        // `final_part_sent` guard inside the processor prevents double-emission when both
-        // variants deliver the same (block_number, hash).
-        let (canonical_tx, mut canonical_rx) = mpsc::unbounded_channel::<(u64, B256)>();
+        hooks.add_node_started_hook(move |full_node| {
+            if !reth_firehose::is_tracer_initialized() {
+                warn!(
+                    url = %ws_url,
+                    "skipping Firehose flashblocks streamer: Firehose tracer is not initialized"
+                );
+                return Ok(());
+            }
+            let chain_id = full_node.provider.chain_spec().chain().id();
+            let chain_config = firehose_tracer::config::ChainConfig::new(chain_id);
+            let tracer_config = firehose_tracer::config::Config {
+                chain_client: firehose_tracer::config::ChainClient::Reth,
+                ..Default::default()
+            };
+            let tracer = FlashblocksTracerHandle::new(tracer_config, chain_config);
+            let processor = FirehoseFlashblocksProcessor::new(full_node.provider.clone(), tracer);
+            info!(url = %ws_url, "starting Firehose flashblocks streamer");
+            let streamer = FirehoseFlashblocksStreamer::new(processor, ws_url);
+            // All canonical signals feed the processor's single serialized command queue, so
+            // they are applied in strict arrival order relative to each other and to the
+            // WebSocket flashblock stream — never concurrently. The `final_part_sent` guard
+            // inside the processor prevents double-emission when several signals deliver the
+            // same (block_number, hash).
+            let canonical_block_sender = streamer.canonical_block_sender();
+            streamer.start();
 
-        let hooks = hooks.add_engine_event_listener_hook(move |mut events| {
+            // Earliest in-engine signals, from the consensus engine's event broadcast.
+            let mut engine_events = full_node.add_ons_handle.engine_events.new_listener();
+            let canonical_block_sender_for_engine = canonical_block_sender.clone();
             tokio::spawn(async move {
-                while let Some(event) = events.next().await {
+                while let Some(event) = engine_events.next().await {
                     let (number, hash, source) = match event {
                         // Fires the moment the engine receives a payload from the consensus
                         // layer, before validation and insertion. Mirrors geth's
@@ -102,10 +120,10 @@ impl BaseNodeExtension for FirehoseFlashblocksExtension {
                         ConsensusEngineEvent::BlockReceived(num_hash) => {
                             (num_hash.number, num_hash.hash, "BlockReceived")
                         }
-                        // Fallback: fires after the engine has validated and added the block
-                        // to the canonical chain. Carries the same (number, hash) — racing
-                        // with BlockReceived; whichever arrives first triggers the
-                        // is_final emission, the other is a no-op via `final_part_sent`.
+                        // Fires after the engine has validated and added the block to the
+                        // canonical chain. Carries the same (number, hash) — racing with
+                        // BlockReceived; whichever arrives first triggers the is_final emission,
+                        // the other is a no-op via `final_part_sent`.
                         ConsensusEngineEvent::CanonicalBlockAdded(block, _elapsed) => (
                             block.recovered_block.number,
                             block.recovered_block.hash(),
@@ -120,44 +138,6 @@ impl BaseNodeExtension for FirehoseFlashblocksExtension {
                         source,
                         "engine canonical signal",
                     );
-                    if canonical_tx.send((number, hash)).is_err() {
-                        return;
-                    }
-                }
-            });
-        });
-
-        let ws_url_for_node = ws_url.clone();
-        hooks.add_node_started_hook(move |full_node| {
-            if !reth_firehose::is_tracer_initialized() {
-                warn!(
-                    url = %ws_url_for_node,
-                    "skipping Firehose flashblocks streamer: Firehose tracer is not initialized"
-                );
-                return Ok(());
-            }
-            let chain_id = full_node.provider.chain_spec().chain().id();
-            let chain_config = firehose_tracer::config::ChainConfig::new(chain_id);
-            let tracer_config = firehose_tracer::config::Config {
-                chain_client: firehose_tracer::config::ChainClient::Reth,
-                ..Default::default()
-            };
-            let tracer = FlashblocksTracerHandle::new(tracer_config, chain_config);
-            let processor =
-                FirehoseFlashblocksProcessor::new(full_node.provider.clone(), tracer);
-            info!(url = %ws_url_for_node, "starting Firehose flashblocks streamer");
-            let streamer = FirehoseFlashblocksStreamer::new(processor, ws_url_for_node);
-            // Both canonical signals feed the processor's single serialized command queue, so
-            // they are applied in strict arrival order relative to each other and to the
-            // WebSocket flashblock stream — never concurrently.
-            let canonical_block_sender = streamer.canonical_block_sender();
-            streamer.start();
-
-            // Earliest in-engine signal: drain canonical blocks forwarded by the engine-event
-            // listener installed above.
-            let canonical_block_sender_for_engine = canonical_block_sender.clone();
-            tokio::spawn(async move {
-                while let Some((number, hash)) = canonical_rx.recv().await {
                     canonical_block_sender_for_engine.send(number, hash);
                 }
             });

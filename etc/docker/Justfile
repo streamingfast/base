@@ -187,7 +187,7 @@ upgrade-signal-future upgrade='azul' offset='120':
 # Runs full devnet checks (status + smoke tests)
 checks: status smoke
 
-# Sends an ingress transaction and verifies transaction events reached audit-archiver Postgres
+# Sends a transaction through proxyd and verifies transaction events reached audit-archiver Postgres
 tx-observability-smoke:
     @./etc/scripts/devnet/transaction-events-smoke.sh
 
@@ -216,19 +216,19 @@ transfer-leader to='':
 conductor:
     cargo run --quiet -p basectl -- -c devnet monitor conductor
 
-# Stops devnet+ingress, deletes data, and starts fresh with full ingress stack
-ingress: ingress-down _build-setup-image (_build-rust-images "ingress" "dev")
+# Stops devnet+tx-observability, deletes data, and starts fresh with full observability stack
+tx-observability: tx-observability-down _build-setup-image (_build-rust-images "tx-observability" "dev")
     mkdir -p .devnet
-    docker compose {{ _env }} {{ _base }} -f etc/docker/docker-compose.ingress.yml up -d --no-build
+    docker compose {{ _env }} {{ _base }} -f etc/docker/docker-compose.tx-observability.yml up -d --no-build
 
-# Stops devnet+ingress and deletes all data
-ingress-down:
-    -docker compose {{ _env }} {{ _base }} -f etc/docker/docker-compose.ingress.yml down
+# Stops devnet+tx-observability and deletes all data
+tx-observability-down:
+    -docker compose {{ _env }} {{ _base }} -f etc/docker/docker-compose.tx-observability.yml down
     -[ ! -d .devnet ] || docker run --rm -v "$(pwd)/.devnet:/devnet" alpine sh -c 'rm -rf /devnet/*'
 
-# Stream logs from devnet+ingress containers (optionally specify container names)
-ingress-logs *containers:
-    docker compose {{ _env }} {{ _base }} -f etc/docker/docker-compose.ingress.yml logs -f {{ containers }}
+# Stream logs from devnet+tx-observability containers (optionally specify container names)
+tx-observability-logs *containers:
+    docker compose {{ _env }} {{ _base }} -f etc/docker/docker-compose.tx-observability.yml logs -f {{ containers }}
 
 # Builds one of the shared Rust service images (default: base)
 build-image target='base' profile='dev':
@@ -262,14 +262,13 @@ tests: _install-nextest _build-contracts
 tests-ci: _install-nextest _build-contracts
     RUST_MIN_STACK={{ system_test_min_stack }} cargo nextest run -P ci --locked -p base-system-tests --cargo-profile ci --no-fail-fast
 
-# Runs system test benchmarks
-bench name:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    case "{{ name }}" in
-      b20-zk-proving) cargo bench -p base-system-tests --bench b20_zk_proving ;;
-      *) echo "unknown system test bench: {{ name }}" >&2; exit 1 ;;
-    esac
+# Builds base-bench in release mode and runs a benchmark
+bench *args:
+    cargo run --release -p base-system-tests --bin base-bench -- {{ args }}
+
+# Runs the B-20 ZK proving system benchmark
+proofs-bench:
+    cargo bench -p base-system-tests --bench b20_zk_proving
 
 [private]
 _install-nextest:
@@ -291,7 +290,7 @@ _build-rust-images group profile='dev':
     case "{{ profile }}" in
       dev|profiling)
         case "{{ group }}" in
-          devnet|ingress) elf_require=0 ;;
+          devnet|tx-observability) elf_require=0 ;;
         esac
         ;;
     esac
@@ -308,16 +307,22 @@ _up-devnet compose_profile mode:
     compose_profile={{ quote(compose_profile) }}
     devnet_mode={{ quote(mode) }}
 
-    # Denim is scheduled through devnet-env. Zenith mode additionally schedules the
-    # genesis-only Zenith gate used for future hardfork feature testing.
+    # Denim is scheduled through devnet-env. Everest mode additionally schedules Everest
+    # (EIP-8130). Zenith mode schedules Everest plus the genesis-only Zenith gate used for
+    # future hardfork feature testing.
     case "$devnet_mode" in
       default) ;;
+      everest)
+        export L2_BASE_DENIM_BLOCK="${L2_BASE_DENIM_BLOCK-25}"
+        export L2_BASE_EVEREST_BLOCK="${L2_BASE_EVEREST_BLOCK:-100}"
+        ;;
       zenith)
         export L2_BASE_DENIM_BLOCK="${L2_BASE_DENIM_BLOCK-25}"
+        export L2_BASE_EVEREST_BLOCK="${L2_BASE_EVEREST_BLOCK:-100}"
         export L2_BASE_ZENITH_BLOCK="${L2_BASE_ZENITH_BLOCK:-100}"
         ;;
       *)
-        echo "ERROR: mode must be 'default' or 'zenith' (got '${devnet_mode}')" >&2
+        echo "ERROR: mode must be 'default', 'everest', or 'zenith' (got '${devnet_mode}')" >&2
         exit 1
         ;;
     esac
@@ -326,7 +331,7 @@ _up-devnet compose_profile mode:
       ha)
         compose_files=({{ _ha }})
         # Any of the three conductor-managed sequencers can be the leader/builder,
-        # so ingress nodes fan validity (advanced) txs out to all of them.
+        # so mempool nodes fan validity (advanced) txs out to all of them.
         export VALIDITY_BUILDER_RPC_URLS="http://base-builder:${L2_BUILDER_HTTP_PORT},http://base-sequencer-1:${L2_SEQ1_HTTP_PORT},http://base-sequencer-2:${L2_SEQ2_HTTP_PORT}"
         ;;
       base) compose_files=({{ _base }}) ;;

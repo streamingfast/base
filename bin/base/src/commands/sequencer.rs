@@ -65,6 +65,7 @@ impl SequencerCommand {
         consensus_config.upgrade_signal = builder.rollup_args.upgrade_signal.clone();
         let consensus_args = ConsensusNodeArgs::new(consensus_chain, consensus_config);
         let mut rollup_config = consensus_args.load_rollup_config()?;
+        Arc::make_mut(&mut execution_chain).block_time = Some(rollup_config.block_time);
 
         let rollup_args = builder.rollup_args.clone();
         let sequencer_rpc = rollup_args.sequencer.clone();
@@ -111,14 +112,15 @@ impl SequencerCommand {
                         .with_cutover_enabled(payload_builder_cutover)
                         .with_basic_only(basic_payload_builder),
                 );
-            runner.install_ext::<MeteringStoreExtension>(metering_provider);
+            runner.install_ext::<MeteringStoreExtension>(Arc::clone(&metering_provider));
             runner.install_ext::<TxPoolRpcExtension>(TxPoolRpcConfig { sequencer_rpc });
-            runner.install_ext::<BuilderApiExtension>(builder_api_config);
+            runner.install_ext::<BuilderApiExtension>(
+                builder_api_config.with_metering_provider(metering_provider),
+            );
             runner.install_ext::<SendRawTransactionValidityExtension>(
                 SendRawTransactionValidityConfig {
                     max_validity_predicates: builder_api_config.max_validity_predicates,
-                    experimental_override: builder_api_config
-                        .accept_experimental_validity_transactions,
+                    validity_signature_mode: builder_api_config.validity_signature_mode,
                     ..Default::default()
                 },
             );

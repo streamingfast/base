@@ -29,9 +29,6 @@ reth-chain-state.workspace = true
 reth-engine-primitives.workspace = true
 base-execution-cli = { workspace = true, features = ["otlp"] }
 
-# alloy
-alloy-primitives.workspace = true
-
 # cli
 url.workspace = true
 clap.workspace = true
@@ -48,7 +45,9 @@ tokio-stream.workspace = true
 tracing.workspace = true
 
 [features]
-default = [ "jemalloc" ]
+default = [ "asm-keccak", "jemalloc", "keccak-cache-global" ]
+asm-keccak = [ "base-execution-cli/asm-keccak" ]
+keccak-cache-global = [ "base-execution-cli/keccak-cache-global" ]
 jemalloc = [ "base-execution-cli/jemalloc", "reth-cli-util/jemalloc" ]
 jemalloc-prof = [
 	"base-execution-cli/jemalloc-symbols",

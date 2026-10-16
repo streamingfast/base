@@ -6,7 +6,7 @@ use revm::precompile::PrecompileId;
 use url::Url;
 
 use crate::{
-    config::OsakaTarget,
+    config::{OsakaTarget, ValiditySigningMode},
     utils::{BaselineError, Result},
 };
 
@@ -85,6 +85,15 @@ pub enum ValidityPredicateTemplate {
     /// Balance comparison template.
     Balance {
         /// Account whose balance is read.
+        address: PredicateAddress,
+        /// Comparison operator.
+        op: ValidityOperator,
+        /// Right-hand comparison value.
+        value: U256,
+    },
+    /// Protocol-nonce comparison template.
+    Nonce {
+        /// Account whose protocol nonce is read.
         address: PredicateAddress,
         /// Comparison operator.
         op: ValidityOperator,
@@ -292,11 +301,15 @@ pub struct LoadConfig {
     pub max_gas_price: u128,
     /// Optional builder flashblocks WebSocket used for early inclusion signals.
     pub flashblocks_ws: Option<Url>,
+    /// Optional canonical `newHeads` WebSocket used for lightweight block-boundary pacing.
+    pub canonical_heads_ws: Option<Url>,
     /// Fraction of transactions that draw a fresh recipient address instead of cycling through
     /// the sender pool. Used to drive account-trie fan-out for account-create workloads.
     pub fresh_recipient_ratio: f64,
     /// Fraction `0.0..=1.0` of senders routed through `base_sendRawTransactionValidity`.
     pub validity_ratio: f64,
+    /// Sidecar signing strategy during staged signature rollout.
+    pub validity_signing: ValiditySigningMode,
     /// Predicate templates attached to each validity-bearing transaction.
     pub validity_predicates: Vec<ValidityPredicateTemplate>,
     /// Fraction of validity senders in the priority-lead cohort.
@@ -334,8 +347,10 @@ impl LoadConfig {
             batch_size: crate::rpc::MAX_BATCH_RPC_SIZE,
             max_gas_price: DEFAULT_MAX_GAS_PRICE,
             flashblocks_ws: None,
+            canonical_heads_ws: None,
             fresh_recipient_ratio: 0.0,
             validity_ratio: 0.0,
+            validity_signing: ValiditySigningMode::Adaptive,
             validity_predicates: Vec::new(),
             validity_priority_lead_ratio: 0.0,
             validity_priority_lead_multiplier: 1,
@@ -445,6 +460,12 @@ impl LoadConfig {
         }
         if self.flashblocks_ws.as_ref().is_some_and(|url| !matches!(url.scheme(), "ws" | "wss")) {
             return Err(BaselineError::Config("flashblocks_ws must use ws:// or wss://".into()));
+        }
+        if self.canonical_heads_ws.as_ref().is_some_and(|url| !matches!(url.scheme(), "ws" | "wss"))
+        {
+            return Err(BaselineError::Config(
+                "canonical_heads_ws must use ws:// or wss://".into(),
+            ));
         }
         Ok(())
     }

@@ -43,9 +43,10 @@ pub use common::{
     AbiFingerprint, FakePolicyAccounting, InMemoryTokenAccounting, TestStablecoinToken,
 };
 pub use common::{
-    B20_MAX_SUPPLY_CAP, B20Abi, B20CoreStorage, B20Guards, B20PausableFeature, B20PolicyType,
-    B20TokenRole, Eip712Domain, IB20, IB20V1, IB20V2, NonZeroAddress, PermitArgs, Token,
-    TokenAccounting, TransferPolicyIds, ZeroAddressError,
+    B20_MAX_SUPPLY_CAP, B20Abi, B20CoreStorage, B20CreditRecipient, B20CreditRecipientError,
+    B20CreditRecipientStrategy, B20Guards, B20PausableFeature, B20PolicyType, B20TokenRole,
+    Eip712Domain, IB20, IB20V1, IB20V2, NonZeroAddress, PermitArgs, Token, TokenAccounting,
+    TransferPolicyIds, ZeroAddressError,
 };
 
 mod observer;
@@ -61,16 +62,16 @@ pub use metrics::{
 mod b20_asset;
 pub(crate) use b20_asset::AssetCall;
 pub use b20_asset::{
-    Asset, AssetAbi, AssetAbiPair, AssetAccounting, AssetV1, AssetV2, AssetVersion, AssetVersions,
-    B20AssetExtensionStorage, B20AssetInit, B20AssetPrecompile, B20AssetStorage, B20AssetToken,
-    ERC165_INTERFACE_ID, ERC8056_INTERFACE_IDS, IB20Asset, IB20AssetV1, IB20AssetV2,
+    Asset, AssetAbi, AssetAbiPair, AssetAccounting, AssetV1, AssetV2, AssetV3, AssetVersion,
+    AssetVersions, B20AssetExtensionStorage, B20AssetInit, B20AssetPrecompile, B20AssetStorage,
+    B20AssetToken, ERC165_INTERFACE_ID, ERC8056_INTERFACE_IDS, IB20Asset, IB20AssetV1, IB20AssetV2,
 };
 
 mod b20_stablecoin;
 pub use b20_stablecoin::{
     B20StablecoinExtensionStorage, B20StablecoinInit, B20StablecoinPrecompile,
     B20StablecoinStorage, B20StablecoinToken, IB20Stablecoin, Stablecoin, StablecoinAccounting,
-    StablecoinV1, StablecoinV2, StablecoinVersion, StablecoinVersions,
+    StablecoinV1, StablecoinV2, StablecoinV3, StablecoinVersion, StablecoinVersions,
 };
 
 mod b20_factory;
@@ -81,9 +82,10 @@ pub use b20_factory::{
 
 mod policy;
 pub use policy::{
-    IPolicyRegistry, IPolicyRegistryV1, IPolicyRegistryV2, PackedPolicy, PolicyAbi,
-    PolicyAccounting, PolicyRegistryLogic, PolicyRegistryPrecompile, PolicyRegistryStorage,
-    PolicyRegistryV1, PolicyRegistryV2, PolicyVersion, PolicyVersions,
+    IPolicyRegistry, IPolicyRegistryV1, IPolicyRegistryV2, IPolicyRegistryV3, PackedPolicy,
+    PolicyAbi, PolicyAccounting, PolicyRegistryLogic, PolicyRegistryPrecompile,
+    PolicyRegistryStorage, PolicyRegistryV1, PolicyRegistryV2, PolicyRegistryV3, PolicyVersion,
+    PolicyVersions,
 };
 
 mod tx_context;

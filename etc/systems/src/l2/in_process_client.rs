@@ -11,6 +11,7 @@ use base_execution_chainspec::BaseChainSpec;
 use base_execution_cli::{
     ExecutionUpgradeSignal, ExecutionUpgradeSignalConfig, ExecutionUpgradeSignalRuntimeExtension,
 };
+use base_execution_txpool::ValiditySignatureMode;
 use base_flashblocks::FlashblocksConfig;
 use base_flashblocks_node::FlashblocksExtension;
 use base_node_core::args::RollupArgs;
@@ -35,7 +36,7 @@ use tempfile::TempDir;
 use tracing::warn;
 use url::Url;
 
-use super::TestNodeRuntime;
+use super::InProcessNodeRuntime;
 
 type BuiltExtensions = (Vec<Box<dyn BaseNodeExtension>>, Option<FlashblocksConfig>);
 
@@ -51,6 +52,8 @@ pub enum ChainSpecSource {
 /// Configuration for starting an in-process client node.
 #[derive(Debug)]
 pub struct InProcessClientConfig {
+    /// Runtime sizing policy for the execution node.
+    pub runtime: InProcessNodeRuntime,
     /// Chain specification source.
     pub chain_spec: ChainSpecSource,
     /// Existing caller-owned datadir. A temporary datadir is created when omitted.
@@ -80,8 +83,8 @@ pub struct InProcessClientConfig {
     /// Optional transaction forwarding configuration.
     /// When set, the client will forward transactions to builder RPC endpoints.
     pub tx_forwarding_config: Option<TxForwardingConfig>,
-    /// Whether to register the experimental validity transaction RPC.
-    pub enable_experimental_validity_transactions: bool,
+    /// Staged signature policy at local validity ingress before forwarding.
+    pub validity_signature_mode: ValiditySignatureMode,
     /// Optional L1 upgrade signal configuration.
     ///
     /// When the mode applies at startup, the schedule is read from L1 and applied to the chain
@@ -134,7 +137,9 @@ impl InProcessClient {
 
         let (data_dir, temp_dir) = Self::prepare_datadir(config.datadir.clone())?;
         let runtime = RuntimeBuilder::new(
-            TestNodeRuntime::config()
+            config
+                .runtime
+                .config()
                 .with_tokio(TokioConfig::existing_handle(tokio::runtime::Handle::current())),
         )
         .build()?;
@@ -217,6 +222,11 @@ impl InProcessClient {
         if config.datadir.is_some() {
             node_config.debug.startup_sync_state_idle = true;
         }
+        // In-process system-test datadirs are disposable and may be restored from snapshots.
+        // Never reinsert a transaction journal captured in the source snapshot or write a new
+        // journal that can contaminate a later benchmark clone.
+        node_config.txpool.disable_transactions_backup = true;
+        node_config.txpool.transactions_backup_path = None;
         let metrics_addr = SocketAddr::new(
             std::net::Ipv4Addr::LOCALHOST.into(),
             config.metrics_port.unwrap_or_else(get_available_port),
@@ -423,13 +433,10 @@ impl InProcessClient {
 
         // TxForwarding extension (optional - forwards txs to builder RPC)
         if let Some(ref tx_fwd_config) = config.tx_forwarding_config {
-            if config.enable_experimental_validity_transactions
-                && tx_fwd_config.enabled
-                && !tx_fwd_config.builder_urls.is_empty()
-            {
+            if tx_fwd_config.enabled && !tx_fwd_config.builder_urls.is_empty() {
                 extensions.push(Box::new(SendRawTransactionValidityExtension::from_config(
                     SendRawTransactionValidityConfig {
-                        experimental_override: true,
+                        validity_signature_mode: config.validity_signature_mode,
                         ..Default::default()
                     },
                 )));

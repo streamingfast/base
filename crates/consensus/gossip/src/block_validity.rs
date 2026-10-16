@@ -175,7 +175,8 @@ impl BlockHandler {
         // The timestamp is at most 5 seconds in the future.
         let is_future = envelope.payload.timestamp() > current_timestamp + 5;
         // The timestamp is at most 60 seconds in the past.
-        let is_past = envelope.payload.timestamp() < current_timestamp - 60;
+        let is_past =
+            envelope.payload.timestamp() < current_timestamp.saturating_sub(Self::MAX_BLOCK_AGE);
 
         // CHECK: The timestamp is not too far in the future or past.
         if is_future || is_past {
@@ -226,9 +227,9 @@ impl BlockHandler {
         if let Some(seen_hashes_at_height) =
             self.seen_hashes.get_mut(&envelope.payload.block_number())
         {
-            // CHECK: If more than [`Self::MAX_BLOCKS_TO_KEEP`] different blocks have been received
+            // CHECK: If [`Self::MAX_BLOCKS_TO_KEEP`] different blocks have already been received
             // for the same height, reject the block.
-            if seen_hashes_at_height.len() > Self::MAX_BLOCKS_TO_KEEP {
+            if seen_hashes_at_height.len() >= Self::MAX_BLOCKS_TO_KEEP {
                 return Err(BlockInvalidError::TooManyBlocks {
                     height: envelope.payload.block_number(),
                 });
@@ -590,7 +591,7 @@ pub(crate) mod tests {
 
         assert!(handler.block_valid(&envelope).is_ok());
 
-        let next_payloads = (0..=BlockHandler::MAX_BLOCKS_TO_KEEP)
+        let next_payloads = (0..BlockHandler::MAX_BLOCKS_TO_KEEP)
             .map(|_| {
                 let mut block = v1_valid_block();
                 // The blocks have the same height

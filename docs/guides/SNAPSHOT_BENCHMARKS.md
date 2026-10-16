@@ -70,7 +70,16 @@ rollup configuration is selected automatically and `--rollup-config` is optional
 
 `base-bench snapshot` launches the snapshot builder and validator, funds an
 ephemeral load-test account, runs the workload, verifies that both roles have
-matching canonical blocks for the measured window, and then shuts down.
+matching canonical blocks for the measured window, writes the result artifacts,
+and terminates the process without running node or database cleanup. Snapshot
+datadirs are expected to be disposable writable clones. Pass a nonzero
+`--shutdown-timeout-seconds` (for example, `10`) to request the old bounded
+graceful teardown.
+
+The local sequencer defaults to a 10 Ggas block limit for 2s workloads and a 1 Ggas block limit for
+200ms workloads, keeping theoretical block capacity at 5 Ggas/s for both cadences. Pass
+`--block-gas-limit <gas>` to override the cadence default for a benchmark run. The load-test YAML's
+`block_gas_limit` setting only controls load-generator pacing and does not change produced blocks.
 
 Each `--output-dir` is a self-contained `base/benchmark` input directory:
 
@@ -95,6 +104,7 @@ selected list of its direct-child run directories:
 ```sh
 target/release/base-bench aggregate \
   --output-dir /absolute/path/to/results \
+  --versioned-pages \
   /absolute/path/to/results/run-a \
   /absolute/path/to/results/run-b
 ```
@@ -102,9 +112,15 @@ target/release/base-bench aggregate \
 The command atomically writes `results/metadata.json`. It retains the latest
 `createdAt` entry for every unique report tag set, including the configured
 scenario and block-time tag. This preserves distinct scenarios, block cadences,
-and client versions, but replaces an older repetition with the latest one. It
-does not modify source metadata or scenario labels. `id` remains the unique raw
-artifact identifier and `BenchmarkRun` remains the report cohort/page key.
+and client versions, but replaces an older repetition with the latest one.
+`--versioned-pages` then rewrites `BenchmarkRun` into one page per client
+version plus a `{cohort}--latest` alias. Latest keeps the newest run from the
+last seven days for each Scenario / block-time / transaction-payload identity,
+renames pages so the visualizer dropdown can tell them apart, and stamps latest
+1ms after the newest selected run so the visualizer Latest option resolves to
+that page. It does not modify source metadata or scenario labels. `id` remains
+the unique raw artifact identifier and `BenchmarkRun` remains the report
+cohort/page key.
 
 ## Choose Comparable Runs
 

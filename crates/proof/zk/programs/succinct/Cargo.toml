@@ -41,8 +41,8 @@ base-proof = { path = "../../../proof", default-features = false }
 base-proof-zk-utils = { path = "../../utils" }
 
 # SP1 (must match the cargo-prove Docker tag)
-sp1-lib = { version = "=6.4.0", features = ["verify"] }
-sp1-zkvm = { version = "=6.4.0", features = ["verify"] }
+sp1-lib = { version = "=6.8.1", features = ["verify"] }
+sp1-zkvm = { version = "=6.8.1", features = ["verify"] }
 
 # alloy (must match root Cargo.toml versions)
 alloy-consensus = { version = "2.0.5", default-features = false }
@@ -63,7 +63,9 @@ incremental = true
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+# LTO with the succinct-1.96.0-64bit-v2 toolchain (SP1 6.8.1) leaves `__atomic_*` libcalls that
+# fail to link for riscv64im-succinct-zkvm-elf.
+lto = false
 debug = "none"
 strip = "symbols"
 panic = "unwind"
