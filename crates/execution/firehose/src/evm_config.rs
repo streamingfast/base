@@ -31,7 +31,7 @@ use reth_primitives_traits::{
 use alloy_evm::block::BlockExecutionResult;
 use reth_revm::revm::context::TxEnv;
 
-use crate::{OpPostTxExtras, OpPreTxAdjust};
+use crate::{BasePreExecutionWrites, OpPostTxExtras, OpPreTxAdjust};
 
 /// Chain-hook strategy that installs [`OpPostTxExtras`] and [`OpPreTxAdjust`] for OP Stack.
 ///
@@ -86,7 +86,8 @@ where
             withdrawals,
             OpPreTxAdjust,
             OpPostTxExtras,
-        );
+        )
+        .with_pre_execution_writes(BasePreExecutionWrites);
 
         wrapped.execute_block(block.transactions_recovered())
     }
@@ -194,6 +195,7 @@ where
 {
     type PreTxAdjust = OpPreTxAdjust;
     type PostTxExtras = OpPostTxExtras;
+    type PreExecutionWrites = BasePreExecutionWrites;
 }
 
 impl<F, ExecutionData> ConfigureEngineEvm<ExecutionData> for OpFirehoseEvmConfig<F>

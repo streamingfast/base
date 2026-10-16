@@ -25,6 +25,10 @@ This crate is that wrapper for Base / OP Stack.
 - [`OpFirehoseEvmConfig`] — `ConfigureEvm` wrapper whose `batch_executor` constructs
   `FirehoseBlockExecutor::new_with_hooks(..., OpPreTxAdjust, OpPostTxExtras)` so the
   pipeline fires the same OP hooks the live engine-API path already uses.
+- [`BasePreExecutionWrites`] — the code and storage Base's pre-execution changes write straight to
+  the state DB at upgrade activations (Canyon `create2deployer`, Denim BaseTime predeploy, Everest
+  nonce manager stub). `reth_firehose` reads them before and after those changes and emits what
+  changed, which the inspector cannot see.
 - [`BuiltBlock`] and [`BuiltBlockTracer`] — tracing of a block the payload builder assembles
   from payload attributes alone, which is how the consensus node derives blocks from L1. Such a
   block enters the chain already executed and skips the engine validation, so the payload

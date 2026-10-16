@@ -18,7 +18,7 @@ use base_common_consensus::{BasePrimitives, BaseTxEnvelope};
 use base_common_evm::{BaseBlockExecutionCtx, BaseBlockExecutor};
 use base_common_flashblocks::Flashblock;
 use base_execution_evm::{BaseEvmConfig, BaseNextBlockEnvAttributes};
-use base_execution_firehose::{OpPostTxExtras, OpPreTxAdjust};
+use base_execution_firehose::{BasePreExecutionWrites, OpPostTxExtras, OpPreTxAdjust};
 use base_flashblocks::{
     AssembledBlock, BlockAssembler, FlashblockSequenceValidator, FlashblocksReceiver,
     SequenceValidationResult,
@@ -1700,7 +1700,8 @@ where
             .clone()
             .map(|ws| alloy_eips::eip4895::Withdrawals::new(ws.0));
         let mut executor =
-            FirehoseWrappedExecutor::with_hooks(inner, withdrawals, OpPreTxAdjust, OpPostTxExtras);
+            FirehoseWrappedExecutor::with_hooks(inner, withdrawals, OpPreTxAdjust, OpPostTxExtras)
+                .with_pre_execution_writes(BasePreExecutionWrites);
 
         if is_first_execution_for_block {
             executor.apply_pre_execution_changes().map_err(|e| Error::Execution(Box::new(e)))?;

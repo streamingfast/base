@@ -8,5 +8,8 @@ pub use extras::{OpPostTxExtras, OpPreTxAdjust};
 mod evm_config;
 pub use evm_config::{OpChainHooks, OpFirehoseEvmConfig};
 
+mod pre_execution;
+pub use pre_execution::BasePreExecutionWrites;
+
 mod built_block;
 pub use built_block::{BuiltBlock, BuiltBlockTracer};

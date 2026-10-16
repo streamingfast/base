@@ -157,6 +157,7 @@ base-shadow-indexer-db.workspace = true
 reth-primitives-traits.workspace = true
 
 # firehose
+base-common-evm.workspace = true
 base-firehose-tests.workspace = true
 
 # database

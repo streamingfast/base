@@ -22,6 +22,7 @@ reth-primitives-traits.workspace = true
 # base
 base-execution-evm.workspace = true
 base-common-evm = { workspace = true, features = ["reth"] }
+base-common-precompiles.workspace = true
 base-common-consensus = { workspace = true, features = ["reth"] }
 
 # alloy
