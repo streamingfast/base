@@ -50,9 +50,9 @@ Statuses checked 2026-10-16 against Base `v1.5.0` (`crates/common/chains/src/con
   transaction would emit a block that differs from the chain, and failing block execution would
   make the node report a valid block as invalid.
 - Tracing 8130 properly needs a new transaction type in the block model and the tracer, the 8130
-  fields (nonce key, payer, phases with value, account changes, phase statuses), and handling of
-  its execution shape: pre-call writes and `NonceIncremented` logs outside any call frame, one
-  depth-0 frame per phase, payer prepay and refund, and fee vault credits outside the EVM.
+  fields, and handling of its execution shape: pre-call writes and `NonceIncremented` logs outside
+  any call frame, phases that revert after their calls reported success, payer prepay and refund,
+  and fee vault credits outside the EVM. See [the preparation plan](docs/prepare_EIP-8130.md).
 - The activation block writes a code stub to the nonce manager in `apply_pre_execution_changes`
   (`ensure_eip8130_system_accounts`). `BasePreExecutionWrites` lists it, so it is emitted as a
   block-level code change.

@@ -1,132 +1,152 @@
-# Preparing Firehose tracing for EIP-8130 (Cobalt)
+# Preparing Firehose tracing for EIP-8130 (Everest)
 
-EIP-8130 ("Account Abstraction by Account Configuration") introduces a new
-transaction type (`0x79`) with its own wire format, phased execution, sponsored
-gas, 2D nonces, and protocol-injected logs. It is fully implemented in this
-codebase (since upstream v1.2.0), gated behind the **Cobalt** hardfork, which
-Base targets for **mainnet in September 2026**. Firehose tracing does not
-support it yet: a 0x79 transaction is currently recorded as a legacy
-transaction with wrong fields, and the injected Keystore logs would likely trip
-the call/receipt log-count panic. This document captures the analysis
-(2026-08-28) and the preparation plan.
+EIP-8130 ("Account Abstraction by Account Configuration") adds transaction type `0x79` (121). It
+has its own wire format, phased execution, a payer separate from the sender, 2D nonces, and logs
+the protocol writes outside any call frame. Base gates it behind the **Everest** upgrade.
 
-## Launch timeline
+Firehose can't trace it. The `reth-firehose` mapper (`crates/firehose/src/mapper.rs` in
+`streamingfast/reth`) stops the node on the first `0x79` transaction with an error naming the
+transaction and its type. Stopping is deliberate: skipping the transaction would emit a block that
+differs from the chain. This document describes what the transaction does under a tracer, the
+block model changes agreed in review, and the work in each repository.
 
-- **Now**: live on "vibenet", Base's ephemeral devnet (<https://vibes.base.org>),
-  per the [Base engineering blog](https://blog.base.dev/native-account-abstraction).
-- **September 2026**: mainnet, via the Cobalt upgrade
-  ([announcement coverage](https://www.bitget.com/amp/news/detail/12560605520641)).
-  Beryl (reth v2, B20) already activated June 25, 2026.
-- In code, `cobalt_timestamp` is `None` for mainnet, sepolia, devnet and
-  zeronet in `crates/common/chains/src/config.rs` — **that field being set for
-  sepolia is the tripwire**. The only place Cobalt activates today is the local
-  Docker devnet (`L2_BASE_COBALT_BLOCK=22` in `etc/docker/devnet-env`).
-- The [EIP itself](https://eips.ethereum.org/EIPS/eip-8130) is still **Draft**
-  and the wire format is still churning — see "Moving target" below.
+## Activation
 
-## Status in this codebase
+- Everest is contract-backed: an L1 upgrade signal (the `ProtocolVersions` contract, read by
+  `crates/utilities/upgrade-signal`) can schedule it with no new node release. A timestamp in
+  `crates/common/chains/src/config.rs` is not a reliable warning. Watch the signal itself.
+- No network has scheduled Everest. [ACTIVATIONS.md](../ACTIVATIONS.md) tracks the status.
+- Everest requires every earlier Base upgrade, Denim included, so only Base's own stack can run
+  it. The local Docker stack (`etc/systems`) and the in-process action harness
+  (`actions/harness/tests/everest`) both activate it.
+- Zenith gates the keystore part of 8130: account configuration changes, account creation, and
+  non-k1 authenticators. Zenith can only be set in genesis, so on real networks an Everest
+  transaction can only carry k1 signatures and `Delegation` account changes.
 
-Not scaffolding — ~1500 references across 76 files:
+## How a `0x79` transaction runs under a tracer
 
-- **Type `0x79`** (`EIP8130_TX_TYPE_ID = 121`), payer signature domain `0x7A`.
-  Fields: `chain_id`, optional `sender`, `nonce_key: U256` +
-  `nonce_sequence: u64`, validity window, 1559 fees, `gas_limit`,
-  `account_changes`, `calls: Vec<Vec<Call>>` (phases), `metadata`, optional
-  `payer`, plus opaque `sender_auth`/`payer_auth` blobs (no v/r/s).
-- **Execution** (`crates/execution/eip8130/`,
-  `crates/common/evm/src/eip8130.rs`): `Eip8130Executor` is invoked from
-  `BaseEvm::transact_raw`, bypassing the mainnet single-frame handler.
-  Authorization, account changes, nonce validation, and payer precharge run
-  **directly against the journal with no EVM call frame**; only the `calls`
-  phases run as real EVM frames.
-- **System contracts**: Keystore (named `AccountConfiguration` in this
-  checkout) at `0x2403408177dB7F8512a9593343a7C80371D8f2dF`, `NonceManager`
-  precompile at `0x813000000000000000000000000000000000aa01`, `TxContext`
-  precompile at `0x813000000000000000000000000000000000aa02`. These addresses
-  are documented upstream as **provisional Base Sepolia values**.
-- **Receipt**: `Eip8130Receipt` adds `phaseStatuses` — excluded from RLP so
-  the receipts-trie root is unchanged; it is RPC-only, handed from executor to
-  receipt builder via a thread-local (`eip8130_phase_statuses.rs`).
-- Mempool (2D-nonce pool), span-batch derivation, and RPC (`eth_estimateGas`,
-  channel nonces) are all done.
+`BaseEvm::transact_raw` sends 8130 transactions to `Eip8130Executor`
+(`crates/common/evm/src/eip8130.rs`) instead of revm's mainnet handler. In order:
 
-### Moving target
+1. `authorize_and_apply` validates the sender and payer, then writes straight to the journal, with
+   no call frame and no inspector hook:
+   - delegation code (`0xef0100 ‖ target`, or empty to clear);
+   - for a non-zero `nonce_key`, the 2D nonce `sstore` on the nonce manager
+     (`0x813000000000000000000000000000000000aa01`), a `0xEF` code stub rewrite on that account,
+     and a `NonceIncremented` log;
+   - for `nonce_key == U256::MAX` (nonce-free), the replay ring `sstore`s;
+   - transient `TxContext` writes on `0x8130…aa02`.
+2. `prepay` bumps the sender's account nonce when `nonce_key == 0` and debits the payer for
+   `(gas_limit + payer_auth_gas) × effective_price` plus the L1 and operator fees, again straight
+   to the journal.
+3. `start_inspection` opens one synthetic depth-0 `CALL` from the sender to the sender, with the
+   EIP-2718-encoded transaction as input. It runs even when `calls` is empty.
+4. Each phase runs under a journal checkpoint. Each call in a phase is a real revm frame at journal
+   depth 1 under the synthetic root, so the inspector sees it and everything inside it. A call
+   blocked by the actor policy, or one that can't pay for a new account, gets no frame.
+5. A failed phase is rolled back with `checkpoint_revert` after its calls already reported success
+   through `call_end`. No hook marks the rollback. Later phases are skipped.
+6. `settle_fees` refunds the payer and credits the base fee vault, the block beneficiary, the L1
+   fee vault, and the operator fee vault, straight to the journal.
+7. `end_inspection` closes the synthetic root as `Revert` if any phase failed.
 
-Upstream `main` has work that is *not* in this checkout: the
-`valid_after`/`valid_before` millisecond validity window (base/base#4330 —
-this checkout still has a single `expiry` field, i.e. the RLP layout changed),
-the `SignedAccountChanges` redesign (base/base#4327), and the `Keystore.sol`
-rename. The wire format is not frozen; do not freeze goldens against it yet.
+The receipt status is success only if every phase committed. State from phases that committed
+before the failing one stays, along with the nonce, the delegation code, and the fees.
 
-## Impact on the Firehose block model (`sf/ethereum/type/v2/type.proto`)
+## What the tracing stack gets wrong today
 
-1. **New `Type` enum value.** Nothing maps 0x79. Suggest
-   `TRX_TYPE_BASE_EIP8130 = 121`, following the convention of matching the
-   wire byte (`TRX_TYPE_OPTIMISM_DEPOSIT = 126`).
-2. **Transaction fields that don't fit the current message.**
-   `TransactionTrace.nonce` is `uint64`, but 8130 has a 256-bit `nonce_key`
-   plus `nonce_sequence`. There is no `to` (a phase/call list instead), no
-   `value`, no v/r/s (opaque auth blobs), and new concepts: `payer`, validity
-   window, `metadata`, `account_changes` (create / config change / delegation
-   entries — structurally similar to how `set_code_authorizations` was added
-   for EIP-7702). This needs a new set of fields or a sub-message, populated
-   only for this type, like the blob and set-code precedents.
-3. **Receipt.** `phaseStatuses` is not part of the consensus receipt, but the
-   tracer can and should carry it: a consumer cannot otherwise tell which
-   phases committed.
-4. **Call tree shape.** The model and its documented consumer contract assume
-   **one root call at index 0 aligned with the transaction**. An 8130
-   transaction produces *multiple top-level frames* (one per call, grouped
-   into phases), and a transaction can be `SUCCEEDED` while individual phases
-   reverted (cross-phase durability). `state_reverted` per call can express
-   the reverted phases, but consumers' "root call #0" processing rules break;
-   calls likely need a phase index, and the status semantics need explicit
+The `0x79` stop hides these, and each needs a fix:
+
+- **Partial success.** The tracer turns a failed receipt into a failed root call, and
+  `populate_state_reverted` then reverts every child, including committed phases, the nonce, and
+  the fees.
+- **Writes before the root call are lost.** The reth inspector skips the journal up to the depth-0
+  call, so the pre-call writes in steps 1 and 2 never reach the block.
+- **The payer is invisible.** The reth inspector only emits `GasBuy` and `GasRefund` for the
+  sender.
+- **Double counting.** `OpPostTxExtras` rebuilds the vault credits with the standard OP Stack
+  formula, while the same credits also arrive from the journal as `Transfer`.
+- **Protocol logs.** `NonceIncremented` is written before the root call. `gather_precompile_logs`
+  attaches it to whichever call ends first, or drops it.
+- **Fields.** The generic mapper emits `to = 0x0`, empty `input`, `value = 0`, and
+  `nonce = nonce_sequence`. It drops `nonce_key`, `payer`, `calls`, `account_changes`, and
+  `metadata`.
+- **Silent fallback.** In `evm-firehose-tracer-rs`, the transaction type mapping in `tracer.rs`
+  sends unknown types to `TRX_TYPE_LEGACY`. The reth mapper stops first, but the tracer should fail
+  on its own.
+
+## Block model (`sf/ethereum/type/v2/type.proto`)
+
+Agreed in review:
+
+- **Enum value.** `TRX_TYPE_EIP8130 = 121`, with no `BASE_` prefix. The wire format comes from the
+  EIP, not from Base, so other chains that adopt it share the value. If L1 ever picks a different type byte,
+  add a second value then.
+- **Reuse existing fields** where the meaning is the same: `hash`, `from` (the resolved sender),
+  `nonce` (`nonce_sequence`), `gas_limit`, `max_fee_per_gas`, `max_priority_fee_per_gas`,
+  `gas_price` (effective), `gas_used`, `status`, `receipt`, and `calls`. `to`, `value`, `input`,
+  `v`/`r`/`s`, `access_list`, and the blob fields stay empty.
+- **Add new fields flat on `TransactionTrace`**, with no chain prefix: `nonce_key` (`BigInt`),
+  `payer`, `valid_after`, `valid_before`, `metadata`, `account_changes` (a new message, like
+  `set_code_authorizations` for EIP-7702), and the phase structure.
+- **`phase_index` on `Call`**, so a reader can group calls by phase without counting.
+- **No `phase_statuses` on the receipt.** The receipts root doesn't commit to it, and a reader can
+  rebuild it: a phase committed if its calls aren't `state_reverted`, and the first phase with
+  reverted calls or no frames is the one that failed.
+- **Status.** A transaction with a failed phase has status `FAILED`, matching the receipt. The root
+  call isn't reverted, and only the failed phase's calls are `state_reverted`. The proto docs must
+  say that, for this type, a failed transaction can carry durable state changes and logs, so
+  readers go by each call's `state_reverted` instead of the transaction status.
+- **Gas.** One `REASON_GAS_BUY` and at most one `REASON_GAS_REFUND` per transaction, as for other
+  types, but on the payer. The payer's authentication gas is part of the same prepay.
+
+Open question: the review preferred one depth-0 call per phase. The executor already produces a
+single synthetic root with the phase calls beneath it, which `debug_traceTransaction` also shows,
+and which keeps the rule that call 0 is the transaction's root. The proposal is to keep that shape.
+
+## Work in each repository, in order
+
+1. **`firehose-ethereum` proto.** The enum value, the new fields, `Call.phase_index`, and the status
    documentation.
-5. **Logs.** The `ActorAuthorized` / `ActorRevoked` / `AccountCreated` /
-   `DelegationApplied` logs are pushed straight into the revm journal
-   (`emit_event` → `internals.log(...)`) outside any call frame, and appear in
-   the receipt **ahead of** the calls' logs. No LOG opcode executes, so
-   inspector log hooks never fire. This is the same mechanism as the B20
-   precompile logs already handled by the tracer — good precedent — but it is
-   precisely the shape that caused the fh-5 panic
-   ("N call logs but N+1 receipt logs").
-6. **State changes outside frames.** Payer precharge/settlement means
-   `REASON_GAS_BUY` / `REASON_GAS_REFUND` balance changes land on the
-   **payer**, not `from`. 2D nonces are `StorageChange`s on the NonceManager
-   precompile, not `NonceChange`s. Auto-delegation writes `0xef0100‖target`
-   code, and account creation sets code directly at a CREATE2 address —
-   `CodeChange`s from the pre-call pipeline, not from a CREATE frame.
+2. **`evm-firehose-tracer-rs`** (5.6.0).
+   - Add `TxType::Eip8130 = 121`, its `Display` entry, and its proto mapping. Make unknown types an
+     error instead of `TRX_TYPE_LEGACY`.
+   - Carry the 8130 fields, through `TxEvent` or a `transaction_mut()` accessor like `block_mut()`.
+   - Let the caller mark a phase's calls `state_reverted` before `complete_transaction`, and skip
+     the "failed receipt fails the root call" step for type 121.
+   - Move logs written after the root call exits into the root call; the deferred state's "root"
+     branch drops them.
+   - Update the test invariants, which check only the first depth-0 call.
+3. **`streamingfast/reth`, `crates/firehose`** (new `base-v…-fhX` tag).
+   - Let a chain read the journal entries written before the depth-0 call instead of skipping
+     them. This covers B-20 and 8130 protocol writes and logs without a hook upstream.
+   - Let a chain choose the reason of balance changes read from the journal, instead of
+     `Transfer`.
+4. **Base** (`crates/execution/firehose`).
+   - Have `Eip8130Executor` record what it did: payer, prepay, refund, each vault credit, how many
+     calls each phase ran, and which phase failed. Use the same thread-local as
+     `Eip8130PhaseStatuses`.
+   - Use that record in the Firehose extras: `GasBuy` and `GasRefund` on the payer, fee reasons on
+     the vault credits, nonce manager writes and `NonceIncremented` on the root call, and
+     `state_reverted` on the failed phase's calls.
+   - Skip 8130 in `OpPostTxExtras`. Fill the 8130 fields in a Base `PreTxAdjust`.
+   - Ignore the nonce manager's `0xEF` code rewrite when the code doesn't change, and the transient
+     `TxContext` writes.
+   - Keystore writes (Zenith only) keep stopping the node with a clear error.
 
-## What breaks today
+## Tests, in order
 
-The tracer maps unknown transaction types to `TrxTypeLegacy` with a silent
-fallthrough (`firehose-tracer` `tracer.rs`, `tx_type` mapping) — past Cobalt
-it would produce **wrong blocks without any error**, plus a probable log-count
-mismatch panic from the injected logs (`FIREHOSE_TRACER_IGNORE_LOG_MISMATCH`
-would "save" the node by dropping data). Tracing the local devnet past block
-22 exercises the broken path right now.
-
-## Preparation plan, in order
-
-1. **Make the tracer fail loud, now.** Replace the silent legacy fallthrough
-   for unknown tx types with a hard error (or at least an error log plus an
-   explicit unknown marker). Cheap, and it converts "corrupt data" into
-   "visible outage" if Cobalt ever front-runs us.
-2. **Design the proto extension now.** The model additions (enum value, 8130
-   sub-message, phase attribution on `Call`, `phaseStatuses`) can be drafted
-   and reviewed in `firehose-ethereum` independent of the wire-format churn —
-   the churn affects field *contents*, not the shape of the model. Needs
-   coordination since `type.v2` is shared across all EVM chains.
-3. **Implement tracing against the local devnet.** Block 22+ on the Docker
-   devnet is a working reproduction today; vibenet gives a second, realistic
-   source of 8130 traffic. Reuse the B20 injected-log handling for the
-   Keystore logs; the new work is multi-root-frame call tracking in the
-   tracer callstack and the journal-only pre-call pipeline (payer precharge,
-   account changes, nonce writes).
-4. **Add a `firehose_8130` system test** alongside `firehose_b20` in
-   `base-firehose-tests`, with JSON-projection goldens (not full-protobuf,
-   per the `nop_transfer` lesson).
-5. **Track two upstream signals**: `cobalt_timestamp` appearing in
-   `config.rs` (sepolia first), and the wire-format PRs (base/base#4330 etc.)
-   landing in a tagged release — hold golden regeneration until the format
-   settles and final contract addresses replace the provisional ones.
+1. Code-only capture tests first, for a fast loop with no Docker: `run_prestate` goldens in
+   `base-firehose-tests`, and `BaseFirehoseCapture` on top of the in-process Everest action tests
+   if that harness goes through `FirehoseWrappedExecutor`. Cases:
+   - paying for yourself;
+   - a named payer;
+   - a 2D nonce and a nonce-free transaction;
+   - a delegation;
+   - two phases where the second fails;
+   - a call blocked by the actor policy.
+2. A `firehose_everest.rs` system test in `etc/systems/tests`, combining the transaction builders
+   of `eip8130.rs` with the activation-block pattern of `firehose_denim.rs`.
+3. Battlefield (`op-reth-devnet`) can't run Everest, since its stack uses upstream `op-node` and
+   `op-geth`. Run it on the new reth tag as a regression check for every other transaction type:
+   the tracer change to `complete_transaction` runs on all of them, so its goldens must not change.
