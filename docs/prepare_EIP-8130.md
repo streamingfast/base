@@ -77,7 +77,7 @@ The `0x79` stop hides these, and each needs a fix:
 
 ## Block model (`sf/ethereum/type/v2/type.proto`)
 
-Agreed in review:
+Proposed, following review:
 
 - **Enum value.** `TRX_TYPE_EIP8130 = 121`, with no `BASE_` prefix. The wire format comes from the
   EIP, not from Base, so other chains that adopt it share the value. If L1 ever picks a different type byte,
@@ -89,10 +89,14 @@ Agreed in review:
 - **Add new fields flat on `TransactionTrace`**, with no chain prefix: `nonce_key` (`BigInt`),
   `payer`, `valid_after`, `valid_before`, `metadata`, `account_changes` (a new message, like
   `set_code_authorizations` for EIP-7702), and the phase structure.
-- **`phase_index` on `Call`**, so a reader can group calls by phase without counting.
-- **No `phase_statuses` on the receipt.** The receipts root doesn't commit to it, and a reader can
-  rebuild it: a phase committed if its calls aren't `state_reverted`, and the first phase with
-  reverted calls or no frames is the one that failed.
+- **`phase_statuses` on `TransactionReceipt`**, one byte per phase (`0x01` committed, `0x00`
+  failed or skipped), as RPC returns `phaseStatuses`. The receipts root doesn't commit to it, but
+  it is persisted with the receipt. With the phases listed on the transaction, it places every
+  call frame in its phase: a committed phase ran all its calls, each as one depth-1 frame; at most
+  one phase fails and nothing runs after it, so the remaining depth-1 frames belong to the failed
+  phase. A failed phase can have no frames at all (blocked by the actor policy or the new-account
+  cost), which only `phase_statuses` tells apart from a skipped phase. Calls carry no phase index,
+  as in RPC traces.
 - **Status.** A transaction with a failed phase has status `FAILED`, matching the receipt. The root
   call isn't reverted, and only the failed phase's calls are `state_reverted`. The proto docs must
   say that, for this type, a failed transaction can carry durable state changes and logs, so
@@ -106,8 +110,8 @@ and which keeps the rule that call 0 is the transaction's root. The proposal is 
 
 ## Work in each repository, in order
 
-1. **`firehose-ethereum` proto.** The enum value, the new fields, `Call.phase_index`, and the status
-   documentation.
+1. **`firehose-ethereum` proto.** The enum value, the new transaction fields,
+   `TransactionReceipt.phase_statuses`, and the status documentation.
 2. **`evm-firehose-tracer-rs`** (5.6.0).
    - Add `TxType::Eip8130 = 121`, its `Display` entry, and its proto mapping. Make unknown types an
      error instead of `TRX_TYPE_LEGACY`.
