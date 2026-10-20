@@ -642,20 +642,18 @@ governor = "0.7"
 # Firehose tracer (defined by the streamingfast reth fork, release/base-2.x branch).
 reth-firehose = { git = "https://github.com/streamingfast/reth.git", tag = "base-v2.5.2.8-fh3.1" }
 reth-firehose-tests = { git = "https://github.com/streamingfast/reth.git", tag = "base-v2.5.2.8-fh3.1" }
-firehose-tracer = "5.5.0"
+firehose-tracer = "5.6.0"
 
 # Shared tracing-regression framework (capture / invariants / projection / golden).
-firehose-tracer-test = "5.5.0"
+firehose-tracer-test = "5.6.0"
 
 # Chain-agnostic generator for replayable Firehose prestate fixtures.
-firehose-tracer-prestate = "5.5.0"
+firehose-tracer-prestate = "5.6.0"
 
 [patch.crates-io]
 # SF fork of alloy-evm that routes system calls (EIP-4788, EIP-2935, etc.) through the
 # Inspector, so Firehose tracing observes them. Must match the patch in streamingfast/reth.
 alloy-evm = { git = "https://github.com/streamingfast/evm.git", tag = "v0.38.0-sf" }
-# Replace with a crates.io bump once streamingfast/evm-firehose-tracer-rs#39 is released.
-firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", branch = "feature/fire-block-time" }
 
 [patch."https://github.com/base/reth"]
 reth-basic-payload-builder = { git = "https://github.com/streamingfast/reth.git", tag = "base-v2.5.2.8-fh3.1" }
