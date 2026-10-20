@@ -7,7 +7,10 @@
 //!   flashblock WebSocket feed and emits per-flashblock partial-block FIRE
 //!   events via a separate, dedicated tracer.
 
-use std::sync::OnceLock;
+use std::{
+    sync::OnceLock,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use base_common_genesis::DenimTimestampSchedule;
 use base_firehose_flashblocks::{
@@ -53,30 +56,30 @@ impl FromExtensionConfig for FirehoseExtension {
 }
 
 /// The running chain's Denim schedule (`None` when Denim is not scheduled), read by
-/// [`fire_block_time_ns`]. Set before `FIRE INIT`, so before any block is traced.
+/// [`fire_block_time`]. Set before `FIRE INIT`, so before any block is traced.
 static DENIM_SCHEDULE: OnceLock<Option<DenimTimestampSchedule>> = OnceLock::new();
 
 /// The FIRE BLOCK line time, which becomes the Firehose block time.
-fn fire_block_time_ns(block: &BlockData) -> u64 {
-    block_time_ns(DENIM_SCHEDULE.get().and_then(Option::as_ref), block)
+fn fire_block_time(block: &BlockData) -> SystemTime {
+    block_time(DENIM_SCHEDULE.get().and_then(Option::as_ref), block)
 }
 
 /// From Denim on, consensus requires a block's `BaseTime` deposit to carry the millisecond part
 /// of the schedule's time for its number, so the schedule gives the block's time in milliseconds.
 /// Earlier blocks use the header time in seconds.
-const fn block_time_ns(schedule: Option<&DenimTimestampSchedule>, block: &BlockData) -> u64 {
+fn block_time(schedule: Option<&DenimTimestampSchedule>, block: &BlockData) -> SystemTime {
     match schedule {
         Some(schedule) if schedule.is_denim_active_at_block(block.number) => {
-            schedule.block_timestamp_millis(block.number) * 1_000_000
+            UNIX_EPOCH + Duration::from_millis(schedule.block_timestamp_millis(block.number))
         }
-        _ => block.time * 1_000_000_000,
+        _ => UNIX_EPOCH + Duration::from_secs(block.time),
     }
 }
 
 fn tracer_config() -> firehose_tracer::config::Config {
     firehose_tracer::config::Config {
         chain_client: firehose_tracer::config::ChainClient::Reth,
-        fire_block_time_ns: Some(fire_block_time_ns),
+        fire_block_time: Some(fire_block_time),
         ..Default::default()
     }
 }
@@ -225,11 +228,11 @@ mod tests {
             (10, 1011, 1_011_000),
         ] {
             assert_eq!(
-                block_time_ns(Some(&schedule), &block(number, time)),
-                want_ms * 1_000_000,
+                block_time(Some(&schedule), &block(number, time)),
+                UNIX_EPOCH + Duration::from_millis(want_ms),
                 "block {number}"
             );
         }
-        assert_eq!(block_time_ns(None, &block(6, 1010)), 1_010_000_000_000);
+        assert_eq!(block_time(None, &block(6, 1010)), UNIX_EPOCH + Duration::from_secs(1010));
     }
 }
