@@ -89,9 +89,9 @@ fn run(tx: BaseTransactionSigned) -> TransactionTrace {
 }
 
 fn call_indexes(trx: &TransactionTrace) -> Vec<Vec<u32>> {
-    trx.aa_trx_input
+    trx.account_abstraction_trx_input
         .as_ref()
-        .expect("aa_trx_input")
+        .expect("account_abstraction_trx_input")
         .phases
         .iter()
         .map(|phase| phase.calls.iter().map(|call| call.call_index).collect())
@@ -109,8 +109,8 @@ fn root_balance_changes(trx: &TransactionTrace) -> Vec<(Address, i32)> {
 fn committed_phases(trx: &TransactionTrace) -> u64 {
     trx.receipt
         .as_ref()
-        .and_then(|r| r.aa_trx_output.as_ref())
-        .expect("aa_trx_output")
+        .and_then(|r| r.account_abstraction_trx_output.as_ref())
+        .expect("account_abstraction_trx_output")
         .committed_phases
 }
 
@@ -129,7 +129,7 @@ fn failed_phase_reverts_its_calls_and_keeps_committed_ones() {
     );
     let trx = run(sign(tx, None));
 
-    assert_eq!(pbeth::transaction_trace::Type::TrxTypeAa as i32, trx.r#type);
+    assert_eq!(pbeth::transaction_trace::Type::TrxTypeAccountAbstraction as i32, trx.r#type);
     assert_eq!(pbeth::TransactionTraceStatus::Failed as i32, trx.status);
     assert_eq!(1, committed_phases(&trx));
     assert!(trx.to.is_empty(), "the calls carry the targets");
@@ -170,7 +170,7 @@ fn named_payer_and_nonce_channel() {
     let trx = run(sign(tx, Some(Account::Bob)));
 
     assert_eq!(pbeth::TransactionTraceStatus::Succeeded as i32, trx.status);
-    let input = trx.aa_trx_input.as_ref().expect("aa_trx_input");
+    let input = trx.account_abstraction_trx_input.as_ref().expect("account_abstraction_trx_input");
     assert_eq!(bob.as_slice(), input.payer.as_slice());
     assert_eq!(vec![7u8], input.nonce_key.as_ref().expect("nonce key").bytes);
     assert_eq!(vec![vec![2]], call_indexes(&trx));
@@ -199,7 +199,7 @@ fn delegation_is_a_code_change_on_the_root_call() {
     tx.account_changes = vec![AccountChange::Delegation(Delegation { target })];
     let trx = run(sign(tx, None));
 
-    let input = trx.aa_trx_input.as_ref().expect("aa_trx_input");
+    let input = trx.account_abstraction_trx_input.as_ref().expect("account_abstraction_trx_input");
     assert_eq!(1, input.account_changes.len());
 
     let alice = Account::Alice.address();

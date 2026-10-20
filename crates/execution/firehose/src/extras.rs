@@ -25,7 +25,11 @@ use base_common_evm::{
 };
 use firehose_tracer::{
     firehose_debug,
-    pb::sf::ethereum::r#type::v2::{AaTrxInput, AaTrxOutput, aa_trx_input, balance_change::Reason},
+    pb::sf::ethereum::r#type::v2::{
+        AccountAbstractionAccountChange, AccountAbstractionPhase, AccountAbstractionPhaseCall,
+        AccountAbstractionTrxInput, AccountAbstractionTrxOutput, account_abstraction_account_change,
+        balance_change::Reason,
+    },
     types::{TxEvent, TxType},
     utils::u256_to_protobuf,
 };
@@ -63,7 +67,7 @@ where
         // receipt builder has not consumed the phase statuses yet: it runs at commit.
         if evm.ctx().tx().is_eip8130() {
             let (_, inspector, _) = evm.components_mut();
-            inspector.tracer_mut().set_aa_trx_output(AaTrxOutput {
+            inspector.tracer_mut().set_account_abstraction_trx_output(AccountAbstractionTrxOutput {
                 committed_phases: Eip8130PhaseStatuses::committed_phases(),
             });
             return;
@@ -177,7 +181,7 @@ where
         tx_event: &mut TxEvent,
         sender: Address,
     ) {
-        if matches!(tx_event.tx_type, TxType::Aa) {
+        if matches!(tx_event.tx_type, TxType::AccountAbstraction) {
             Self::adjust_eip8130_tx_event(evm, tx_env, tx_event, sender);
             return;
         }
@@ -251,14 +255,12 @@ impl OpPreTxAdjust {
             .account_changes
             .iter()
             .map(|change| match change {
-                AccountChange::Delegation(delegation) => aa_trx_input::AccountChange {
-                    change: Some(aa_trx_input::account_change::Change::Delegation(
-                        aa_trx_input::Delegation {
-                            target: if delegation.target.is_zero() {
-                                Vec::new()
-                            } else {
-                                delegation.target.to_vec()
-                            },
+                AccountChange::Delegation(delegation) => AccountAbstractionAccountChange {
+                    change: Some(account_abstraction_account_change::Change::DelegationTarget(
+                        if delegation.target.is_zero() {
+                            Vec::new()
+                        } else {
+                            delegation.target.to_vec()
                         },
                     )),
                 },
@@ -274,10 +276,10 @@ impl OpPreTxAdjust {
         let phases = tx
             .calls
             .iter()
-            .map(|calls| aa_trx_input::Phase {
+            .map(|calls| AccountAbstractionPhase {
                 calls: calls
                     .iter()
-                    .map(|call| aa_trx_input::PhaseCall {
+                    .map(|call| AccountAbstractionPhaseCall {
                         to: call.to.to_vec(),
                         value: u256_to_protobuf(call.value),
                         data: call.data.to_vec(),
@@ -304,7 +306,7 @@ impl OpPreTxAdjust {
                 Bytes::copy_from_slice(&[y_parity])
             });
         }
-        tx_event.aa_trx_input = Some(AaTrxInput {
+        tx_event.account_abstraction_trx_input = Some(AccountAbstractionTrxInput {
             nonce_key: u256_to_protobuf(tx.nonce_key),
             payer: payer.to_vec(),
             valid_after: tx.valid_after,

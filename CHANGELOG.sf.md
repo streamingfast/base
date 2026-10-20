@@ -2,14 +2,15 @@
 
 ### Added
 
-* Firehose traces EIP-8130 transactions (type `0x79`, enabled by Everest) as `TRX_TYPE_AA`, instead
-  of stopping the node. The transaction's own fields are in `TransactionTrace.aa_trx_input`, with
-  each signed call linked to the call that executed it, and `committed_phases` is in
-  `TransactionReceipt.aa_trx_output`. The calls of a phase that reverted are `state_reverted`,
-  including the ones that succeeded before it, while the phases that committed keep their state
-  even though the transaction is `FAILED`. The payer's gas purchase and refund, the fee payouts,
-  the nonce increment, the nonce manager writes and the delegation code are recorded on the root
-  call. Keystore account changes, which only Zenith enables, still stop the node.
+* Firehose traces EIP-8130 transactions (type `0x79`, enabled by Everest) as
+  `TRX_TYPE_ACCOUNT_ABSTRACTION`, instead of stopping the node. The transaction's own fields are in
+  `TransactionTrace.account_abstraction_trx_input`, with each signed call linked to the call that
+  executed it, and `committed_phases` is in `TransactionReceipt.account_abstraction_trx_output`.
+  The calls of a phase that reverted are `state_reverted`, including the ones that succeeded before
+  it, while the phases that committed keep their state even though the transaction is `FAILED`.
+  The payer's gas purchase and refund, the fee payouts, the nonce increment, the nonce manager
+  writes and the delegation code are recorded on the root call.
+  Keystore account changes, which only Zenith enables, still stop the node.
 
 ## v1.5.0-fh3.1
 
