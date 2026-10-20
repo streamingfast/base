@@ -120,14 +120,14 @@ message AccountAbstractionTrxInput {
   uint64 valid_before = 4;
   bytes metadata = 5;
   repeated AccountAbstractionAccountChange account_changes = 6;
-  repeated AccountAbstractionPhase phases = 7;  // every signed call, grouped in phases
+  repeated AccountAbstractionCallPhase call_phases = 7;  // every signed call, grouped in phases
 }
 
-message AccountAbstractionPhase {
-  repeated AccountAbstractionPhaseCall calls = 1;
+message AccountAbstractionCallPhase {
+  repeated AccountAbstractionCallInput calls = 1;
 }
 
-message AccountAbstractionPhaseCall {
+message AccountAbstractionCallInput {
   bytes to = 1;
   BigInt value = 2;
   bytes data = 3;
@@ -156,6 +156,8 @@ message AccountAbstractionTrxOutput {
   renames of the Morph messages to `MorphTrxInput`, `MorphL1MessageTrxInput` and
   `MorphTrxOutput`. The value 121 is the type byte, as for the other Ethereum, Arbitrum and
   Optimism types.
+- **Call phases.** `call_phases`, `AccountAbstractionCallPhase` and `AccountAbstractionCallInput`
+  use the spec's term: the transaction's `calls` field is an array of call phases.
 - **Account changes.** The `oneof` leaves room for the entry types EIP-8430 reserves: EIP-8130
   uses `0x02` and `0x03` for Keystore changes.
 - **Existing fields** keep their meaning, as in the draft's RPC object: `from` is the resolved
@@ -169,7 +171,7 @@ message AccountAbstractionTrxOutput {
   rule that call 0 is the transaction's root. It is a Firehose choice: the draft defines no root
   call, and another client wouldn't necessarily produce one.
 - **Executed calls.** Each signed call that ran is a child of the root call, in execution order, and
-  `AccountAbstractionPhaseCall.call_index` points to it. Calls made by those calls nest below them
+  `AccountAbstractionCallInput.call_index` points to it. Calls made by those calls nest below them
   as usual. Call indexes start at 1, so a signed call that never ran has `call_index = 0`: the rest
   of the phase after the call that reverted, the skipped phases, and a call blocked by the actor
   policy or the new-account cost.
@@ -193,7 +195,7 @@ message AccountAbstractionTrxOutput {
    - Add `TxType::AccountAbstraction = 121`, its `Display` entry, and its proto mapping. Make
      unknown types an error instead of `TRX_TYPE_LEGACY`.
    - Carry `account_abstraction_trx_input` and `account_abstraction_trx_output`, through `TxEvent`
-     or a `transaction_mut()` accessor like `block_mut()`. `AccountAbstractionPhaseCall.call_index`
+     or a `transaction_mut()` accessor like `block_mut()`. `AccountAbstractionCallInput.call_index`
      is only known after execution, so the caller must be able to set it before the transaction
      ends.
    - Let the caller mark a phase's calls `state_reverted` before `complete_transaction`, and skip
@@ -212,7 +214,7 @@ message AccountAbstractionTrxOutput {
      outcomes to the receipt builder (`Eip8130PhaseStatuses` in `v1.5.x`).
    - Use that record in the Firehose extras: `GasBuy` and `GasRefund` on the payer, fee reasons on
      the vault credits, nonce manager writes (and `NonceIncremented` in `v1.5.x`) on the root call,
-     `state_reverted` on the failed phase's calls, each `AccountAbstractionPhaseCall.call_index`,
+     `state_reverted` on the failed phase's calls, each `AccountAbstractionCallInput.call_index`,
      and `committed_phases`.
    - Skip type 121 in `OpPostTxExtras`. Fill the rest of `account_abstraction_trx_input` from
      `TxEip8130` in a Base `PreTxAdjust`.
