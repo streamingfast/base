@@ -101,46 +101,85 @@ The `0x79` stop hides these, and each needs a fix:
 
 ## Block model (`sf/ethereum/type/v2/type.proto`)
 
-Proposed, following review:
+Drafted in [streamingfast/firehose-ethereum#262](https://github.com/streamingfast/firehose-ethereum/pull/262):
 
-- **Enum value.** `121`, matching the wire byte like `TRX_TYPE_OPTIMISM_DEPOSIT = 126`, with no
-  `BASE_` prefix. The type now belongs to the AA Transaction Type draft, not EIP-8130, and that
-  draft's number isn't merged, so a name that doesn't carry an EIP number avoids both:
-  `TRX_TYPE_AA = 121`.
-- **Reuse existing fields** where the meaning is the same, as the draft's RPC object does: `hash`,
-  `from` (the resolved sender), `nonce` (`nonce_sequence`), `gas_limit`, `max_fee_per_gas`,
-  `max_priority_fee_per_gas`, `gas_price` (effective), `gas_used`, `status`, `receipt`, and
-  `calls`. `to`, `value`, `input`, `v`/`r`/`s`, `access_list`, and the blob fields stay empty.
-- **Add new fields flat on `TransactionTrace`**, with no chain prefix: `nonce_key` (`BigInt`),
-  `payer` (resolved), `valid_after`, `valid_before`, `metadata`, `account_changes` (a new message,
-  like `set_code_authorizations` for EIP-7702), and the phases with their calls (`to`, `value`,
-  `data`).
-- **`committed_phases` on `TransactionReceipt`** (`uint64`), the consensus receipt field that RPC
-  returns as `committedPhases`. With the phases listed on the transaction, it places every call
-  frame in its phase: a committed phase ran all its calls, each as one depth-1 frame; phase number
-  `committed_phases` failed, and the remaining depth-1 frames belong to it; later phases have no
-  frames. A failed phase can have no frames at all (blocked by the actor policy or the new-account
-  cost). Calls carry no phase index, as in RPC traces. For blocks from `v1.5.x`, the tracer derives
-  the count from `phase_statuses`: the number of leading `0x01` bytes.
-- **Root call.** One depth-0 call from the sender to the sender, with the encoded transaction as
-  input, and the phase calls beneath it. This keeps the rule that call 0 is the transaction's root
-  and matches what Base's inspector and `debug_traceTransaction` produce. It is a Firehose choice:
-  the draft defines no root call, and another client wouldn't necessarily produce one.
+```protobuf
+message TransactionTrace {
+  enum Type {
+    TRX_TYPE_AA = 121;                      // type byte 0x79
+  }
+  optional AaTrxInput aa_trx_input = 39;    // set only for TRX_TYPE_AA
+}
+
+message AaTrxInput {
+  BigInt nonce_key = 1;                     // sequence number is in TransactionTrace.nonce
+  bytes payer = 2;                          // resolved payer
+  uint64 valid_after = 3;                   // as signed, seconds or milliseconds
+  uint64 valid_before = 4;
+  bytes metadata = 5;
+  repeated AccountChange account_changes = 6;
+  repeated Phase phases = 7;                // every signed call, grouped in phases
+
+  message Phase { repeated PhaseCall calls = 1; }
+  message PhaseCall {
+    bytes to = 1;
+    BigInt value = 2;
+    bytes data = 3;
+    uint32 call_index = 4;                  // Call.index that executed it, 0 if it never ran
+  }
+  message AccountChange { oneof change { Delegation delegation = 1; } }
+  message Delegation { bytes target = 1; }  // empty clears the delegation
+}
+
+message TransactionReceipt {
+  optional AaTrxOutput aa_trx_output = 8;   // set only for TRX_TYPE_AA
+}
+
+message AaTrxOutput {
+  uint64 committed_phases = 1;
+}
+```
+
+- **Name.** `TRX_TYPE_AA`, with no EIP number: the type moved out of EIP-8130 and the AA
+  Transaction Type draft's number isn't merged. `aa_trx_input` and `aa_trx_output` follow the
+  same PR's renames of the Morph messages to `MorphTrxInput`, `MorphL1MessageTrxInput` and
+  `MorphTrxOutput`.
+- **Existing fields** keep their meaning, as in the draft's RPC object: `from` is the resolved
+  sender, `nonce` is `nonce_sequence`, `v`/`r`/`s` hold the sender's secp256k1 signature,
+  `gas_price` is the effective gas price, and `gas_used` includes the payer's authentication gas.
+  `to`, `value` and `input` are empty. The payer's signature isn't stored.
+- **Root call.** `calls[0]` is a call from the sender to the sender, with the encoded transaction
+  as input. It runs no code, carries the state changes made outside the calls (the payer's gas
+  purchase and refund, the fee payouts, the nonce increment, the account changes), and is never
+  reverted. It matches what Base's inspector and `debug_traceTransaction` produce, and keeps the
+  rule that call 0 is the transaction's root. It is a Firehose choice: the draft defines no root
+  call, and another client wouldn't necessarily produce one.
+- **Executed calls.** Each signed call that ran is a child of the root call, in execution order,
+  and `PhaseCall.call_index` points to it. Calls made by those calls nest below them as usual.
+  A signed call that never ran has `call_index = 0`: the rest of the phase after the call that
+  reverted, the skipped phases, and a call blocked by the actor policy or the new-account cost.
+- **`committed_phases`** is the consensus receipt field, returned by RPC as `committedPhases`.
+  Phase number `committed_phases` reverted when it is lower than the number of phases. For blocks
+  from `v1.5.x`, the tracer derives it from `phase_statuses`: the number of leading `0x01` bytes.
 - **Status.** A transaction with a failed phase has status `FAILED`, matching the receipt. The root
-  call isn't reverted, and only the failed phase's calls are `state_reverted`. The proto docs must
-  say that, for this type, a failed transaction can carry durable state changes and logs, so
-  readers go by each call's `state_reverted` instead of the transaction status.
+  call isn't reverted, and only the failed phase's calls are `state_reverted`. The
+  `TransactionTrace.status` docs say that for this type readers process every call with
+  `state_reverted == false`, whatever the status.
 - **Gas.** One `REASON_GAS_BUY` and at most one `REASON_GAS_REFUND` per transaction, as for other
   types, but on the payer. The payer's authentication gas is part of the same prepay.
 
 ## Work in each repository, in order
 
-1. **`firehose-ethereum` proto.** The enum value, the new transaction fields,
-   `TransactionReceipt.committed_phases`, and the status documentation.
+1. **`firehose-ethereum` proto.** Drafted in
+   [firehose-ethereum#262](https://github.com/streamingfast/firehose-ethereum/pull/262).
 2. **`evm-firehose-tracer-rs`** (5.6.0).
+   - Regenerate the bindings, and use the renamed `morph_trx_output` in place of
+     `morph_receipt_config`.
    - Add `TxType::Aa = 121`, its `Display` entry, and its proto mapping. Make unknown types an
      error instead of `TRX_TYPE_LEGACY`.
-   - Carry the new fields, through `TxEvent` or a `transaction_mut()` accessor like `block_mut()`.
+   - Carry `aa_trx_input` and `aa_trx_output`, through `TxEvent` or a `transaction_mut()`
+     accessor like `block_mut()`. `PhaseCall.call_index` is only known after execution, so the
+     caller must be able to set it before the transaction ends.
    - Let the caller mark a phase's calls `state_reverted` before `complete_transaction`, and skip
      the "failed receipt fails the root call" step for type 121.
    - Move logs written after the root call exits into the root call; the deferred state's "root"
@@ -152,13 +191,15 @@ Proposed, following review:
    - Let a chain choose the reason of balance changes read from the journal, instead of
      `Transfer`.
 4. **Base** (`crates/execution/firehose`).
-   - Have `Eip8130Executor` record what it did: payer, prepay, refund, each vault credit, how many
-     calls each phase ran, and which phase failed. Use the same thread-local that hands phase
+   - Have `Eip8130Executor` record what it did: payer, prepay, refund, each vault credit, which
+     signed calls ran, and which phase failed. Use the same thread-local that hands phase
      outcomes to the receipt builder (`Eip8130PhaseStatuses` in `v1.5.x`).
    - Use that record in the Firehose extras: `GasBuy` and `GasRefund` on the payer, fee reasons on
      the vault credits, nonce manager writes (and `NonceIncremented` in `v1.5.x`) on the root call,
-     and `state_reverted` on the failed phase's calls.
-   - Skip type 121 in `OpPostTxExtras`. Fill the new fields in a Base `PreTxAdjust`.
+     `state_reverted` on the failed phase's calls, each `PhaseCall.call_index`, and
+     `committed_phases`.
+   - Skip type 121 in `OpPostTxExtras`. Fill the rest of `aa_trx_input` from `TxEip8130` in a Base
+     `PreTxAdjust`.
    - Ignore the nonce manager's `0xEF` code rewrite when the code doesn't change, and the transient
      `TxContext` writes.
    - Keystore writes (Zenith only) keep stopping the node with a clear error.
