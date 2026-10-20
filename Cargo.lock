@@ -6199,6 +6199,7 @@ name = "base-reth-node"
 version = "1.5.0"
 dependencies = [
  "base-cli-utils",
+ "base-common-genesis",
  "base-execution-cli",
  "base-firehose-flashblocks",
  "base-node-runner",
@@ -9926,9 +9927,9 @@ checksum = "9844ddc3a6e533d62bba727eb6c28b5d360921d5175e9ff0f1e621a5c590a4d5"
 
 [[package]]
 name = "firehose-tracer"
-version = "5.5.0"
+version = "5.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a53eb86c6d17bd4e5517e46f56498d33d128d0641d78d15b86cf2c0605c814ee"
+checksum = "3dbf414244eeb38aa54b38fc82ac982a2587cffb5a9d86f808bdea1698d61a1e"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -9949,9 +9950,9 @@ dependencies = [
 
 [[package]]
 name = "firehose-tracer-prestate"
-version = "5.5.0"
+version = "5.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67ef9f9516014ba4f4f75025ef6325d4e15c2a66f99395fac74cd940348feac4"
+checksum = "29ed9ac9b60374bf1aa11b1b20376051817acdc1758932797a292aa6329105d8"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -9974,9 +9975,9 @@ dependencies = [
 
 [[package]]
 name = "firehose-tracer-test"
-version = "5.5.0"
+version = "5.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90e9cd98b48db9ec72bc4c6ef8bb0ab0e7455105347fa0e27da4add6b0f6d46a"
+checksum = "44af0c41df9cfc759b5638536b8d8d3800c36286211394402ced965c8ba85c4e"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",

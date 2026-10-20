@@ -7,10 +7,17 @@
 //!   flashblock WebSocket feed and emits per-flashblock partial-block FIRE
 //!   events via a separate, dedicated tracer.
 
+use std::{
+    sync::OnceLock,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use base_common_genesis::DenimTimestampSchedule;
 use base_firehose_flashblocks::{
     FirehoseFlashblocksProcessor, FirehoseFlashblocksStreamer, FlashblocksTracerHandle,
 };
 use base_node_runner::{BaseNodeExtension, FromExtensionConfig, NodeHooks};
+use firehose_tracer::types::BlockData;
 use reth_chain_state::CanonStateSubscriptions;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_engine_primitives::ConsensusEngineEvent;
@@ -29,6 +36,7 @@ impl BaseNodeExtension for FirehoseExtension {
     fn apply(self: Box<Self>, hooks: NodeHooks) -> NodeHooks {
         hooks.add_component_initialized_hook(|node| {
             let chain_spec = node.provider.chain_spec();
+            let _ = DENIM_SCHEDULE.set(chain_spec.denim_timestamp_schedule()?);
             reth_firehose::tracer().on_blockchain_init(
                 "reth",
                 concat!("base-", env!("CARGO_PKG_VERSION")),
@@ -47,12 +55,38 @@ impl FromExtensionConfig for FirehoseExtension {
     }
 }
 
+/// The running chain's Denim schedule (`None` when Denim is not scheduled), read by
+/// [`fire_block_time`]. Set before `FIRE INIT`, so before any block is traced.
+static DENIM_SCHEDULE: OnceLock<Option<DenimTimestampSchedule>> = OnceLock::new();
+
+/// The FIRE BLOCK line time, which becomes the Firehose block time.
+fn fire_block_time(block: &BlockData) -> SystemTime {
+    block_time(DENIM_SCHEDULE.get().and_then(Option::as_ref), block)
+}
+
+/// From Denim on, consensus requires a block's `BaseTime` deposit to carry the millisecond part
+/// of the schedule's time for its number, so the schedule gives the block's time in milliseconds.
+/// Earlier blocks use the header time in seconds.
+fn block_time(schedule: Option<&DenimTimestampSchedule>, block: &BlockData) -> SystemTime {
+    match schedule {
+        Some(schedule) if schedule.is_denim_active_at_block(block.number) => {
+            UNIX_EPOCH + Duration::from_millis(schedule.block_timestamp_millis(block.number))
+        }
+        _ => UNIX_EPOCH + Duration::from_secs(block.time),
+    }
+}
+
+fn tracer_config() -> firehose_tracer::config::Config {
+    firehose_tracer::config::Config {
+        chain_client: firehose_tracer::config::ChainClient::Reth,
+        fire_block_time: Some(fire_block_time),
+        ..Default::default()
+    }
+}
+
 /// Initializes the process-wide Firehose tracer with the default `reth` chain-client config.
 pub fn init() {
-    reth_firehose::init_tracer(firehose_tracer::config::Config {
-        chain_client: firehose_tracer::config::ChainClient::Reth,
-        ..Default::default()
-    });
+    reth_firehose::init_tracer(tracer_config());
 }
 
 /// Runner-level extension that subscribes to a flashblock WebSocket feed and emits one
@@ -88,11 +122,7 @@ impl BaseNodeExtension for FirehoseFlashblocksExtension {
             }
             let chain_id = full_node.provider.chain_spec().chain().id();
             let chain_config = firehose_tracer::config::ChainConfig::new(chain_id);
-            let tracer_config = firehose_tracer::config::Config {
-                chain_client: firehose_tracer::config::ChainClient::Reth,
-                ..Default::default()
-            };
-            let tracer = FlashblocksTracerHandle::new(tracer_config, chain_config);
+            let tracer = FlashblocksTracerHandle::new(tracer_config(), chain_config);
             let processor = FirehoseFlashblocksProcessor::new(full_node.provider.clone(), tracer);
             info!(url = %ws_url, "starting Firehose flashblocks streamer");
             let streamer = FirehoseFlashblocksStreamer::new(processor, ws_url);
@@ -171,5 +201,38 @@ impl FromExtensionConfig for FirehoseFlashblocksExtension {
 
     fn from_config(ws_url: Self::Config) -> Self {
         Self::new(ws_url.expect("FirehoseFlashblocksExtension::from_config requires a URL"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+
+    use super::*;
+
+    #[test]
+    fn block_time_follows_the_denim_schedule() {
+        // Denim activates at block 5 (time 1010); blocks then come every 200 ms.
+        let schedule = DenimTimestampSchedule {
+            genesis_block_number: 0,
+            genesis_timestamp: 1000,
+            legacy_block_interval: NonZeroU64::new(2).unwrap(),
+            denim_activation_timestamp: 1010,
+        };
+        let block = |number, time| BlockData { number, time, ..Default::default() };
+
+        for (number, time, want_ms) in [
+            (4, 1008, 1_008_000),
+            (5, 1010, 1_010_000),
+            (6, 1010, 1_010_200),
+            (10, 1011, 1_011_000),
+        ] {
+            assert_eq!(
+                block_time(Some(&schedule), &block(number, time)),
+                UNIX_EPOCH + Duration::from_millis(want_ms),
+                "block {number}"
+            );
+        }
+        assert_eq!(block_time(None, &block(6, 1010)), UNIX_EPOCH + Duration::from_secs(1010));
     }
 }
