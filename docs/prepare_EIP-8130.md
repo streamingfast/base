@@ -189,7 +189,7 @@ message AccountAbstractionTrxOutput {
 
 1. **`firehose-ethereum` proto.** Drafted in
    [firehose-ethereum#262](https://github.com/streamingfast/firehose-ethereum/pull/262).
-2. **`evm-firehose-tracer-rs`** (5.6.0).
+2. **`evm-firehose-tracer-rs`** (5.7.0).
    - Regenerate the bindings, and use the renamed `morph_trx_output` in place of
      `morph_receipt_config`.
    - Add `TxType::AccountAbstraction = 121`, its `Display` entry, and its proto mapping. Make
