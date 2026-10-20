@@ -92,7 +92,7 @@ fn call_indexes(trx: &TransactionTrace) -> Vec<Vec<u32>> {
     trx.account_abstraction_trx_input
         .as_ref()
         .expect("account_abstraction_trx_input")
-        .phases
+        .call_phases
         .iter()
         .map(|phase| phase.calls.iter().map(|call| call.call_index).collect())
         .collect()

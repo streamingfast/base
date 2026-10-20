@@ -26,7 +26,7 @@ use base_common_evm::{
 use firehose_tracer::{
     firehose_debug,
     pb::sf::ethereum::r#type::v2::{
-        AccountAbstractionAccountChange, AccountAbstractionPhase, AccountAbstractionPhaseCall,
+        AccountAbstractionAccountChange, AccountAbstractionCallInput, AccountAbstractionCallPhase,
         AccountAbstractionTrxInput, AccountAbstractionTrxOutput,
         account_abstraction_account_change, balance_change::Reason,
     },
@@ -275,13 +275,13 @@ impl OpPreTxAdjust {
             })
             .collect();
 
-        let phases = tx
+        let call_phases = tx
             .calls
             .iter()
-            .map(|calls| AccountAbstractionPhase {
+            .map(|calls| AccountAbstractionCallPhase {
                 calls: calls
                     .iter()
-                    .map(|call| AccountAbstractionPhaseCall {
+                    .map(|call| AccountAbstractionCallInput {
                         to: call.to.to_vec(),
                         value: u256_to_protobuf(call.value),
                         data: call.data.to_vec(),
@@ -315,7 +315,7 @@ impl OpPreTxAdjust {
             valid_before: tx.valid_before,
             metadata: tx.metadata.to_vec(),
             account_changes,
-            phases,
+            call_phases,
         });
 
         let (_, inspector, _) = evm.components_mut();
