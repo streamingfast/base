@@ -106,44 +106,58 @@ Drafted in [streamingfast/firehose-ethereum#262](https://github.com/streamingfas
 ```protobuf
 message TransactionTrace {
   enum Type {
-    TRX_TYPE_AA = 121;                      // type byte 0x79
+    TRX_TYPE_SET_CODE = 4;
+    TRX_TYPE_ACCOUNT_ABSTRACTION = 121;     // type byte 0x79
   }
-  optional AaTrxInput aa_trx_input = 39;    // set only for TRX_TYPE_AA
+  // set only for TRX_TYPE_ACCOUNT_ABSTRACTION
+  optional AccountAbstractionTrxInput account_abstraction_trx_input = 39;
 }
 
-message AaTrxInput {
+message AccountAbstractionTrxInput {
   BigInt nonce_key = 1;                     // sequence number is in TransactionTrace.nonce
   bytes payer = 2;                          // resolved payer
   uint64 valid_after = 3;                   // as signed, seconds or milliseconds
   uint64 valid_before = 4;
   bytes metadata = 5;
-  repeated AccountChange account_changes = 6;
-  repeated Phase phases = 7;                // every signed call, grouped in phases
+  repeated AccountAbstractionAccountChange account_changes = 6;
+  repeated AccountAbstractionPhase phases = 7;  // every signed call, grouped in phases
+}
 
-  message Phase { repeated PhaseCall calls = 1; }
-  message PhaseCall {
-    bytes to = 1;
-    BigInt value = 2;
-    bytes data = 3;
-    uint32 call_index = 4;                  // Call.index that executed it, 0 if it never ran
+message AccountAbstractionPhase {
+  repeated AccountAbstractionPhaseCall calls = 1;
+}
+
+message AccountAbstractionPhaseCall {
+  bytes to = 1;
+  BigInt value = 2;
+  bytes data = 3;
+  uint32 call_index = 4;                    // Call.index that executed it, 0 if it never ran
+}
+
+message AccountAbstractionAccountChange {
+  oneof change {
+    bytes delegation_target = 1;            // empty clears the delegation
   }
-  message AccountChange { oneof change { Delegation delegation = 1; } }
-  message Delegation { bytes target = 1; }  // empty clears the delegation
 }
 
 message TransactionReceipt {
-  optional AaTrxOutput aa_trx_output = 8;   // set only for TRX_TYPE_AA
+  // set only for TRX_TYPE_ACCOUNT_ABSTRACTION
+  optional AccountAbstractionTrxOutput account_abstraction_trx_output = 8;
 }
 
-message AaTrxOutput {
+message AccountAbstractionTrxOutput {
   uint64 committed_phases = 1;
 }
 ```
 
-- **Name.** `TRX_TYPE_AA`, with no EIP number: the type moved out of EIP-8130 and the AA
-  Transaction Type draft's number isn't merged. `aa_trx_input` and `aa_trx_output` follow the
-  same PR's renames of the Morph messages to `MorphTrxInput`, `MorphL1MessageTrxInput` and
-  `MorphTrxOutput`.
+- **Name.** `TRX_TYPE_ACCOUNT_ABSTRACTION`, with no EIP number: the type moved out of EIP-8130
+  and the AA Transaction Type draft's number isn't merged. The names are spelled out rather than
+  `Aa`. `account_abstraction_trx_input` and `account_abstraction_trx_output` follow the same PR's
+  renames of the Morph messages to `MorphTrxInput`, `MorphL1MessageTrxInput` and
+  `MorphTrxOutput`. The value 121 is the type byte, as for the other Ethereum, Arbitrum and
+  Optimism types.
+- **Account changes.** The `oneof` leaves room for the entry types EIP-8430 reserves: EIP-8130
+  uses `0x02` and `0x03` for Keystore changes.
 - **Existing fields** keep their meaning, as in the draft's RPC object: `from` is the resolved
   sender, `nonce` is `nonce_sequence`, `v`/`r`/`s` hold the sender's secp256k1 signature,
   `gas_price` is the effective gas price, and `gas_used` includes the payer's authentication gas.
@@ -154,10 +168,11 @@ message AaTrxOutput {
   reverted. It matches what Base's inspector and `debug_traceTransaction` produce, and keeps the
   rule that call 0 is the transaction's root. It is a Firehose choice: the draft defines no root
   call, and another client wouldn't necessarily produce one.
-- **Executed calls.** Each signed call that ran is a child of the root call, in execution order,
-  and `PhaseCall.call_index` points to it. Calls made by those calls nest below them as usual.
-  A signed call that never ran has `call_index = 0`: the rest of the phase after the call that
-  reverted, the skipped phases, and a call blocked by the actor policy or the new-account cost.
+- **Executed calls.** Each signed call that ran is a child of the root call, in execution order, and
+  `AccountAbstractionPhaseCall.call_index` points to it. Calls made by those calls nest below them
+  as usual. Call indexes start at 1, so a signed call that never ran has `call_index = 0`: the rest
+  of the phase after the call that reverted, the skipped phases, and a call blocked by the actor
+  policy or the new-account cost.
 - **`committed_phases`** is the consensus receipt field, returned by RPC as `committedPhases`.
   Phase number `committed_phases` reverted when it is lower than the number of phases. For blocks
   from `v1.5.x`, the tracer derives it from `phase_statuses`: the number of leading `0x01` bytes.
@@ -175,11 +190,12 @@ message AaTrxOutput {
 2. **`evm-firehose-tracer-rs`** (5.6.0).
    - Regenerate the bindings, and use the renamed `morph_trx_output` in place of
      `morph_receipt_config`.
-   - Add `TxType::Aa = 121`, its `Display` entry, and its proto mapping. Make unknown types an
-     error instead of `TRX_TYPE_LEGACY`.
-   - Carry `aa_trx_input` and `aa_trx_output`, through `TxEvent` or a `transaction_mut()`
-     accessor like `block_mut()`. `PhaseCall.call_index` is only known after execution, so the
-     caller must be able to set it before the transaction ends.
+   - Add `TxType::AccountAbstraction = 121`, its `Display` entry, and its proto mapping. Make
+     unknown types an error instead of `TRX_TYPE_LEGACY`.
+   - Carry `account_abstraction_trx_input` and `account_abstraction_trx_output`, through `TxEvent`
+     or a `transaction_mut()` accessor like `block_mut()`. `AccountAbstractionPhaseCall.call_index`
+     is only known after execution, so the caller must be able to set it before the transaction
+     ends.
    - Let the caller mark a phase's calls `state_reverted` before `complete_transaction`, and skip
      the "failed receipt fails the root call" step for type 121.
    - Move logs written after the root call exits into the root call; the deferred state's "root"
@@ -196,10 +212,10 @@ message AaTrxOutput {
      outcomes to the receipt builder (`Eip8130PhaseStatuses` in `v1.5.x`).
    - Use that record in the Firehose extras: `GasBuy` and `GasRefund` on the payer, fee reasons on
      the vault credits, nonce manager writes (and `NonceIncremented` in `v1.5.x`) on the root call,
-     `state_reverted` on the failed phase's calls, each `PhaseCall.call_index`, and
-     `committed_phases`.
-   - Skip type 121 in `OpPostTxExtras`. Fill the rest of `aa_trx_input` from `TxEip8130` in a Base
-     `PreTxAdjust`.
+     `state_reverted` on the failed phase's calls, each `AccountAbstractionPhaseCall.call_index`,
+     and `committed_phases`.
+   - Skip type 121 in `OpPostTxExtras`. Fill the rest of `account_abstraction_trx_input` from
+     `TxEip8130` in a Base `PreTxAdjust`.
    - Ignore the nonce manager's `0xEF` code rewrite when the code doesn't change, and the transient
      `TxContext` writes.
    - Keystore writes (Zenith only) keep stopping the node with a clear error.
