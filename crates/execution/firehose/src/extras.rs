@@ -18,7 +18,9 @@
 
 use alloy_evm::Evm as _;
 use alloy_primitives::{Address, B256, Bytes, U256};
-use base_common_consensus::{AccountChange, Predeploys};
+use base_common_consensus::{
+    AccountChange, AccountChangeChannel, ChangeType, Eip8130Constants, Predeploys,
+};
 use base_common_evm::{
     BaseContext, BaseEvm, BaseSpecId, BaseTransaction, BaseTxTr, BaseUpgrade,
     DEPOSIT_TRANSACTION_TYPE, Eip8130PhaseStatuses,
@@ -26,9 +28,12 @@ use base_common_evm::{
 use firehose_tracer::{
     firehose_debug,
     pb::sf::ethereum::r#type::v2::{
-        AccountAbstractionAccountChange, AccountAbstractionCallInput, AccountAbstractionCallPhase,
+        AccountAbstractionAccountChange, AccountAbstractionAccountCreate,
+        AccountAbstractionCallInput, AccountAbstractionCallPhase, AccountAbstractionConfigChange,
+        AccountAbstractionInitialActor, AccountAbstractionKeystoreChange,
         AccountAbstractionTrxInput, AccountAbstractionTrxOutput,
-        account_abstraction_account_change, balance_change::Reason,
+        account_abstraction_account_change, account_abstraction_config_change,
+        account_abstraction_keystore_change, balance_change::Reason,
     },
     types::{TxEvent, TxType},
     utils::u256_to_protobuf,
@@ -253,27 +258,7 @@ impl OpPreTxAdjust {
             )
         });
 
-        let account_changes = tx
-            .account_changes
-            .iter()
-            .map(|change| match change {
-                AccountChange::Delegation(delegation) => AccountAbstractionAccountChange {
-                    change: Some(account_abstraction_account_change::Change::DelegationTarget(
-                        if delegation.target.is_zero() {
-                            Vec::new()
-                        } else {
-                            delegation.target.to_vec()
-                        },
-                    )),
-                },
-                // Keystore entries are gated by Zenith, which only genesis can activate.
-                AccountChange::Create(_) | AccountChange::ConfigChange(_) => panic!(
-                    "Firehose cannot trace transaction {}: the block model has no Keystore \
-                     account change, so this node cannot emit this block",
-                    tx_event.hash
-                ),
-            })
-            .collect();
+        let account_changes = tx.account_changes.iter().map(Self::account_change).collect();
 
         let call_phases = tx
             .calls
@@ -292,12 +277,16 @@ impl OpPreTxAdjust {
             .collect();
 
         tx_event.to = None;
-        // `sender_auth` ends with the sender's `r || s || v` secp256k1 signature, after the
-        // 20-byte authenticator selector when the sender is named.
+        // `sender_auth` is the sender's `r || s || v` secp256k1 signature when the sender is
+        // recovered, and `authenticator || data` when it is named.
         let sender_auth = signed.sender_auth();
-        if let Some(signature) = sender_auth.get(sender_auth.len().saturating_sub(65)..)
-            && signature.len() == 65
-        {
+        let k1_signature = if tx.sender.is_none() {
+            Some(sender_auth.as_ref())
+        } else {
+            sender_auth.strip_prefix(Eip8130Constants::K1_AUTHENTICATOR.as_slice())
+        }
+        .filter(|signature| signature.len() == 65);
+        if let Some(signature) = k1_signature {
             tx_event.r = B256::from_slice(&signature[..32]);
             tx_event.s = B256::from_slice(&signature[32..64]);
             // Typed transactions record the y-parity, trimmed like a big integer.
@@ -316,6 +305,7 @@ impl OpPreTxAdjust {
             metadata: tx.metadata.to_vec(),
             account_changes,
             call_phases,
+            sender_auth: if k1_signature.is_some() { Vec::new() } else { sender_auth.to_vec() },
         });
 
         let (_, inspector, _) = evm.components_mut();
@@ -329,5 +319,76 @@ impl OpPreTxAdjust {
                 (Predeploys::OPERATOR_FEE_VAULT, Reason::RewardTransactionFee),
             ],
         });
+    }
+
+    /// Maps an EIP-8130 account change entry to the block model.
+    fn account_change(change: &AccountChange) -> AccountAbstractionAccountChange {
+        let change = match change {
+            AccountChange::Delegation(delegation) => {
+                account_abstraction_account_change::Change::DelegationTarget(
+                    if delegation.target.is_zero() {
+                        Vec::new()
+                    } else {
+                        delegation.target.to_vec()
+                    },
+                )
+            }
+            AccountChange::Create(entry) => account_abstraction_account_change::Change::Create(
+                AccountAbstractionAccountCreate {
+                    user_salt: entry.user_salt.to_vec(),
+                    code: entry.code.to_vec(),
+                    initial_actors: entry
+                        .initial_actors
+                        .iter()
+                        .map(|actor| AccountAbstractionInitialActor {
+                            actor_id: actor.actor_id.to_vec(),
+                            authenticator: actor.authenticator.to_vec(),
+                            scope: actor.scope.into(),
+                            policy_data: actor.policy_data.to_vec(),
+                        })
+                        .collect(),
+                },
+            ),
+            AccountChange::ConfigChange(batch) => {
+                account_abstraction_account_change::Change::ConfigChange(
+                    AccountAbstractionConfigChange {
+                        channel: match batch.channel {
+                            AccountChangeChannel::Local => {
+                                account_abstraction_config_change::Channel::Local
+                            }
+                            AccountChangeChannel::Multichain => {
+                                account_abstraction_config_change::Channel::Multichain
+                            }
+                        } as i32,
+                        sequence: batch.sequence,
+                        changes: batch
+                            .changes
+                            .iter()
+                            .map(|change| AccountAbstractionKeystoreChange {
+                                r#type: Self::keystore_change_type(change.change_type) as i32,
+                                payload: change.payload.to_vec(),
+                            })
+                            .collect(),
+                        auth: batch.signature.to_vec(),
+                    },
+                )
+            }
+        };
+        AccountAbstractionAccountChange { change: Some(change) }
+    }
+
+    /// Maps a Keystore change type to the block model.
+    const fn keystore_change_type(
+        change_type: ChangeType,
+    ) -> account_abstraction_keystore_change::Type {
+        match change_type {
+            ChangeType::AuthorizeActor => account_abstraction_keystore_change::Type::AuthorizeActor,
+            ChangeType::RevokeActor => account_abstraction_keystore_change::Type::RevokeActor,
+            ChangeType::IncrementLocalEpoch => {
+                account_abstraction_keystore_change::Type::IncrementLocalEpoch
+            }
+            ChangeType::Lock => account_abstraction_keystore_change::Type::Lock,
+            ChangeType::Unlock => account_abstraction_keystore_change::Type::Unlock,
+        }
     }
 }

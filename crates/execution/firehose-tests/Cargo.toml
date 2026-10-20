@@ -50,4 +50,7 @@ path = "tests/eip8130.rs"
 [dev-dependencies]
 k256.workspace = true
 alloy-signer.workspace = true
+alloy-sol-types.workspace = true
 base-test-utils.workspace = true
+base-execution-eip8130.workspace = true
+p256 = { workspace = true, features = ["ecdsa"] }

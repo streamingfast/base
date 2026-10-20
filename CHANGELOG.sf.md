@@ -10,7 +10,9 @@
   it, while the phases that committed keep their state even though the transaction is `FAILED`.
   The payer's gas purchase and refund, the fee payouts, the nonce increment, the nonce manager
   writes and the delegation code are recorded on the root call.
-  Keystore account changes, which only Zenith enables, still stop the node.
+  The Keystore account changes Zenith enables (EIP-8130 create and config change entries) are
+  recorded in `account_changes`, and a sender that signs with a P-256, WebAuthn or delegate
+  authenticator has its authentication in `sender_auth` instead of `v`, `r` and `s`.
 
 ## v1.5.0-fh3.1
 
