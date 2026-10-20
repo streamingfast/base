@@ -654,6 +654,8 @@ firehose-tracer-prestate = "5.5.0"
 # SF fork of alloy-evm that routes system calls (EIP-4788, EIP-2935, etc.) through the
 # Inspector, so Firehose tracing observes them. Must match the patch in streamingfast/reth.
 alloy-evm = { git = "https://github.com/streamingfast/evm.git", tag = "v0.38.0-sf" }
+# Replace with a crates.io bump once streamingfast/evm-firehose-tracer-rs#39 is released.
+firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", branch = "feature/fire-block-time" }
 
 [patch."https://github.com/base/reth"]
 reth-basic-payload-builder = { git = "https://github.com/streamingfast/reth.git", tag = "base-v2.5.2.8-fh3.1" }

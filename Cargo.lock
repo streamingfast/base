@@ -6199,6 +6199,7 @@ name = "base-reth-node"
 version = "1.5.0"
 dependencies = [
  "base-cli-utils",
+ "base-common-genesis",
  "base-execution-cli",
  "base-firehose-flashblocks",
  "base-node-runner",
@@ -9927,8 +9928,7 @@ checksum = "9844ddc3a6e533d62bba727eb6c28b5d360921d5175e9ff0f1e621a5c590a4d5"
 [[package]]
 name = "firehose-tracer"
 version = "5.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a53eb86c6d17bd4e5517e46f56498d33d128d0641d78d15b86cf2c0605c814ee"
+source = "git+https://github.com/streamingfast/evm-firehose-tracer-rs.git?branch=feature%2Ffire-block-time#0fbe8aba7a0e2eb9d73f2fd36baa5f0e1f5747fd"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
