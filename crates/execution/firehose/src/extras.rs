@@ -27,8 +27,8 @@ use firehose_tracer::{
     firehose_debug,
     pb::sf::ethereum::r#type::v2::{
         AccountAbstractionAccountChange, AccountAbstractionPhase, AccountAbstractionPhaseCall,
-        AccountAbstractionTrxInput, AccountAbstractionTrxOutput, account_abstraction_account_change,
-        balance_change::Reason,
+        AccountAbstractionTrxInput, AccountAbstractionTrxOutput,
+        account_abstraction_account_change, balance_change::Reason,
     },
     types::{TxEvent, TxType},
     utils::u256_to_protobuf,
@@ -67,9 +67,11 @@ where
         // receipt builder has not consumed the phase statuses yet: it runs at commit.
         if evm.ctx().tx().is_eip8130() {
             let (_, inspector, _) = evm.components_mut();
-            inspector.tracer_mut().set_account_abstraction_trx_output(AccountAbstractionTrxOutput {
-                committed_phases: Eip8130PhaseStatuses::committed_phases(),
-            });
+            inspector.tracer_mut().set_account_abstraction_trx_output(
+                AccountAbstractionTrxOutput {
+                    committed_phases: Eip8130PhaseStatuses::committed_phases(),
+                },
+            );
             return;
         }
 
