@@ -43,5 +43,11 @@ serde_json.workspace = true
 name = "prestate"
 path = "tests/prestate.rs"
 
+[[test]]
+name = "eip8130"
+path = "tests/eip8130.rs"
+
 [dev-dependencies]
 k256.workspace = true
+alloy-signer.workspace = true
+base-test-utils.workspace = true

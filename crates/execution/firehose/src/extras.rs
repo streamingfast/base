@@ -17,18 +17,25 @@
 //!   into the event.
 
 use alloy_evm::Evm as _;
-use alloy_primitives::{Address, Bytes, U256};
-use base_common_consensus::Predeploys;
+use alloy_primitives::{Address, B256, Bytes, U256};
+use base_common_consensus::{AccountChange, Predeploys};
 use base_common_evm::{
-    BaseContext, BaseEvm, BaseSpecId, BaseTxTr, BaseUpgrade, DEPOSIT_TRANSACTION_TYPE,
+    BaseContext, BaseEvm, BaseSpecId, BaseTransaction, BaseTxTr, BaseUpgrade,
+    DEPOSIT_TRANSACTION_TYPE, Eip8130PhaseStatuses,
 };
-use firehose_tracer::firehose_debug;
-use firehose_tracer::pb::sf::ethereum::r#type::v2::balance_change::Reason;
-use firehose_tracer::types::{TxEvent, TxType};
-use reth_firehose::inspector::FirehoseInspectorApi;
-use reth_firehose::{PostTxExtras, PreTxAdjust};
+use firehose_tracer::{
+    firehose_debug,
+    pb::sf::ethereum::r#type::v2::{AaTrxInput, AaTrxOutput, aa_trx_input, balance_change::Reason},
+    types::{TxEvent, TxType},
+    utils::u256_to_protobuf,
+};
+use reth_firehose::{
+    PostTxExtras, PreTxAdjust,
+    inspector::{FirehoseInspectorApi, RootJournalReasons},
+};
 use reth_revm::revm::{
-    context_interface::ContextTr,
+    context::TxEnv,
+    context_interface::{Block as _, ContextTr},
     handler::PrecompileProvider,
     inspector::Inspector,
     interpreter::{InterpreterResult, interpreter::EthInterpreter},
@@ -45,17 +52,23 @@ where
     I: Inspector<BaseContext<DB>, EthInterpreter> + FirehoseInspectorApi,
     P: PrecompileProvider<BaseContext<DB>, Output = InterpreterResult>,
 {
-    fn emit_post_tx_extras(
-        &self,
-        evm: &mut BaseEvm<DB, I, P>,
-        gas_used: u64,
-        base_fee: u64,
-    ) {
+    fn emit_post_tx_extras(&self, evm: &mut BaseEvm<DB, I, P>, gas_used: u64, base_fee: u64) {
         firehose_debug!(
             "OpPostTxExtras::emit_post_tx_extras called (gas_used={}, base_fee={})",
             gas_used,
             base_fee
         );
+        // An EIP-8130 transaction credits its fee recipients on the journal inside its root call
+        // (see `OpPreTxAdjust`), so only its committed phase count is left to record. The
+        // receipt builder has not consumed the phase statuses yet: it runs at commit.
+        if evm.ctx().tx().is_eip8130() {
+            let (_, inspector, _) = evm.components_mut();
+            inspector.tracer_mut().set_aa_trx_output(AaTrxOutput {
+                committed_phases: Eip8130PhaseStatuses::committed_phases(),
+            });
+            return;
+        }
+
         // Deposit txs return early in `BaseHandler::reward_beneficiary` without crediting any
         // vault — skip them here so we do not emit phantom entries.
         let (enveloped, spec): (Bytes, BaseSpecId) = {
@@ -70,19 +83,13 @@ where
             // emit nothing rather than panic: the tracer stays consistent with the handler,
             // which would have errored out before reaching `reward_beneficiary`.
             let Some(bytes) = tx.enveloped_tx().cloned() else {
-                firehose_debug!(
-                    "OpPostTxExtras: non-deposit tx has no enveloped bytes — skipping"
-                );
+                firehose_debug!("OpPostTxExtras: non-deposit tx has no enveloped bytes — skipping");
                 return;
             };
             (bytes, *ctx.cfg().spec())
         };
 
-        firehose_debug!(
-            "OpPostTxExtras: enveloped_len={}, spec={:?}",
-            enveloped.len(),
-            spec
-        );
+        firehose_debug!("OpPostTxExtras: enveloped_len={}, spec={:?}", enveloped.len(), spec);
 
         // CRITICAL: `calculate_tx_l1_cost` caches its result on `L1BlockInfo.tx_l1_cost`
         // (see `l1block.rs:297`). The OP handler relies on that cache being `None` at the
@@ -103,8 +110,7 @@ where
             l1.clear_tx_l1_cost();
             (l1_cost, operator_fee_cost)
         };
-        let base_fee_amount =
-            U256::from(base_fee as u128).saturating_mul(U256::from(gas_used));
+        let base_fee_amount = U256::from(base_fee as u128).saturating_mul(U256::from(gas_used));
 
         firehose_debug!(
             "OpPostTxExtras: l1_cost={}, base_fee_amount={}, operator_fee_cost={}",
@@ -143,9 +149,7 @@ where
                 new,
                 amount
             );
-            inspector
-                .tracer_mut()
-                .on_balance_change(vault, old, new, Reason::RewardTransactionFee);
+            inspector.tracer_mut().on_balance_change(vault, old, new, Reason::RewardTransactionFee);
         }
     }
 }
@@ -169,9 +173,15 @@ where
     fn adjust_tx_event(
         &self,
         evm: &mut BaseEvm<DB, I, P>,
+        tx_env: &BaseTransaction<TxEnv>,
         tx_event: &mut TxEvent,
         sender: Address,
     ) {
+        if matches!(tx_event.tx_type, TxType::Aa) {
+            Self::adjust_eip8130_tx_event(evm, tx_env, tx_event, sender);
+            return;
+        }
+
         // Only OP deposit txs need any fixup — every other envelope carries a real nonce and
         // is correctly classified as `GasBuy` by the generic depth-0 inspector path.
         if !matches!(tx_event.tx_type, TxType::OptimismDeposit) {
@@ -198,5 +208,122 @@ where
         // `enter_frame_pre_hook`). Non-deposit OP txs hit the early return above and keep
         // the default `GasBuy` reason.
         inspector.set_root_balance_reason(Reason::IncreaseMint);
+    }
+}
+
+impl OpPreTxAdjust {
+    /// Fills the fields of an EIP-8130 transaction (type `0x79`) the generic mapper cannot read
+    /// from the envelope, and records its fees from the journal.
+    ///
+    /// The executor charges the payer, increments the nonce and applies the account changes on
+    /// the journal before the root call, and refunds the payer and credits the beneficiary and
+    /// the fee vaults after the last call, all outside the calls below the root call. The
+    /// inspector records them inside the root call with the reasons set here.
+    fn adjust_eip8130_tx_event<DB, I, P>(
+        evm: &mut BaseEvm<DB, I, P>,
+        tx_env: &BaseTransaction<TxEnv>,
+        tx_event: &mut TxEvent,
+        sender: Address,
+    ) where
+        DB: alloy_evm::Database,
+        I: Inspector<BaseContext<DB>, EthInterpreter> + FirehoseInspectorApi,
+        P: PrecompileProvider<BaseContext<DB>, Output = InterpreterResult>,
+    {
+        let Some(parts) = tx_env.eip8130_parts() else {
+            panic!(
+                "Firehose cannot trace transaction {}: an EIP-8130 transaction reached the EVM \
+                 without its envelope",
+                tx_event.hash
+            );
+        };
+        let signed = &parts.signed;
+        let tx = signed.tx();
+        let beneficiary = evm.ctx().block().beneficiary();
+
+        let payer = signed.resolved_payer(sender).unwrap_or_else(|_| {
+            panic!(
+                "Firehose cannot trace transaction {}: its open payer signature does not recover",
+                tx_event.hash
+            )
+        });
+
+        let account_changes = tx
+            .account_changes
+            .iter()
+            .map(|change| match change {
+                AccountChange::Delegation(delegation) => aa_trx_input::AccountChange {
+                    change: Some(aa_trx_input::account_change::Change::Delegation(
+                        aa_trx_input::Delegation {
+                            target: if delegation.target.is_zero() {
+                                Vec::new()
+                            } else {
+                                delegation.target.to_vec()
+                            },
+                        },
+                    )),
+                },
+                // Keystore entries are gated by Zenith, which only genesis can activate.
+                AccountChange::Create(_) | AccountChange::ConfigChange(_) => panic!(
+                    "Firehose cannot trace transaction {}: the block model has no Keystore \
+                     account change, so this node cannot emit this block",
+                    tx_event.hash
+                ),
+            })
+            .collect();
+
+        let phases = tx
+            .calls
+            .iter()
+            .map(|calls| aa_trx_input::Phase {
+                calls: calls
+                    .iter()
+                    .map(|call| aa_trx_input::PhaseCall {
+                        to: call.to.to_vec(),
+                        value: u256_to_protobuf(call.value),
+                        data: call.data.to_vec(),
+                        call_index: 0,
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        tx_event.to = None;
+        // `sender_auth` ends with the sender's `r || s || v` secp256k1 signature, after the
+        // 20-byte authenticator selector when the sender is named.
+        let sender_auth = signed.sender_auth();
+        if let Some(signature) = sender_auth.get(sender_auth.len().saturating_sub(65)..)
+            && signature.len() == 65
+        {
+            tx_event.r = B256::from_slice(&signature[..32]);
+            tx_event.s = B256::from_slice(&signature[32..64]);
+            // Typed transactions record the y-parity, trimmed like a big integer.
+            let y_parity = signature[64].saturating_sub(27);
+            tx_event.v = Some(if y_parity == 0 {
+                Bytes::new()
+            } else {
+                Bytes::copy_from_slice(&[y_parity])
+            });
+        }
+        tx_event.aa_trx_input = Some(AaTrxInput {
+            nonce_key: u256_to_protobuf(tx.nonce_key),
+            payer: payer.to_vec(),
+            valid_after: tx.valid_after,
+            valid_before: tx.valid_before,
+            metadata: tx.metadata.to_vec(),
+            account_changes,
+            phases,
+        });
+
+        let (_, inspector, _) = evm.components_mut();
+        inspector.set_root_journal_reasons(RootJournalReasons {
+            decreases: vec![(payer, Reason::GasBuy)],
+            increases: vec![
+                (payer, Reason::GasRefund),
+                (beneficiary, Reason::RewardTransactionFee),
+                (Predeploys::BASE_FEE_VAULT, Reason::RewardTransactionFee),
+                (Predeploys::L1_FEE_VAULT, Reason::RewardTransactionFee),
+                (Predeploys::OPERATOR_FEE_VAULT, Reason::RewardTransactionFee),
+            ],
+        });
     }
 }
