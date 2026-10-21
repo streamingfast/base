@@ -333,7 +333,7 @@ impl OpPreTxAdjust {
     }
 
     /// Maps an EIP-8130 account change entry to the block model.
-    fn account_change(change: &AccountChange) -> AccountAbstractionAccountChange {
+    pub fn account_change(change: &AccountChange) -> AccountAbstractionAccountChange {
         let change = match change {
             AccountChange::Delegation(delegation) => {
                 account_abstraction_account_change::Change::DelegationTarget(
@@ -389,7 +389,7 @@ impl OpPreTxAdjust {
     }
 
     /// Maps a Keystore change type to the block model.
-    const fn keystore_change_type(
+    pub const fn keystore_change_type(
         change_type: ChangeType,
     ) -> account_abstraction_keystore_change::Type {
         match change_type {
