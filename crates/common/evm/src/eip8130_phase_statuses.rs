@@ -98,4 +98,18 @@ impl Eip8130PhaseStatuses {
     pub const fn take() -> Vec<u8> {
         Vec::new()
     }
+
+    /// Returns a copy of the statuses recorded by the most recent [`Self::set`] on this
+    /// thread, leaving them in place for [`Self::take`]. Empty in `no_std` builds.
+    #[cfg(feature = "std")]
+    pub fn peek() -> Vec<u8> {
+        PHASE_STATUSES.with(|cell| cell.borrow().clone())
+    }
+
+    /// Returns a copy of the statuses recorded by the most recent [`Self::set`] on this
+    /// thread, leaving them in place for [`Self::take`]. Empty in `no_std` builds.
+    #[cfg(not(feature = "std"))]
+    pub const fn peek() -> Vec<u8> {
+        Vec::new()
+    }
 }

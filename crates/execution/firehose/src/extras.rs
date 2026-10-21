@@ -17,18 +17,34 @@
 //!   into the event.
 
 use alloy_evm::Evm as _;
-use alloy_primitives::{Address, Bytes, U256};
-use base_common_consensus::Predeploys;
-use base_common_evm::{
-    BaseContext, BaseEvm, BaseSpecId, BaseTxTr, BaseUpgrade, DEPOSIT_TRANSACTION_TYPE,
+use alloy_primitives::{Address, B256, Bytes, U256};
+use base_common_consensus::{
+    AccountChange, AccountChangeChannel, ChangeType, Eip8130Constants, Predeploys,
 };
-use firehose_tracer::firehose_debug;
-use firehose_tracer::pb::sf::ethereum::r#type::v2::balance_change::Reason;
-use firehose_tracer::types::{TxEvent, TxType};
-use reth_firehose::inspector::FirehoseInspectorApi;
-use reth_firehose::{PostTxExtras, PreTxAdjust};
+use base_common_evm::{
+    BaseContext, BaseEvm, BaseSpecId, BaseTransaction, BaseTxTr, BaseUpgrade,
+    DEPOSIT_TRANSACTION_TYPE, Eip8130PhaseStatuses,
+};
+use firehose_tracer::{
+    firehose_debug,
+    pb::sf::ethereum::r#type::v2::{
+        AccountAbstractionAccountChange, AccountAbstractionAccountCreate,
+        AccountAbstractionCallInput, AccountAbstractionCallPhase, AccountAbstractionConfigChange,
+        AccountAbstractionInitialActor, AccountAbstractionKeystoreChange,
+        AccountAbstractionTrxInput, AccountAbstractionTrxOutput,
+        account_abstraction_account_change, account_abstraction_config_change,
+        account_abstraction_keystore_change, balance_change::Reason,
+    },
+    types::{TxEvent, TxType},
+    utils::u256_to_protobuf,
+};
+use reth_firehose::{
+    PostTxExtras, PreTxAdjust,
+    inspector::{FirehoseInspectorApi, RootJournalReasons},
+};
 use reth_revm::revm::{
-    context_interface::ContextTr,
+    context::TxEnv,
+    context_interface::{Block as _, ContextTr},
     handler::PrecompileProvider,
     inspector::Inspector,
     interpreter::{InterpreterResult, interpreter::EthInterpreter},
@@ -45,17 +61,27 @@ where
     I: Inspector<BaseContext<DB>, EthInterpreter> + FirehoseInspectorApi,
     P: PrecompileProvider<BaseContext<DB>, Output = InterpreterResult>,
 {
-    fn emit_post_tx_extras(
-        &self,
-        evm: &mut BaseEvm<DB, I, P>,
-        gas_used: u64,
-        base_fee: u64,
-    ) {
+    fn emit_post_tx_extras(&self, evm: &mut BaseEvm<DB, I, P>, gas_used: u64, base_fee: u64) {
         firehose_debug!(
             "OpPostTxExtras::emit_post_tx_extras called (gas_used={}, base_fee={})",
             gas_used,
             base_fee
         );
+        // An EIP-8130 transaction credits its fee recipients on the journal inside its root call
+        // (see `OpPreTxAdjust`), so only its committed phase count is left to record. The
+        // receipt builder has not consumed the phase statuses yet: it runs at commit. Phases stop
+        // at the first revert, so the committed ones are the leading `0x01` statuses.
+        if evm.ctx().tx().is_eip8130() {
+            let committed_phases =
+                Eip8130PhaseStatuses::peek().iter().take_while(|status| **status == 0x01).count()
+                    as u64;
+            let (_, inspector, _) = evm.components_mut();
+            inspector.tracer_mut().set_account_abstraction_trx_output(
+                AccountAbstractionTrxOutput { committed_phases },
+            );
+            return;
+        }
+
         // Deposit txs return early in `BaseHandler::reward_beneficiary` without crediting any
         // vault — skip them here so we do not emit phantom entries.
         let (enveloped, spec): (Bytes, BaseSpecId) = {
@@ -70,19 +96,13 @@ where
             // emit nothing rather than panic: the tracer stays consistent with the handler,
             // which would have errored out before reaching `reward_beneficiary`.
             let Some(bytes) = tx.enveloped_tx().cloned() else {
-                firehose_debug!(
-                    "OpPostTxExtras: non-deposit tx has no enveloped bytes — skipping"
-                );
+                firehose_debug!("OpPostTxExtras: non-deposit tx has no enveloped bytes — skipping");
                 return;
             };
             (bytes, *ctx.cfg().spec())
         };
 
-        firehose_debug!(
-            "OpPostTxExtras: enveloped_len={}, spec={:?}",
-            enveloped.len(),
-            spec
-        );
+        firehose_debug!("OpPostTxExtras: enveloped_len={}, spec={:?}", enveloped.len(), spec);
 
         // CRITICAL: `calculate_tx_l1_cost` caches its result on `L1BlockInfo.tx_l1_cost`
         // (see `l1block.rs:297`). The OP handler relies on that cache being `None` at the
@@ -169,9 +189,15 @@ where
     fn adjust_tx_event(
         &self,
         evm: &mut BaseEvm<DB, I, P>,
+        tx_env: &BaseTransaction<TxEnv>,
         tx_event: &mut TxEvent,
         sender: Address,
     ) {
+        if matches!(tx_event.tx_type, TxType::AccountAbstraction) {
+            Self::adjust_eip8130_tx_event(evm, tx_env, tx_event, sender);
+            return;
+        }
+
         // Only OP deposit txs need any fixup — every other envelope carries a real nonce and
         // is correctly classified as `GasBuy` by the generic depth-0 inspector path.
         if !matches!(tx_event.tx_type, TxType::OptimismDeposit) {
@@ -198,5 +224,182 @@ where
         // `enter_frame_pre_hook`). Non-deposit OP txs hit the early return above and keep
         // the default `GasBuy` reason.
         inspector.set_root_balance_reason(Reason::IncreaseMint);
+    }
+}
+
+impl OpPreTxAdjust {
+    /// Fills the fields of an EIP-8130 transaction (type `0x79`) the generic mapper cannot read
+    /// from the envelope, and records its fees from the journal.
+    ///
+    /// The executor charges the payer, increments the nonce and applies the account changes on
+    /// the journal before the root call, and refunds the payer and credits the beneficiary and
+    /// the fee vaults after the last call, all outside the calls below the root call. The
+    /// inspector records them inside the root call with the reasons set here.
+    pub fn adjust_eip8130_tx_event<DB, I, P>(
+        evm: &mut BaseEvm<DB, I, P>,
+        tx_env: &BaseTransaction<TxEnv>,
+        tx_event: &mut TxEvent,
+        sender: Address,
+    ) where
+        DB: alloy_evm::Database,
+        I: Inspector<BaseContext<DB>, EthInterpreter> + FirehoseInspectorApi,
+        P: PrecompileProvider<BaseContext<DB>, Output = InterpreterResult>,
+    {
+        // Every type 0x79 transaction environment is built from its envelope, so this cannot
+        // fail. The tracer has no transaction context yet, so the message carries it.
+        let Some(parts) = tx_env.eip8130_parts() else {
+            panic!(
+                "Firehose cannot trace transaction {} (index {}) at block #{}: an EIP-8130 \
+                 transaction reached the EVM without its envelope",
+                tx_event.hash,
+                tx_event.index,
+                evm.ctx().block().number()
+            );
+        };
+        let signed = &parts.signed;
+        let tx = signed.tx();
+        let beneficiary = evm.ctx().block().beneficiary();
+
+        // An open payer signature that does not recover makes the transaction invalid: the
+        // executor rejects it before the root call and the block is discarded, so there is
+        // nothing to trace.
+        let Ok(payer) = signed.resolved_payer(sender) else {
+            return;
+        };
+
+        let account_changes = tx.account_changes.iter().map(Self::account_change).collect();
+
+        let call_phases = tx
+            .calls
+            .iter()
+            .map(|calls| AccountAbstractionCallPhase {
+                calls: calls
+                    .iter()
+                    .map(|call| AccountAbstractionCallInput {
+                        to: call.to.to_vec(),
+                        value: u256_to_protobuf(call.value),
+                        data: call.data.to_vec(),
+                        call_index: 0,
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        tx_event.to = None;
+        // `sender_auth` is the sender's `r || s || v` secp256k1 signature when the sender is
+        // recovered, and `authenticator || data` when it is named.
+        let sender_auth = signed.sender_auth();
+        let k1_signature = if tx.sender.is_none() {
+            Some(sender_auth.as_ref())
+        } else {
+            sender_auth.strip_prefix(Eip8130Constants::K1_AUTHENTICATOR.as_slice())
+        }
+        .filter(|signature| signature.len() == 65);
+        if let Some(signature) = k1_signature {
+            tx_event.r = B256::from_slice(&signature[..32]);
+            tx_event.s = B256::from_slice(&signature[32..64]);
+            // Typed transactions record the y-parity, trimmed like a big integer.
+            let y_parity = signature[64].saturating_sub(27);
+            tx_event.v = Some(if y_parity == 0 {
+                Bytes::new()
+            } else {
+                Bytes::copy_from_slice(&[y_parity])
+            });
+        }
+        tx_event.account_abstraction_trx_input = Some(AccountAbstractionTrxInput {
+            nonce_key: u256_to_protobuf(tx.nonce_key),
+            payer: payer.to_vec(),
+            valid_after: tx.valid_after,
+            valid_before: tx.valid_before,
+            metadata: tx.metadata.to_vec(),
+            account_changes,
+            call_phases,
+            sender_auth: if k1_signature.is_some() { Vec::new() } else { sender_auth.to_vec() },
+        });
+
+        let (_, inspector, _) = evm.components_mut();
+        inspector.set_root_journal_reasons(RootJournalReasons {
+            decreases: vec![(payer, Reason::GasBuy)],
+            // In the order `Eip8130Executor::settle_fees` credits them: an account listed twice,
+            // such as a payer that is also the beneficiary, takes its reasons in this order.
+            increases: vec![
+                (payer, Reason::GasRefund),
+                (Predeploys::BASE_FEE_VAULT, Reason::RewardTransactionFee),
+                (beneficiary, Reason::RewardTransactionFee),
+                (Predeploys::L1_FEE_VAULT, Reason::RewardTransactionFee),
+                (Predeploys::OPERATOR_FEE_VAULT, Reason::RewardTransactionFee),
+            ],
+        });
+    }
+
+    /// Maps an EIP-8130 account change entry to the block model.
+    pub fn account_change(change: &AccountChange) -> AccountAbstractionAccountChange {
+        let change = match change {
+            AccountChange::Delegation(delegation) => {
+                account_abstraction_account_change::Change::DelegationTarget(
+                    if delegation.target.is_zero() {
+                        Vec::new()
+                    } else {
+                        delegation.target.to_vec()
+                    },
+                )
+            }
+            AccountChange::Create(entry) => account_abstraction_account_change::Change::Create(
+                AccountAbstractionAccountCreate {
+                    user_salt: entry.user_salt.to_vec(),
+                    code: entry.code.to_vec(),
+                    initial_actors: entry
+                        .initial_actors
+                        .iter()
+                        .map(|actor| AccountAbstractionInitialActor {
+                            actor_id: actor.actor_id.to_vec(),
+                            authenticator: actor.authenticator.to_vec(),
+                            scope: actor.scope.into(),
+                            policy_data: actor.policy_data.to_vec(),
+                        })
+                        .collect(),
+                },
+            ),
+            AccountChange::ConfigChange(batch) => {
+                account_abstraction_account_change::Change::ConfigChange(
+                    AccountAbstractionConfigChange {
+                        channel: match batch.channel {
+                            AccountChangeChannel::Local => {
+                                account_abstraction_config_change::Channel::Local
+                            }
+                            AccountChangeChannel::Multichain => {
+                                account_abstraction_config_change::Channel::Multichain
+                            }
+                        } as i32,
+                        sequence: batch.sequence,
+                        changes: batch
+                            .changes
+                            .iter()
+                            .map(|change| AccountAbstractionKeystoreChange {
+                                r#type: Self::keystore_change_type(change.change_type) as i32,
+                                payload: change.payload.to_vec(),
+                            })
+                            .collect(),
+                        auth: batch.signature.to_vec(),
+                    },
+                )
+            }
+        };
+        AccountAbstractionAccountChange { change: Some(change) }
+    }
+
+    /// Maps a Keystore change type to the block model.
+    pub const fn keystore_change_type(
+        change_type: ChangeType,
+    ) -> account_abstraction_keystore_change::Type {
+        match change_type {
+            ChangeType::AuthorizeActor => account_abstraction_keystore_change::Type::AuthorizeActor,
+            ChangeType::RevokeActor => account_abstraction_keystore_change::Type::RevokeActor,
+            ChangeType::IncrementLocalEpoch => {
+                account_abstraction_keystore_change::Type::IncrementLocalEpoch
+            }
+            ChangeType::Lock => account_abstraction_keystore_change::Type::Lock,
+            ChangeType::Unlock => account_abstraction_keystore_change::Type::Unlock,
+        }
     }
 }

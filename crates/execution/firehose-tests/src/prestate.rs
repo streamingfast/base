@@ -11,20 +11,20 @@
 use std::{path::Path, sync::Arc};
 
 use alloy_consensus::{
-    Header,
+    Block, Header,
     constants::{EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH},
     proofs::calculate_transaction_root,
 };
 use alloy_eips::{eip2718::Decodable2718, eip4895::Withdrawals};
 use alloy_primitives::B256;
-use base_common_consensus::{BasePrimitives, BaseTransactionSigned};
+use base_common_consensus::{BaseBlockBody, BasePrimitives, BaseTransactionSigned};
 use base_execution_chainspec::BaseChainSpec;
 use base_execution_evm::BaseEvmConfig;
 use base_execution_firehose::{OpPostTxExtras, OpPreTxAdjust};
 use eyre::Context;
 use reth_firehose::{FirehoseBlockTracer, run_wrapped_block};
 use reth_firehose_tests::{
-    RunOutcome, TraceContext, decode_hex, parse_fire_block_for, seed_cache_db,
+    Prestate, RunOutcome, TraceContext, decode_hex, parse_fire_block_for, seed_cache_db,
 };
 use reth_primitives_traits::{Block as _, RecoveredBlock};
 use reth_revm::State;
@@ -37,23 +37,31 @@ use revm::database::{CacheDB, EmptyDB};
 /// `FIRE BLOCK` line emitted for the executed block; assert against it with `BlockInvariants` and a
 /// `BlockProjection` golden (see `tests/prestate.rs`).
 pub fn run_prestate(case_folder: &Path) -> eyre::Result<RunOutcome> {
-    use alloy_consensus::Block;
-    use base_common_consensus::BaseBlockBody;
-    use reth_firehose_tests::Prestate;
-
     let prestate_path = case_folder.join("prestate.json");
     let prestate: Prestate = serde_json::from_slice(&std::fs::read(&prestate_path)?)
         .with_context(|| format!("reading prestate.json at {}", prestate_path.display()))?;
-
-    let chain_spec = Arc::new(BaseChainSpec::from_genesis(prestate.genesis.clone()));
-    let parent_hash = chain_spec.inner.genesis_hash();
 
     let tx_bytes = decode_hex(&prestate.input).context("decoding prestate.input hex")?;
     let signed_tx = BaseTransactionSigned::decode_2718(&mut tx_bytes.as_slice())
         .context("EIP-2718-decoding prestate.input as a signed transaction")?;
 
-    let transactions = vec![signed_tx];
-    let header = build_op_header(&prestate.context, parent_hash, &transactions);
+    run_block(&prestate.genesis, &prestate.context, vec![signed_tx])
+}
+
+/// Run `transactions` as one block on top of `genesis` through the Firehose harness, with the
+/// block fields taken from `context`, and return the captured Block.
+///
+/// [`run_prestate`] runs a fixture folder through it. Tests that build their genesis and sign
+/// their transactions in code, such as the EIP-8130 cases, call it directly.
+pub fn run_block(
+    genesis: &alloy_genesis::Genesis,
+    context: &TraceContext,
+    transactions: Vec<BaseTransactionSigned>,
+) -> eyre::Result<RunOutcome> {
+    let chain_spec = Arc::new(BaseChainSpec::from_genesis(genesis.clone()));
+    let parent_hash = chain_spec.inner.genesis_hash();
+
+    let header = build_op_header(context, parent_hash, &transactions);
 
     // OP Stack post-Canyon blocks always carry a withdrawals list (may be empty).
     // An absent slot would change the header keccak vs Geth's representation.
@@ -70,14 +78,14 @@ pub fn run_prestate(case_folder: &Path) -> eyre::Result<RunOutcome> {
         block.try_into_recovered().map_err(|_| eyre::eyre!("recovering tx senders"))?;
 
     let mut db = CacheDB::new(EmptyDB::default());
-    seed_cache_db(&mut db, &prestate.genesis)?;
+    seed_cache_db(&mut db, genesis)?;
     let mut state = State::builder().with_database(db).with_bundle_update().build();
 
     let evm_config = BaseEvmConfig::base(chain_spec);
 
     let (mut tracer, buffer) = firehose_tracer::Tracer::with_buffer(
         firehose_tracer::config::Config::default(),
-        firehose_tracer::config::ChainConfig::from_genesis(&prestate.genesis),
+        firehose_tracer::config::ChainConfig::from_genesis(genesis),
         "base-firehose-tests",
         env!("CARGO_PKG_VERSION"),
     );

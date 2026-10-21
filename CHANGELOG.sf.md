@@ -1,3 +1,24 @@
+## v1.5.0-fh3.1-2
+
+### Added
+
+* Firehose traces EIP-8130 transactions (type `0x79`, enabled by Everest) as
+  `TRX_TYPE_ACCOUNT_ABSTRACTION`, instead of stopping the node. The transaction's own fields are in
+  `TransactionTrace.account_abstraction_trx_input`, with each signed call linked to the call that
+  executed it, and `committed_phases` is in `TransactionReceipt.account_abstraction_trx_output`.
+  The calls of a phase that reverted are `state_reverted`, including the ones that succeeded before
+  it, while the phases that committed keep their state even though the transaction is `FAILED`.
+  The payer's gas purchase and refund, the fee payouts, the nonce increment, the nonce manager
+  writes and the delegation code are recorded on the root call.
+  The Keystore account changes Zenith enables (EIP-8130 create and config change entries) are
+  recorded in `account_changes`, and a sender that signs with a P-256, WebAuthn or delegate
+  authenticator has its authentication in `sender_auth` instead of `v`, `r` and `s`.
+
+### Changed
+
+* Uses `streamingfast/reth` `base-v2.5.2.8-fh3.1-2` and `firehose-tracer` 5.7.0, which add the
+  account abstraction tracing above.
+
 ## v1.5.0-fh3.1-1
 
 ### Changed

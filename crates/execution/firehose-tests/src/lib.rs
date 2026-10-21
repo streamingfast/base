@@ -5,10 +5,10 @@ pub use firehose_tracer_test::{
     BlockDiff, BlockInvariants, BlockProjection, FirehoseCapture, Golden, InvariantConfig,
     ProductionReplay, SymbolTable, Violation, VolatilePolicy,
 };
-pub use reth_firehose_tests::RunOutcome;
+pub use reth_firehose_tests::{RunOutcome, TraceContext};
 
 mod prestate;
-pub use prestate::run_prestate;
+pub use prestate::{run_block, run_prestate};
 
 mod capture;
 pub use capture::BaseFirehoseCapture;
