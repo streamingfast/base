@@ -16,8 +16,8 @@ Statuses checked 2026-10-16 against Base `v1.5.0` (`crates/common/chains/src/con
 | Beryl | Active 2026-06-25 18:00 UTC | Active 2026-06-18 18:00 UTC | Already in the stream. |
 | Cobalt | Active 2026-09-30 18:00 UTC | Active 2026-09-23 18:00 UTC | B-20 V2 precompiles. Covered by `etc/systems/tests/firehose_cobalt_b20.rs`. |
 | Denim | Not scheduled | 2026-10-21 18:00 UTC (`1_792_605_600`) | See [Denim](#denim). |
-| Everest | Not scheduled | Not scheduled | See [Everest](#everest). **The node stops on the first EIP-8130 transaction.** |
-| Zenith | Never (genesis only) | Never (genesis only) | Gates the EIP-8130 keystore (account configuration changes, non-k1 authenticators). Unreachable on real networks. |
+| Everest | Not scheduled | Not scheduled | See [Everest](#everest). Traced from `v1.5.0-fh3.1-2` as `TRX_TYPE_ACCOUNT_ABSTRACTION`. **Earlier versions stop on the first EIP-8130 transaction.** |
+| Zenith | Never (genesis only) | Never (genesis only) | Gates the EIP-8130 keystore (account configuration changes, non-k1 authenticators). Unreachable on real networks. Traced from `v1.5.0-fh3.1-2`: create and config change entries in `account_changes`, non-k1 sender authentication in `sender_auth`. |
 
 ## Denim
 
@@ -44,15 +44,25 @@ Statuses checked 2026-10-16 against Base `v1.5.0` (`crates/common/chains/src/con
 
 - Gates EIP-8130 transactions (type `0x79` = 121) in the EVM, the transaction pool, RPC and
   derivation. Before v1.5.0 this was Zenith, which no real network can activate.
-- `reth-firehose` cannot map type 121: `firehose-tracer` 5.5.0 `TxType` and the block model have
-  no such type. The mapper panics on it with a message naming the transaction and its type
-  (`crates/firehose/src/mapper.rs` in `streamingfast/reth`). Halting is deliberate: dropping the
-  transaction would emit a block that differs from the chain, and failing block execution would
-  make the node report a valid block as invalid.
-- Tracing 8130 properly needs a new transaction type in the block model and the tracer, the 8130
-  fields (nonce key, payer, phases with value, account changes, phase statuses), and handling of
-  its execution shape: pre-call writes and `NonceIncremented` logs outside any call frame, one
-  depth-0 frame per phase, payer prepay and refund, and fee vault credits outside the EVM.
+- From `v1.5.0-fh3.1-2` (`firehose-tracer` 5.7.0, `streamingfast/reth` `base-v2.5.2.8-fh3.1-2`),
+  type 121 is traced as `TRX_TYPE_ACCOUNT_ABSTRACTION`:
+  - `TransactionTrace.account_abstraction_trx_input` holds the nonce key, the payer, the validity
+    window, the metadata, the account changes, the sender's non-k1 authentication, and the signed
+    calls grouped in `call_phases`, each linked by `call_index` to the call that executed it (0 if
+    it never ran). `TransactionReceipt.account_abstraction_trx_output.committed_phases` counts the
+    phases that committed.
+  - The root call goes from the sender to itself and runs no code. It carries the writes the
+    executor makes outside the calls: the payer's gas purchase and refund, the fee vault and
+    beneficiary credits, the nonce or nonce manager writes, the account changes and their logs.
+    Each signed call that ran is a child of the root call.
+  - A transaction whose phase reverted is `FAILED`, but the phases before it keep their state: only
+    the reverted phase's calls are `state_reverted`, and the root call never is.
+  - Covered by `crates/execution/firehose-tests/tests/eip8130.rs`, which runs signed transactions
+    through the Base executor on an Everest genesis (and a Zenith one for the Keystore cases). No
+    Docker system test yet.
+- Versions before `v1.5.0-fh3.1-2` cannot map type 121 and stop on the first EIP-8130 transaction,
+  with a message naming it. Run `v1.5.0-fh3.1-2` or later before Everest activates on a network we
+  serve.
 - The activation block writes a code stub to the nonce manager in `apply_pre_execution_changes`
   (`ensure_eip8130_system_accounts`). `BasePreExecutionWrites` lists it, so it is emitted as a
   block-level code change.
