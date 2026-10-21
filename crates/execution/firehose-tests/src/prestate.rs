@@ -11,20 +11,20 @@
 use std::{path::Path, sync::Arc};
 
 use alloy_consensus::{
-    Header,
+    Block, Header,
     constants::{EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH},
     proofs::calculate_transaction_root,
 };
 use alloy_eips::{eip2718::Decodable2718, eip4895::Withdrawals};
 use alloy_primitives::B256;
-use base_common_consensus::{BasePrimitives, BaseTransactionSigned};
+use base_common_consensus::{BaseBlockBody, BasePrimitives, BaseTransactionSigned};
 use base_execution_chainspec::BaseChainSpec;
 use base_execution_evm::BaseEvmConfig;
 use base_execution_firehose::{OpPostTxExtras, OpPreTxAdjust};
 use eyre::Context;
 use reth_firehose::{FirehoseBlockTracer, run_wrapped_block};
 use reth_firehose_tests::{
-    RunOutcome, TraceContext, decode_hex, parse_fire_block_for, seed_cache_db,
+    Prestate, RunOutcome, TraceContext, decode_hex, parse_fire_block_for, seed_cache_db,
 };
 use reth_primitives_traits::{Block as _, RecoveredBlock};
 use reth_revm::State;
@@ -37,8 +37,6 @@ use revm::database::{CacheDB, EmptyDB};
 /// `FIRE BLOCK` line emitted for the executed block; assert against it with `BlockInvariants` and a
 /// `BlockProjection` golden (see `tests/prestate.rs`).
 pub fn run_prestate(case_folder: &Path) -> eyre::Result<RunOutcome> {
-    use reth_firehose_tests::Prestate;
-
     let prestate_path = case_folder.join("prestate.json");
     let prestate: Prestate = serde_json::from_slice(&std::fs::read(&prestate_path)?)
         .with_context(|| format!("reading prestate.json at {}", prestate_path.display()))?;
@@ -60,9 +58,6 @@ pub fn run_block(
     context: &TraceContext,
     transactions: Vec<BaseTransactionSigned>,
 ) -> eyre::Result<RunOutcome> {
-    use alloy_consensus::Block;
-    use base_common_consensus::BaseBlockBody;
-
     let chain_spec = Arc::new(BaseChainSpec::from_genesis(genesis.clone()));
     let parent_hash = chain_spec.inner.genesis_hash();
 

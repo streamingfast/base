@@ -118,7 +118,8 @@ where
             l1.clear_tx_l1_cost();
             (l1_cost, operator_fee_cost)
         };
-        let base_fee_amount = U256::from(base_fee as u128).saturating_mul(U256::from(gas_used));
+        let base_fee_amount =
+            U256::from(base_fee as u128).saturating_mul(U256::from(gas_used));
 
         firehose_debug!(
             "OpPostTxExtras: l1_cost={}, base_fee_amount={}, operator_fee_cost={}",
@@ -157,7 +158,9 @@ where
                 new,
                 amount
             );
-            inspector.tracer_mut().on_balance_change(vault, old, new, Reason::RewardTransactionFee);
+            inspector
+                .tracer_mut()
+                .on_balance_change(vault, old, new, Reason::RewardTransactionFee);
         }
     }
 }
@@ -227,7 +230,7 @@ impl OpPreTxAdjust {
     /// the journal before the root call, and refunds the payer and credits the beneficiary and
     /// the fee vaults after the last call, all outside the calls below the root call. The
     /// inspector records them inside the root call with the reasons set here.
-    fn adjust_eip8130_tx_event<DB, I, P>(
+    pub fn adjust_eip8130_tx_event<DB, I, P>(
         evm: &mut BaseEvm<DB, I, P>,
         tx_env: &BaseTransaction<TxEnv>,
         tx_event: &mut TxEvent,
@@ -328,10 +331,12 @@ impl OpPreTxAdjust {
         let (_, inspector, _) = evm.components_mut();
         inspector.set_root_journal_reasons(RootJournalReasons {
             decreases: vec![(payer, Reason::GasBuy)],
+            // In the order `Eip8130Executor::settle_fees` credits them: an account listed twice,
+            // such as a payer that is also the beneficiary, takes its reasons in this order.
             increases: vec![
                 (payer, Reason::GasRefund),
-                (beneficiary, Reason::RewardTransactionFee),
                 (Predeploys::BASE_FEE_VAULT, Reason::RewardTransactionFee),
+                (beneficiary, Reason::RewardTransactionFee),
                 (Predeploys::L1_FEE_VAULT, Reason::RewardTransactionFee),
                 (Predeploys::OPERATOR_FEE_VAULT, Reason::RewardTransactionFee),
             ],
