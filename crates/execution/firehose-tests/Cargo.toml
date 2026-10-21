@@ -51,3 +51,4 @@ path = "tests/eip8130.rs"
 k256.workspace = true
 alloy-signer.workspace = true
 base-test-utils.workspace = true
+base-execution-eip8130.workspace = true

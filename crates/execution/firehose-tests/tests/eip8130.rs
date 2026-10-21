@@ -1,13 +1,15 @@
 //! Firehose tracing of EIP-8130 transactions (type `0x79`), run through the real Base executor
 //! and the Firehose wrapper on an Everest genesis.
 
+use alloy_eips::eip2718::Encodable2718;
 use alloy_genesis::{Genesis, GenesisAccount};
 use alloy_primitives::{Address, Bytes, U256, address, bytes};
 use alloy_signer::SignerSync;
 use base_common_consensus::{
-    AccountChange, BaseTransactionSigned, Call, Delegation, Eip8130Constants, Eip8130Signed,
-    Predeploys, TxEip8130,
+    AccountChange, BaseTransactionSigned, BaseTxEnvelope, Call, Delegation, Eip8130Constants,
+    Eip8130Signed, Predeploys, TxEip8130,
 };
+use base_execution_eip8130::{Eip8130GasSchedule, IntrinsicGas, IntrinsicGasInput};
 use base_firehose_tests::{BlockInvariants, TraceContext, run_block};
 use base_test_utils::{Account, build_test_genesis_everest};
 use firehose_tracer::pb::sf::ethereum::r#type::v2::{
@@ -83,7 +85,15 @@ fn sign(tx: TxEip8130, payer: Option<Account>) -> BaseTransactionSigned {
 
 fn run(tx: BaseTransactionSigned) -> TransactionTrace {
     let genesis = genesis();
-    let outcome = run_block(&genesis, &context(&genesis), vec![tx]).expect("block runs");
+    run_in(&genesis, &context(&genesis), tx)
+}
+
+fn run_in(
+    genesis: &Genesis,
+    context: &TraceContext,
+    tx: BaseTransactionSigned,
+) -> TransactionTrace {
+    let outcome = run_block(genesis, context, vec![tx]).expect("block runs");
     BlockInvariants::assert(&outcome.block).expect("block invariants hold");
     outcome.block.transaction_traces.into_iter().next().expect("one transaction")
 }
@@ -229,4 +239,122 @@ fn open_payer_signature_that_does_not_recover_rejects_the_block() {
 
     let result = run_block(&genesis, &context(&genesis), vec![tx]);
     assert!(result.is_err(), "the block is rejected instead of traced");
+}
+
+#[test]
+fn payer_that_is_the_beneficiary_gets_its_refund_then_its_tip() {
+    let genesis = genesis();
+    let alice = Account::Alice.address();
+    let mut context = context(&genesis);
+    context.miner = alice;
+    let tx = unsigned(genesis.config.chain_id, vec![vec![call(Account::Bob.address(), 1)]]);
+    let trx = run_in(&genesis, &context, sign(tx, None));
+
+    let root_reasons: Vec<i32> = trx.calls[0]
+        .balance_changes
+        .iter()
+        .filter(|change| change.address == alice.to_vec())
+        .map(|change| change.reason)
+        .collect();
+    assert_eq!(
+        vec![Reason::GasBuy as i32, Reason::GasRefund as i32, Reason::RewardTransactionFee as i32],
+        root_reasons,
+        "the payer is charged, refunded, then tipped"
+    );
+
+    // Across every call, including the 1 wei the payer sends in its call, each change of the
+    // payer starts where the previous one ended.
+    let mut changes: Vec<_> = trx
+        .calls
+        .iter()
+        .flat_map(|call| &call.balance_changes)
+        .filter(|change| change.address == alice.to_vec())
+        .collect();
+    changes.sort_by_key(|change| change.ordinal);
+    for pair in changes.windows(2) {
+        assert_eq!(
+            big(&pair[0].new_value),
+            big(&pair[1].old_value),
+            "each change starts where the previous one ended"
+        );
+    }
+}
+
+#[test]
+fn nonce_free_transaction_records_its_replay_entry_and_no_nonce_change() {
+    let genesis = genesis();
+    let context = context(&genesis);
+    let mut tx = unsigned(genesis.config.chain_id, vec![vec![call(Account::Bob.address(), 1)]]);
+    tx.nonce_key = Eip8130Constants::NONCE_KEY_MAX;
+    tx.valid_before = context.timestamp + 10;
+    let trx = run_in(&genesis, &context, sign(tx, None));
+
+    assert_eq!(pbeth::TransactionTraceStatus::Succeeded as i32, trx.status);
+    let input = trx.account_abstraction_trx_input.as_ref().expect("account_abstraction_trx_input");
+    assert_eq!(vec![0xff; 32], input.nonce_key.as_ref().expect("nonce key").bytes);
+    let root = &trx.calls[0];
+    assert!(root.nonce_changes.is_empty(), "nonce-free mode leaves every nonce alone");
+    assert!(
+        root.storage_changes.iter().any(|change| change.address == NONCE_MANAGER.to_vec()),
+        "the replay entry is a nonce manager storage write"
+    );
+}
+
+#[test]
+fn failure_in_the_first_phase_commits_nothing() {
+    let genesis = genesis();
+    let bob = Account::Bob.address();
+    let tx = unsigned(genesis.config.chain_id, vec![vec![call(REVERTER, 0)], vec![call(bob, 1)]]);
+    let trx = run(sign(tx, None));
+
+    assert_eq!(pbeth::TransactionTraceStatus::Failed as i32, trx.status);
+    assert_eq!(0, committed_phases(&trx));
+    assert_eq!(vec![vec![2], vec![0]], call_indexes(&trx));
+    let reverted: Vec<bool> = trx.calls.iter().map(|call| call.state_reverted).collect();
+    assert_eq!(vec![false, true], reverted, "only the reverted call is reverted");
+    assert_eq!(
+        root_balance_changes(&trx).first(),
+        Some(&(Account::Alice.address(), Reason::GasBuy as i32)),
+        "the fees are still charged"
+    );
+}
+
+#[test]
+fn call_refused_for_lack_of_new_account_gas_is_left_unlinked() {
+    let genesis = genesis();
+    let alice = Account::Alice;
+    let fresh = address!("0x00000000000000000000000000000000000fe5e1");
+    let mut tx = unsigned(genesis.config.chain_id, vec![vec![call(fresh, 1)]]);
+
+    // One gas short of the new-account charge once the sender-intrinsic gas is paid, so the
+    // protocol refuses the call before it runs.
+    let shortfall = Eip8130GasSchedule::NEW_ACCOUNT_COST - 1;
+    let mut gas_limit = shortfall;
+    for _ in 0..8 {
+        tx.gas_limit = gas_limit;
+        let signed = sign(tx.clone(), None);
+        let BaseTxEnvelope::Eip8130(envelope) = &signed else { panic!("an EIP-8130 envelope") };
+        let intrinsic = IntrinsicGas::compute(
+            envelope,
+            &signed.encoded_2718(),
+            &IntrinsicGasInput::new(alice.address(), true),
+        )
+        .expect("intrinsic gas");
+        let next = intrinsic.sender_intrinsic() + shortfall;
+        if next == gas_limit {
+            break;
+        }
+        gas_limit = next;
+    }
+    tx.gas_limit = gas_limit;
+    let trx = run(sign(tx, None));
+
+    assert_eq!(pbeth::TransactionTraceStatus::Failed as i32, trx.status);
+    assert_eq!(0, committed_phases(&trx));
+    assert_eq!(vec![vec![0]], call_indexes(&trx), "the refused call never ran");
+    assert_eq!(1, trx.calls.len(), "only the root call");
+}
+
+fn big(value: &Option<pbeth::BigInt>) -> U256 {
+    value.as_ref().map_or(U256::ZERO, |value| U256::from_be_slice(&value.bytes))
 }
