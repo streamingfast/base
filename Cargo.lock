@@ -4877,6 +4877,7 @@ dependencies = [
  "base-execution-evm",
  "base-execution-firehose",
  "base-test-utils",
+ "base64 0.22.1",
  "eyre",
  "firehose-tracer",
  "firehose-tracer-test",
@@ -4888,6 +4889,7 @@ dependencies = [
  "reth-revm",
  "revm",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
