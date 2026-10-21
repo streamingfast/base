@@ -1,4 +1,4 @@
-## Unreleased
+## v1.5.0-fh3.1-2
 
 ### Added
 
@@ -13,6 +13,11 @@
   The Keystore account changes Zenith enables (EIP-8130 create and config change entries) are
   recorded in `account_changes`, and a sender that signs with a P-256, WebAuthn or delegate
   authenticator has its authentication in `sender_auth` instead of `v`, `r` and `s`.
+
+### Changed
+
+* Uses `streamingfast/reth` `base-v2.5.2.8-fh3.1-2` and `firehose-tracer` 5.7.0, which add the
+  account abstraction tracing above.
 
 ## v1.5.0-fh3.1-1
 
