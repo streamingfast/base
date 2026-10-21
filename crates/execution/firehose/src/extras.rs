@@ -322,6 +322,7 @@ impl OpPreTxAdjust {
             metadata: tx.metadata.to_vec(),
             account_changes,
             call_phases,
+            sender_auth: Vec::new(),
         });
 
         let (_, inspector, _) = evm.components_mut();

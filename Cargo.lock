@@ -6201,6 +6201,7 @@ name = "base-reth-node"
 version = "1.5.0"
 dependencies = [
  "base-cli-utils",
+ "base-common-genesis",
  "base-execution-cli",
  "base-firehose-flashblocks",
  "base-node-runner",
@@ -9929,7 +9930,8 @@ checksum = "9844ddc3a6e533d62bba727eb6c28b5d360921d5175e9ff0f1e621a5c590a4d5"
 [[package]]
 name = "firehose-tracer"
 version = "5.7.0"
-source = "git+https://github.com/streamingfast/evm-firehose-tracer-rs.git?branch=feature%2Faa-transaction-type#2bd8bd6a983fcd76461833346cd1cdc0c8122125"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13e2e57e7576a3f4da038684d23aa2a69360b034e60feab88aeec0593ca4714d"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -9951,7 +9953,8 @@ dependencies = [
 [[package]]
 name = "firehose-tracer-prestate"
 version = "5.7.0"
-source = "git+https://github.com/streamingfast/evm-firehose-tracer-rs.git?branch=feature%2Faa-transaction-type#2bd8bd6a983fcd76461833346cd1cdc0c8122125"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "630884e25b18bf0fa75c7c6f8e504ffddf95dcd5b7cc71e3f47320fa97ffd7ba"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -9975,7 +9978,8 @@ dependencies = [
 [[package]]
 name = "firehose-tracer-test"
 version = "5.7.0"
-source = "git+https://github.com/streamingfast/evm-firehose-tracer-rs.git?branch=feature%2Faa-transaction-type#2bd8bd6a983fcd76461833346cd1cdc0c8122125"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb25c3ae3ecb8c3eab2a0c9badd4f5f094122738e52054671491d1d782d76ac8"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -11283,7 +11287,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b1e4910d3a9137442723dfb772c32dc10674c4181ca078d2fd227cd5dce9db0"
 dependencies = [
  "bincode 1.3.3",
- "derive_more 1.0.0",
+ "derive_more 2.1.1",
  "iai-callgrind-macros",
  "iai-callgrind-runner",
 ]
@@ -11294,7 +11298,7 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d03775318d3f9f01b39ac6612b01464006dc397a654a89dd57df2fd34fb68c3"
 dependencies = [
- "derive_more 1.0.0",
+ "derive_more 2.1.1",
  "proc-macro-error2",
  "proc-macro2",
  "quote",
@@ -16312,7 +16316,7 @@ checksum = "1e061d1b48cb8d38042de4ae0a7a6401009d6143dc80d2e2d6f31f0bdd6470c7"
 [[package]]
 name = "reth-basic-payload-builder"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -16339,7 +16343,7 @@ dependencies = [
 [[package]]
 name = "reth-chain-state"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -16370,7 +16374,7 @@ dependencies = [
 [[package]]
 name = "reth-chainspec"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-chains",
  "alloy-consensus 2.4.1",
@@ -16390,7 +16394,7 @@ dependencies = [
 [[package]]
 name = "reth-cli"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-genesis",
  "clap",
@@ -16403,7 +16407,7 @@ dependencies = [
 [[package]]
 name = "reth-cli-commands"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-chains",
  "alloy-consensus 2.4.1",
@@ -16492,7 +16496,7 @@ dependencies = [
 [[package]]
 name = "reth-cli-runner"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "reth-tasks",
  "tokio",
@@ -16502,7 +16506,7 @@ dependencies = [
 [[package]]
 name = "reth-cli-util"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives",
@@ -16553,7 +16557,7 @@ dependencies = [
 [[package]]
 name = "reth-config"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "eyre",
  "humantime-serde",
@@ -16570,7 +16574,7 @@ dependencies = [
 [[package]]
 name = "reth-consensus"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eip7928 0.4.5",
@@ -16584,7 +16588,7 @@ dependencies = [
 [[package]]
 name = "reth-consensus-common"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -16597,7 +16601,7 @@ dependencies = [
 [[package]]
 name = "reth-consensus-debug-client"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -16622,7 +16626,7 @@ dependencies = [
 [[package]]
 name = "reth-db"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-primitives",
  "derive_more 2.1.1",
@@ -16651,7 +16655,7 @@ dependencies = [
 [[package]]
 name = "reth-db-api"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -16677,7 +16681,7 @@ dependencies = [
 [[package]]
 name = "reth-db-common"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-genesis",
@@ -16707,7 +16711,7 @@ dependencies = [
 [[package]]
 name = "reth-db-models"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives",
@@ -16722,7 +16726,7 @@ dependencies = [
 [[package]]
 name = "reth-discv4"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -16747,7 +16751,7 @@ dependencies = [
 [[package]]
 name = "reth-discv5"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -16771,7 +16775,7 @@ dependencies = [
 [[package]]
 name = "reth-dns-discovery"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-primitives",
  "dashmap",
@@ -16795,7 +16799,7 @@ dependencies = [
 [[package]]
 name = "reth-downloaders"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -16830,7 +16834,7 @@ dependencies = [
 [[package]]
 name = "reth-e2e-test-utils"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -16887,7 +16891,7 @@ dependencies = [
 [[package]]
 name = "reth-ecies"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "aes",
  "alloy-primitives",
@@ -16914,7 +16918,7 @@ dependencies = [
 [[package]]
 name = "reth-engine-local"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -16937,7 +16941,7 @@ dependencies = [
 [[package]]
 name = "reth-engine-primitives"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -16964,7 +16968,7 @@ dependencies = [
 [[package]]
 name = "reth-engine-tree"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eip7928 0.4.5",
@@ -17021,7 +17025,7 @@ dependencies = [
 [[package]]
 name = "reth-engine-util"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -17051,7 +17055,7 @@ dependencies = [
 [[package]]
 name = "reth-era"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17069,7 +17073,7 @@ dependencies = [
 [[package]]
 name = "reth-era-downloader"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-primitives",
  "bytes",
@@ -17085,7 +17089,7 @@ dependencies = [
 [[package]]
 name = "reth-era-utils"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -17109,7 +17113,7 @@ dependencies = [
 [[package]]
 name = "reth-errors"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "reth-consensus",
  "reth-execution-errors",
@@ -17120,7 +17124,7 @@ dependencies = [
 [[package]]
 name = "reth-eth-wire"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-chains",
  "alloy-primitives",
@@ -17149,7 +17153,7 @@ dependencies = [
 [[package]]
 name = "reth-eth-wire-types"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-chains",
  "alloy-consensus 2.4.1",
@@ -17175,7 +17179,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-consensus"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17191,7 +17195,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-engine-primitives"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives",
@@ -17207,7 +17211,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-forks"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-eip2124",
  "alloy-hardforks 0.4.7",
@@ -17221,7 +17225,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-payload-builder"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17251,7 +17255,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-primitives"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17265,7 +17269,7 @@ dependencies = [
 [[package]]
 name = "reth-etl"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "rayon",
  "reth-db-api",
@@ -17275,7 +17279,7 @@ dependencies = [
 [[package]]
 name = "reth-evm"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eip7928 0.4.5",
@@ -17301,7 +17305,7 @@ dependencies = [
 [[package]]
 name = "reth-evm-ethereum"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17321,7 +17325,7 @@ dependencies = [
 [[package]]
 name = "reth-execution-cache"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-primitives",
  "fixed-cache",
@@ -17339,7 +17343,7 @@ dependencies = [
 [[package]]
 name = "reth-execution-errors"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-evm",
  "alloy-primitives",
@@ -17352,7 +17356,7 @@ dependencies = [
 [[package]]
 name = "reth-execution-types"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17371,7 +17375,7 @@ dependencies = [
 [[package]]
 name = "reth-exex"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17409,7 +17413,7 @@ dependencies = [
 [[package]]
 name = "reth-exex-test-utils"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-eips 2.4.1",
  "eyre",
@@ -17441,7 +17445,7 @@ dependencies = [
 [[package]]
 name = "reth-exex-types"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives",
@@ -17455,7 +17459,7 @@ dependencies = [
 [[package]]
 name = "reth-firehose"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eip7928 0.4.5",
@@ -17484,7 +17488,7 @@ dependencies = [
 [[package]]
 name = "reth-firehose-tests"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17511,7 +17515,7 @@ dependencies = [
 [[package]]
 name = "reth-fs-util"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "serde",
  "serde_json",
@@ -17521,7 +17525,7 @@ dependencies = [
 [[package]]
 name = "reth-invalid-block-hooks"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -17547,7 +17551,7 @@ dependencies = [
 [[package]]
 name = "reth-ipc"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "bytes",
  "futures",
@@ -17567,7 +17571,7 @@ dependencies = [
 [[package]]
 name = "reth-libmdbx"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "bitflags 2.13.1",
  "byteorder",
@@ -17584,7 +17588,7 @@ dependencies = [
 [[package]]
 name = "reth-mdbx-sys"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "bindgen 0.72.1",
  "cc",
@@ -17593,7 +17597,7 @@ dependencies = [
 [[package]]
 name = "reth-metrics"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "futures",
  "libc",
@@ -17607,7 +17611,7 @@ dependencies = [
 [[package]]
 name = "reth-net-banlist"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-primitives",
  "ipnet",
@@ -17616,7 +17620,7 @@ dependencies = [
 [[package]]
 name = "reth-net-nat"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "futures-util",
  "if-addrs 0.14.0",
@@ -17630,7 +17634,7 @@ dependencies = [
 [[package]]
 name = "reth-network"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17689,7 +17693,7 @@ dependencies = [
 [[package]]
 name = "reth-network-api"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -17714,7 +17718,7 @@ dependencies = [
 [[package]]
 name = "reth-network-p2p"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eip7928 0.4.5",
@@ -17738,7 +17742,7 @@ dependencies = [
 [[package]]
 name = "reth-network-peers"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -17753,7 +17757,7 @@ dependencies = [
 [[package]]
 name = "reth-network-types"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-eip2124",
  "humantime-serde",
@@ -17767,7 +17771,7 @@ dependencies = [
 [[package]]
 name = "reth-nippy-jar"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "anyhow",
  "bincode 1.3.3",
@@ -17784,7 +17788,7 @@ dependencies = [
 [[package]]
 name = "reth-node-api"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-rpc-types-engine",
  "eyre",
@@ -17808,7 +17812,7 @@ dependencies = [
 [[package]]
 name = "reth-node-builder"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17877,7 +17881,7 @@ dependencies = [
 [[package]]
 name = "reth-node-core"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17932,7 +17936,7 @@ dependencies = [
 [[package]]
 name = "reth-node-ethereum"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -17981,7 +17985,7 @@ dependencies = [
 [[package]]
 name = "reth-node-ethstats"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -18005,7 +18009,7 @@ dependencies = [
 [[package]]
 name = "reth-node-events"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -18029,7 +18033,7 @@ dependencies = [
 [[package]]
 name = "reth-node-metrics"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "bytes",
  "eyre",
@@ -18058,7 +18062,7 @@ dependencies = [
 [[package]]
 name = "reth-node-types"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "reth-chainspec",
  "reth-db-api",
@@ -18070,7 +18074,7 @@ dependencies = [
 [[package]]
 name = "reth-payload-builder"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -18094,7 +18098,7 @@ dependencies = [
 [[package]]
 name = "reth-payload-builder-primitives"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "pin-project",
  "reth-payload-primitives",
@@ -18106,7 +18110,7 @@ dependencies = [
 [[package]]
 name = "reth-payload-primitives"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -18129,7 +18133,7 @@ dependencies = [
 [[package]]
 name = "reth-payload-util"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -18139,7 +18143,7 @@ dependencies = [
 [[package]]
 name = "reth-payload-validator"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-rpc-types-engine",
@@ -18182,7 +18186,7 @@ dependencies = [
 [[package]]
 name = "reth-provider"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eip7928 0.4.5",
@@ -18232,7 +18236,7 @@ dependencies = [
 [[package]]
 name = "reth-prune"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -18259,7 +18263,7 @@ dependencies = [
 [[package]]
 name = "reth-prune-types"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-primitives",
  "arbitrary",
@@ -18275,7 +18279,7 @@ dependencies = [
 [[package]]
 name = "reth-revm"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -18290,7 +18294,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-dyn-abi",
@@ -18366,7 +18370,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-api"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-genesis",
@@ -18396,7 +18400,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-builder"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-network 2.4.1",
  "alloy-provider",
@@ -18439,7 +18443,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-convert"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-evm",
@@ -18459,7 +18463,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-engine-api"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives",
@@ -18490,7 +18494,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-eth-api"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-dyn-abi",
@@ -18537,7 +18541,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-eth-types"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-chains",
  "alloy-consensus 2.4.1",
@@ -18588,7 +18592,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-layer"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-rpc-types-engine",
  "http 1.4.2",
@@ -18602,7 +18606,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-server-types"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives",
@@ -18633,7 +18637,7 @@ dependencies = [
 [[package]]
 name = "reth-stages"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -18684,7 +18688,7 @@ dependencies = [
 [[package]]
 name = "reth-stages-api"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives",
@@ -18712,7 +18716,7 @@ dependencies = [
 [[package]]
 name = "reth-stages-types"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-primitives",
  "arbitrary",
@@ -18726,7 +18730,7 @@ dependencies = [
 [[package]]
 name = "reth-static-file"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-primitives",
  "parking_lot",
@@ -18746,7 +18750,7 @@ dependencies = [
 [[package]]
 name = "reth-static-file-types"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-primitives",
  "clap",
@@ -18761,7 +18765,7 @@ dependencies = [
 [[package]]
 name = "reth-storage-api"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eip7928 0.4.5",
@@ -18787,7 +18791,7 @@ dependencies = [
 [[package]]
 name = "reth-storage-errors"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives",
@@ -18804,7 +18808,7 @@ dependencies = [
 [[package]]
 name = "reth-storage-overlay"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives",
@@ -18831,7 +18835,7 @@ dependencies = [
 [[package]]
 name = "reth-tasks"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "crossbeam-utils",
  "dashmap",
@@ -18852,7 +18856,7 @@ dependencies = [
 [[package]]
 name = "reth-testing-utils"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -18868,7 +18872,7 @@ dependencies = [
 [[package]]
 name = "reth-tokio-util"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "tokio",
  "tokio-stream",
@@ -18878,7 +18882,7 @@ dependencies = [
 [[package]]
 name = "reth-tracing"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "clap",
  "eyre",
@@ -18898,7 +18902,7 @@ dependencies = [
 [[package]]
 name = "reth-tracing-otlp"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -18917,7 +18921,7 @@ dependencies = [
 [[package]]
 name = "reth-transaction-pool"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -18960,7 +18964,7 @@ dependencies = [
 [[package]]
 name = "reth-trie"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -18986,7 +18990,7 @@ dependencies = [
 [[package]]
 name = "reth-trie-common"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives",
@@ -19013,7 +19017,7 @@ dependencies = [
 [[package]]
 name = "reth-trie-db"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-primitives",
  "reth-db-api",
@@ -19029,7 +19033,7 @@ dependencies = [
 [[package]]
 name = "reth-trie-parallel"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-evm",
  "alloy-primitives",
@@ -19053,7 +19057,7 @@ dependencies = [
 [[package]]
 name = "reth-trie-sparse"
 version = "2.5.2"
-source = "git+https://github.com/streamingfast/reth.git?branch=feature%2Faa-transaction-type#f2b650a6e466c9ec18540b6605702126a54cfe30"
+source = "git+https://github.com/streamingfast/reth.git?branch=release%2Fbase-2.x#19657a66de514b884e5c1837203ccd921e24b0f7"
 dependencies = [
  "alloy-primitives",
  "alloy-trie",
