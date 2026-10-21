@@ -17,6 +17,7 @@ use base_execution_eip8130::{
 };
 use base_firehose_tests::{BlockInvariants, TraceContext, run_block};
 use base_test_utils::{Account, build_test_genesis_everest};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use firehose_tracer::pb::sf::ethereum::r#type::v2::{
     self as pbeth, TransactionTrace, account_abstraction_account_change::Change,
     account_abstraction_config_change::Channel, account_abstraction_keystore_change,
@@ -25,6 +26,7 @@ use firehose_tracer::pb::sf::ethereum::r#type::v2::{
 use p256::ecdsa::{
     Signature as P256Signature, SigningKey as P256SigningKey, signature::hazmat::PrehashSigner,
 };
+use sha2::{Digest, Sha256};
 
 /// Contract whose code is `PUSH1 0 PUSH1 0 REVERT`.
 const REVERTER: Address = address!("0x00000000000000000000000000000000000ad0ad");
@@ -36,6 +38,15 @@ sol! {
         address authenticator;
         uint48 expiry;
         uint16 scope;
+    }
+
+    struct WebAuthnAuth {
+        bytes32 r;
+        bytes32 s;
+        uint256 challengeIndex;
+        uint256 typeIndex;
+        bytes authenticatorData;
+        string clientDataJSON;
     }
 }
 
@@ -118,6 +129,28 @@ fn keystore_genesis(funded: &[Address]) -> Genesis {
 /// The k1 actor id of `address`: the address right-aligned in a word.
 fn k1_actor_id(address: Address) -> B256 {
     address.into_word()
+}
+
+/// `abi.encode(actorId, ActorConfig, policyData)` authorizing `actor_id` as an unrestricted admin
+/// with no expiry and no policy.
+fn authorize_payload(actor_id: B256, authenticator: Address) -> Vec<u8> {
+    (actor_id, ActorConfigAbi { authenticator, expiry: U48::ZERO, scope: 0 }, Bytes::new())
+        .abi_encode_params()
+}
+
+/// A batch of `changes` for Alice's account at sequence 0 of `channel`, signed with her key.
+fn alice_batch(
+    genesis: &Genesis,
+    channel: AccountChangeChannel,
+    changes: Vec<SignedChange>,
+) -> SignedAccountChanges {
+    let alice = Account::Alice;
+    let mut batch = SignedAccountChanges { channel, sequence: 0, changes, signature: Bytes::new() };
+    let digest =
+        ConfigChangeAuthorizer::changes_digest(alice.address(), genesis.config.chain_id, &batch);
+    let signature = alice.signer().sign_hash_sync(&digest).expect("sign");
+    batch.signature = auth_blob(Eip8130Constants::K1_AUTHENTICATOR, &signature.as_bytes());
+    batch
 }
 
 /// `authenticator || data`.
@@ -331,29 +364,15 @@ fn keystore_config_change_authorizes_the_p256_actor_that_signs() {
     let point = p256_key.verifying_key().to_encoded_point(false);
     let p256_actor_id = keccak256(&point.as_bytes()[1..]);
 
-    let payload = (
-        p256_actor_id,
-        ActorConfigAbi {
-            authenticator: Eip8130Contracts::P256_AUTHENTICATOR,
-            expiry: U48::ZERO,
-            scope: 0,
-        },
-        Bytes::new(),
-    )
-        .abi_encode_params();
-    let mut batch = SignedAccountChanges {
-        channel: AccountChangeChannel::Multichain,
-        sequence: 0,
-        changes: vec![SignedChange {
+    let payload = authorize_payload(p256_actor_id, Eip8130Contracts::P256_AUTHENTICATOR);
+    let batch = alice_batch(
+        &genesis,
+        AccountChangeChannel::Multichain,
+        vec![SignedChange {
             change_type: ChangeType::AuthorizeActor,
             payload: payload.clone().into(),
         }],
-        signature: Bytes::new(),
-    };
-    let digest =
-        ConfigChangeAuthorizer::changes_digest(alice.address(), genesis.config.chain_id, &batch);
-    let batch_signature = alice.signer().sign_hash_sync(&digest).expect("sign");
-    batch.signature = auth_blob(Eip8130Constants::K1_AUTHENTICATOR, &batch_signature.as_bytes());
+    );
 
     let mut tx = unsigned(genesis.config.chain_id, vec![vec![call(Account::Bob.address(), 1)]]);
     tx.sender = Some(alice.address());
@@ -528,4 +547,110 @@ fn call_refused_for_lack_of_new_account_gas_is_left_unlinked() {
 
 fn big(value: &Option<pbeth::BigInt>) -> U256 {
     value.as_ref().map_or(U256::ZERO, |value| U256::from_be_slice(&value.bytes))
+}
+
+#[test]
+fn keystore_local_batch_authorizes_then_revokes_an_actor() {
+    let genesis = keystore_genesis(&[]);
+    let alice = Account::Alice;
+    let actor_id = B256::repeat_byte(0x5c);
+    let revoke_payload = actor_id.abi_encode();
+    let batch = alice_batch(
+        &genesis,
+        AccountChangeChannel::Local,
+        vec![
+            SignedChange {
+                change_type: ChangeType::AuthorizeActor,
+                payload: authorize_payload(actor_id, Eip8130Contracts::P256_AUTHENTICATOR).into(),
+            },
+            SignedChange {
+                change_type: ChangeType::RevokeActor,
+                payload: revoke_payload.clone().into(),
+            },
+        ],
+    );
+
+    let mut tx = unsigned(genesis.config.chain_id, vec![vec![call(Account::Bob.address(), 1)]]);
+    tx.sender = Some(alice.address());
+    tx.account_changes = vec![AccountChange::ConfigChange(batch)];
+    let signature = alice.signer().sign_hash_sync(&tx.sender_signature_hash()).expect("sign");
+    let sender_auth = auth_blob(Eip8130Constants::K1_AUTHENTICATOR, &signature.as_bytes());
+    let trx = run_on(&genesis, Eip8130Signed::new(tx, sender_auth, Bytes::new()).into());
+
+    assert_eq!(pbeth::TransactionTraceStatus::Succeeded as i32, trx.status);
+    let input = trx.account_abstraction_trx_input.as_ref().expect("account_abstraction_trx_input");
+    let Some(Change::ConfigChange(change)) = &input.account_changes[0].change else {
+        panic!("expected a config change entry, got {:?}", input.account_changes);
+    };
+    assert_eq!(Channel::Local as i32, change.channel);
+    let types: Vec<i32> = change.changes.iter().map(|change| change.r#type).collect();
+    assert_eq!(
+        vec![
+            account_abstraction_keystore_change::Type::AuthorizeActor as i32,
+            account_abstraction_keystore_change::Type::RevokeActor as i32,
+        ],
+        types
+    );
+    assert_eq!(revoke_payload, change.changes[1].payload);
+
+    let keystore_logs = trx.calls[0]
+        .logs
+        .iter()
+        .filter(|log| log.address == Eip8130Contracts::ACCOUNT_CONFIG.to_vec())
+        .count();
+    assert_eq!(2, keystore_logs, "the ActorAuthorized and ActorRevoked logs are on the root call");
+}
+
+#[test]
+fn keystore_webauthn_sender_auth_is_recorded_as_signed() {
+    let genesis = keystore_genesis(&[]);
+    let alice = Account::Alice;
+    let key = P256SigningKey::from_slice(&[0x78; 32]).expect("p256 key");
+    let point = key.verifying_key().to_encoded_point(false);
+    let (x, y) =
+        (B256::from_slice(&point.as_bytes()[1..33]), B256::from_slice(&point.as_bytes()[33..]));
+    let actor_id = keccak256([x.as_slice(), y.as_slice()].concat());
+    let batch = alice_batch(
+        &genesis,
+        AccountChangeChannel::Multichain,
+        vec![SignedChange {
+            change_type: ChangeType::AuthorizeActor,
+            payload: authorize_payload(actor_id, Eip8130Contracts::WEBAUTHN_AUTHENTICATOR).into(),
+        }],
+    );
+
+    let mut tx = unsigned(genesis.config.chain_id, vec![vec![call(Account::Bob.address(), 1)]]);
+    tx.sender = Some(alice.address());
+    tx.account_changes = vec![AccountChange::ConfigChange(batch)];
+
+    // An OpenZeppelin-layout WebAuthn assertion over the sender signature hash.
+    let challenge = URL_SAFE_NO_PAD.encode(tx.sender_signature_hash().as_slice());
+    let client_json = format!(
+        "{{\"type\":\"webauthn.get\",\"challenge\":\"{challenge}\",\"origin\":\"https://base.org\"}}"
+    );
+    let mut authenticator_data = vec![0xaa; 32];
+    authenticator_data.push(0x01); // user present
+    authenticator_data.extend_from_slice(&[0, 0, 0, 1]);
+    let signed_digest = Sha256::new()
+        .chain_update(&authenticator_data)
+        .chain_update(Sha256::digest(client_json.as_bytes()))
+        .finalize();
+    let signature: P256Signature = key.sign_prehash(&signed_digest).expect("sign");
+    let signature = signature.normalize_s().unwrap_or(signature);
+    let assertion = WebAuthnAuth {
+        r: B256::from_slice(&signature.to_bytes()[..32]),
+        s: B256::from_slice(&signature.to_bytes()[32..]),
+        challengeIndex: U256::from(client_json.find("\"challenge\":\"").expect("challenge")),
+        typeIndex: U256::from(client_json.find("\"type\":\"webauthn.get\"").expect("type")),
+        authenticatorData: authenticator_data.into(),
+        clientDataJSON: client_json,
+    };
+    let data = (assertion, x, y).abi_encode_params();
+    let sender_auth = auth_blob(Eip8130Contracts::WEBAUTHN_AUTHENTICATOR, &data);
+    let trx = run_on(&genesis, Eip8130Signed::new(tx, sender_auth.clone(), Bytes::new()).into());
+
+    assert_eq!(pbeth::TransactionTraceStatus::Succeeded as i32, trx.status);
+    let input = trx.account_abstraction_trx_input.as_ref().expect("account_abstraction_trx_input");
+    assert_eq!(sender_auth.to_vec(), input.sender_auth);
+    assert!(trx.v.is_empty() && trx.r.is_empty() && trx.s.is_empty(), "no k1 signature");
 }
