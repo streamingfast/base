@@ -210,3 +210,23 @@ fn delegation_is_a_code_change_on_the_root_call() {
         .expect("the sender's delegation code is recorded on the root call");
     assert_eq!([&[0xef, 0x01, 0x00][..], target.as_slice()].concat(), code_change.new_code);
 }
+
+#[test]
+fn open_payer_signature_that_does_not_recover_rejects_the_block() {
+    let genesis = genesis();
+    let mut tx = unsigned(genesis.config.chain_id, vec![vec![call(Account::Bob.address(), 1)]]);
+    tx.payer = Some(Eip8130Constants::OPEN_PAYER);
+    let sender_auth: Bytes = Account::Alice
+        .signer()
+        .sign_hash_sync(&tx.sender_signature_hash())
+        .expect("sign")
+        .as_bytes()
+        .to_vec()
+        .into();
+    // `v` must be 27 or 28, so this payer signature never recovers.
+    let payer_auth = Bytes::from(vec![0x11; 65]);
+    let tx = Eip8130Signed::new(tx, sender_auth, payer_auth).into();
+
+    let result = run_block(&genesis, &context(&genesis), vec![tx]);
+    assert!(result.is_err(), "the block is rejected instead of traced");
+}

@@ -99,22 +99,17 @@ impl Eip8130PhaseStatuses {
         Vec::new()
     }
 
-    /// Number of phases that committed in the statuses recorded by the most recent
-    /// [`Self::set`] on this thread, leaving them in place for [`Self::take`]. Phases stop at
-    /// the first revert, so this is the count of leading `0x01` statuses. Returns 0 in `no_std`
-    /// builds.
+    /// Returns a copy of the statuses recorded by the most recent [`Self::set`] on this
+    /// thread, leaving them in place for [`Self::take`]. Empty in `no_std` builds.
     #[cfg(feature = "std")]
-    pub fn committed_phases() -> u64 {
-        PHASE_STATUSES
-            .with(|cell| cell.borrow().iter().take_while(|status| **status == 0x01).count() as u64)
+    pub fn peek() -> Vec<u8> {
+        PHASE_STATUSES.with(|cell| cell.borrow().clone())
     }
 
-    /// Number of phases that committed in the statuses recorded by the most recent
-    /// [`Self::set`] on this thread, leaving them in place for [`Self::take`]. Phases stop at
-    /// the first revert, so this is the count of leading `0x01` statuses. Returns 0 in `no_std`
-    /// builds.
+    /// Returns a copy of the statuses recorded by the most recent [`Self::set`] on this
+    /// thread, leaving them in place for [`Self::take`]. Empty in `no_std` builds.
     #[cfg(not(feature = "std"))]
-    pub const fn committed_phases() -> u64 {
-        0
+    pub const fn peek() -> Vec<u8> {
+        Vec::new()
     }
 }
