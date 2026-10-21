@@ -20,6 +20,7 @@ workspace = true
 base-cli-utils.workspace = true
 base-node-runner.workspace = true
 base-firehose-flashblocks.workspace = true
+base-common-genesis.workspace = true
 
 # reth
 base-reth-cli.workspace = true

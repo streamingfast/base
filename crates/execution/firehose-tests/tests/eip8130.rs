@@ -378,3 +378,23 @@ fn keystore_config_change_authorizes_the_p256_actor_that_signs() {
         "the ActorAuthorized log is on the root call"
     );
 }
+
+#[test]
+fn open_payer_signature_that_does_not_recover_rejects_the_block() {
+    let genesis = genesis();
+    let mut tx = unsigned(genesis.config.chain_id, vec![vec![call(Account::Bob.address(), 1)]]);
+    tx.payer = Some(Eip8130Constants::OPEN_PAYER);
+    let sender_auth: Bytes = Account::Alice
+        .signer()
+        .sign_hash_sync(&tx.sender_signature_hash())
+        .expect("sign")
+        .as_bytes()
+        .to_vec()
+        .into();
+    // `v` must be 27 or 28, so this payer signature never recovers.
+    let payer_auth = Bytes::from(vec![0x11; 65]);
+    let tx = Eip8130Signed::new(tx, sender_auth, payer_auth).into();
+
+    let result = run_block(&genesis, &context(&genesis), vec![tx]);
+    assert!(result.is_err(), "the block is rejected instead of traced");
+}

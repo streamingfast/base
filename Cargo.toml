@@ -640,15 +640,15 @@ notify = "8.2"
 governor = "0.7"
 
 # Firehose tracer (defined by the streamingfast reth fork, release/base-2.x branch).
-reth-firehose = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-firehose-tests = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", branch = "feature/aa-keystore" }
+reth-firehose = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-firehose-tests = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+firehose-tracer = "5.7.0"
 
 # Shared tracing-regression framework (capture / invariants / projection / golden).
-firehose-tracer-test = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", branch = "feature/aa-keystore" }
+firehose-tracer-test = "5.7.0"
 
 # Chain-agnostic generator for replayable Firehose prestate fixtures.
-firehose-tracer-prestate = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs.git", branch = "feature/aa-keystore" }
+firehose-tracer-prestate = "5.7.0"
 
 [patch.crates-io]
 # SF fork of alloy-evm that routes system calls (EIP-4788, EIP-2935, etc.) through the
@@ -656,74 +656,74 @@ firehose-tracer-prestate = { git = "https://github.com/streamingfast/evm-firehos
 alloy-evm = { git = "https://github.com/streamingfast/evm.git", tag = "v0.38.0-sf" }
 
 [patch."https://github.com/base/reth"]
-reth-basic-payload-builder = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-chain-state = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-chainspec = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-cli = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-cli-commands = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-cli-runner = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-cli-util = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-consensus = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-consensus-common = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-db = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-db-api = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-db-common = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-db-models = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-discv4 = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-discv5 = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-e2e-test-utils = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-ecies = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-engine-primitives = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-engine-tree = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-errors = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-eth-wire = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-eth-wire-types = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-ethereum-forks = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-ethereum-primitives = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-evm = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-evm-ethereum = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-execution-cache = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-execution-errors = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-execution-types = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-exex = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-exex-test-utils = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-ipc = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-net-nat = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-network = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-network-api = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-network-p2p = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-network-peers = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-node-api = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-node-builder = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-node-core = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-node-ethereum = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-node-metrics = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-payload-builder = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-payload-builder-primitives = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-payload-primitives = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-payload-util = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-payload-validator = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-provider = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-prune-types = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-revm = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-rpc = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-rpc-api = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-rpc-convert = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-rpc-engine-api = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-rpc-eth-api = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-rpc-eth-types = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-rpc-layer = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-rpc-server-types = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-stages-types = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-storage-api = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-storage-errors = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-tasks = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-testing-utils = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-tokio-util = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-tracing = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-tracing-otlp = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-transaction-pool = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-trie = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-trie-common = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-trie-db = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
-reth-trie-parallel = { git = "https://github.com/streamingfast/reth.git", branch = "feature/aa-keystore" }
+reth-basic-payload-builder = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-chain-state = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-chainspec = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-cli = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-cli-commands = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-cli-runner = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-cli-util = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-consensus = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-consensus-common = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-db = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-db-api = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-db-common = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-db-models = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-discv4 = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-discv5 = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-e2e-test-utils = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-ecies = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-engine-primitives = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-engine-tree = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-errors = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-eth-wire = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-eth-wire-types = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-ethereum-forks = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-ethereum-primitives = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-evm = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-evm-ethereum = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-execution-cache = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-execution-errors = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-execution-types = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-exex = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-exex-test-utils = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-ipc = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-net-nat = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-network = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-network-api = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-network-p2p = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-network-peers = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-node-api = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-node-builder = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-node-core = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-node-ethereum = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-node-metrics = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-payload-builder = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-payload-builder-primitives = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-payload-primitives = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-payload-util = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-payload-validator = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-provider = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-prune-types = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-revm = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-rpc = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-rpc-api = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-rpc-convert = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-rpc-engine-api = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-rpc-eth-api = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-rpc-eth-types = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-rpc-layer = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-rpc-server-types = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-stages-types = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-storage-api = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-storage-errors = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-tasks = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-testing-utils = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-tokio-util = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-tracing = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-tracing-otlp = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-transaction-pool = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-trie = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-trie-common = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-trie-db = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }
+reth-trie-parallel = { git = "https://github.com/streamingfast/reth.git", branch = "release/base-2.x" }

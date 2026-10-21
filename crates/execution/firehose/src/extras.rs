@@ -69,13 +69,15 @@ where
         );
         // An EIP-8130 transaction credits its fee recipients on the journal inside its root call
         // (see `OpPreTxAdjust`), so only its committed phase count is left to record. The
-        // receipt builder has not consumed the phase statuses yet: it runs at commit.
+        // receipt builder has not consumed the phase statuses yet: it runs at commit. Phases stop
+        // at the first revert, so the committed ones are the leading `0x01` statuses.
         if evm.ctx().tx().is_eip8130() {
+            let committed_phases =
+                Eip8130PhaseStatuses::peek().iter().take_while(|status| **status == 0x01).count()
+                    as u64;
             let (_, inspector, _) = evm.components_mut();
             inspector.tracer_mut().set_account_abstraction_trx_output(
-                AccountAbstractionTrxOutput {
-                    committed_phases: Eip8130PhaseStatuses::committed_phases(),
-                },
+                AccountAbstractionTrxOutput { committed_phases },
             );
             return;
         }
@@ -240,23 +242,27 @@ impl OpPreTxAdjust {
         I: Inspector<BaseContext<DB>, EthInterpreter> + FirehoseInspectorApi,
         P: PrecompileProvider<BaseContext<DB>, Output = InterpreterResult>,
     {
+        // Every type 0x79 transaction environment is built from its envelope, so this cannot
+        // fail. The tracer has no transaction context yet, so the message carries it.
         let Some(parts) = tx_env.eip8130_parts() else {
             panic!(
-                "Firehose cannot trace transaction {}: an EIP-8130 transaction reached the EVM \
-                 without its envelope",
-                tx_event.hash
+                "Firehose cannot trace transaction {} (index {}) at block #{}: an EIP-8130 \
+                 transaction reached the EVM without its envelope",
+                tx_event.hash,
+                tx_event.index,
+                evm.ctx().block().number()
             );
         };
         let signed = &parts.signed;
         let tx = signed.tx();
         let beneficiary = evm.ctx().block().beneficiary();
 
-        let payer = signed.resolved_payer(sender).unwrap_or_else(|_| {
-            panic!(
-                "Firehose cannot trace transaction {}: its open payer signature does not recover",
-                tx_event.hash
-            )
-        });
+        // An open payer signature that does not recover makes the transaction invalid: the
+        // executor rejects it before the root call and the block is discarded, so there is
+        // nothing to trace.
+        let Ok(payer) = signed.resolved_payer(sender) else {
+            return;
+        };
 
         let account_changes = tx.account_changes.iter().map(Self::account_change).collect();
 

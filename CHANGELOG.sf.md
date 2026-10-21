@@ -14,6 +14,15 @@
   recorded in `account_changes`, and a sender that signs with a P-256, WebAuthn or delegate
   authenticator has its authentication in `sender_auth` instead of `v`, `r` and `s`.
 
+## v1.5.0-fh3.1-1
+
+### Changed
+
+* The `<timestamp_unix_nano>` field of each FIRE BLOCK line, which becomes the Firehose block time,
+  now has millisecond precision from Denim on, so consecutive 200 ms blocks get distinct times. It
+  comes from the Denim schedule, which consensus requires the BaseTime deposit to match. Pre-Denim
+  blocks keep whole seconds. The Ethereum block header's `timestamp` is unchanged.
+
 ## v1.5.0-fh3.1
 
 ### Changed
