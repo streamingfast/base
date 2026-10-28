@@ -1,3 +1,14 @@
+## v1.5.1-fh3.1
+
+### Changed
+
+* Rebased on upstream Base `v1.5.1`. It schedules the Denim hardfork on Base mainnet at
+  2026-11-05 18:00:00 UTC, so mainnet operators must run this release before then.
+  `streamingfast/reth` stays on `base-v2.5.2.8-fh3.1-2` and `firehose-tracer` on 5.7.0; the
+  Firehose block model is unchanged.
+* From Denim on, Base publishes no flashblocks, so a node started with `--firehose-flashblocks-url`
+  emits no partial blocks after the activation; full blocks come every 200 ms instead.
+
 ## v1.5.0-fh3.1-2
 
 ### Added
