@@ -45,6 +45,9 @@ tokio-stream.workspace = true
 # tracing
 tracing.workspace = true
 
+[dev-dependencies]
+base-execution-chainspec.workspace = true
+
 [features]
 default = [ "asm-keccak", "jemalloc", "keccak-cache-global" ]
 asm-keccak = [ "base-execution-cli/asm-keccak" ]

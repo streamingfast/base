@@ -4547,7 +4547,7 @@ dependencies = [
 
 [[package]]
 name = "base-execution-firehose"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-evm",
@@ -4804,7 +4804,7 @@ dependencies = [
 
 [[package]]
 name = "base-firehose-flashblocks"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -4849,7 +4849,7 @@ dependencies = [
 
 [[package]]
 name = "base-firehose-prestate"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "alloy-genesis",
  "base-common-chains",
@@ -4867,7 +4867,7 @@ dependencies = [
 
 [[package]]
 name = "base-firehose-tests"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
@@ -6211,6 +6211,7 @@ version = "1.5.1"
 dependencies = [
  "base-cli-utils",
  "base-common-genesis",
+ "base-execution-chainspec",
  "base-execution-cli",
  "base-firehose-flashblocks",
  "base-node-runner",

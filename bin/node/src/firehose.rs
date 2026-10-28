@@ -208,6 +208,8 @@ impl FromExtensionConfig for FirehoseFlashblocksExtension {
 mod tests {
     use std::num::NonZeroU64;
 
+    use base_execution_chainspec::BaseChainSpec;
+
     use super::*;
 
     #[test]
@@ -234,5 +236,29 @@ mod tests {
             );
         }
         assert_eq!(block_time(None, &block(6, 1010)), UNIX_EPOCH + Duration::from_secs(1010));
+    }
+
+    #[test]
+    fn mainnet_block_time_switches_to_milliseconds_at_denim() {
+        // Denim is configured for 1_793_901_600 and activates on the first 2-second slot at or
+        // after it: block 53_556_127, at 1_793_901_601.
+        let schedule = BaseChainSpec::mainnet()
+            .denim_timestamp_schedule()
+            .expect("mainnet has a block time")
+            .expect("mainnet schedules Denim");
+        let block = |number, time| BlockData { number, time, ..Default::default() };
+
+        for (number, time, want_ms) in [
+            (53_556_126, 1_793_901_599, 1_793_901_599_000),
+            (53_556_127, 1_793_901_601, 1_793_901_601_000),
+            (53_556_128, 1_793_901_601, 1_793_901_601_200),
+            (53_556_132, 1_793_901_602, 1_793_901_602_000),
+        ] {
+            assert_eq!(
+                block_time(Some(&schedule), &block(number, time)),
+                UNIX_EPOCH + Duration::from_millis(want_ms),
+                "block {number}"
+            );
+        }
     }
 }
