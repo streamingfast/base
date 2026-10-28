@@ -19,7 +19,7 @@ use base_common_evm::L1BlockInfo;
 use base_execution_eip8130::IntrinsicGas;
 use base_execution_firehose::{BuiltBlock, BuiltBlockTracer};
 use base_execution_txpool::{
-    BasePooledTx, GuardMetrics, ParkableTransactionPool, PredicateContext, ValidityPredicate,
+    BasePooledTx, GuardMetrics, ParkableTransactionPool, PredicateContext,
     estimated_da_size::DataAvailabilitySized,
 };
 use base_observability_events::{
@@ -508,7 +508,12 @@ impl<Txs> Builder<'_, Txs> {
             Some(executed),
             block_access_list.map(|bal| alloy_rlp::encode(bal).into()),
         );
-        BuilderMetrics::record_inclusion(&info.inclusion);
+        // `no_tx_pool` builds replay consensus input; the payload-builder cutover also sends one
+        // to the unselected builder for every block. Only the builder that composed the block
+        // records its inclusion, matching flashblocks.
+        if !no_tx_pool {
+            BuilderMetrics::record_inclusion(&info.inclusion);
+        }
 
         if no_tx_pool || ctx.is_denim_active() {
             // if `no_tx_pool` is set only transactions from the payload attributes will be included
@@ -964,7 +969,7 @@ where
                 continue;
             }
 
-            let has_validity_predicates = !tx.validity_predicates().is_empty();
+            let has_validity_predicates = !tx.validity_conditions().is_empty();
             let coinbase_tip = tx.as_eip8130().and_then(|signed| CoinbaseTip::decode(signed.tx()));
             let has_coinbase_tip = coinbase_tip.is_some();
             // Every validity candidate ends with a decision event, so there is no separate
@@ -972,11 +977,7 @@ where
             if has_validity_predicates {
                 validity_consideration_index += 1;
             }
-            if tx
-                .validity_predicates()
-                .iter()
-                .any(|predicate| matches!(predicate, ValidityPredicate::FlashblockIndex { .. }))
-            {
+            if tx.validity_conditions().flashblock().is_present() {
                 ValidityMetrics::validity_predicate_evaluations_total("unsupported").increment(1);
                 emit_native_validity_event!(
                     self,
@@ -1038,7 +1039,7 @@ where
                         &mut predicate_loads,
                     );
                     ValidityPredicateEvaluation::evaluate(
-                        tx.validity_predicates(),
+                        tx.validity_conditions(),
                         &mut recorder,
                         &predicate_context,
                     )
@@ -1078,7 +1079,7 @@ where
                     }
                     Ok(ValidityPredicateEvaluation::Unsatisfied {
                         blocker,
-                        blocker_index,
+                        predicate,
                         expired: false,
                     }) => {
                         ValidityMetrics::validity_predicate_evaluations_total("not_satisfied")
@@ -1102,7 +1103,6 @@ where
                                 }
                             );
                         }
-                        let predicate = tx.validity_predicates()[blocker_index].clone();
                         predicate_index.park(tx_hash, tx, predicate);
                         continue;
                     }
@@ -1434,7 +1434,7 @@ where
                         &mut predicate_loads,
                     );
                     ValidityPredicateEvaluation::evaluate(
-                        parked_transaction.validity_predicates(),
+                        parked_transaction.validity_conditions(),
                         &mut recorder,
                         &predicate_context,
                     )
@@ -1448,13 +1448,11 @@ where
                         predicate_index.remove(parked_hash);
                         best_txs.promote(parked_hash);
                     }
-                    Ok(ValidityPredicateEvaluation::Unsatisfied { blocker_index, .. }) => {
+                    Ok(ValidityPredicateEvaluation::Unsatisfied { predicate, .. }) => {
                         ValidityMetrics::validity_predicate_evaluations_total(
                             "rescan_not_satisfied",
                         )
                         .increment(1);
-                        let predicate =
-                            parked_transaction.validity_predicates()[blocker_index].clone();
                         predicate_index.reindex(parked_hash, predicate);
                     }
                     Err(error) => {
@@ -1673,6 +1671,29 @@ mod tests {
     #[test]
     fn parallel_state_root_is_used() {
         assert_eq!(build_empty_payload(state_root_handle()), B256::repeat_byte(0x42));
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn only_pool_builds_record_per_block_inclusion() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            build_empty_payload(state_root_handle());
+            assert!(!handle.render().contains("txs_included_per_block"));
+
+            build_pool_payload(
+                pool_payload_context(DENIM_TIMESTAMP),
+                TestParkableTransactions::new(vec![pool_transaction(0)]),
+            );
+        });
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(r#"base_builder_txs_included_per_block_count{flow="standard"} 1"#)
+        );
+        assert!(rendered.contains(r#"base_builder_txs_included_per_block_sum{flow="standard"} 1"#));
     }
 
     const DENIM_TIMESTAMP: u64 = 1;
