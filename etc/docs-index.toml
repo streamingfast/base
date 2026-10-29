@@ -60,7 +60,7 @@ digest = "b67d590f7d"
 
 ["bin/basectl/README.md"]
 summary = "basectl operator console reference: global options, TUI and scriptable commands (block, sync-status, p2p, txpool, conductor, sequencer, batcher, doctor, proofs), JSON output and examples."
-digest = "dede2cd58a"
+digest = "78a08a9f7a"
 
 ["bin/builder/README.md"]
 summary = "Stub README for the base-builder block builder binary, which runs base-builder-core. Minimal, no usage details."
@@ -152,7 +152,7 @@ digest = "d1525977c0"
 
 ["crates/batcher/cli/README.md"]
 summary = "base-batcher-cli: base batcher flags and startup, with sequencer endpoints and leader search, channel and DA config, and shadow mode posting to the inbox a parity validator derives its chain from."
-digest = "8c65ed44e2"
+digest = "1ccdbc3fb7"
 
 ["crates/batcher/comp/README.md"]
 summary = "base-comp: incremental Brotli channel compression (CompressionStream, BrotliLevel) producing protocol-compatible channels; batch encoding and framing live in batcher-encoder."
@@ -160,7 +160,7 @@ digest = "ce9421e523"
 
 ["crates/batcher/core/README.md"]
 summary = "base-batcher-core: async BatchDriver, SubmissionQueue for L1 transactions, and the DA throttle (Off, Step, Linear, Quadratic strategies) that publishes the DA limits the block builders apply."
-digest = "0f339286c4"
+digest = "de7352c3a8"
 
 ["crates/batcher/encoder/README.md"]
 summary = "base-batcher-encoder: synchronous, no-I/O encoder from L2 blocks to L1 submissions. Covers channel closing rules, blob framing, metric labels, and BatchEncoder usage."
@@ -408,7 +408,7 @@ digest = "559e8e9f95"
 
 ["crates/execution/tx-forwarding/README.md"]
 summary = "base-tx-forwarding: forwards mempool txs to builder RPCs via per-destination queues fed by FIFO and tip-priority lanes; dedup, batching, resend; spawn_requests for custom ForwardRequest; CLI flags."
-digest = "b72a1536e1"
+digest = "824cdc212c"
 
 ["crates/execution/txpool-rpc/README.md"]
 summary = "Txpool RPC admin/status APIs and validity submissions; shared staged signature modes, signature rejection metrics, predicate forwarding and sequencer proxy behavior."
@@ -420,7 +420,7 @@ digest = "e58f6b44fb"
 
 ["crates/execution/txpool/PROPAGATION_PIPELINE.md"]
 summary = "Plan to forward mempool txs to builders via base_insertValidatedTransaction in 4 PRs (consumer, forwarder, builder endpoint, node integration). Only PR 1 is marked done. Names a crates/txpool/ path."
-digest = "2e785bfe9d"
+digest = "ce42872576"
 
 ["crates/execution/txpool/README.md"]
 summary = "Base txpool validation/ordering, builder wire extensions, staged EIP-712 predicate authorization, wallet signing contract, rejection metrics, and rollout/security limits."
@@ -512,7 +512,7 @@ digest = "dc8e161148"
 
 ["crates/proof/primitives/README.md"]
 summary = "base-proof-primitives: shared proof wire types (Proposal, ProofBundle, ProofResult with Tee and Zk variants) exchanged among proposer, enclave, provers and on-chain verifiers."
-digest = "274b61e6c7"
+digest = "b8cdb98d76"
 
 ["crates/proof/proof/README.md"]
 summary = "base-proof SDK: oracle-backed derivation and execution pieces (OraclePipeline, Oracle L1/L2 providers, CachingOracle, BaseExecutor), boot info and EIP-2935 lookups for fault proof generation."
@@ -656,7 +656,7 @@ digest = "393c4961d6"
 
 ["docs/guides/P2P.md"]
 summary = "Explains the Base P2P stack for newcomers: consensus-layer discv5 and libp2p gossipsub versus execution-layer reth networking, how they interact via Engine API, key files, flags, and glossary."
-digest = "2407f38ac8"
+digest = "0a50fafb9b"
 
 ["docs/guides/RELEASE.md"]
 summary = "Release process: Start Release creates releases/vX.Y.Z, version sync PR, automatic RC tags and builds per commit, then Publish Release for the final tag, Docker images and binaries."
