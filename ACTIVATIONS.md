@@ -7,7 +7,9 @@ and refresh the statuses when an activation is announced.
 Denim and Everest are contract-backed: an L1 upgrade signal (`crates/utilities/upgrade-signal`) can
 schedule them on a network with no new node release. Zenith can only be set in genesis.
 
-Statuses checked 2026-10-28 against Base `v1.5.1` (`crates/common/chains/src/config.rs`).
+Statuses checked 2026-11-06 against Base `v1.5.4` (`crates/common/chains/src/config.rs`). On both
+L1s, `getSchedule()` on the configured `protocol_versions_address` reverts, so no upgrade is
+scheduled through the signal; the schedules below are the ones in the code.
 
 | Upgrade | Base mainnet | Base Sepolia | Effect on the Firehose block |
 |---------|--------------|--------------|------------------------------|
@@ -15,7 +17,7 @@ Statuses checked 2026-10-28 against Base `v1.5.1` (`crates/common/chains/src/con
 | Azul | Active 2026-05-28 18:00 UTC | Active 2026-04-20 18:00 UTC | Already in the stream. |
 | Beryl | Active 2026-06-25 18:00 UTC | Active 2026-06-18 18:00 UTC | Already in the stream. |
 | Cobalt | Active 2026-09-30 18:00 UTC | Active 2026-09-23 18:00 UTC | B-20 V2 precompiles. Covered by `etc/systems/tests/firehose_cobalt_b20.rs`. |
-| Denim | Scheduled 2026-11-05 18:00 UTC (`1_793_901_600`) from `v1.5.1`; first Denim block is 53_556_127 at `1_793_901_601` | Active 2026-10-21 18:00 UTC (`1_792_605_600`) | See [Denim](#denim). **Mainnet nodes must run `v1.5.1-fh3.1` or later before activation.** |
+| Denim | Active 2026-11-05 18:00 UTC (`1_793_901_600`); first Denim block is 53_556_127 at `1_793_901_601` | Active 2026-10-21 18:00 UTC (`1_792_605_600`) | See [Denim](#denim). Mainnet nodes need `v1.5.1-fh3.1` or later. |
 | Everest | Not scheduled | Not scheduled | See [Everest](#everest). Traced from `v1.5.0-fh3.1-2` as `TRX_TYPE_ACCOUNT_ABSTRACTION`. **Earlier versions stop on the first EIP-8130 transaction.** |
 | Zenith | Never (genesis only) | Never (genesis only) | Gates the EIP-8130 keystore (account configuration changes, non-k1 authenticators). Unreachable on real networks. Traced from `v1.5.0-fh3.1-2`: create and config change entries in `account_changes`, non-k1 sender authentication in `sender_auth`. |
 

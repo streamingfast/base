@@ -1,3 +1,16 @@
+## v1.5.4-fh3.1
+
+### Changed
+
+* Rebased on upstream Base `v1.5.4` (with `v1.5.2` and `v1.5.3`), recommended for synchronization
+  and block propagation at 200 ms block times. Uses `streamingfast/reth` `base-v2.5.2.11-fh3.1`;
+  `firehose-tracer` stays on 5.7.0 and the Firehose block model is unchanged.
+* Upstream raises the engine persistence defaults of `base-reth-node` to 70 blocks
+  (`--engine.persistence-threshold`, `--engine.memory-block-buffer-target`) and 160 blocks
+  (`--engine.persistence-backpressure-threshold`). After an unclean shutdown the node executes
+  the blocks it held in memory again and emits their FIRE BLOCK lines again: up to about 14 s of
+  chain at 200 ms blocks, instead of about 1 s.
+
 ## v1.5.1-fh3.1
 
 ### Changed
