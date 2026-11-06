@@ -775,7 +775,7 @@ impl BasePayloadBuilderCtx {
         // Total validity-predicate evaluation time (inclusive of the state loads each
         // evaluation performs) across this flashblock build. `None` until the first
         // evaluation, so it both accumulates and records whether any validity
-        // transaction was seen; emitted once when the loop finishes.
+        // transaction was seen; emitted once when the loop ends, including on cancellation.
         let mut predicate_eval_total: Option<Duration> = None;
         let mut validity_candidates_evaluated = 0_u64;
         let mut validity_candidates_deferred = 0_u64;
@@ -784,12 +784,12 @@ impl BasePayloadBuilderCtx {
         let mut validity_handling = Duration::ZERO;
 
         while let Some(tx) = best_txs.next(()) {
+            // Break rather than return so the per-build metrics below are still recorded. A
+            // flashblock whose selection loop runs until the deadline is the case where
+            // validity handling costs the most, so dropping its observations would hide it.
             if self.cancel.is_cancelled() {
                 diag.cancelled = true;
-                diag.txs_considered = num_txs_considered;
-                diag.txs_included =
-                    (info.executed_transactions.len() as u64).saturating_sub(min_tx_index);
-                return Ok(diag);
+                break;
             }
 
             num_txs_considered += 1;
@@ -876,13 +876,17 @@ impl BasePayloadBuilderCtx {
                     "matched"
                 };
                 ValidityMetrics::validity_predicate_evaluations_total(outcome).increment(1);
+                // Only matched candidates pay for the resting lookup.
                 if outcome == "matched" && best_txs.is_resting(tx_hash, tx.validity_conditions()) {
-                    BuilderMetrics::resting_predicate_shadow_mismatches_total().increment(1);
+                    ValidityMetrics::resting_predicate_shadow_mismatches_total().increment(1);
                     debug!(
                         target: "payload_builder",
                         tx_hash = ?tx_hash,
                         "resting validity transaction matched when evaluated"
                     );
+                }
+                if predicate_read_failed || predicate_expired || blocking_predicate.is_none() {
+                    best_txs.release(tx_hash);
                 }
             }
             if predicate_read_failed || blocking_predicate.is_some() {
@@ -1474,12 +1478,14 @@ impl BasePayloadBuilderCtx {
                 ValidityMetrics::validity_predicate_evaluations_total(outcome).increment(1);
                 if predicate_read_failed {
                     predicate_index.remove(*parked_hash);
+                    best_txs.release(*parked_hash);
                     best_txs.discard_parked(*parked_hash);
                 } else if let Some((_, predicate)) = blocking_predicate {
                     best_txs.rest(*parked_hash, &predicate);
                     predicate_index.reindex(*parked_hash, predicate);
                 } else {
                     predicate_index.remove(*parked_hash);
+                    best_txs.release(*parked_hash);
                     best_txs.promote(*parked_hash);
                 }
             }
@@ -1538,7 +1544,11 @@ impl BasePayloadBuilderCtx {
         }
         let resting_stats = best_txs.take_resting_stats();
         if resting_stats.parked > 0 {
-            BuilderMetrics::resting_predicate_parked_total().increment(resting_stats.parked);
+            ValidityMetrics::resting_predicate_parked_total().increment(resting_stats.parked);
+        }
+        if resting_stats.carried_parked > 0 {
+            ValidityMetrics::resting_predicate_carried_parked_total()
+                .increment(resting_stats.carried_parked);
         }
         let validity_handling = validity_handling + resting_stats.duration;
         if !validity_handling.is_zero() {
@@ -1564,6 +1574,9 @@ impl BasePayloadBuilderCtx {
             &predicate_index,
         );
 
+        // A pool iterator whose hold the cancellation interrupted returns `None` before the loop
+        // reaches its per-candidate check, so record the cancellation here as well.
+        diag.cancelled |= self.cancel.is_cancelled();
         diag.txs_considered = num_txs_considered;
         diag.txs_included = (info.executed_transactions.len() as u64).saturating_sub(min_tx_index);
 
@@ -1899,6 +1912,64 @@ mod tests {
         assert_eq!(diagnostics.txs_rejected_gas, 1);
         assert_eq!(best_txs.over_limit_rejections, 1);
         assert!(best_txs.over_limit_remaining > OVER_LIMIT - 10);
+    }
+
+    #[test]
+    fn cancelled_selection_still_records_per_build_metrics() {
+        let ctx = test_builder_context();
+        let mut best_txs = LimitRejectionTransactions::new(0, 2, ctx.cancel.clone());
+        let db = StateProviderDatabase::new(NoopProvider::default());
+        let mut state = State::builder().with_database(db).with_bundle_update().build();
+        let mut info = ExecutionInfo::default();
+        let limits = ResourceLimits { block_gas_limit: 0, ..Default::default() };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        let diagnostics = metrics::with_local_recorder(&recorder, || {
+            ctx.execute_best_transactions(
+                &mut info,
+                &mut BlockDeferrals::default(),
+                &mut state,
+                &mut best_txs,
+                &limits,
+            )
+            .expect("cancelled selection should succeed")
+        });
+
+        assert!(diagnostics.cancelled);
+        let rendered = handle.render();
+        assert!(
+            rendered
+                .contains("base_builder_validity_predicate_candidates_evaluated_per_build_count 1"),
+            "cancelled build must record per-build validity metrics:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("base_builder_payload_num_tx_considered_count 1"),
+            "cancelled build must record payload builder metrics:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn cancellation_that_ends_the_iterator_is_reported_as_cancelled() {
+        // An interrupted resting hold ends the pool iterator without yielding a candidate, so the
+        // loop never reaches its per-candidate cancellation check.
+        let ctx = test_builder_context();
+        ctx.cancel.cancel();
+        let mut best_txs = LimitRejectionTransactions::new(0, 0, ctx.cancel.clone());
+        let db = StateProviderDatabase::new(NoopProvider::default());
+        let mut state = State::builder().with_database(db).with_bundle_update().build();
+
+        let diagnostics = ctx
+            .execute_best_transactions(
+                &mut ExecutionInfo::default(),
+                &mut BlockDeferrals::default(),
+                &mut state,
+                &mut best_txs,
+                &ResourceLimits::default(),
+            )
+            .expect("cancelled selection should succeed");
+
+        assert_eq!(diagnostics.selection_outcome(), FlashblockSelectionOutcome::Cancelled);
     }
 
     #[test]

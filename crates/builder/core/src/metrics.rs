@@ -94,6 +94,8 @@ base_metrics::define_metrics! {
     flashblocks_time_drift: histogram,
     #[describe("Time offset we used for first flashblock")]
     first_flashblock_time_offset: histogram,
+    #[describe("Time from the start of the payload job to flashblock scheduling, in seconds")]
+    flashblocks_schedule_delay: histogram,
     #[describe("Count of the number of times transactions had metering information")]
     metering_known_transaction: counter,
     #[describe("Count of the number of times transactions did not have any metering information")]
@@ -104,6 +106,10 @@ base_metrics::define_metrics! {
     metering_store_ttl_expirations: counter,
     #[describe("Size of MeteringStore")]
     metering_store_size: gauge,
+    #[describe(
+        "Builder started with resource metering enabled but no resource-metering schedule configured"
+    )]
+    resource_metering_schedule_missing_total: counter,
     #[describe("Transactions inserted into the rejection cache")]
     rejection_cache_insertions: counter,
     #[describe("Transactions skipped by the rejection cache (P2P re-insertion prevented)")]
@@ -189,10 +195,6 @@ base_metrics::define_metrics! {
     tx_accounts_modified: histogram,
     #[describe("Number of storage slots modified by a transaction (from EVM post-state)")]
     tx_storage_slots_modified: histogram,
-    #[describe("Resting validity transactions parked in the transaction iterator without reaching the build loop")]
-    resting_predicate_parked_total: counter,
-    #[describe("Resting validity transactions whose predicates matched when evaluated in shadow mode")]
-    resting_predicate_shadow_mismatches_total: counter,
     #[describe("Time per flashblock spent handling validity transactions, from yield to the predicate gate decision, including resting transactions parked in the iterator, in seconds")]
     validity_candidate_handling_duration: histogram,
     #[describe("Builder transaction events successfully enqueued")]

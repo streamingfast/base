@@ -26,7 +26,7 @@ use base_execution_consensus::{calculate_receipt_root_no_memo, isthmus};
 use base_execution_evm::{BaseEvmConfig, BaseNextBlockEnvAttributes};
 use base_execution_payload_builder::{
     BaseBuiltPayload, BasePayloadBuilderAttributes, BuilderMetrics as SharedBuilderMetrics,
-    ValidityMetrics,
+    RestingPredicateStore, RestingPredicates, SharedRestingPredicates, ValidityMetrics,
 };
 use base_execution_txpool::AccountStateDiff;
 use base_observability_events::{GlobalTransactionEventWriter, TransactionEventType};
@@ -44,6 +44,7 @@ use reth_provider::{
 use reth_revm::{
     State, database::StateProviderDatabase, db::states::bundle_state::BundleRetention,
 };
+use reth_tasks::Runtime;
 use reth_transaction_pool::TransactionPool;
 use reth_trie::{HashedPostState, updates::TrieUpdates};
 use revm::Database as _;
@@ -51,7 +52,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, metadata::Level, span, warn};
+use tracing::{debug, debug_span, error, info, metadata::Level, span, warn};
 
 use crate::{
     BlockDeferrals, BuilderConfig, BuilderMetrics, ExecutionInfo, PayloadBuilder, ResourceLimits,
@@ -122,6 +123,8 @@ pub(super) struct BasePayloadBuilder<Pool, Client> {
     pub outputs: BuilderOutputs,
     /// Last flashblock emitted by this builder instance.
     last_emitted_flashblock_id: Arc<LastEmittedFlashblockId>,
+    /// Validity transactions resting from the last block this builder finished.
+    resting_predicates: RestingPredicateStore,
 }
 
 impl<Pool, Client> BasePayloadBuilder<Pool, Client> {
@@ -132,6 +135,7 @@ impl<Pool, Client> BasePayloadBuilder<Pool, Client> {
         client: Client,
         config: BuilderConfig,
         outputs: BuilderOutputs,
+        executor: Runtime,
     ) -> Self {
         Self {
             evm_config,
@@ -140,6 +144,7 @@ impl<Pool, Client> BasePayloadBuilder<Pool, Client> {
             config,
             outputs,
             last_emitted_flashblock_id: Arc::default(),
+            resting_predicates: RestingPredicateStore::new(executor),
         }
     }
 
@@ -300,9 +305,37 @@ where
         BuilderMetrics::sequencer_tx_duration().record(sequencer_tx_time);
         BuilderMetrics::sequencer_tx_gauge().set(sequencer_tx_time);
 
-        // We adjust our flashblocks timings based on time_drift if dynamic adjustment enable
+        // Derive the flashblock schedule before carrying the resting set into the block, so the
+        // carry cannot delay the schedule; the timer below takes it out of the first flashblock.
         let (flashblocks_per_block, first_flashblock_offset) =
             self.calculate_flashblocks(timestamp);
+        BuilderMetrics::flashblocks_schedule_delay().record(block_build_start_time.elapsed());
+        let resting_carry_start = Instant::now();
+
+        // Resting transactions carry across flashblocks and across the blocks this builder finishes
+        // in sequence. Checked against the parent before the fallback build merges the transitions,
+        // which hold the system calls and deposits applied on top of the parent state.
+        let resting = (!ctx.attributes().no_tx_pool
+            && self.config.resting_predicate_mode.is_enabled())
+        .then(|| {
+            let _span = debug_span!(target: "payload_builder", "resting_begin_block").entered();
+            let start = Instant::now();
+            // The sweep has already overlapped the previous block's state root and the leeway, so
+            // this rarely waits. Waiting longer than one flashblock would cost more than starting
+            // with an empty set, which only means evaluating every validity transaction again.
+            let mut resting = self.resting_predicates.take(
+                self.config.predicate_bucket_ordered_threshold,
+                self.config.flashblocks_interval,
+            );
+            let carry_over = resting.begin_block(
+                ctx.parent().hash(),
+                ctx.block_number(),
+                state.transition_state.as_ref(),
+            );
+            ValidityMetrics::record_resting_carry_over(&carry_over, start.elapsed());
+            resting
+        });
+        let resting_carry = resting_carry_start.elapsed();
 
         let skip_flashblocks_building = ctx.attributes().no_tx_pool || flashblocks_per_block == 0;
 
@@ -416,15 +449,25 @@ where
         let mut fb_cancel = block_cancel.child_token();
         ctx = ctx.with_cancel(fb_cancel.clone()).with_extra_ctx(extra);
 
-        // Create best_transaction iterator
+        // Create best_transaction iterator. The resting set is shared with every pool iterator of
+        // this block, whose hold parks resting members before the build loop sees them.
+        let resting = SharedRestingPredicates::new(resting.unwrap_or_else(|| {
+            RestingPredicates::new(self.config.predicate_bucket_ordered_threshold)
+        }));
+        let hold = self
+            .config
+            .resting_predicate_mode
+            .is_enforced()
+            .then(|| crate::flashblock_hold(&resting, &fb_cancel));
         let best_txs_attributes = ctx.best_transaction_attributes();
         let mut best_txs = BestFlashblocksTxs::new(
             ParkableBestPayloadTransactions::new(
-                self.pool.best_transactions_with_attributes_and_parking(best_txs_attributes),
+                self.pool.best_transactions_with_attributes_and_parking(best_txs_attributes, hold),
             ),
             self.config.rejection_cache.clone(),
         )
-        .with_resting_predicate_mode(self.config.resting_predicate_mode);
+        .with_resting_predicate_mode(self.config.resting_predicate_mode)
+        .with_resting_predicates(resting);
         let interval = self.config.flashblocks_interval;
         let (tx, mut rx) = mpsc::channel((self.config.flashblocks_per_block() + 1) as usize);
 
@@ -434,7 +477,7 @@ where
             async move {
                 let mut timer = tokio::time::interval_at(
                     tokio::time::Instant::now()
-                        .checked_add(first_flashblock_offset)
+                        .checked_add(first_flashblock_delay(first_flashblock_offset, resting_carry))
                         .expect("can add flashblock offset to current time"),
                     interval,
                 );
@@ -490,7 +533,7 @@ where
                     &span,
                     "Payload building complete, target flashblock count reached",
                 );
-                return self.finalize_payload(&mut state, &ctx, &mut info);
+                return self.finalize_block(&mut state, &ctx, &mut info, &mut best_txs);
             }
 
             // build first flashblock immediately
@@ -517,7 +560,7 @@ where
                         &span,
                         "Payload building complete, job cancelled or target flashblock count reached",
                     );
-                    return self.finalize_payload(&mut state, &ctx, &mut info);
+                    return self.finalize_block(&mut state, &ctx, &mut info, &mut best_txs);
                 }
                 Err(err) => {
                     error!(
@@ -543,7 +586,7 @@ where
                         &span,
                         "Payload building complete, channel closed or job cancelled",
                     );
-                    return self.finalize_payload(&mut state, &ctx, &mut info);
+                    return self.finalize_block(&mut state, &ctx, &mut info, &mut best_txs);
                 }
             }
         }
@@ -625,7 +668,10 @@ where
         let best_txs_start_time = Instant::now();
         let best_txs_attributes = ctx.best_transaction_attributes();
         best_txs.refresh_iterator(ParkableBestPayloadTransactions::new(
-            self.pool.best_transactions_with_attributes_and_parking(best_txs_attributes),
+            self.pool.best_transactions_with_attributes_and_parking(
+                best_txs_attributes,
+                best_txs.iterator_hold(&ctx.cancel),
+            ),
         ));
         let transaction_pool_fetch_time = best_txs_start_time.elapsed();
         BuilderMetrics::transaction_pool_fetch_duration().record(transaction_pool_fetch_time);
@@ -950,6 +996,35 @@ where
         );
 
         span.record("flashblock_count", ctx.flashblock_index());
+    }
+
+    /// Finalizes the payload and carries the resting set into the next block.
+    ///
+    /// The finalized payload is the one returned to the payload resolver, so its hash is the parent
+    /// the next block is checked against.
+    fn finalize_block<DB, P>(
+        &self,
+        state: &mut State<DB>,
+        ctx: &BasePayloadBuilderCtx,
+        info: &mut ExecutionInfo,
+        best_txs: &mut NextBestFlashblocksTxs<Pool>,
+    ) -> Result<BaseBuiltPayload, PayloadBuilderError>
+    where
+        DB: Database<Error = ProviderError> + AsRef<P>,
+        P: StateRootProvider + HashedPostStateProvider + StorageRootProvider,
+    {
+        // Start the end-of-block sweep before the state root so the two overlap. The set is only
+        // stored once the block is sealed, so a block that fails to seal does not hand it on.
+        let resting = self
+            .config
+            .resting_predicate_mode
+            .is_enabled()
+            .then(|| self.resting_predicates.finish(best_txs.take_resting_predicates()));
+        let payload = self.finalize_payload(state, ctx, info)?;
+        if let Some(resting) = resting {
+            self.resting_predicates.put(resting, payload.block().hash());
+        }
+        Ok(payload)
     }
 
     /// Finalize the payload by computing the state root.
@@ -1378,9 +1453,22 @@ where
     ))
 }
 
+/// Time from starting the flashblock timer to its first tick.
+///
+/// The resting carry runs after the schedule is derived, so it comes out of the first flashblock
+/// instead of moving the schedule. It never takes more than the whole first flashblock: a first
+/// tick in the past would fire missed ticks back to back and cancel flashblocks before they build
+/// anything. A longer carry delays the schedule by the excess.
+const fn first_flashblock_delay(
+    first_flashblock_offset: Duration,
+    resting_carry: Duration,
+) -> Duration {
+    first_flashblock_offset.saturating_sub(resting_carry)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use alloy_consensus::{Header, Receipt};
     use alloy_primitives::{Address, B256, Log, U256, map::foldhash::HashMap};
@@ -1393,7 +1481,7 @@ mod tests {
     use reth_provider::{StateProviderBox, noop::NoopProvider};
     use reth_revm::{State, database::StateProviderDatabase};
 
-    use super::{FlashblocksMetadata, build_block};
+    use super::{FlashblocksMetadata, build_block, first_flashblock_delay};
     use crate::{ExecutionInfo, flashblocks::context::BasePayloadBuilderCtx};
 
     /// Creates a minimal [`BaseChainSpec`] with all L1 upgrades through Cancun
@@ -1420,6 +1508,23 @@ mod tests {
     fn genesis_header() -> Arc<SealedHeader> {
         let header = Header { gas_limit: 30_000_000, timestamp: 0, ..Default::default() };
         Arc::new(SealedHeader::seal_slow(header))
+    }
+
+    #[test]
+    fn resting_carry_comes_out_of_the_first_flashblock() {
+        let offset = Duration::from_millis(120);
+        assert_eq!(first_flashblock_delay(offset, Duration::ZERO), offset);
+        assert_eq!(
+            first_flashblock_delay(offset, Duration::from_millis(20)),
+            Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn resting_carry_longer_than_the_first_flashblock_never_starts_the_timer_in_the_past() {
+        let offset = Duration::from_millis(5);
+        assert_eq!(first_flashblock_delay(offset, offset), Duration::ZERO);
+        assert_eq!(first_flashblock_delay(offset, Duration::from_millis(300)), Duration::ZERO);
     }
 
     #[test]
