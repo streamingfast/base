@@ -30,7 +30,7 @@ use base_execution_rpc::{
 use base_execution_txpool::{
     BaseOrdering, BasePooledTransaction, BasePooledTx, BaseTransactionPool,
     BaseTransactionValidator, GuardLimits, ParkableTransactionPool, TimestampedTransaction,
-    maintain_state_diff_invalidation,
+    ValidityPoolLimits, maintain_state_diff_invalidation,
 };
 use reth_chain_state::CanonStateSubscriptions;
 use reth_chainspec::{BaseFeeParams, ChainSpecProvider, EthChainSpec, Hardforks};
@@ -273,6 +273,7 @@ impl BaseNode {
                         signature_limit: mempool_sender_limit,
                         payment_limit: mempool_payer_limit,
                     })
+                    .with_validity_pool_limits(self.args.validity_pool_limits())
                     .with_additional_trusted_delegation_targets(
                         self.args.mempool_trusted_delegation_targets.iter().copied(),
                     ),
@@ -888,6 +889,8 @@ pub struct BasePoolBuilder<T = BasePooledTransaction> {
     pub max_inflight_delegated_slots: usize,
     /// Per-account EIP-8130 admission caps.
     pub guard_limits: GuardLimits,
+    /// Capacity of the validity pool; unset fields copy the pending subpool limit.
+    pub validity_pool_limits: ValidityPoolLimits,
     /// Additional trusted EIP-7702 delegation targets for locked payers.
     pub additional_trusted_delegation_targets: AddressSet,
     /// Marker for the pooled transaction type.
@@ -901,6 +904,7 @@ impl<T> Default for BasePoolBuilder<T> {
             ordering: BaseOrdering::default(),
             max_inflight_delegated_slots: 4,
             guard_limits: GuardLimits::default(),
+            validity_pool_limits: ValidityPoolLimits::inherit(),
             additional_trusted_delegation_targets: AddressSet::default(),
             _pd: Default::default(),
         }
@@ -914,6 +918,7 @@ impl<T> Clone for BasePoolBuilder<T> {
             ordering: self.ordering.clone(),
             max_inflight_delegated_slots: self.max_inflight_delegated_slots,
             guard_limits: self.guard_limits,
+            validity_pool_limits: self.validity_pool_limits,
             additional_trusted_delegation_targets: self
                 .additional_trusted_delegation_targets
                 .clone(),
@@ -950,6 +955,12 @@ impl<T> BasePoolBuilder<T> {
         self
     }
 
+    /// Sets the validity pool's capacity. Unset fields copy the pending subpool limit.
+    pub const fn with_validity_pool_limits(mut self, limits: ValidityPoolLimits) -> Self {
+        self.validity_pool_limits = limits;
+        self
+    }
+
     /// Sets additional trusted delegation targets for balance-bounded locked payers.
     pub fn with_additional_trusted_delegation_targets(
         mut self,
@@ -978,6 +989,7 @@ where
             ordering,
             max_inflight_delegated_slots,
             guard_limits,
+            validity_pool_limits,
             additional_trusted_delegation_targets,
             ..
         } = self;
@@ -1016,8 +1028,9 @@ where
             blob_store,
             final_pool_config.clone(),
         );
-        let transaction_pool =
-            BaseTransactionPool::new(transaction_pool, ordering).with_guard_limits(guard_limits);
+        let transaction_pool = BaseTransactionPool::new(transaction_pool, ordering)
+            .with_guard_limits(guard_limits)
+            .with_validity_pool_limits(validity_pool_limits);
         spawn_maintenance_tasks(ctx, transaction_pool.clone(), &final_pool_config)?;
         let state_diff_events = BroadcastStream::new(ctx.provider().subscribe_to_canonical_state());
         ctx.task_executor().spawn_critical_task(
@@ -1030,6 +1043,12 @@ where
             max_inflight_delegated_slots = max_inflight_delegated_slots,
             sender_limit = guard_limits.signature_limit,
             payer_limit = guard_limits.payment_limit,
+            validity_pool_max_txs = validity_pool_limits
+                .max_txs
+                .unwrap_or(final_pool_config.pending_limit.max_txs),
+            validity_pool_max_size = validity_pool_limits
+                .max_size
+                .unwrap_or(final_pool_config.pending_limit.max_size),
             "Transaction pool initialized"
         );
         debug!(target: "reth::cli", "Spawned txpool maintenance tasks");
@@ -1172,8 +1191,10 @@ where
                     resource_metering: self.resource_metering,
                     rejection_cache: self.rejection_cache,
                     state_provider_metrics: ctx.config().engine.state_provider_metrics,
+                    resting_predicate_mode: Default::default(),
                 },
-            );
+            )
+            .with_task_executor(ctx.task_executor().clone());
         Ok(payload_builder)
     }
 }

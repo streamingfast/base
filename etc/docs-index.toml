@@ -156,7 +156,7 @@ digest = "1ccdbc3fb7"
 
 ["crates/batcher/comp/README.md"]
 summary = "base-comp: incremental Brotli channel compression (CompressionStream, BrotliLevel) producing protocol-compatible channels; batch encoding and framing live in batcher-encoder."
-digest = "ce9421e523"
+digest = "7d603b8774"
 
 ["crates/batcher/core/README.md"]
 summary = "base-batcher-core: async BatchDriver, SubmissionQueue for L1 transactions, and the DA throttle (Off, Step, Linear, Quadratic strategies) that publishes the DA limits the block builders apply."
@@ -164,7 +164,7 @@ digest = "de7352c3a8"
 
 ["crates/batcher/encoder/README.md"]
 summary = "base-batcher-encoder: synchronous, no-I/O encoder from L2 blocks to L1 submissions. Covers channel closing rules, blob framing, metric labels, and BatchEncoder usage."
-digest = "06022a9fa3"
+digest = "e8624eb69c"
 
 ["crates/batcher/service/README.md"]
 summary = "base-batcher-service: BatcherConfig and BatcherService, which wire the encoder, block source, tx manager, and driver into a running batcher process."
@@ -355,8 +355,8 @@ summary = "Proofs-history ExEx: versioned MDBX trie store serving historical eth
 digest = "13927f28e4"
 
 ["crates/execution/flashblocks-node/README.md"]
-summary = "FlashblocksExtension for the Base node: install_ext usage (install last), CLI flags (--flashblocks-url, --max-pending-blocks-depth, cached-execution), and the state, subscriber, RPC components."
-digest = "557e4ec2a8"
+summary = "FlashblocksExtension for the Base node: install_ext usage (install last), CLI flags (--flashblocks-url, --max-pending-blocks-depth, cached-execution), state, subscriber, RPC, and pool deadline expiry."
+digest = "bda32eab6a"
 
 ["crates/execution/flashblocks-node/tests/README.md"]
 summary = "Explains why flashblocks-node integration tests live in tests/ (public API only, single compilation unit with test utils) versus private-internals unit tests in src/. Read before adding tests."
@@ -408,23 +408,23 @@ digest = "559e8e9f95"
 
 ["crates/execution/tx-forwarding/README.md"]
 summary = "base-tx-forwarding: forwards mempool txs to builder RPCs via per-destination queues fed by FIFO and tip-priority lanes; dedup, batching, resend; spawn_requests for custom ForwardRequest; CLI flags."
-digest = "824cdc212c"
+digest = "bd5709a547"
 
 ["crates/execution/txpool-rpc/README.md"]
 summary = "Txpool RPC admin/status APIs and validity submissions; shared staged signature modes, signature rejection metrics, predicate forwarding and sequencer proxy behavior."
 digest = "adef27d8c3"
 
 ["crates/execution/txpool-tracing/README.md"]
-summary = "Txpool tracing extension: tracks mempool lifecycle events, txpool_transactionStatus RPC, enabling CLI flags, and reth_transaction_tracing_tx_event histogram. Use to debug tx latency or drops."
-digest = "e58f6b44fb"
+summary = "Txpool tracing extension: tracks mempool lifecycle events, txpool_transactionStatus RPC, enabling CLI flags, tx_event histogram and flow-labeled inclusion metrics. Use to debug tx latency or drops."
+digest = "469e9f8628"
 
 ["crates/execution/txpool/PROPAGATION_PIPELINE.md"]
 summary = "Plan to forward mempool txs to builders via base_insertValidatedTransaction in 4 PRs (consumer, forwarder, builder endpoint, node integration). Only PR 1 is marked done. Names a crates/txpool/ path."
 digest = "ce42872576"
 
 ["crates/execution/txpool/README.md"]
-summary = "Base txpool validation/ordering, builder wire extensions, staged EIP-712 predicate authorization, wallet signing contract, rejection metrics, and rollout/security limits."
-digest = "f8413da3b9"
+summary = "Base txpool validation/ordering, the separate validity pool, builder wire extensions, staged EIP-712 predicate authorization, wallet signing contract, rejection metrics, and rollout/security limits."
+digest = "446353ed97"
 
 ["crates/infra/audit/README.md"]
 summary = "audit-archiver-lib: ingests Vector transaction-event/v1 batches into Postgres idempotently and serves JSON-RPC queries; covers the migrations and schema snapshot regeneration."
@@ -615,8 +615,8 @@ summary = "One-line crate description: typed Optimism rollup JSON-RPC provider e
 digest = "d0aafc0327"
 
 ["crates/utilities/reth-cli/README.md"]
-summary = "Reth-specific CLI utilities for Base EL binaries: init_reth! for version metadata, and the snapshot manifest archive generator shared by snapshot-manifest and the snapshotter sidecar."
-digest = "4bc018ccf3"
+summary = "Reth CLI utilities for Base EL binaries: init_reth! (version metadata), init_engine! (200ms-block persistence defaults), and the shared snapshot manifest archive generator."
+digest = "72f0488bd4"
 
 ["crates/utilities/retry/README.md"]
 summary = "Shared RetryConfig wrapper over backon exponential retry builders, giving services common delay normalization, jitter, and bounded or unbounded retry limits. Use when adding retry logic."
@@ -680,7 +680,7 @@ digest = "e87f3373b8"
 
 ["docs/transaction-events/README.md"]
 summary = "Spec for transaction-event/v1, the JSONL business event journal for transaction observability: config fields, envelope, event vocabulary, Vector to audit-archiver ingest, Postgres retention, examples."
-digest = "24f8b4422b"
+digest = "7a35820370"
 
 ["docs/transaction-events/tips-parity-checklist.md"]
 summary = "Checklist for verifying TIPS UI audit-archiver/Postgres responses match the S3-backed routes (block, txn, bundle, rejected) before switching TIPS_UI_QUERY_BACKEND=audit."
