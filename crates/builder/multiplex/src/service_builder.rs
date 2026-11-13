@@ -1,4 +1,5 @@
 use base_builder_core::{BuilderConfig, FlashblocksServiceBuilder, NodeBounds, PoolBounds};
+use base_common_rpc_types_engine::PayloadReady;
 use base_execution_evm::BaseEvmConfig;
 use base_execution_firehose::OpFirehoseEvmConfig;
 use base_execution_payload_builder::config::BaseBuilderConfig;
@@ -17,7 +18,7 @@ use reth_node_builder::{
 };
 use reth_payload_builder::{PayloadBuilderHandle, PayloadBuilderService};
 use reth_provider::CanonStateSubscriptions;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info};
 
 use crate::{HealthState, MultiplexRouter, RoutingConfig};
@@ -31,12 +32,19 @@ pub struct MultiplexingServiceBuilder {
     pub routing_config: RoutingConfig,
     /// Whether to run only the basic payload builder.
     pub basic_only: bool,
+    /// Optional notifications for frozen sequencer payloads from the basic payload builder.
+    pub payload_ready: Option<broadcast::Sender<PayloadReady>>,
 }
 
 impl MultiplexingServiceBuilder {
     /// Creates a new multiplexing service builder.
     pub fn new(builder_config: BuilderConfig) -> Self {
-        Self { builder_config, routing_config: RoutingConfig::default(), basic_only: false }
+        Self {
+            builder_config,
+            routing_config: RoutingConfig::default(),
+            basic_only: false,
+            payload_ready: None,
+        }
     }
 
     /// Configures multiplexer runtime config.
@@ -67,6 +75,7 @@ impl MultiplexingServiceBuilder {
         BaseBuilderConfig {
             da_config: self.builder_config.da_config.clone(),
             gas_limit_config: self.builder_config.gas_limit_config.clone(),
+            max_uncompressed_block_size: self.builder_config.max_uncompressed_block_size,
             manifest_precheck_enabled: self.builder_config.manifest_precheck_enabled,
             predicate_eval_hard_cutoff: self.builder_config.predicate_eval_hard_cutoff,
             predicate_bucket_ordered_threshold: self
@@ -116,7 +125,8 @@ where
                 evm_config.inner.clone(),
                 self.native_payload_config(builder_config.state_provider_metrics),
             )
-            .with_task_executor(ctx.task_executor().clone());
+            .with_task_executor(ctx.task_executor().clone())
+            .with_payload_ready(self.payload_ready.clone());
 
         let payload_config = ctx.config().builder.clone();
         let payload_job_config = BasicPayloadJobGeneratorConfig::default()
@@ -200,7 +210,8 @@ impl BasePayloadServiceBuilder for MultiplexingServiceBuilder {
         BaseConsensusBuilder,
     >;
 
-    fn build_components(self, base_node: &BaseNode) -> Self::ComponentsBuilder {
+    fn build_components(mut self, base_node: &BaseNode) -> Self::ComponentsBuilder {
+        self.payload_ready = base_node.payload_ready.clone();
         base_node.components::<BaseNodeTypes>().payload(self)
     }
 }
@@ -213,6 +224,21 @@ mod tests {
     use base_execution_payload_builder::{ResourceMeteringConfig, ResourceMeteringSchedule};
 
     use super::*;
+
+    /// Both cutover and basic-only builds retain the shared uncompressed byte cap.
+    #[test]
+    fn native_payload_config_forwards_max_uncompressed_block_size() {
+        for limit in [None, Some(0), Some(1_000)] {
+            for basic_only in [false, true] {
+                let config = BuilderConfig {
+                    max_uncompressed_block_size: limit,
+                    ..BuilderConfig::default()
+                };
+                let service = MultiplexingServiceBuilder::new(config).with_basic_only(basic_only);
+                assert_eq!(service.native_payload_config(false).max_uncompressed_block_size, limit);
+            }
+        }
+    }
 
     #[test]
     fn native_payload_config_preserves_metering_provider_and_rejection_cache() {
