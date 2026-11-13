@@ -7,7 +7,7 @@ and refresh the statuses when an activation is announced.
 Denim and Everest are contract-backed: an L1 upgrade signal (`crates/utilities/upgrade-signal`) can
 schedule them on a network with no new node release. Zenith can only be set in genesis.
 
-Statuses checked 2026-11-06 against Base `v1.5.4` (`crates/common/chains/src/config.rs`). On both
+Statuses checked 2026-11-13 against Base `v1.5.5` (`crates/common/chains/src/config.rs`). On both
 L1s, `getSchedule()` on the configured `protocol_versions_address` reverts, so no upgrade is
 scheduled through the signal; the schedules below are the ones in the code.
 
