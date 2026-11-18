@@ -1,3 +1,14 @@
+## v1.5.5-fh3.1
+
+### Changed
+
+* Rebased on upstream Base `v1.5.5`, recommended for Base mainnet and Base Sepolia: it fixes the
+  `eth_call` latency regression of `v1.5.4`. Uses `streamingfast/reth` `base-v2.5.2.11-fh3.1`;
+  `firehose-tracer` stays on 5.7.0 and the Firehose block model is unchanged.
+* Upstream returns `--engine.memory-block-buffer-target` of `base-reth-node` to 5 blocks (70 in
+  `v1.5.4`). After an unclean shutdown the node still executes again and emits again the FIRE BLOCK
+  lines of up to about 70 blocks, now fewer on average.
+
 ## v1.5.4-fh3.1
 
 ### Changed
