@@ -1,3 +1,14 @@
+## v1.5.6-fh3.1
+
+### Changed
+
+* Rebased on upstream Base `v1.5.6`, recommended for Base mainnet and Base Sepolia with no
+  deadline. Uses `streamingfast/reth` `base-v2.5.2.11-fh3.1`; `firehose-tracer` stays on 5.7.0 and
+  the Firehose block model is unchanged.
+* Upstream exempts deposit transactions from the EIP-7825 transaction gas limit cap during
+  execution. The root call of a deposit with a gas limit above 16,777,216 now gets the whole gas
+  limit minus the intrinsic gas, and its `gas_used` is only the gas it used.
+
 ## v1.5.5-fh3.1
 
 ### Changed

@@ -47,6 +47,10 @@ path = "tests/prestate.rs"
 name = "eip8130"
 path = "tests/eip8130.rs"
 
+[[test]]
+name = "deposit_gas"
+path = "tests/deposit_gas.rs"
+
 [dev-dependencies]
 k256.workspace = true
 sha2.workspace = true

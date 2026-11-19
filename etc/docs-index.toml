@@ -212,7 +212,7 @@ digest = "e0d063f6c5"
 
 ["crates/common/evm/README.md"]
 summary = "Base revm-based EVM support: upgrade-to-SpecId mapping, BaseEvmFactory, block executors, receipt builders, and create2 deployer handling. Use when changing per-upgrade execution rules."
-digest = "835735d39b"
+digest = "0bfaf33862"
 
 ["crates/common/evm2/README.md"]
 summary = "Scaffold for Base's EVM2 integration (BaseEvmTypes, currently mirroring stock Ethereum), not wired into the node, for differential testing against revm. Use when working on EVM2 groundwork."
@@ -308,7 +308,7 @@ digest = "030a8cd22a"
 
 ["crates/consensus/service/README.md"]
 summary = "Consensus node composition layer: actor model, RollupNode vs FollowNode, startup sequence, and each actor (engine, derivation, sequencer, network, L1 watcher, RPC). Read to understand node wiring."
-digest = "07a60f6111"
+digest = "9b6ffcbc45"
 
 ["crates/consensus/service/src/actors/network/README.md"]
 summary = "Overview and example of the network actor, which owns libp2p gossip and discv5 discovery, built via NetworkBuilder or with_transport for tests. Use when wiring or testing the P2P actor."
@@ -388,7 +388,7 @@ digest = "2a3542b962"
 
 ["crates/execution/runner/README.md"]
 summary = "base-node-runner: BaseNodeExtension, FromExtensionConfig and NodeHooks for node extensions, plus the frozen-payload notification channel (PayloadReady) the unified sequencer uses to seal early."
-digest = "029ce212e6"
+digest = "20a419164e"
 
 ["crates/execution/shadow-indexer-db/README.md"]
 summary = "One-line stub: database access layer for shadow indexer block persistence. Little detail beyond that."

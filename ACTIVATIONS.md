@@ -7,14 +7,14 @@ and refresh the statuses when an activation is announced.
 Denim and Everest are contract-backed: an L1 upgrade signal (`crates/utilities/upgrade-signal`) can
 schedule them on a network with no new node release. Zenith can only be set in genesis.
 
-Statuses checked 2026-11-13 against Base `v1.5.5` (`crates/common/chains/src/config.rs`). On both
+Statuses checked 2026-11-18 against Base `v1.5.6` (`crates/common/chains/src/config.rs`). On both
 L1s, `getSchedule()` on the configured `protocol_versions_address` reverts, so no upgrade is
 scheduled through the signal; the schedules below are the ones in the code.
 
 | Upgrade | Base mainnet | Base Sepolia | Effect on the Firehose block |
 |---------|--------------|--------------|------------------------------|
 | Bedrock … Jovian | Active (Jovian 2025-12-02) | Active | Already in the stream. Canyon's `create2deployer` install is a direct DB write in `apply_pre_execution_changes`; it is emitted as a block-level code change when the block is traced with `v1.5.0-fh3.1` or later. |
-| Azul | Active 2026-05-28 18:00 UTC | Active 2026-04-20 18:00 UTC | Already in the stream. |
+| Azul | Active 2026-05-28 18:00 UTC | Active 2026-04-20 18:00 UTC | Already in the stream. Azul brings the EIP-7825 transaction gas limit cap (16,777,216). From `v1.5.6-fh3.1`, deposits are exempt from it during execution as well as validation: the root call of a deposit with a higher gas limit gets the whole limit minus the intrinsic gas, and only the gas it uses is reported. Covered by `crates/execution/firehose-tests/tests/deposit_gas.rs`. |
 | Beryl | Active 2026-06-25 18:00 UTC | Active 2026-06-18 18:00 UTC | Already in the stream. |
 | Cobalt | Active 2026-09-30 18:00 UTC | Active 2026-09-23 18:00 UTC | B-20 V2 precompiles. Covered by `etc/systems/tests/firehose_cobalt_b20.rs`. |
 | Denim | Active 2026-11-05 18:00 UTC (`1_793_901_600`); first Denim block is 53_556_127 at `1_793_901_601` | Active 2026-10-21 18:00 UTC (`1_792_605_600`) | See [Denim](#denim). Mainnet nodes need `v1.5.1-fh3.1` or later. |
