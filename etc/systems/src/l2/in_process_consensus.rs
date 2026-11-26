@@ -43,7 +43,7 @@ const SEQUENCER_UNSAFE_HEAD_TIMEOUT: Duration = Duration::from_secs(60);
 const SEQUENCER_UNSAFE_HEAD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Configuration for starting an in-process consensus node.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct InProcessConsensusConfig {
     /// Parsed rollup configuration.
     pub rollup_config: RollupConfig,

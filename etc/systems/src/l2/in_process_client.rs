@@ -99,6 +99,33 @@ pub struct InProcessClientConfig {
     pub extra_extensions: Vec<Box<dyn BaseNodeExtension>>,
 }
 
+impl InProcessClientConfig {
+    /// Returns a copy of this configuration without [`Self::extra_extensions`], which are boxed
+    /// trait objects and cannot be cloned.
+    pub fn clone_without_extensions(&self) -> Self {
+        Self {
+            runtime: self.runtime,
+            chain_spec: self.chain_spec.clone(),
+            datadir: self.datadir.clone(),
+            jwt_secret: self.jwt_secret,
+            builder_rpc_url: self.builder_rpc_url.clone(),
+            builder_flashblocks_url: self.builder_flashblocks_url.clone(),
+            builder_p2p_enode: self.builder_p2p_enode.clone(),
+            http_port: self.http_port,
+            ws_port: self.ws_port,
+            auth_port: self.auth_port,
+            p2p_port: self.p2p_port,
+            metrics_port: self.metrics_port,
+            persistence_threshold: self.persistence_threshold,
+            persistence_backpressure_threshold: self.persistence_backpressure_threshold,
+            tx_forwarding_config: self.tx_forwarding_config.clone(),
+            validity_signature_mode: self.validity_signature_mode,
+            upgrade_signal: self.upgrade_signal.clone(),
+            extra_extensions: Vec::new(),
+        }
+    }
+}
+
 /// In-process Base client node that syncs from a builder.
 ///
 /// This replaces the Docker-based `ClientContainer` for faster test execution.

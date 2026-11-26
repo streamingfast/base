@@ -70,9 +70,9 @@ pub use l2::{
     InProcessBuilderConfig, InProcessClient, InProcessClientConfig, InProcessConsensus,
     InProcessConsensusConfig, InProcessFollowConsensus, InProcessFollowConsensusConfig,
     InProcessNodeRuntime, InProcessStandaloneSequencer, InProcessStandaloneSequencerConfig,
-    L2ClientConsensus, L2ClientConsensusMode, L2ContainerConfig, L2Stack, L2StackConfig,
-    ShadowSequencer, ShadowSequencerConfig, ShadowSequencersConfig, SnapshotBoundary,
-    SnapshotL2Stack, SnapshotL2StackConfig, TestNodeRuntime,
+    L2ClientConsensus, L2ClientConsensusMode, L2ClientReplacement, L2ContainerConfig, L2Stack,
+    L2StackConfig, ShadowSequencer, ShadowSequencerConfig, ShadowSequencersConfig,
+    SnapshotBoundary, SnapshotL2Stack, SnapshotL2StackConfig, TestNodeRuntime,
 };
 
 mod network;

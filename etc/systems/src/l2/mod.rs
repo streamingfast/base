@@ -37,5 +37,6 @@ pub use shadow_sequencer::{ShadowSequencer, ShadowSequencerConfig};
 
 mod stack;
 pub use stack::{
-    L2ClientConsensus, L2ClientConsensusMode, L2Stack, L2StackConfig, ShadowSequencersConfig,
+    L2ClientConsensus, L2ClientConsensusMode, L2ClientReplacement, L2Stack, L2StackConfig,
+    ShadowSequencersConfig,
 };
