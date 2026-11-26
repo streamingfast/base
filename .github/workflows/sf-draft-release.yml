@@ -37,3 +37,5 @@ jobs:
         with:
           version: ${{ steps.detect.outputs.version }}
           homebrew-tap-token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # Comment as the bot user (sf-slack-ops forwards GitHub comments to Slack), github-actions[bot] when omitted
+          github-token: ${{ secrets.PR_COMMENTER }}
