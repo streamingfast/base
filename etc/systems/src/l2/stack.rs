@@ -26,7 +26,7 @@ use base_execution_txpool::ValiditySignatureMode;
 use base_node_runner::BaseNodeExtension;
 use base_tx_forwarding::TxForwardingConfig;
 use base_upgrade_signal::UpgradeSignalConfig;
-use eyre::{Result, WrapErr};
+use eyre::{Result, WrapErr, eyre};
 use tokio::time::{sleep, timeout};
 use url::Url;
 
@@ -171,7 +171,15 @@ pub struct L2Stack {
     batcher: InProcessBatcher,
     client: InProcessClient,
     client_consensus: L2ClientConsensus,
+    client_replacement: Option<L2ClientReplacement>,
     shadow_sequencers: Vec<ShadowSequencer>,
+}
+
+/// The configurations [`L2Stack::replace_client`] starts the new client and consensus node from.
+#[derive(Debug)]
+pub struct L2ClientReplacement {
+    client: InProcessClientConfig,
+    consensus: InProcessConsensusConfig,
 }
 
 impl std::fmt::Debug for L2Stack {
@@ -323,11 +331,20 @@ impl L2Stack {
             upgrade_signal: config.execution_upgrade_signal.clone(),
             extra_extensions: config.extra_client_extensions,
         };
+        // Extra extensions are boxed trait objects that cannot be installed a second time, so a
+        // client carrying any cannot be replaced. A replacement never reuses a caller-owned
+        // datadir: it starts empty.
+        let replacement_client_config = client_config.extra_extensions.is_empty().then(|| {
+            let mut replacement = client_config.clone_without_extensions();
+            replacement.datadir = None;
+            replacement
+        });
         let client = InProcessClient::start(client_config)
             .await
             .wrap_err("Failed to start in-process client")?;
 
         // 5. Start client consensus.
+        let mut replacement_consensus_config = None;
         let client_consensus = match config.client_consensus_mode {
             L2ClientConsensusMode::Validator => {
                 let client_consensus_config = InProcessConsensusConfig {
@@ -351,6 +368,7 @@ impl L2Stack {
                     upgrade_signal: config.upgrade_signal.clone(),
                     execution_forwarding_endpoint: None,
                 };
+                replacement_consensus_config = Some(client_consensus_config.clone());
                 let client_consensus = InProcessConsensus::start(client_consensus_config)
                     .await
                     .wrap_err("Failed to start client consensus")?;
@@ -545,6 +563,9 @@ impl L2Stack {
             batcher: batcher.expect("batcher starts in both shadow startup paths"),
             client,
             client_consensus,
+            client_replacement: replacement_client_config
+                .zip(replacement_consensus_config)
+                .map(|(client, consensus)| L2ClientReplacement { client, consensus }),
             shadow_sequencers,
         })
     }
@@ -614,6 +635,49 @@ impl L2Stack {
         self.client_consensus.follow_rollup_config()
     }
 
+    /// Replaces the client node and its consensus node with fresh ones once the chain has moved on.
+    ///
+    /// Stops both, waits until the builder is `gap_blocks` past the client's head, then starts a
+    /// new client on an empty datadir and reconnects a new consensus node to the builder's. The new
+    /// node comes up behind the chain tip, as a reader joining or catching up late does. Only a
+    /// validator-mode client without extra extensions can be replaced.
+    pub async fn replace_client(mut self, gap_blocks: u64, gap_timeout: Duration) -> Result<Self> {
+        let replacement = self.client_replacement.as_ref().ok_or_else(|| {
+            eyre!("only a validator-mode client without extra extensions can be replaced")
+        })?;
+        let builder_provider = RootProvider::<Base>::new_http(self.builder.rpc_url()?);
+        let client_provider = RootProvider::<Base>::new_http(self.client.rpc_url()?);
+
+        self.client_consensus.shutdown().await;
+        let target = client_provider.get_block_number().await? + gap_blocks;
+        self.client.shutdown().await.wrap_err("Failed to stop L2 client")?;
+
+        timeout(gap_timeout, async {
+            while builder_provider.get_block_number().await? < target {
+                sleep(Duration::from_millis(100)).await;
+            }
+            Ok::<_, eyre::Error>(())
+        })
+        .await
+        .wrap_err_with(|| format!("Timed out waiting for the builder to reach block {target}"))??;
+
+        self.client = InProcessClient::start(replacement.client.clone_without_extensions())
+            .await
+            .wrap_err("Failed to start replacement L2 client")?;
+        let mut consensus_config = replacement.consensus.clone();
+        consensus_config.l2_engine_url = self.client.engine_url()?;
+        let client_consensus = InProcessConsensus::start(consensus_config)
+            .await
+            .wrap_err("Failed to start replacement client consensus")?;
+        client_consensus
+            .connect_peer(&self.builder_consensus.p2p_addr())
+            .await
+            .wrap_err("Failed to connect replacement client consensus to builder consensus")?;
+        self.client_consensus = L2ClientConsensus::Validator(client_consensus);
+
+        Ok(self)
+    }
+
     /// Stops the in-process L2 services and gracefully shuts down execution runtimes.
     pub async fn shutdown(self) -> Result<()> {
         let Self {
@@ -622,6 +686,7 @@ impl L2Stack {
             batcher,
             client,
             client_consensus,
+            client_replacement: _,
             shadow_sequencers,
         } = self;
 

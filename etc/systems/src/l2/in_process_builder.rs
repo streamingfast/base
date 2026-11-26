@@ -482,6 +482,9 @@ fn create_node_config(
         && config.p2p_port.is_none()
     {
         node_config = node_config.with_unused_ports();
+        // Clients dial the builder through the enode built from this port, so it must be a real
+        // port rather than the OS-assigned 0 that `with_unused_ports` leaves.
+        node_config.network.port = get_available_port();
     }
 
     Ok(node_config)

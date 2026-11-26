@@ -1,3 +1,14 @@
+## v1.5.6-fh3.1-1
+
+### Fixed
+
+* Blocks replayed by staged sync now advertise the node's finalized block as LIB, or the block
+  itself when it's at or below the finalized block. Before, every replayed block reported itself
+  as final. On OP Stack, a node more than 32 blocks behind backfills up to the unsafe head, so a
+  reader catching up after a restart or stall reported unsafe, reorgable blocks as final and
+  pushed LIB past the chain's real finalized head. Uses `streamingfast/reth`
+  `release/base-2.x` at `202ac0fe` (streamingfast/reth#110).
+
 ## v1.5.6-fh3.1
 
 ### Changed

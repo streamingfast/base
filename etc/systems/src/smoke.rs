@@ -208,6 +208,17 @@ impl SystemTestStack {
         &self.l2_stack
     }
 
+    /// Replaces the L2 client and its consensus node with fresh ones once the builder is
+    /// `gap_blocks` past the client's head. See [`L2Stack::replace_client`].
+    pub async fn replace_l2_client(
+        mut self,
+        gap_blocks: u64,
+        gap_timeout: Duration,
+    ) -> Result<Self> {
+        self.l2_stack = self.l2_stack.replace_client(gap_blocks, gap_timeout).await?;
+        Ok(self)
+    }
+
     /// Returns the controllable L1 RPC proxy when fault injection was enabled.
     pub const fn l1_rpc_proxy(&self) -> Option<&L1RpcProxy> {
         self.l1_rpc_proxy.as_ref()
